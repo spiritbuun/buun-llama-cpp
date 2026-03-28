@@ -2,8 +2,8 @@
  * TBQ (TurboQuant-B): KV cache compression via SRHT + Lloyd-Max codebook
  * Based on: Zandieh et al., "TurboQuant", ICLR 2026
  *
- * Implements GGML_TYPE_TBQ3_0 (3-bit) and GGML_TYPE_TBQ4_0 (4-bit)
- * for use as --cache-type-k tbq3 --cache-type-v tbq3 in llama-server.
+ * Implements GGML_TYPE_TBQ2_0 (2-bit), GGML_TYPE_TBQ3_0 (3-bit) and GGML_TYPE_TBQ4_0 (4-bit)
+ * for use as --cache-type-k tbq2 --cache-type-v tbq2 in llama-server.
  *
  * Key difference from TURBO types: TBQ uses SRHT (Subsampled Randomized
  * Hadamard Transform) + Lloyd-Max codebook quantization with 128-element
@@ -24,6 +24,13 @@
 // ============================================================================
 
 // Lloyd-Max codebook values for standard Gaussian N(0,1)
+static const float tbq2_centroids_cpu[4] = {
+    -1.5104176085f, -0.4527800346f, 0.4527800346f, 1.5104176085f
+};
+static const float tbq2_boundaries_cpu[3] = {
+    -0.9815988216f, 0.0000000000f, 0.9815988216f
+};
+
 static const float tbq3_centroids_cpu[8] = {
     -2.1519478649f, -1.3439114671f, -0.7560068854f, -0.2450947664f,
      0.2450947664f,  0.7560068854f,  1.3439114671f,  2.1519478649f
@@ -70,6 +77,11 @@ static void tbq_hadamard_128(float * data) {
     for (int i = 0; i < 128; i++) {
         data[i] *= 0.0883883f;
     }
+}
+
+static inline int tbq_quantize_2bit(float val) {
+    if (val > tbq2_boundaries_cpu[1]) return val > tbq2_boundaries_cpu[2] ? 3 : 2;
+    return val > tbq2_boundaries_cpu[0] ? 1 : 0;
 }
 
 static inline int tbq_quantize_3bit(float val) {
@@ -240,6 +252,77 @@ void ggml_vec_dot_tbq4_0_q8_K(int n, float * restrict s, size_t bs, const void *
             uint8_t packed = x[i].qs[j];
             tmp[j * 2 + 0] = tbq4_centroids_cpu[packed & 0xf];
             tmp[j * 2 + 1] = tbq4_centroids_cpu[(packed >> 4) & 0xf];
+        }
+        tbq_hadamard_128(tmp);
+        for (int j = 0; j < 128; j++) tmp[j] *= tbq_get_sign(j);
+        float norm = GGML_FP16_TO_FP32(x[i].norm);
+        float sum = 0.0f;
+        for (int j = 0; j < 128; j++) sum += (tmp[j] * norm) * (y[i].qs[j] * y[i].d);
+        sumf += sum;
+    }
+    *s = sumf;
+}
+
+void quantize_row_tbq2_0_ref(const float * restrict x, block_tbq2_0 * restrict y, int64_t k) {
+    assert(k % QK_TBQ2 == 0);
+    const int64_t nb = k / QK_TBQ2;
+    float tmp[128];
+
+    for (int64_t i = 0; i < nb; i++) {
+        float norm = 0.0f;
+        for (int j = 0; j < 128; j++) norm += x[i * 128 + j] * x[i * 128 + j];
+        norm = sqrtf(norm);
+        if (norm < 1e-12f) norm = 1e-12f;
+
+        for (int j = 0; j < 128; j++) tmp[j] = x[i * 128 + j] / norm;
+        for (int j = 0; j < 128; j++) tmp[j] *= tbq_get_sign(j);
+        tbq_hadamard_128(tmp);
+
+        // Pack 2-bit indices: 4 values per byte
+        memset(y[i].qs, 0, 32);
+        for (int j = 0; j < 128; j++) {
+            int idx = tbq_quantize_2bit(tmp[j]);
+            y[i].qs[j / 4] |= (uint8_t)(idx << ((j % 4) * 2));
+        }
+        y[i].norm = GGML_FP32_TO_FP16(norm);
+    }
+}
+
+void quantize_row_tbq2_0(const float * restrict x, void * restrict y, int64_t k) {
+    quantize_row_tbq2_0_ref(x, (block_tbq2_0 *)y, k);
+}
+
+void dequantize_row_tbq2_0(const block_tbq2_0 * restrict x, float * restrict y, int64_t k) {
+    assert(k % QK_TBQ2 == 0);
+    const int64_t nb = k / QK_TBQ2;
+    float tmp[128];
+
+    for (int64_t i = 0; i < nb; i++) {
+        for (int j = 0; j < 128; j++) {
+            int idx = (x[i].qs[j / 4] >> ((j % 4) * 2)) & 0x3;
+            tmp[j] = tbq2_centroids_cpu[idx];
+        }
+        tbq_hadamard_128(tmp);
+        for (int j = 0; j < 128; j++) tmp[j] *= tbq_get_sign(j);
+        float norm = GGML_FP16_TO_FP32(x[i].norm);
+        for (int j = 0; j < 128; j++) y[i * 128 + j] = tmp[j] * norm;
+    }
+}
+
+void ggml_vec_dot_tbq2_0_q8_K(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    GGML_UNUSED(nrc); GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by);
+
+    const int nb = n / QK_TBQ2;
+    float tmp[128];
+    float sumf = 0.0f;
+    const block_tbq2_0 * x = (const block_tbq2_0 *)vx;
+    const block_q8_K    * y = (const block_q8_K *)vy;
+
+    for (int i = 0; i < nb; i++) {
+        for (int j = 0; j < 128; j++) {
+            int idx = (x[i].qs[j / 4] >> ((j % 4) * 2)) & 0x3;
+            tmp[j] = tbq2_centroids_cpu[idx];
         }
         tbq_hadamard_128(tmp);
         for (int j = 0; j < 128; j++) tmp[j] *= tbq_get_sign(j);

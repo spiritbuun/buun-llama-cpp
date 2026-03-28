@@ -324,6 +324,16 @@ typedef struct {
 } block_tbq4_0;
 static_assert(sizeof(block_tbq4_0) == 66, "wrong tbq4_0 block size/padding");
 
+// TBQ 2-bit: SRHT + Lloyd-Max 4-level codebook
+// Per block: 2-bit packed indices (32 bytes) + norm(fp16) = 34 bytes per 128 values
+// = 2.125 bits/value → 7.53× compression vs fp16
+#define QK_TBQ2 128
+typedef struct {
+    uint8_t  qs[32];    // 2-bit packed codebook indices (128 * 2 / 8 = 32)
+    ggml_half norm;     // L2 norm (corrected: ||x|| / ||centroids||)
+} block_tbq2_0;
+static_assert(sizeof(block_tbq2_0) == 34, "wrong tbq2_0 block size/padding");
+
 //
 // Super-block quantization structures
 //

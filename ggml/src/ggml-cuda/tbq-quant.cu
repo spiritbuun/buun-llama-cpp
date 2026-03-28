@@ -11,6 +11,14 @@
 // Computed via iterative centroid optimization
 // ============================================================================
 
+// 2-bit (4 levels)
+static __constant__ float tbq2_centroids[4] = {
+    -1.5104176085f, -0.4527800346f, 0.4527800346f, 1.5104176085f
+};
+static __constant__ float tbq2_boundaries[3] = {
+    -0.9815988216f, 0.0000000000f, 0.9815988216f
+};
+
 // 3-bit (8 levels)
 static __constant__ float tbq3_centroids[8] = {
     -2.1519478649f, -1.3439114671f, -0.7560068854f, -0.2450947664f,
@@ -85,6 +93,20 @@ static __device__ void apply_sign_flips(float * smem, int tid) {
     float sign = (tbq_rademacher[word] >> bit) & 1 ? -1.0f : 1.0f;
     smem[tid] *= sign;
     __syncthreads();
+}
+
+// ============================================================================
+// Device helper: Lloyd-Max 2-bit quantization (binary search)
+// Returns index 0-3
+// ============================================================================
+static __device__ __forceinline__ int quantize_lloyd_max_2bit(float val) {
+    int idx = 0;
+    if (val > tbq2_boundaries[1]) {  // > 0
+        idx = val > tbq2_boundaries[2] ? 3 : 2;
+    } else {
+        idx = val > tbq2_boundaries[0] ? 1 : 0;
+    }
+    return idx;
 }
 
 // ============================================================================
@@ -163,6 +185,109 @@ static __device__ __forceinline__ int unpack_3bit(const uint8_t * qs, int tid) {
         val |= ((int)qs[byte_idx + 1]) << (8 - bit_pos);
     }
     return val & 0x7;
+}
+
+// ============================================================================
+// Quantization kernel: TBQ2_0
+// Grid: ceil(k/128), Block: 128 threads
+// ============================================================================
+static __global__ void quantize_tbq2_0_kernel(const float * __restrict__ x,
+                                                block_tbq2_0 * __restrict__ y,
+                                                int64_t k) {
+    const int64_t block_idx = blockIdx.x;
+    const int     tid       = threadIdx.x;
+    const int64_t offset    = block_idx * 128;
+
+    if (offset + tid >= k) return;
+
+    __shared__ float smem[128];
+
+    // 1. Load data
+    smem[tid] = x[offset + tid];
+    __syncthreads();
+
+    // 2. Compute L2 norm
+    __shared__ float norm_shared;
+    {
+        float val = smem[tid] * smem[tid];
+        for (int s = 16; s > 0; s >>= 1) {
+            val += __shfl_down_sync(0xffffffff, val, s);
+        }
+        __shared__ float warp_sums[4];
+        if (tid % 32 == 0) {
+            warp_sums[tid / 32] = val;
+        }
+        __syncthreads();
+        if (tid == 0) {
+            float total = 0.0f;
+            for (int i = 0; i < 4; i++) total += warp_sums[i];
+            norm_shared = sqrtf(total);
+        }
+        __syncthreads();
+    }
+
+    float norm = norm_shared;
+    if (norm < 1e-12f) norm = 1e-12f;
+
+    // 3. Normalize
+    smem[tid] /= norm;
+    __syncthreads();
+
+    // 4. Apply random sign flips
+    apply_sign_flips(smem, tid);
+
+    // 5. Hadamard transform
+    hadamard_128_inplace(smem, tid);
+
+    // 6. Lloyd-Max quantize (2-bit)
+    // 7. Pack 2-bit indices: 4 values per byte, 32 bytes total
+    // Thread tid handles packing if tid < 32 (each packs 4 values)
+    if (tid < 32) {
+        int base = tid * 4;
+        int i0 = quantize_lloyd_max_2bit(smem[base + 0]);
+        int i1 = quantize_lloyd_max_2bit(smem[base + 1]);
+        int i2 = quantize_lloyd_max_2bit(smem[base + 2]);
+        int i3 = quantize_lloyd_max_2bit(smem[base + 3]);
+        y[block_idx].qs[tid] = (uint8_t)((i3 << 6) | (i2 << 4) | (i1 << 2) | i0);
+    }
+
+    // 8. Write norm
+    if (tid == 0) {
+        y[block_idx].norm = __float2half(norm);
+    }
+}
+
+// ============================================================================
+// Dequantization kernel: TBQ2_0
+// Grid: ceil(k/128), Block: 128 threads
+// ============================================================================
+static __global__ void dequantize_tbq2_0_kernel(const block_tbq2_0 * __restrict__ x,
+                                                  float * __restrict__ y,
+                                                  int64_t k) {
+    const int64_t block_idx = blockIdx.x;
+    const int     tid       = threadIdx.x;
+    const int64_t offset    = block_idx * 128;
+
+    if (offset + tid >= k) return;
+
+    __shared__ float smem[128];
+
+    // 1. Unpack 2-bit index and codebook lookup
+    int byte_idx = tid / 4;
+    int bit_shift = (tid % 4) * 2;
+    int idx = (x[block_idx].qs[byte_idx] >> bit_shift) & 0x3;
+    smem[tid] = tbq2_centroids[idx];
+    __syncthreads();
+
+    // 2. Inverse Hadamard transform
+    hadamard_128_inplace(smem, tid);
+
+    // 3. Inverse sign flips
+    apply_sign_flips(smem, tid);
+
+    // 4. Rescale by norm
+    float norm = __half2float(x[block_idx].norm);
+    y[offset + tid] = smem[tid] * norm;
 }
 
 // ============================================================================
@@ -390,6 +515,22 @@ static __global__ void dequantize_tbq4_0_kernel(const block_tbq4_0 * __restrict_
 // ============================================================================
 // Host wrapper functions
 // ============================================================================
+
+void quantize_row_tbq2_0_cuda(const float * x, void * y, int64_t k, cudaStream_t stream) {
+    GGML_ASSERT(k % QK_TBQ2 == 0);
+    const int64_t nblocks = k / QK_TBQ2;
+    quantize_tbq2_0_kernel<<<nblocks, 128, 0, stream>>>(x, (block_tbq2_0 *)y, k);
+}
+
+void dequantize_row_tbq2_0_cuda(const void * x, float * y, int64_t k, cudaStream_t stream) {
+    GGML_ASSERT(k % QK_TBQ2 == 0);
+    const int64_t nblocks = k / QK_TBQ2;
+    dequantize_tbq2_0_kernel<<<nblocks, 128, 0, stream>>>((const block_tbq2_0 *)x, y, k);
+}
+
+void dequantize_row_tbq2_0_cuda_fp32(const void * x, float * y, int64_t nrows, int64_t n_per_row, cudaStream_t stream) {
+    dequantize_row_tbq2_0_cuda(x, y, nrows * n_per_row, stream);
+}
 
 void quantize_row_tbq3_0_cuda(const float * x, void * y, int64_t k, cudaStream_t stream) {
     GGML_ASSERT(k % QK_TBQ3 == 0);

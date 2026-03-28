@@ -365,6 +365,37 @@ static __global__ void k_tbq_fwht_forward(
     if (threadIdx.x < 128) dst[offset + threadIdx.x] = buf[threadIdx.x] * inv_sqrt_128;
 }
 
+// TBQ2 dequant to f16 with full inverse SRHT (Hadamard + Rademacher signs)
+static __global__ void k_tbq2_dequant_f16(
+        const char * __restrict__ src, half * __restrict__ dst,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2,
+        const size_t nb1, const size_t nb2, const size_t nb3) {
+    const int64_t row = blockIdx.x, head = blockIdx.y, strm = blockIdx.z;
+    const int tid = threadIdx.x;
+    if (tid >= ne0) return;
+    const char * src_row = src + strm * nb3 + head * nb2 + row * nb1;
+    const int blk_idx = tid / QK_TBQ2, j_in = tid % QK_TBQ2;
+    const block_tbq2_0 * blk = (const block_tbq2_0 *)src_row + blk_idx;
+    const float norm = __half2float(blk->norm);
+    const int idx = (blk->qs[j_in / 4] >> ((j_in % 4) * 2)) & 0x3;
+    extern __shared__ float smem_dq[];
+    float * sm = smem_dq + blk_idx * QK_TBQ2;
+    sm[j_in] = d_tbq2_centroids_fattn[idx];
+    __syncthreads();
+    for (int step = 1; step < QK_TBQ2; step <<= 1) {
+        int partner = j_in ^ step;
+        float a = sm[j_in], b = sm[partner];
+        __syncthreads();
+        if (j_in < partner) { sm[j_in] = a + b; sm[partner] = a - b; }
+        __syncthreads();
+    }
+    sm[j_in] *= 0.08838834764831845f;
+    __syncthreads();
+    const int word = j_in / 32, bit = j_in % 32;
+    const float sign = (d_tbq_rademacher_fattn[word] >> bit) & 1 ? -1.0f : 1.0f;
+    dst[strm * (ne2 * ne1 * ne0) + head * (ne1 * ne0) + row * ne0 + tid] = __float2half(sm[j_in] * sign * norm);
+}
+
 // TBQ dequant to f16 with full inverse SRHT (Hadamard + Rademacher signs)
 static __global__ void k_tbq3_dequant_f16(
         const char * __restrict__ src, half * __restrict__ dst,
@@ -437,8 +468,8 @@ static void ggml_cuda_tbq_prefill_attend(ggml_backend_cuda_context & ctx, ggml_t
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
-    const bool tbq_k = K->type == GGML_TYPE_TBQ3_0 || K->type == GGML_TYPE_TBQ4_0;
-    const bool tbq_v = V->type == GGML_TYPE_TBQ3_0 || V->type == GGML_TYPE_TBQ4_0;
+    const bool tbq_k = K->type == GGML_TYPE_TBQ2_0 || K->type == GGML_TYPE_TBQ3_0 || K->type == GGML_TYPE_TBQ4_0;
+    const bool tbq_v = V->type == GGML_TYPE_TBQ2_0 || V->type == GGML_TYPE_TBQ3_0 || V->type == GGML_TYPE_TBQ4_0;
 
     half * k_fp16 = nullptr;
     half * v_fp16 = nullptr;
@@ -448,7 +479,10 @@ static void ggml_cuda_tbq_prefill_attend(ggml_backend_cuda_context & ctx, ggml_t
         CUDA_CHECK(cudaMallocAsync(&k_fp16, k_size, stream));
         dim3 grid_k(K->ne[1], K->ne[2], K->ne[3]);
         const size_t smem = K->ne[0] * sizeof(float);
-        if (K->type == GGML_TYPE_TBQ3_0) {
+        if (K->type == GGML_TYPE_TBQ2_0) {
+            k_tbq2_dequant_f16<<<grid_k, K->ne[0], smem, stream>>>(
+                (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
+        } else if (K->type == GGML_TYPE_TBQ3_0) {
             k_tbq3_dequant_f16<<<grid_k, K->ne[0], smem, stream>>>(
                 (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
         } else {
@@ -462,7 +496,10 @@ static void ggml_cuda_tbq_prefill_attend(ggml_backend_cuda_context & ctx, ggml_t
         CUDA_CHECK(cudaMallocAsync(&v_fp16, v_size, stream));
         dim3 grid_v(V->ne[1], V->ne[2], V->ne[3]);
         const size_t smem = V->ne[0] * sizeof(float);
-        if (V->type == GGML_TYPE_TBQ3_0) {
+        if (V->type == GGML_TYPE_TBQ2_0) {
+            k_tbq2_dequant_f16<<<grid_v, V->ne[0], smem, stream>>>(
+                (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
+        } else if (V->type == GGML_TYPE_TBQ3_0) {
             k_tbq3_dequant_f16<<<grid_v, V->ne[0], smem, stream>>>(
                 (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
         } else {
@@ -695,12 +732,16 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO2_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ2_0,  GGML_TYPE_TBQ2_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ3_0,  GGML_TYPE_TBQ3_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ4_0,  GGML_TYPE_TBQ4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ2_0,  GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ3_0,  GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ4_0,  GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,    GGML_TYPE_TBQ2_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,    GGML_TYPE_TBQ3_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,    GGML_TYPE_TBQ4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ2_0,  GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ3_0,  GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ4_0,  GGML_TYPE_F16)
 #else
@@ -720,12 +761,16 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO2_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ2_0,  GGML_TYPE_TBQ2_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ3_0,  GGML_TYPE_TBQ3_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ4_0,  GGML_TYPE_TBQ4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ2_0,  GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ3_0,  GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ4_0,  GGML_TYPE_Q8_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,    GGML_TYPE_TBQ2_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,    GGML_TYPE_TBQ3_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,    GGML_TYPE_TBQ4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ2_0,  GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ3_0,  GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TBQ4_0,  GGML_TYPE_F16)
 #endif // GGML_CUDA_FA_ALL_QUANTS
@@ -823,6 +868,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case GGML_TYPE_TURBO2_0:
         case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
+        case GGML_TYPE_TBQ2_0:
         case GGML_TYPE_TBQ3_0:
         case GGML_TYPE_TBQ4_0:
             break;
@@ -840,6 +886,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     if (K->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO2_0 ||
         K->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO3_0 ||
         K->type == GGML_TYPE_TURBO4_0 || V->type == GGML_TYPE_TURBO4_0 ||
+        K->type == GGML_TYPE_TBQ2_0   || V->type == GGML_TYPE_TBQ2_0   ||
         K->type == GGML_TYPE_TBQ3_0   || V->type == GGML_TYPE_TBQ3_0   ||
         K->type == GGML_TYPE_TBQ4_0   || V->type == GGML_TYPE_TBQ4_0) {
         if (Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0)
@@ -963,8 +1010,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     // is worth it since only prompt tokens are affected (generated tokens use full-precision SET_ROWS)
     const bool turbo_kv = K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 ||
                           V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0;
-    const bool tbq_kv = K->type == GGML_TYPE_TBQ3_0 || K->type == GGML_TYPE_TBQ4_0 ||
-                        V->type == GGML_TYPE_TBQ3_0 || V->type == GGML_TYPE_TBQ4_0;
+    const bool tbq_kv = K->type == GGML_TYPE_TBQ2_0 || K->type == GGML_TYPE_TBQ3_0 || K->type == GGML_TYPE_TBQ4_0 ||
+                        V->type == GGML_TYPE_TBQ2_0 || V->type == GGML_TYPE_TBQ3_0 || V->type == GGML_TYPE_TBQ4_0;
     if (tbq_kv && Q->ne[1] > 1 && turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
         // TBQ prefill: dequant K/V to f16 (inverse SRHT) then MMA. No Q rotation needed
         // since dequant produces original-domain values.
@@ -990,7 +1037,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         ggml_tensor * orig_v_decode = nullptr;
 
         if (do_decode_dequant) {
-            if (K->type == GGML_TYPE_TBQ3_0 || K->type == GGML_TYPE_TBQ4_0) {
+            if (K->type == GGML_TYPE_TBQ2_0 || K->type == GGML_TYPE_TBQ3_0 || K->type == GGML_TYPE_TBQ4_0) {
                 int device; CUDA_CHECK(cudaGetDevice(&device));
                 const size_t k_size = K->ne[0] * K->ne[1] * K->ne[2] * K->ne[3] * sizeof(half);
                 if (k_size > tbq_k_dec_size[device]) {
@@ -1001,7 +1048,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 k_fp16_dec = tbq_k_dec_buf[device];
                 dim3 grid_k(K->ne[1], K->ne[2], K->ne[3]);
                 const size_t smem = K->ne[0] * sizeof(float);
-                if (K->type == GGML_TYPE_TBQ3_0) {
+                if (K->type == GGML_TYPE_TBQ2_0) {
+                    k_tbq2_dequant_f16<<<grid_k, K->ne[0], smem, stream>>>(
+                        (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
+                } else if (K->type == GGML_TYPE_TBQ3_0) {
                     k_tbq3_dequant_f16<<<grid_k, K->ne[0], smem, stream>>>(
                         (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
                 } else {
@@ -1038,7 +1088,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 orig_k_decode = dst->src[1];
                 dst->src[1] = &K_f16_dec;
             }
-            if (V->type == GGML_TYPE_TBQ3_0 || V->type == GGML_TYPE_TBQ4_0) {
+            if (V->type == GGML_TYPE_TBQ2_0 || V->type == GGML_TYPE_TBQ3_0 || V->type == GGML_TYPE_TBQ4_0) {
                 int device; CUDA_CHECK(cudaGetDevice(&device));
                 const size_t v_size = V->ne[0] * V->ne[1] * V->ne[2] * V->ne[3] * sizeof(half);
                 if (v_size > tbq_v_dec_size[device]) {
@@ -1049,7 +1099,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 v_fp16_dec = tbq_v_dec_buf[device];
                 dim3 grid_v(V->ne[1], V->ne[2], V->ne[3]);
                 const size_t smem = V->ne[0] * sizeof(float);
-                if (V->type == GGML_TYPE_TBQ3_0) {
+                if (V->type == GGML_TYPE_TBQ2_0) {
+                    k_tbq2_dequant_f16<<<grid_v, V->ne[0], smem, stream>>>(
+                        (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
+                } else if (V->type == GGML_TYPE_TBQ3_0) {
                     k_tbq3_dequant_f16<<<grid_v, V->ne[0], smem, stream>>>(
                         (const char *)V->data, v_fp16_dec, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
                 } else {
@@ -1092,7 +1145,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         ggml_tensor Q_rot_decode;
         ggml_tensor * orig_q_decode = nullptr;
         const bool turbo_k_any = (K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0);
-        const bool tbq_k_any = (K->type == GGML_TYPE_TBQ3_0 || K->type == GGML_TYPE_TBQ4_0);
+        const bool tbq_k_any = (K->type == GGML_TYPE_TBQ2_0 || K->type == GGML_TYPE_TBQ3_0 || K->type == GGML_TYPE_TBQ4_0);
         if ((turbo_k_any || tbq_k_any) && Q->ne[0] % 128 == 0) {
             int device;
             CUDA_CHECK(cudaGetDevice(&device));
@@ -1138,8 +1191,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         if (orig_k_decode) dst->src[1] = orig_k_decode;
         if (orig_v_decode) dst->src[2] = orig_v_decode;
         // Only free TURBO alloc-per-call buffers; TBQ uses persistent per-device buffers
-        const bool tbq_k_used = (K->type == GGML_TYPE_TBQ3_0 || K->type == GGML_TYPE_TBQ4_0);
-        const bool tbq_v_used = (V->type == GGML_TYPE_TBQ3_0 || V->type == GGML_TYPE_TBQ4_0);
+        const bool tbq_k_used = (K->type == GGML_TYPE_TBQ2_0 || K->type == GGML_TYPE_TBQ3_0 || K->type == GGML_TYPE_TBQ4_0);
+        const bool tbq_v_used = (V->type == GGML_TYPE_TBQ2_0 || V->type == GGML_TYPE_TBQ3_0 || V->type == GGML_TYPE_TBQ4_0);
         if (k_fp16_dec && !tbq_k_used) CUDA_CHECK(cudaFreeAsync(k_fp16_dec, stream));
         if (v_fp16_dec && !tbq_v_used) CUDA_CHECK(cudaFreeAsync(v_fp16_dec, stream));
     }

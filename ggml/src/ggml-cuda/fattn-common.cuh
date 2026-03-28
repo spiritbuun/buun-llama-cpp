@@ -15,6 +15,9 @@ static __constant__ float d_turbo_centroids_3bit_fattn[8] = {
 };
 
 // TBQ (SRHT + Lloyd-Max) centroid tables for flash attention
+static __constant__ float d_tbq2_centroids_fattn[4] = {
+    -1.5104176085f, -0.4527800346f, 0.4527800346f, 1.5104176085f
+};
 static __constant__ float d_tbq3_centroids_fattn[8] = {
     -2.1519478649f, -1.3439114671f, -0.7560068854f, -0.2450947664f,
      0.2450947664f,  0.7560068854f,  1.3439114671f,  2.1519478649f
@@ -442,6 +445,47 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0(
 #else
             const float2 qf = ((const float2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
             sum += k0 * qf.x + k1 * qf.y;
+#endif
+        }
+    }
+    return sum;
+}
+
+// TBQ2 vec_dot: 2-bit packed indices, Lloyd-Max centroid lookup
+template<int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tbq2_0(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v,
+    const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+    const block_tbq2_0 * K_t2 = (const block_tbq2_0 *) K_c;
+    GGML_UNUSED(Q_q8); GGML_UNUSED(Q_ds_v);
+    constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
+    constexpr int cpy_ne = cpy_nb / 4;
+    float sum = 0.0f;
+    int prev_ib = -1;
+    float cn[4];
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads*cpy_ne) {
+        const int base_f2 = k_KQ_0 + (threadIdx.x % nthreads) * cpy_ne;
+        const int elem0 = base_f2 * 2;
+        const int ib = elem0 / QK_TBQ2;
+        const int j0 = elem0 % QK_TBQ2;
+        if (ib != prev_ib) {
+            const float norm = __half2float(K_t2[ib].norm);
+#pragma unroll
+            for (int c = 0; c < 4; c++) cn[c] = d_tbq2_centroids_fattn[c] * norm;
+            prev_ib = ib;
+        }
+#pragma unroll
+        for (int k_KQ_1 = 0; k_KQ_1 < cpy_ne; ++k_KQ_1) {
+            const int lj = j0 + k_KQ_1 * 2;
+            const int idx0 = (K_t2[ib].qs[lj / 4] >> ((lj % 4) * 2)) & 0x3;
+            const int idx1 = (K_t2[ib].qs[(lj + 1) / 4] >> (((lj + 1) % 4) * 2)) & 0x3;
+#ifdef V_DOT2_F32_F16_AVAILABLE
+            ggml_cuda_mad(sum, make_half2(__float2half(cn[idx0]), __float2half(cn[idx1])),
+                          ((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1]);
+#else
+            const float2 qf = ((const float2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
+            sum += cn[idx0] * qf.x + cn[idx1] * qf.y;
 #endif
         }
     }
@@ -930,6 +974,36 @@ static __device__ __forceinline__ void dequantize_V_turbo4_0(
     } else { static_assert(std::is_same_v<T, void>, "bad type"); }
 }
 
+// TBQ2 V dequant: 2-bit packed codebook indices
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_tbq2_0(
+        const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_tbq2_0 * x = (const block_tbq2_0 *) vx;
+    const int64_t ib = i0 / QK_TBQ2;
+    const int     j0 = (int)(i0 % QK_TBQ2);
+    const float norm = __half2float(x[ib].norm);
+    static_assert(ne == 2 || ne == 4 || ne == 8, "bad ne");
+    float cn[4];
+#pragma unroll
+    for (int c = 0; c < 4; c++) cn[c] = d_tbq2_centroids_fattn[c] * norm;
+    float vals[ne];
+#pragma unroll
+    for (int l = 0; l < ne; l++) {
+        const int j = j0 + l;
+        const int idx = (x[ib].qs[j / 4] >> ((j % 4) * 2)) & 0x3;
+        vals[l] = cn[idx];
+    }
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+        for (int l0 = 0; l0 < ne; l0 += 2)
+            ((half2 *)dst)[l0/2] = make_half2(__float2half(vals[l0]), __float2half(vals[l0+1]));
+    } else
+#endif
+    if constexpr (std::is_same_v<T, float>) {
+        for (int l = 0; l < ne; ++l) ((float *)dst)[l] = vals[l];
+    } else { static_assert(std::is_same_v<T, void>, "bad type"); }
+}
+
 // TBQ3 V dequant: 3-bit packed codebook indices
 template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_tbq3_0(
@@ -1016,6 +1090,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_turbo3_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_TURBO4_0) {
         return vec_dot_fattn_vec_KQ_turbo4_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TBQ2_0) {
+        return vec_dot_fattn_vec_KQ_tbq2_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_TBQ3_0) {
         return vec_dot_fattn_vec_KQ_tbq3_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_TBQ4_0) {
@@ -1046,6 +1122,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_turbo3_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_TURBO4_0) {
         return dequantize_V_turbo4_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TBQ2_0) {
+        return dequantize_V_tbq2_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_TBQ3_0) {
         return dequantize_V_tbq3_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_TBQ4_0) {
