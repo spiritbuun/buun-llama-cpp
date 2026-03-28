@@ -155,7 +155,7 @@ int main(int argc, char * argv[]) {
                 type == GGML_TYPE_IQ3_XXS ? MAX_QUANTIZATION_TOTAL_ERROR_3BITS_XXS :
                 type == GGML_TYPE_NVFP4   ? MAX_QUANTIZATION_TOTAL_ERROR_FP4 :
                 type == GGML_TYPE_TURBO2_0 || type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0 ||
-                type == GGML_TYPE_TBQ3_0   || type == GGML_TYPE_TBQ4_0
+                type == GGML_TYPE_TBQ2_0   || type == GGML_TYPE_TBQ3_0   || type == GGML_TYPE_TBQ4_0
                                          ? MAX_QUANTIZATION_TOTAL_ERROR_TURBO : MAX_QUANTIZATION_TOTAL_ERROR;
             failed = !(total_error < max_quantization_error);
             num_failed += failed;
