@@ -304,6 +304,26 @@ typedef struct {
 } block_turbo4_0;                       // 68 bytes total
 static_assert(sizeof(block_turbo4_0) == 2*sizeof(ggml_half) + QK_TURBO4*3/8 + QK_TURBO4/8, "wrong turbo4_0 block size/padding");
 
+// TBQ 3-bit: SRHT + Lloyd-Max 8-level codebook
+// Per block: 3-bit packed indices (48 bytes) + norm(fp16) = 50 bytes per 128 values
+// = 3.125 bits/value → 5.12× compression vs fp16
+#define QK_TBQ3 128
+typedef struct {
+    uint8_t  qs[48];    // 3-bit packed codebook indices (128 * 3 / 8 = 48)
+    ggml_half norm;     // L2 norm of the original block
+} block_tbq3_0;
+static_assert(sizeof(block_tbq3_0) == 50, "wrong tbq3_0 block size/padding");
+
+// TBQ 4-bit: SRHT + Lloyd-Max 16-level codebook
+// Per block: 4-bit packed indices (64 bytes) + norm(fp16) = 66 bytes per 128 values
+// = 4.125 bits/value → 3.88× compression vs fp16
+#define QK_TBQ4 128
+typedef struct {
+    uint8_t  qs[64];    // 4-bit packed codebook indices (128 * 4 / 8 = 64)
+    ggml_half norm;     // L2 norm of the original block
+} block_tbq4_0;
+static_assert(sizeof(block_tbq4_0) == 66, "wrong tbq4_0 block size/padding");
+
 //
 // Super-block quantization structures
 //

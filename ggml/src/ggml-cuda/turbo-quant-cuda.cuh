@@ -451,6 +451,306 @@ static __global__ void k_set_rows_turbo2(
     }
 }
 
+// === TBQ: device constants (copies for use in set_rows path) ===
+static __constant__ float d_tbq3_centroids[8] = {
+    -2.1519478649f, -1.3439114671f, -0.7560068854f, -0.2450947664f,
+     0.2450947664f,  0.7560068854f,  1.3439114671f,  2.1519478649f
+};
+static __constant__ float d_tbq4_centroids[16] = {
+    -2.7643471169f, -2.1048021157f, -1.6544546703f, -1.2904430627f,
+    -0.9718584055f, -0.6794737713f, -0.4023510241f, -0.1332771696f,
+     0.1332771696f,  0.4023510241f,  0.6794737713f,  0.9718584055f,
+     1.2904430627f,  1.6544546703f,  2.1048021157f,  2.7643471169f
+};
+static __constant__ float d_tbq3_boundaries[7] = {
+    -1.7479296660f, -1.0499591762f, -0.5005508259f, 0.0000000000f,
+     0.5005508259f,  1.0499591762f,  1.7479296660f
+};
+static __constant__ float d_tbq4_boundaries[15] = {
+    -2.4345746163f, -1.8796283930f, -1.4724488665f, -1.1311507341f,
+    -0.8256660884f, -0.5409123977f, -0.2678140968f,  0.0000000000f,
+     0.2678140968f,  0.5409123977f,  0.8256660884f,  1.1311507341f,
+     1.4724488665f,  1.8796283930f,  2.4345746163f
+};
+static __constant__ uint32_t d_tbq_rademacher[4] = {
+    0xa3b1c6d9u, 0x7e4f2a85u, 0xd1936cf0u, 0x5b8e47a2u
+};
+
+// === TBQ: cooperative 128-thread Hadamard + sign helpers ===
+// Hadamard WITH 1/sqrt(128) normalization (for dequant / inverse transform)
+static __device__ void tbq_hadamard_128(float * smem, int tid) {
+    for (int step = 1; step < 128; step <<= 1) {
+        int partner = tid ^ step;
+        float a = smem[tid], b = smem[partner];
+        __syncthreads();
+        if (tid < partner) {
+            smem[tid]     = a + b;
+            smem[partner] = a - b;
+        }
+        __syncthreads();
+    }
+    smem[tid] *= 0.0883883f; // 1/sqrt(128)
+    __syncthreads();
+}
+
+// Hadamard WITHOUT normalization (for quant path — centroids expect N(0,1) scale)
+static __device__ void tbq_hadamard_128_unnorm(float * smem, int tid) {
+    for (int step = 1; step < 128; step <<= 1) {
+        int partner = tid ^ step;
+        float a = smem[tid], b = smem[partner];
+        __syncthreads();
+        if (tid < partner) {
+            smem[tid]     = a + b;
+            smem[partner] = a - b;
+        }
+        __syncthreads();
+    }
+}
+
+static __device__ __forceinline__ void tbq_apply_signs(float * smem, int tid) {
+    int word = tid / 32;
+    int bit  = tid % 32;
+    float sign = ((d_tbq_rademacher[word] >> bit) & 1u) ? -1.0f : 1.0f;
+    smem[tid] *= sign;
+    __syncthreads();
+}
+
+static __device__ __forceinline__ int tbq_quantize_3bit(float val) {
+    int idx = 0;
+    if (val > d_tbq3_boundaries[3]) {
+        if (val > d_tbq3_boundaries[5]) { idx = val > d_tbq3_boundaries[6] ? 7 : 6; }
+        else                            { idx = val > d_tbq3_boundaries[4] ? 5 : 4; }
+    } else {
+        if (val > d_tbq3_boundaries[1]) { idx = val > d_tbq3_boundaries[2] ? 3 : 2; }
+        else                            { idx = val > d_tbq3_boundaries[0] ? 1 : 0; }
+    }
+    return idx;
+}
+
+static __device__ __forceinline__ int tbq_quantize_4bit(float val) {
+    int idx = 0;
+    if (val > d_tbq4_boundaries[7]) {
+        if (val > d_tbq4_boundaries[11]) {
+            idx = val > d_tbq4_boundaries[13] ? (val > d_tbq4_boundaries[14] ? 15 : 14)
+                                              : (val > d_tbq4_boundaries[12] ? 13 : 12);
+        } else {
+            idx = val > d_tbq4_boundaries[9] ? (val > d_tbq4_boundaries[10] ? 11 : 10)
+                                             : (val > d_tbq4_boundaries[8]  ?  9 :  8);
+        }
+    } else {
+        if (val > d_tbq4_boundaries[3]) {
+            idx = val > d_tbq4_boundaries[5] ? (val > d_tbq4_boundaries[6] ? 7 : 6)
+                                             : (val > d_tbq4_boundaries[4] ? 5 : 4);
+        } else {
+            idx = val > d_tbq4_boundaries[1] ? (val > d_tbq4_boundaries[2] ? 3 : 2)
+                                             : (val > d_tbq4_boundaries[0] ? 1 : 0);
+        }
+    }
+    return idx;
+}
+
+// === TBQ3: SET_ROWS kernel (128 threads per block, one block per 128-element group) ===
+template<typename idx_t>
+static __global__ void k_set_rows_tbq3(
+        const float * __restrict__ src0, const idx_t * __restrict__ src1,
+        block_tbq3_0 * __restrict__ dst, const int64_t ne_total_groups,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02,
+        const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
+        const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t s10, const int64_t s11, const int64_t s12,
+        const int64_t s1,  const int64_t s2,  const int64_t s3,
+        const uint3 ne00_fd, const uint3 ne01_fd, const uint3 ne02_fd,
+        const uint3 ne11_fd, const uint3 ne12_fd) {
+
+    const int64_t i   = (int64_t)blockIdx.x;   // one block per 128-element group
+    const int     tid = threadIdx.x;            // 0..127
+
+    if (i >= ne_total_groups) return;
+
+    // Resolve tensor coordinates from group index
+    const int64_t i_base = i * QK_TBQ3;
+    uint32_t tmp = (uint32_t)i_base; uint2 div_mod;
+    div_mod = fast_div_modulo(tmp, ne00_fd); const int64_t i00 = div_mod.y; tmp = div_mod.x;
+    div_mod = fast_div_modulo(tmp, ne01_fd); const int64_t i01 = div_mod.y; tmp = div_mod.x;
+    div_mod = fast_div_modulo(tmp, ne02_fd); const int64_t i02 = div_mod.y; const int64_t i03 = div_mod.x;
+    const int64_t i12    = fastmodulo((uint32_t)i03, ne12_fd);
+    const int64_t i11    = fastmodulo((uint32_t)i02, ne11_fd);
+    const int64_t dst_row = *(src1 + i01*s10 + i11*s11 + i12*s12);
+
+    const float *    grp_src = src0 + i01*s01 + i02*s02 + i03*s03 + i00;
+    block_tbq3_0 * dst_blk   = (block_tbq3_0 *)((char *)dst + dst_row*s1 + i02*s2 + i03*s3) + (i00 / QK_TBQ3);
+
+    __shared__ float smem[128];
+    __shared__ float norm_shared;
+    __shared__ uint8_t indices[128];
+
+    // 1. Load element
+    smem[tid] = grp_src[tid];
+    __syncthreads();
+
+    // 2. Parallel L2 norm reduction
+    {
+        float val = smem[tid] * smem[tid];
+        for (int s = 16; s > 0; s >>= 1) val += __shfl_down_sync(0xffffffff, val, s);
+        __shared__ float warp_sums[4];
+        if (tid % 32 == 0) warp_sums[tid / 32] = val;
+        __syncthreads();
+        if (tid == 0) {
+            float total = warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3];
+            norm_shared = sqrtf(total);
+        }
+        __syncthreads();
+    }
+    float norm = norm_shared;
+    if (norm < 1e-12f) norm = 1e-12f;
+
+    // 3. Normalize
+    smem[tid] /= norm;
+    __syncthreads();
+
+    // 4. Rademacher sign flips
+    tbq_apply_signs(smem, tid);
+
+    // 5. Hadamard (7 butterfly stages, NO 1/sqrt(128) — centroids expect N(0,1) scale)
+    tbq_hadamard_128_unnorm(smem, tid);
+    __syncthreads();
+
+    // 6. Quantize + compute reconstruction norm for correction
+    int idx = tbq_quantize_3bit(smem[tid]);
+    indices[tid] = (uint8_t)idx;
+    float centroid_val = d_tbq3_centroids[idx];
+    __syncthreads();
+
+    // 6b. Norm correction: ||original|| / ||reconstructed centroids||
+    __shared__ float corrected_norm;
+    {
+        float c2 = centroid_val * centroid_val;
+        for (int s = 16; s > 0; s >>= 1) c2 += __shfl_down_sync(0xffffffff, c2, s);
+        __shared__ float warp_c2[4];
+        if (tid % 32 == 0) warp_c2[tid / 32] = c2;
+        __syncthreads();
+        if (tid == 0) {
+            float recon_norm = sqrtf(warp_c2[0] + warp_c2[1] + warp_c2[2] + warp_c2[3]);
+            corrected_norm = (recon_norm > 1e-10f) ? norm / recon_norm : norm;
+        }
+        __syncthreads();
+    }
+
+    // 7. Pack 3-bit indices: 128*3=384 bits=48 bytes; threads 0..47 each pack one byte
+    if (tid < 48) {
+        int bit_start = tid * 8;
+        uint8_t packed = 0;
+        for (int b = 0; b < 8; b++) {
+            int bit_pos = bit_start + b;
+            int idx_num = bit_pos / 3;
+            int idx_bit = bit_pos % 3;
+            if (idx_num < 128) packed |= (((indices[idx_num] >> idx_bit) & 1) << b);
+        }
+        dst_blk->qs[tid] = packed;
+    }
+
+    // 8. Write corrected norm
+    if (tid == 0) dst_blk->norm = __float2half(corrected_norm);
+
+    GGML_UNUSED(ne10); GGML_UNUSED(ne11); GGML_UNUSED(ne12); GGML_UNUSED(ne13);
+}
+
+// === TBQ4: SET_ROWS kernel (128 threads per block, one block per 128-element group) ===
+template<typename idx_t>
+static __global__ void k_set_rows_tbq4(
+        const float * __restrict__ src0, const idx_t * __restrict__ src1,
+        block_tbq4_0 * __restrict__ dst, const int64_t ne_total_groups,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02,
+        const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
+        const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t s10, const int64_t s11, const int64_t s12,
+        const int64_t s1,  const int64_t s2,  const int64_t s3,
+        const uint3 ne00_fd, const uint3 ne01_fd, const uint3 ne02_fd,
+        const uint3 ne11_fd, const uint3 ne12_fd) {
+
+    const int64_t i   = (int64_t)blockIdx.x;
+    const int     tid = threadIdx.x;
+
+    if (i >= ne_total_groups) return;
+
+    const int64_t i_base = i * QK_TBQ4;
+    uint32_t tmp = (uint32_t)i_base; uint2 div_mod;
+    div_mod = fast_div_modulo(tmp, ne00_fd); const int64_t i00 = div_mod.y; tmp = div_mod.x;
+    div_mod = fast_div_modulo(tmp, ne01_fd); const int64_t i01 = div_mod.y; tmp = div_mod.x;
+    div_mod = fast_div_modulo(tmp, ne02_fd); const int64_t i02 = div_mod.y; const int64_t i03 = div_mod.x;
+    const int64_t i12     = fastmodulo((uint32_t)i03, ne12_fd);
+    const int64_t i11     = fastmodulo((uint32_t)i02, ne11_fd);
+    const int64_t dst_row = *(src1 + i01*s10 + i11*s11 + i12*s12);
+
+    const float *    grp_src = src0 + i01*s01 + i02*s02 + i03*s03 + i00;
+    block_tbq4_0 * dst_blk   = (block_tbq4_0 *)((char *)dst + dst_row*s1 + i02*s2 + i03*s3) + (i00 / QK_TBQ4);
+
+    __shared__ float smem[128];
+    __shared__ float norm_shared;
+
+    // 1. Load element
+    smem[tid] = grp_src[tid];
+    __syncthreads();
+
+    // 2. Parallel L2 norm reduction
+    {
+        float val = smem[tid] * smem[tid];
+        for (int s = 16; s > 0; s >>= 1) val += __shfl_down_sync(0xffffffff, val, s);
+        __shared__ float warp_sums[4];
+        if (tid % 32 == 0) warp_sums[tid / 32] = val;
+        __syncthreads();
+        if (tid == 0) {
+            float total = warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3];
+            norm_shared = sqrtf(total);
+        }
+        __syncthreads();
+    }
+    float norm = norm_shared;
+    if (norm < 1e-12f) norm = 1e-12f;
+
+    // 3. Normalize
+    smem[tid] /= norm;
+    __syncthreads();
+
+    // 4. Rademacher sign flips
+    tbq_apply_signs(smem, tid);
+
+    // 5. Hadamard (7 butterfly stages, NO 1/sqrt(128) — centroids expect N(0,1) scale)
+    tbq_hadamard_128_unnorm(smem, tid);
+    __syncthreads();
+
+    // 6. Quantize + compute reconstruction norm for correction
+    int idx = tbq_quantize_4bit(smem[tid]);
+    float centroid_val = d_tbq4_centroids[idx];
+
+    // 6b. Norm correction: ||original|| / ||reconstructed centroids||
+    __shared__ float corrected_norm;
+    {
+        float c2 = centroid_val * centroid_val;
+        for (int s = 16; s > 0; s >>= 1) c2 += __shfl_down_sync(0xffffffff, c2, s);
+        __shared__ float warp_c2[4];
+        if (tid % 32 == 0) warp_c2[tid / 32] = c2;
+        __syncthreads();
+        if (tid == 0) {
+            float recon_norm = sqrtf(warp_c2[0] + warp_c2[1] + warp_c2[2] + warp_c2[3]);
+            corrected_norm = (recon_norm > 1e-10f) ? norm / recon_norm : norm;
+        }
+        __syncthreads();
+    }
+
+    // 7. Pack 4-bit nibble pairs: threads 0..63 each write one byte
+    if (tid < 64) {
+        int lo = tbq_quantize_4bit(smem[tid * 2 + 0]);
+        int hi = tbq_quantize_4bit(smem[tid * 2 + 1]);
+        dst_blk->qs[tid] = (uint8_t)((hi << 4) | (lo & 0xf));
+    }
+
+    // 8. Write corrected norm
+    if (tid == 0) dst_blk->norm = __float2half(corrected_norm);
+
+    GGML_UNUSED(ne10); GGML_UNUSED(ne11); GGML_UNUSED(ne12); GGML_UNUSED(ne13);
+}
+
 // === TURBO2: GET_ROWS dequantize ===
 #define QR_TURBO2_0 2
 static __device__ __forceinline__
