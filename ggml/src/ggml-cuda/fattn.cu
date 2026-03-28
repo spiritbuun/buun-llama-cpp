@@ -461,6 +461,83 @@ static __global__ void k_tbq4_dequant_f16(
     dst[strm * (ne2 * ne1 * ne0) + head * (ne1 * ne0) + row * ne0 + tid] = __float2half(sm[j_in] * sign * norm);
 }
 
+// TBQ prefill: dequant K/V to f16 via inverse SRHT, then dispatch MMA.
+// Simpler than turbo prefill — no Q rotation needed (dequant produces original domain).
+static void ggml_cuda_tbq_prefill_attend(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    cudaStream_t stream = ctx.stream();
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    const bool tbq_k = K->type == GGML_TYPE_TBQ3_0 || K->type == GGML_TYPE_TBQ4_0;
+    const bool tbq_v = V->type == GGML_TYPE_TBQ3_0 || V->type == GGML_TYPE_TBQ4_0;
+
+    half * k_fp16 = nullptr;
+    half * v_fp16 = nullptr;
+
+    if (tbq_k) {
+        const size_t k_size = K->ne[0] * K->ne[1] * K->ne[2] * K->ne[3] * sizeof(half);
+        CUDA_CHECK(cudaMallocAsync(&k_fp16, k_size, stream));
+        dim3 grid_k(K->ne[1], K->ne[2], K->ne[3]);
+        const size_t smem = K->ne[0] * sizeof(float);
+        if (K->type == GGML_TYPE_TBQ3_0) {
+            k_tbq3_dequant_f16<<<grid_k, K->ne[0], smem, stream>>>(
+                (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
+        } else {
+            k_tbq4_dequant_f16<<<grid_k, K->ne[0], smem, stream>>>(
+                (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
+        }
+    }
+
+    if (tbq_v) {
+        const size_t v_size = V->ne[0] * V->ne[1] * V->ne[2] * V->ne[3] * sizeof(half);
+        CUDA_CHECK(cudaMallocAsync(&v_fp16, v_size, stream));
+        dim3 grid_v(V->ne[1], V->ne[2], V->ne[3]);
+        const size_t smem = V->ne[0] * sizeof(float);
+        if (V->type == GGML_TYPE_TBQ3_0) {
+            k_tbq3_dequant_f16<<<grid_v, V->ne[0], smem, stream>>>(
+                (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
+        } else {
+            k_tbq4_dequant_f16<<<grid_v, V->ne[0], smem, stream>>>(
+                (const char *)V->data, v_fp16, V->ne[0], V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
+        }
+    }
+
+    ggml_tensor K_f16 = *K;
+    ggml_tensor V_f16 = *V;
+
+    if (k_fp16) {
+        K_f16.type = GGML_TYPE_F16;
+        K_f16.data = k_fp16;
+        K_f16.nb[0] = sizeof(half);
+        K_f16.nb[1] = K->ne[0] * sizeof(half);
+        K_f16.nb[2] = K->ne[0] * K->ne[1] * sizeof(half);
+        K_f16.nb[3] = K->ne[0] * K->ne[1] * K->ne[2] * sizeof(half);
+    }
+
+    if (v_fp16) {
+        V_f16.type = GGML_TYPE_F16;
+        V_f16.data = v_fp16;
+        V_f16.nb[0] = sizeof(half);
+        V_f16.nb[1] = V->ne[0] * sizeof(half);
+        V_f16.nb[2] = V->ne[0] * V->ne[1] * sizeof(half);
+        V_f16.nb[3] = V->ne[0] * V->ne[1] * V->ne[2] * sizeof(half);
+    }
+
+    ggml_tensor * orig_k = dst->src[1];
+    ggml_tensor * orig_v = dst->src[2];
+
+    dst->src[1] = k_fp16 ? &K_f16 : orig_k;
+    dst->src[2] = v_fp16 ? &V_f16 : orig_v;
+
+    ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+
+    dst->src[1] = orig_k;
+    dst->src[2] = orig_v;
+
+    if (k_fp16) CUDA_CHECK(cudaFreeAsync(k_fp16, stream));
+    if (v_fp16) CUDA_CHECK(cudaFreeAsync(v_fp16, stream));
+}
+
 static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     cudaStream_t stream = ctx.stream();
     const ggml_tensor * K = dst->src[1];
@@ -927,8 +1004,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                           V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0;
     const bool tbq_kv = K->type == GGML_TYPE_TBQ3_0 || K->type == GGML_TYPE_TBQ4_0 ||
                         V->type == GGML_TYPE_TBQ3_0 || V->type == GGML_TYPE_TBQ4_0;
-    GGML_UNUSED(tbq_kv);
-    if (turbo_kv && !turbo_prefill_vec && Q->ne[1] > 1 && turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+    if (tbq_kv && Q->ne[1] > 1 && turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+        // TBQ prefill: dequant K/V to f16 (inverse SRHT) then MMA. No Q rotation needed.
+        ggml_cuda_tbq_prefill_attend(ctx, dst);
+    } else if (turbo_kv && !turbo_prefill_vec && Q->ne[1] > 1 && turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
         // Prefill path: turbo4 K uses inverse FWHT dequant (original domain, no Q rotation),
         // turbo2/3 K uses simple dequant (rotated domain, Q pre-rotated). V un-rotation at graph level.
         ggml_cuda_turbo_prefill_attend(ctx, dst);
