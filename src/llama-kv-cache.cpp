@@ -114,8 +114,21 @@ llama_kv_cache::llama_kv_cache(
         }
 
         // [TAG_V_CACHE_VARIABLE]
-        const uint32_t n_embd_k_gqa =            hparams.n_embd_k_gqa(il);
-        const uint32_t n_embd_v_gqa = !v_trans ? hparams.n_embd_v_gqa(il) : hparams.n_embd_v_gqa_max();
+        uint32_t n_embd_k_gqa =            hparams.n_embd_k_gqa(il);
+        uint32_t n_embd_v_gqa = !v_trans ? hparams.n_embd_v_gqa(il) : hparams.n_embd_v_gqa_max();
+
+        // TBQ types require dimensions divisible by QK_TBQ (128) for the Hadamard transform.
+        // Pad to next multiple of 128 — extra elements are zero and don't affect attention.
+        {
+            const bool is_tbq_k = (type_k == GGML_TYPE_TBQ2_0 || type_k == GGML_TYPE_TBQ3_0 || type_k == GGML_TYPE_TBQ4_0);
+            const bool is_tbq_v = (type_v == GGML_TYPE_TBQ2_0 || type_v == GGML_TYPE_TBQ3_0 || type_v == GGML_TYPE_TBQ4_0);
+            if (is_tbq_k && n_embd_k_gqa % 128 != 0) {
+                n_embd_k_gqa = ((n_embd_k_gqa + 127) / 128) * 128;
+            }
+            if (is_tbq_v && n_embd_v_gqa % 128 != 0) {
+                n_embd_v_gqa = ((n_embd_v_gqa + 127) / 128) * 128;
+            }
+        }
 
         const char * dev_name = "CPU";
 
@@ -135,7 +148,9 @@ llama_kv_cache::llama_kv_cache(
         bool cpu_fallback = false;
         if (ggml_backend_buft_is_host(buft)) {
             const bool layer_has_turbo = (type_k == GGML_TYPE_TURBO2_0 || type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 ||
-                                          type_v == GGML_TYPE_TURBO2_0 || type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0);
+                                          type_v == GGML_TYPE_TURBO2_0 || type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0 ||
+                                          type_k == GGML_TYPE_TBQ2_0   || type_k == GGML_TYPE_TBQ3_0   || type_k == GGML_TYPE_TBQ4_0   ||
+                                          type_v == GGML_TYPE_TBQ2_0   || type_v == GGML_TYPE_TBQ3_0   || type_v == GGML_TYPE_TBQ4_0);
             if (layer_has_turbo) {
                 cpu_fallback = true;
             }
