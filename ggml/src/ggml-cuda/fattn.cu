@@ -1024,7 +1024,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         // simpler inner loop (no bit extract + LUT). Eliminates context scaling on MoE,
         // zero cost on dense models. Set GGML_TURBO_DECODE_NATIVE=1 to disable.
         static const bool turbo_decode_native = (getenv("GGML_TURBO_DECODE_NATIVE") != nullptr);
-        const bool do_decode_dequant = !turbo_decode_native && (turbo_kv || tbq_kv);
+        // TBQ: use native vec_dot (no dequant) to avoid O(context) temp f16 allocation
+        // This requires Q pre-rotation via k_tbq_fwht_forward (same as TURBO's approach)
+        const bool do_decode_dequant = !turbo_decode_native && turbo_kv;
 
         half * k_fp16_dec = nullptr;
         half * v_fp16_dec = nullptr;
@@ -1135,7 +1137,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         ggml_tensor Q_rot_decode;
         ggml_tensor * orig_q_decode = nullptr;
         const bool turbo_k_any = (K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0);
-        if (turbo_k_any && Q->ne[0] % 128 == 0) {
+        const bool tbq_k_any = (K->type == GGML_TYPE_TBQ3_0 || K->type == GGML_TYPE_TBQ4_0);
+        if ((turbo_k_any || tbq_k_any) && Q->ne[0] % 128 == 0) {
             int device;
             CUDA_CHECK(cudaGetDevice(&device));
             const size_t q_size = ggml_nelements(Q) * sizeof(float);
@@ -1145,8 +1148,14 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 q_rot_buf_size[device] = q_size;
             }
             const int64_t n_q_groups = ggml_nelements(Q) / 128;
-            k_turbo_fwht_forward<<<(int)n_q_groups, 128, 0, stream>>>(
-                (const float *)Q->data, q_rot_buf[device], ggml_nelements(Q));
+            if (tbq_k_any) {
+                // TBQ uses different Rademacher signs than TURBO
+                k_tbq_fwht_forward<<<(int)n_q_groups, 128, 0, stream>>>(
+                    (const float *)Q->data, q_rot_buf[device], ggml_nelements(Q));
+            } else {
+                k_turbo_fwht_forward<<<(int)n_q_groups, 128, 0, stream>>>(
+                    (const float *)Q->data, q_rot_buf[device], ggml_nelements(Q));
+            }
             Q_rot_decode = *Q;
             Q_rot_decode.data = q_rot_buf[device];
             orig_q_decode = dst->src[0];
