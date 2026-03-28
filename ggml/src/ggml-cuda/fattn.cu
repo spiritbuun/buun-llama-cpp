@@ -293,6 +293,12 @@ static __global__ void k_turbo4_dequant_f16(
 static float * q_rot_buf[GGML_CUDA_MAX_DEVICES] = {};
 static size_t  q_rot_buf_size[GGML_CUDA_MAX_DEVICES] = {};
 
+// Persistent TBQ decode dequant buffers per device (avoid cudaMallocAsync per token)
+static half * tbq_k_dec_buf[GGML_CUDA_MAX_DEVICES] = {};
+static size_t tbq_k_dec_size[GGML_CUDA_MAX_DEVICES] = {};
+static half * tbq_v_dec_buf[GGML_CUDA_MAX_DEVICES] = {};
+static size_t tbq_v_dec_size[GGML_CUDA_MAX_DEVICES] = {};
+
 // === FWHT rotation kernels for pre-rotate-queries approach ===
 // Forward rotation on Q before attention (both prefill and decode paths).
 // One block per 128-element group, 128 threads per block.
@@ -983,8 +989,14 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
         if (do_decode_dequant) {
             if (K->type == GGML_TYPE_TBQ3_0 || K->type == GGML_TYPE_TBQ4_0) {
+                int device; CUDA_CHECK(cudaGetDevice(&device));
                 const size_t k_size = K->ne[0] * K->ne[1] * K->ne[2] * K->ne[3] * sizeof(half);
-                CUDA_CHECK(cudaMallocAsync(&k_fp16_dec, k_size, stream));
+                if (k_size > tbq_k_dec_size[device]) {
+                    if (tbq_k_dec_buf[device]) CUDA_CHECK(cudaFree(tbq_k_dec_buf[device]));
+                    CUDA_CHECK(cudaMalloc(&tbq_k_dec_buf[device], k_size));
+                    tbq_k_dec_size[device] = k_size;
+                }
+                k_fp16_dec = tbq_k_dec_buf[device];
                 dim3 grid_k(K->ne[1], K->ne[2], K->ne[3]);
                 const size_t smem = K->ne[0] * sizeof(float);
                 if (K->type == GGML_TYPE_TBQ3_0) {
@@ -1025,8 +1037,14 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 dst->src[1] = &K_f16_dec;
             }
             if (V->type == GGML_TYPE_TBQ3_0 || V->type == GGML_TYPE_TBQ4_0) {
+                int device; CUDA_CHECK(cudaGetDevice(&device));
                 const size_t v_size = V->ne[0] * V->ne[1] * V->ne[2] * V->ne[3] * sizeof(half);
-                CUDA_CHECK(cudaMallocAsync(&v_fp16_dec, v_size, stream));
+                if (v_size > tbq_v_dec_size[device]) {
+                    if (tbq_v_dec_buf[device]) CUDA_CHECK(cudaFree(tbq_v_dec_buf[device]));
+                    CUDA_CHECK(cudaMalloc(&tbq_v_dec_buf[device], v_size));
+                    tbq_v_dec_size[device] = v_size;
+                }
+                v_fp16_dec = tbq_v_dec_buf[device];
                 dim3 grid_v(V->ne[1], V->ne[2], V->ne[3]);
                 const size_t smem = V->ne[0] * sizeof(float);
                 if (V->type == GGML_TYPE_TBQ3_0) {
@@ -1110,8 +1128,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         if (orig_q_decode) dst->src[0] = orig_q_decode;
         if (orig_k_decode) dst->src[1] = orig_k_decode;
         if (orig_v_decode) dst->src[2] = orig_v_decode;
-        if (k_fp16_dec) CUDA_CHECK(cudaFreeAsync(k_fp16_dec, stream));
-        if (v_fp16_dec) CUDA_CHECK(cudaFreeAsync(v_fp16_dec, stream));
+        // Only free TURBO alloc-per-call buffers; TBQ uses persistent per-device buffers
+        const bool tbq_k_used = (K->type == GGML_TYPE_TBQ3_0 || K->type == GGML_TYPE_TBQ4_0);
+        const bool tbq_v_used = (V->type == GGML_TYPE_TBQ3_0 || V->type == GGML_TYPE_TBQ4_0);
+        if (k_fp16_dec && !tbq_k_used) CUDA_CHECK(cudaFreeAsync(k_fp16_dec, stream));
+        if (v_fp16_dec && !tbq_v_used) CUDA_CHECK(cudaFreeAsync(v_fp16_dec, stream));
     }
 
     // Output inverse rotation for turbo V types is handled at graph level
