@@ -364,10 +364,10 @@ llama_context::llama_context(
         // Q pre-rotation and V inverse rotation are only implemented in the Flash Attention path.
         // Without FA, attention computes dot(Q_unrotated, K_rotated) = garbage.
         {
-            const bool turbo_k = (params.type_k == GGML_TYPE_TURBO2_0 || params.type_k == GGML_TYPE_TURBO3_0 || params.type_k == GGML_TYPE_TURBO4_0);
-            const bool turbo_v = (params.type_v == GGML_TYPE_TURBO2_0 || params.type_v == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO4_0);
+            const bool turbo_k = (params.type_k == GGML_TYPE_TURBO2_0 || params.type_k == GGML_TYPE_TURBO3_0 || params.type_k == GGML_TYPE_TURBO4_0 || params.type_k == GGML_TYPE_TBQ3_0 || params.type_k == GGML_TYPE_TBQ4_0);
+            const bool turbo_v = (params.type_v == GGML_TYPE_TURBO2_0 || params.type_v == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO4_0 || params.type_v == GGML_TYPE_TBQ3_0 || params.type_v == GGML_TYPE_TBQ4_0);
             if ((turbo_k || turbo_v) && !cparams.flash_attn) {
-                LLAMA_LOG_WARN("%s: turbo KV cache requires Flash Attention — enabling automatically\n", __func__);
+                LLAMA_LOG_WARN("%s: turbo/tbq KV cache requires Flash Attention — enabling automatically\n", __func__);
                 cparams.flash_attn = true;
             }
         }

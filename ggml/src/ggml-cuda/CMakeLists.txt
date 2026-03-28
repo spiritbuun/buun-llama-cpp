@@ -128,6 +128,10 @@ if (CUDAToolkit_FOUND)
         list(APPEND GGML_SOURCES_CUDA ${SRCS})
         file(GLOB   SRCS "template-instances/fattn-vec*turbo4_0*.cu")
         list(APPEND GGML_SOURCES_CUDA ${SRCS})
+        file(GLOB   SRCS "template-instances/fattn-vec*tbq3_0*.cu")
+        list(APPEND GGML_SOURCES_CUDA ${SRCS})
+        file(GLOB   SRCS "template-instances/fattn-vec*tbq4_0*.cu")
+        list(APPEND GGML_SOURCES_CUDA ${SRCS})
     endif()
 
     ggml_add_backend_library(ggml-cuda
