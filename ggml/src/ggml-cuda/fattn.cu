@@ -1057,10 +1057,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                           V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0;
     const bool tbq_kv = K->type == GGML_TYPE_TBQ2_0 || K->type == GGML_TYPE_TBQ3_0 || K->type == GGML_TYPE_TBQ4_0 ||
                         V->type == GGML_TYPE_TBQ2_0 || V->type == GGML_TYPE_TBQ3_0 || V->type == GGML_TYPE_TBQ4_0;
-    // TBQ: use vec kernel for both prefill and decode (native vec_dot, no temp f16 buffer).
-    // Avoids O(context) temp allocation that limits prefill to ~32K on 27B.
-    // TODO: chunked MMA prefill for higher throughput (see docs/tbq-chunked-prefill-plan.md)
-    if (turbo_kv && !turbo_prefill_vec && Q->ne[1] > 1 && turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+    // TBQ prefill: try MMA (fast, needs temp f16 buffer) first.
+    // Falls back to vec kernel (slower, zero temp) if MMA OOMs or context too large.
+    if (tbq_kv && Q->ne[1] > 1 && turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+        ggml_cuda_tbq_prefill_attend(ctx, dst);
+    } else if (turbo_kv && !turbo_prefill_vec && Q->ne[1] > 1 && turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
         // Prefill path: turbo4 K uses inverse FWHT dequant (original domain, no Q rotation),
         // turbo2/3 K uses simple dequant (rotated domain, Q pre-rotated). V un-rotation at graph level.
         ggml_cuda_turbo_prefill_attend(ctx, dst);
