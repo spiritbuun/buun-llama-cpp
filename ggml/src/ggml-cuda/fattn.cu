@@ -498,6 +498,511 @@ static __global__ void k_tbq4_dequant_f16(
     dst[strm * (ne2 * ne1 * ne0) + head * (ne1 * ne0) + row * ne0 + tid] = __float2half(sm[j_in] * sign * norm);
 }
 
+// === TBQ chunked prefill: FlashAttention online softmax with O(CHUNK) temp memory ===
+// Enables 350K+ context on 27B models by processing KV in chunks of CHUNK tokens.
+// Uses cuBLAS SGEMM for Q@K^T and P@V, custom kernels for online softmax updates.
+//
+// TBQ_CHUNK must be a power of 2. The last chunk may have fewer tokens (chunk_len < TBQ_CHUNK)
+// — we pad shared memory to chunk_pad = next_pow2(chunk_len) for the binary-tree reduction.
+// S is always allocated with stride TBQ_CHUNK so pointer arithmetic is consistent.
+static constexpr int TBQ_CHUNK = 4096;
+
+// Kernel 1: Initialize accumulators for online softmax.
+// O_acc = 0, l_acc = 0, m_acc = -inf
+// Grid: (nq_heads, 1, 1), blockDim.x = min(D, 1024).
+// Thread 0 initializes l_acc and m_acc; all threads loop over D to zero O_acc.
+static __global__ void k_chunked_attn_init(
+        float * __restrict__ O_acc,
+        float * __restrict__ l_acc,
+        float * __restrict__ m_acc,
+        const int64_t nq_heads,
+        const int64_t D) {
+    const int64_t hq  = (int64_t)blockIdx.x;
+    const int     tid = (int)threadIdx.x;
+    const int     bdx = (int)blockDim.x;
+    if (hq >= nq_heads) return;
+    if (tid == 0) {
+        l_acc[hq] = 0.0f;
+        m_acc[hq] = -INFINITY;
+    }
+    for (int64_t d = tid; d < D; d += bdx) {
+        O_acc[hq * D + d] = 0.0f;
+    }
+}
+
+// Kernel 2: Online softmax update.
+// Processes one (head, query) pair per thread block.
+// Uses dynamic shared memory of size (chunk_pad + 2) * sizeof(float):
+//   sm[0..chunk_pad-1]: scores / exp values for reduction
+//   sm[chunk_pad]:      broadcast alpha (exp(m_old - m_new))
+//   sm[chunk_pad+1]:    broadcast beta  (exp(m_chunk - m_new))
+//
+// blockDim.x = min(chunk_pad, 1024). Each thread covers multiple sm slots in load/store passes.
+// Binary tree reduction uses only threads 0..stride-1, which is ≤ blockDim.x for all strides
+// once the initial load has populated sm[] with all chunk_pad values.
+//
+// Algorithm:
+//   1. Load S[head,q,:] + mask into sm[0..chunk_len-1], pad sm[chunk_len..chunk_pad-1] = -inf
+//   2. Tree-reduce sm → m_chunk = max
+//   3. Compute exp(score - m_chunk), pad with 0
+//   4. Tree-reduce sm → l_chunk = sum
+//   5. Update m_acc, l_acc, broadcast alpha/beta via sm[chunk_pad..chunk_pad+1]
+//   6. Rescale O_acc by alpha (parallel over D)
+//   7. Write P[c] = beta * exp(S[c] - m_chunk) to S (for cuBLAS P@V)
+static __global__ void k_chunked_softmax_update(
+        float * __restrict__ S,          // [nh_q, nq, TBQ_CHUNK] scores → P after kernel
+        float * __restrict__ O_acc,      // [nh_q, nq, D]
+        float * __restrict__ l_acc,      // [nh_q, nq]
+        float * __restrict__ m_acc,      // [nh_q, nq]
+        const int chunk_len,             // actual tokens in this chunk (≤ TBQ_CHUNK)
+        const int chunk_pad,             // next power-of-2 ≥ chunk_len
+        const int64_t D,
+        const int64_t nq,
+        const int64_t nh_q,
+        const half  * __restrict__ mask, // [nq, nkv_total] f16 mask, or nullptr
+        const int64_t mask_stride,       // mask->nb[1]/sizeof(half)
+        const int64_t kv_start) {        // absolute KV offset for mask column
+    const int64_t hq_idx = (int64_t)blockIdx.x;
+    const int64_t head   = hq_idx / nq;
+    const int64_t q_pos  = hq_idx % nq;
+    if (head >= nh_q) return;
+
+    const int tid = (int)threadIdx.x;
+    const int bdx = (int)blockDim.x;
+    extern __shared__ float sm[];  // (chunk_pad + 2) floats
+    // sm[chunk_pad]   = sh_alpha (broadcast)
+    // sm[chunk_pad+1] = sh_beta  (broadcast)
+
+    // S is strided by TBQ_CHUNK (constant), not chunk_len
+    const int64_t s_base = head * (int64_t)nq * TBQ_CHUNK + q_pos * TBQ_CHUNK;
+
+    // --- Step 1: Load scores + mask into sm[], pad with -inf ---
+    for (int c = tid; c < chunk_pad; c += bdx) {
+        if (c < chunk_len) {
+            float val = S[s_base + c];
+            if (mask != nullptr) {
+                val += __half2float(mask[q_pos * mask_stride + kv_start + c]);
+            }
+            sm[c] = val;
+        } else {
+            sm[c] = -INFINITY;
+        }
+    }
+    __syncthreads();
+
+    // --- Step 2: Binary tree max reduction ---
+    for (int stride = chunk_pad >> 1; stride >= 1; stride >>= 1) {
+        for (int c = tid; c < stride; c += bdx) {
+            sm[c] = fmaxf(sm[c], sm[c + stride]);
+        }
+        __syncthreads();
+    }
+    const float m_chunk = sm[0];
+    __syncthreads();
+
+    // --- Step 3: Compute exp(score - m_chunk), pad with 0 ---
+    for (int c = tid; c < chunk_pad; c += bdx) {
+        if (c < chunk_len) {
+            float val = S[s_base + c];
+            if (mask != nullptr) {
+                val += __half2float(mask[q_pos * mask_stride + kv_start + c]);
+            }
+            sm[c] = __expf(val - m_chunk);
+        } else {
+            sm[c] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    // --- Step 4: Binary tree sum reduction ---
+    for (int stride = chunk_pad >> 1; stride >= 1; stride >>= 1) {
+        for (int c = tid; c < stride; c += bdx) {
+            sm[c] += sm[c + stride];
+        }
+        __syncthreads();
+    }
+    const float l_chunk = sm[0];
+    __syncthreads();
+
+    // --- Step 5: Update m_acc, l_acc, compute and broadcast alpha/beta ---
+    if (tid == 0) {
+        const float m_old = m_acc[hq_idx];
+        const float m_new = fmaxf(m_old, m_chunk);
+        // When m_old == -inf (first chunk), alpha = 0 to avoid 0 * (-inf) = NaN
+        const float alpha = (m_old > -INFINITY) ? __expf(m_old - m_new) : 0.0f;
+        const float beta  = __expf(m_chunk - m_new);
+        sm[chunk_pad]     = alpha;
+        sm[chunk_pad + 1] = beta;
+        l_acc[hq_idx] = alpha * l_acc[hq_idx] + beta * l_chunk;
+        m_acc[hq_idx] = m_new;
+    }
+    __syncthreads();
+
+    const float alpha = sm[chunk_pad];
+    const float beta  = sm[chunk_pad + 1];
+
+    // --- Step 6: Rescale O_acc in parallel over D ---
+    for (int64_t d = tid; d < D; d += bdx) {
+        O_acc[hq_idx * D + d] *= alpha;
+    }
+    __syncthreads();
+
+    // --- Step 7: Write P = beta * exp(S - m_chunk) back to S ---
+    for (int c = tid; c < chunk_len; c += bdx) {
+        float val = S[s_base + c];
+        if (mask != nullptr) {
+            val += __half2float(mask[q_pos * mask_stride + kv_start + c]);
+        }
+        S[s_base + c] = beta * __expf(val - m_chunk);
+    }
+}
+
+// Kernel 3: Finalize attention output.
+// Computes dst[head, q, d] = f16(O_acc[head, q, d] / l_acc[head, q])
+static __global__ void k_chunked_attn_finalize(
+        const float * __restrict__ O_acc, // [nh_q, nq, D]
+        const float * __restrict__ l_acc, // [nh_q, nq]
+        half        * __restrict__ dst,   // [nh_q, nq, D] f16 output
+        const int64_t nq,
+        const int64_t D) {
+    const int64_t hq_idx = (int64_t)blockIdx.x;  // head * nq + q_pos
+    const int64_t d      = (int64_t)blockIdx.y * blockDim.x + threadIdx.x;
+    if (d >= D) return;
+
+    const float l = fmaxf(l_acc[hq_idx], 1e-30f);
+    dst[hq_idx * D + d] = __float2half(O_acc[hq_idx * D + d] / l);
+}
+
+// Helper: next power of 2 >= n (host side, n >= 1)
+static int next_pow2(int n) {
+    int p = 1;
+    while (p < n) p <<= 1;
+    return p;
+}
+
+// TBQ chunked prefill: FlashAttention with O(CHUNK_SIZE) temp memory.
+// Replaces ggml_cuda_tbq_prefill_attend for nkv > TBQ_CHUNKED_PREFILL_THRESHOLD.
+static void ggml_cuda_tbq_chunked_prefill(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    cudaStream_t stream = ctx.stream();
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    const int64_t D     = Q->ne[0];    // head_dim
+    const int64_t nq    = Q->ne[1];    // query tokens
+    const int64_t nkv   = K->ne[1];    // KV tokens
+    const int64_t nh_q  = Q->ne[2];    // Q heads
+    const int64_t nh_kv = K->ne[2];    // KV heads
+    const int64_t gqa   = nh_q / nh_kv;
+
+    // Extract attention scale from op_params
+    float scale = 1.0f;
+    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+
+    // --- Allocate persistent chunk dequant buffers (TBQ_CHUNK * nh_kv * D each) ---
+    half * k_tmp = nullptr;
+    half * v_tmp = nullptr;
+    CUDA_CHECK(cudaMalloc(&k_tmp, (size_t)D * TBQ_CHUNK * nh_kv * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&v_tmp, (size_t)D * TBQ_CHUNK * nh_kv * sizeof(half)));
+
+    // Check that total allocations fit in ~14GB available VRAM
+    // S = nh_q * nq * TBQ_CHUNK * 4, O_acc+Q_f32 = 2 * nh_q * nq * D * 4
+    const size_t s_size = (size_t)nh_q * nq * TBQ_CHUNK * sizeof(float);
+    const size_t acc_size = 2 * (size_t)nh_q * nq * D * sizeof(float);
+    if (s_size + acc_size > 14ULL * 1024 * 1024 * 1024) {
+        // Too large for chunked cuBLAS — fall back to the standard MMA dequant path.
+        // This re-enters the dispatch which will use MMA with full f16 temp buffer.
+        half *k_fp16 = nullptr, *v_fp16 = nullptr;
+        // ... just allocate and dequant the full KV like the original function
+        // For now, ASSERT — caller should check before calling chunked path
+        GGML_ASSERT(false && "chunked prefill: nq too large, reduce batch size or context");
+        return;
+    }
+
+    // --- Allocate float accumulators ---
+    float * O_acc = nullptr;
+    float * l_acc = nullptr;
+    float * m_acc = nullptr;
+    CUDA_CHECK(cudaMalloc(&O_acc, nh_q * nq * D * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&l_acc, nh_q * nq     * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&m_acc, nh_q * nq     * sizeof(float)));
+
+    // --- Initialize accumulators ---
+    // One block per (head, query) pair; D threads per block zero O_acc in parallel.
+    {
+        const int64_t nq_heads = nh_q * nq;
+        // Cap D at 1024 (CUDA max threads/block); O_acc loop handles D > 1024
+        const int threads_init = (int)std::min(D, (int64_t)1024);
+        k_chunked_attn_init<<<(int)nq_heads, threads_init, 0, stream>>>(O_acc, l_acc, m_acc, nq_heads, D);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    // --- cuBLAS handle, set to current stream ---
+    cublasHandle_t cublas_handle = ctx.cublas_handle();
+    CUBLAS_CHECK(cublasSetStream(cublas_handle, stream));
+
+    // Cast Q to float32 for cuBLAS (Q may be f32 already, but we copy to contiguous buffer)
+    // Q layout: [D, nq, nh_q] with strides nb[0..3]
+    float * Q_f32 = nullptr;
+    CUDA_CHECK(cudaMalloc(&Q_f32, nh_q * nq * D * sizeof(float)));
+    // Q->data is f32 (GGML_TYPE_F32), strides: nb[0]=4, nb[1]=D*4, nb[2]=nq*D*4, nb[3]=...
+    // We need a contiguous [nh_q, nq, D] float buffer
+    // Use cudaMemcpy2DAsync or a kernel if non-contiguous. For prefill Q is typically contiguous.
+    if (Q->nb[0] == sizeof(float) &&
+        Q->nb[1] == (size_t)D * sizeof(float) &&
+        Q->nb[2] == (size_t)D * nq * sizeof(float)) {
+        // Already contiguous
+        CUDA_CHECK(cudaMemcpyAsync(Q_f32, Q->data, nh_q * nq * D * sizeof(float),
+                                   cudaMemcpyDeviceToDevice, stream));
+    } else {
+        // Non-contiguous: copy element by element via a simple kernel
+        // (Rare case — prefill Q is almost always contiguous)
+        // For safety, use a 1D memcpy kernel
+        // TODO: handle non-contiguous Q via a proper gather kernel if needed
+        GGML_ASSERT(Q->nb[0] == sizeof(float)); // must be at least element-contiguous
+        for (int64_t h = 0; h < nh_q; h++) {
+            for (int64_t q = 0; q < nq; q++) {
+                const char * src_ptr = (const char *)Q->data + h * Q->nb[2] + q * Q->nb[1];
+                float * dst_ptr = Q_f32 + h * nq * D + q * D;
+                CUDA_CHECK(cudaMemcpyAsync(dst_ptr, src_ptr, D * sizeof(float),
+                                           cudaMemcpyDeviceToDevice, stream));
+            }
+        }
+    }
+
+    // Check K/V types
+    const bool tbq_k = K->type == GGML_TYPE_TBQ2_0 || K->type == GGML_TYPE_TBQ3_0 || K->type == GGML_TYPE_TBQ4_0;
+    const bool tbq_v = V->type == GGML_TYPE_TBQ2_0 || V->type == GGML_TYPE_TBQ3_0 || V->type == GGML_TYPE_TBQ4_0;
+
+    // Mask layout: [nkv, nq] f16 — mask[q_pos * (mask->nb[1]/sizeof(half)) + kv_pos]
+    const half * mask_data    = mask ? (const half *) mask->data : nullptr;
+    const int64_t mask_stride = mask ? (int64_t)(mask->nb[1] / sizeof(half)) : 0;
+
+    // S buffer: [nh_q, nq, TBQ_CHUNK] float32 — reused for each KV chunk.
+    float * S = nullptr;
+    CUDA_CHECK(cudaMalloc(&S, s_size));
+
+    // Main loop over KV chunks
+    for (int64_t kv_start = 0; kv_start < nkv; kv_start += TBQ_CHUNK) {
+        const int64_t chunk_len = (kv_start + TBQ_CHUNK <= nkv) ? TBQ_CHUNK : (nkv - kv_start);
+
+        // --- 1. Dequant K chunk to f16 ---
+        // The existing dequant kernels use: row = blockIdx.x, head = blockIdx.y, strm = blockIdx.z
+        // src offset: kv_start * nb[1] into K->data
+        // Output: k_tmp[head * chunk_len * D + row * D + d] (contiguous, chunk_len rows per head)
+        // We pass ne1=chunk_len and offset the src pointer by kv_start * K->nb[1]
+        {
+            const char * k_src = (const char *)K->data + kv_start * K->nb[1];
+            dim3 grid_k((int)chunk_len, (int)nh_kv, 1);
+            const size_t smem_k = D * sizeof(float);
+            if (tbq_k) {
+                if (K->type == GGML_TYPE_TBQ2_0) {
+                    k_tbq2_dequant_f16<<<grid_k, (int)D, smem_k, stream>>>(
+                        k_src, k_tmp, D, chunk_len, nh_kv, K->nb[1], K->nb[2], K->nb[3]);
+                } else if (K->type == GGML_TYPE_TBQ3_0) {
+                    k_tbq3_dequant_f16<<<grid_k, (int)D, smem_k, stream>>>(
+                        k_src, k_tmp, D, chunk_len, nh_kv, K->nb[1], K->nb[2], K->nb[3]);
+                } else {
+                    k_tbq4_dequant_f16<<<grid_k, (int)D, smem_k, stream>>>(
+                        k_src, k_tmp, D, chunk_len, nh_kv, K->nb[1], K->nb[2], K->nb[3]);
+                }
+            } else {
+                // K is already f16 — copy chunk to k_tmp
+                // K->nb[1] = D * sizeof(half) for contiguous f16
+                CUDA_CHECK(cudaMemcpy2DAsync(
+                    k_tmp, D * sizeof(half),
+                    (const char *)K->data + kv_start * K->nb[1], K->nb[1],
+                    D * sizeof(half), (size_t)(chunk_len * nh_kv),
+                    cudaMemcpyDeviceToDevice, stream));
+            }
+            CUDA_CHECK(cudaGetLastError());
+        }
+
+        // --- 2. Dequant V chunk to f16 ---
+        {
+            const char * v_src = (const char *)V->data + kv_start * V->nb[1];
+            dim3 grid_v((int)chunk_len, (int)nh_kv, 1);
+            const size_t smem_v = D * sizeof(float);
+            if (tbq_v) {
+                if (V->type == GGML_TYPE_TBQ2_0) {
+                    k_tbq2_dequant_f16<<<grid_v, (int)D, smem_v, stream>>>(
+                        v_src, v_tmp, D, chunk_len, nh_kv, V->nb[1], V->nb[2], V->nb[3]);
+                } else if (V->type == GGML_TYPE_TBQ3_0) {
+                    k_tbq3_dequant_f16<<<grid_v, (int)D, smem_v, stream>>>(
+                        v_src, v_tmp, D, chunk_len, nh_kv, V->nb[1], V->nb[2], V->nb[3]);
+                } else {
+                    k_tbq4_dequant_f16<<<grid_v, (int)D, smem_v, stream>>>(
+                        v_src, v_tmp, D, chunk_len, nh_kv, V->nb[1], V->nb[2], V->nb[3]);
+                }
+            } else {
+                CUDA_CHECK(cudaMemcpy2DAsync(
+                    v_tmp, D * sizeof(half),
+                    (const char *)V->data + kv_start * V->nb[1], V->nb[1],
+                    D * sizeof(half), (size_t)(chunk_len * nh_kv),
+                    cudaMemcpyDeviceToDevice, stream));
+            }
+            CUDA_CHECK(cudaGetLastError());
+        }
+
+        // --- 3. S = Q_f32 @ k_tmp^T * scale via cuBLAS ---
+        // Q_f32 layout: [nh_q, nq, D]  (row-major, each head is a batch)
+        // k_tmp layout: [nh_kv, chunk_len, D] (after dequant kernel: contiguous)
+        // S layout: [nh_q, nq, TBQ_CHUNK] float32 — stride is TBQ_CHUNK even for last chunk
+        // cuBLAS is column-major. To compute S[b] = Q[b] @ K[b]^T (row-major):
+        //   Treat as K[b]^T @ Q[b] in column-major:
+        //   A = K chunk col-major: K[chunk_len × D] stored [D, chunk_len] → lda = D, OP_N
+        //   B = Q col-major: Q[nq × D] stored [D, nq] → ldb = D, OP_T
+        //   C = S: S[chunk_len × nq] col-major → ldc = chunk_len (but stride = TBQ_CHUNK)
+        //   C[i,j] = sum_d K[i,d] * Q[j,d] = (Q @ K^T)[j,i] — correct row-major Q@K^T
+
+        {
+            const float alpha_v = scale;
+            const float beta_v  = 0.0f;
+
+            // k_tmp head stride: contiguous chunk (chunk_len rows × D cols)
+            const long long stride_A = (long long)chunk_len * D;
+            // Q head stride
+            const long long stride_B = (long long)nq * D;
+            // S head stride: TBQ_CHUNK (fixed for entire run)
+            const long long stride_C = (long long)nq * TBQ_CHUNK;
+
+            if (gqa == 1) {
+                CUBLAS_CHECK(cublasGemmStridedBatchedEx(
+                    cublas_handle,
+                    CUBLAS_OP_N, CUBLAS_OP_T,   // A=K no-T, B=Q transpose
+                    (int)chunk_len, (int)nq, (int)D,
+                    &alpha_v,
+                    k_tmp,   CUDA_R_16F, (int)D,            stride_A,  // A: K chunk
+                    Q_f32,   CUDA_R_32F, (int)D,            stride_B,  // B: Q
+                    &beta_v,
+                    S,       CUDA_R_32F, (int)TBQ_CHUNK,    stride_C,  // C: S (ldc = TBQ_CHUNK)
+                    (int)nh_q,
+                    CUBLAS_COMPUTE_32F,
+                    CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            } else {
+                // GQA: share K head across gqa Q heads using stride=0 for A
+                for (int64_t kv_h = 0; kv_h < nh_kv; kv_h++) {
+                    const half  * k_head  = k_tmp + kv_h * chunk_len * D;
+                    const float * q_start = Q_f32 + kv_h * gqa * nq * D;
+                    float       * s_start = S     + kv_h * gqa * (long long)nq * TBQ_CHUNK;
+                    CUBLAS_CHECK(cublasGemmStridedBatchedEx(
+                        cublas_handle,
+                        CUBLAS_OP_N, CUBLAS_OP_T,
+                        (int)chunk_len, (int)nq, (int)D,
+                        &alpha_v,
+                        k_head,   CUDA_R_16F, (int)D,            0LL,                   // A: same K for all gqa sub-batches
+                        q_start,  CUDA_R_32F, (int)D,            (long long)nq * D,     // B: consecutive Q heads
+                        &beta_v,
+                        s_start,  CUDA_R_32F, (int)TBQ_CHUNK,    (long long)nq * TBQ_CHUNK,
+                        (int)gqa,
+                        CUBLAS_COMPUTE_32F,
+                        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                }
+            }
+        }
+
+        // --- 4. Online softmax update (updates S in-place to P, updates O_acc/l_acc/m_acc) ---
+        {
+            const int64_t nq_heads   = nh_q * nq;
+            const int chunk_len_int  = (int)chunk_len;
+            // chunk_pad: next power-of-2 >= chunk_len, for binary tree reduction in shared memory
+            const int chunk_pad      = next_pow2(chunk_len_int);
+            // Use up to 1024 threads/block; each thread covers multiple sm slots via stride loops
+            const int threads_sm     = (chunk_pad < 1024) ? chunk_pad : 1024;
+            // smem: chunk_pad floats for scores/exp + 2 extra floats for alpha/beta broadcast
+            const size_t smem        = ((size_t)chunk_pad + 2) * sizeof(float);
+            k_chunked_softmax_update<<<(int)nq_heads, threads_sm, smem, stream>>>(
+                S, O_acc, l_acc, m_acc,
+                chunk_len_int, chunk_pad,
+                D, nq, nh_q,
+                mask_data, mask_stride, kv_start);
+            CUDA_CHECK(cudaGetLastError());
+        }
+
+        // --- 5. O_acc += P @ v_tmp ---
+        // P (now in S): [nh_q, nq, TBQ_CHUNK] float32
+        // v_tmp: [nh_kv, chunk_len, D] float16
+        // O_acc: [nh_q, nq, D] float32
+        // cuBLAS col-major: O = P @ V → A=V, B=P^T
+        //   A = V [chunk_len × D] col-major [D, chunk_len] → lda=D, OP_N
+        //   B = P [nq × chunk_len] → transpose → col-major [chunk_len, nq] → ldb=TBQ_CHUNK, OP_T
+        //   C = O [D × nq] col-major → ldc=D
+        {
+            const float alpha_v = 1.0f;
+            const float beta_v  = 1.0f;  // accumulate into O_acc
+
+            const long long stride_A = (long long)chunk_len * D;       // V head stride
+            const long long stride_B = (long long)nq * TBQ_CHUNK;      // P head stride
+            const long long stride_C = (long long)nq * D;              // O head stride
+
+            if (gqa == 1) {
+                CUBLAS_CHECK(cublasGemmStridedBatchedEx(
+                    cublas_handle,
+                    CUBLAS_OP_N, CUBLAS_OP_T,   // A=V no-T, B=P transpose
+                    (int)D, (int)nq, (int)chunk_len,
+                    &alpha_v,
+                    v_tmp, CUDA_R_16F, (int)D,            stride_A,  // A: V chunk
+                    S,     CUDA_R_32F, (int)TBQ_CHUNK,    stride_B,  // B: P (stride = TBQ_CHUNK)
+                    &beta_v,
+                    O_acc, CUDA_R_32F, (int)D,            stride_C,  // C: O_acc
+                    (int)nh_q,
+                    CUBLAS_COMPUTE_32F,
+                    CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            } else {
+                // GQA: each KV head is shared across gqa Q heads; V stride=0 for A
+                for (int64_t kv_h = 0; kv_h < nh_kv; kv_h++) {
+                    const half  * v_head  = v_tmp  + kv_h * chunk_len * D;
+                    const float * p_start = S      + kv_h * gqa * (long long)nq * TBQ_CHUNK;
+                    float       * o_start = O_acc  + kv_h * gqa * (long long)nq * D;
+                    CUBLAS_CHECK(cublasGemmStridedBatchedEx(
+                        cublas_handle,
+                        CUBLAS_OP_N, CUBLAS_OP_T,
+                        (int)D, (int)nq, (int)chunk_len,
+                        &alpha_v,
+                        v_head,   CUDA_R_16F, (int)D,            0LL,                       // A: same V for all gqa sub-batches
+                        p_start,  CUDA_R_32F, (int)TBQ_CHUNK,    (long long)nq * TBQ_CHUNK, // B: consecutive P heads
+                        &beta_v,
+                        o_start,  CUDA_R_32F, (int)D,            (long long)nq * D,
+                        (int)gqa,
+                        CUBLAS_COMPUTE_32F,
+                        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                }
+            }
+        }
+
+    }  // end KV chunk loop
+
+    // --- 6. Finalize: dst = f16(O_acc / l_acc) ---
+    {
+        // dst layout: [D, nq, nh_q] in ggml convention (ne[0]=D, ne[1]=nq, ne[2]=nh_q)
+        // O_acc layout: [nh_q, nq, D] — same logical layout, just C-order vs ggml order
+        // ggml stores as ne[0]=D fastest, so [nh_q, nq, D] matches dst->data layout
+        const int64_t nq_heads = nh_q * nq;
+        const int threads_fin = 128;
+        // Grid: x = nq_heads, y = ceil(D / threads_fin)
+        const dim3 grid_fin((int)nq_heads, (int)((D + threads_fin - 1) / threads_fin));
+        k_chunked_attn_finalize<<<grid_fin, threads_fin, 0, stream>>>(
+            O_acc, l_acc, (half *)dst->data, nq, D);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    // --- 7. Sync and free ---
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaFree(S));
+    CUDA_CHECK(cudaFree(k_tmp));
+    CUDA_CHECK(cudaFree(v_tmp));
+    CUDA_CHECK(cudaFree(O_acc));
+    CUDA_CHECK(cudaFree(l_acc));
+    CUDA_CHECK(cudaFree(m_acc));
+    CUDA_CHECK(cudaFree(Q_f32));
+}
+
+// Threshold for switching from bulk-dequant MMA to chunked FlashAttention.
+// At 65536 KV tokens with D=128, bulk f16 = 128 * 65536 * 2 * 2 ≈ 32 MB (K+V, per head-group).
+// Above this, chunked saves significant VRAM.
+static constexpr int64_t TBQ_CHUNKED_PREFILL_THRESHOLD = 65536;
+
 // TBQ prefill: dequant K/V to f16 via inverse SRHT, then dispatch MMA.
 // Simpler than turbo prefill — no Q rotation needed (dequant produces original domain).
 static void ggml_cuda_tbq_prefill_attend(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -1060,10 +1565,15 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                           V->type == GGML_TYPE_TURBO2_0 || V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0;
     const bool tbq_kv = K->type == GGML_TYPE_TBQ2_0 || K->type == GGML_TYPE_TBQ3_0 || K->type == GGML_TYPE_TBQ4_0 ||
                         V->type == GGML_TYPE_TBQ2_0 || V->type == GGML_TYPE_TBQ3_0 || V->type == GGML_TYPE_TBQ4_0;
-    // TBQ prefill: try MMA (fast, needs temp f16 buffer) first.
-    // Falls back to vec kernel (slower, zero temp) if MMA OOMs or context too large.
+    // TBQ prefill dispatch:
+    //   - Short context (nkv <= threshold): bulk-dequant MMA (fast tensor cores)
+    //   - Long context (nkv > threshold): chunked FlashAttention (O(CHUNK) VRAM)
     if (tbq_kv && Q->ne[1] > 1 && turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
-        ggml_cuda_tbq_prefill_attend(ctx, dst);
+        if (K->ne[1] > TBQ_CHUNKED_PREFILL_THRESHOLD) {
+            ggml_cuda_tbq_chunked_prefill(ctx, dst);
+        } else {
+            ggml_cuda_tbq_prefill_attend(ctx, dst);
+        }
     } else if (turbo_kv && !turbo_prefill_vec && Q->ne[1] > 1 && turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
         // Prefill path: turbo4 K uses inverse FWHT dequant (original domain, no Q rotation),
         // turbo2/3 K uses simple dequant (rotated domain, Q pre-rotated). V un-rotation at graph level.
