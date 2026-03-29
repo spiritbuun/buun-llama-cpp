@@ -513,7 +513,7 @@ static void ggml_cuda_tbq_prefill_attend(ggml_backend_cuda_context & ctx, ggml_t
 
     if (tbq_k) {
         const size_t k_size = K->ne[0] * K->ne[1] * K->ne[2] * K->ne[3] * sizeof(half);
-        CUDA_CHECK(cudaMallocAsync(&k_fp16, k_size, stream));
+        CUDA_CHECK(cudaMalloc(&k_fp16, k_size));
         dim3 grid_k(K->ne[1], K->ne[2], K->ne[3]);
         const size_t smem = K->ne[0] * sizeof(float);
         if (K->type == GGML_TYPE_TBQ2_0) {
@@ -530,7 +530,7 @@ static void ggml_cuda_tbq_prefill_attend(ggml_backend_cuda_context & ctx, ggml_t
 
     if (tbq_v) {
         const size_t v_size = V->ne[0] * V->ne[1] * V->ne[2] * V->ne[3] * sizeof(half);
-        CUDA_CHECK(cudaMallocAsync(&v_fp16, v_size, stream));
+        CUDA_CHECK(cudaMalloc(&v_fp16, v_size));
         dim3 grid_v(V->ne[1], V->ne[2], V->ne[3]);
         const size_t smem = V->ne[0] * sizeof(float);
         if (V->type == GGML_TYPE_TBQ2_0) {
@@ -577,8 +577,11 @@ static void ggml_cuda_tbq_prefill_attend(ggml_backend_cuda_context & ctx, ggml_t
     dst->src[1] = orig_k;
     dst->src[2] = orig_v;
 
-    if (k_fp16) CUDA_CHECK(cudaFreeAsync(k_fp16, stream));
-    if (v_fp16) CUDA_CHECK(cudaFreeAsync(v_fp16, stream));
+    // Sync + free immediately to release VRAM before decode starts.
+    // cudaFreeAsync keeps memory in the pool, starving decode at long context.
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (k_fp16) CUDA_CHECK(cudaFree(k_fp16));
+    if (v_fp16) CUDA_CHECK(cudaFree(v_fp16));
 }
 
 static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
