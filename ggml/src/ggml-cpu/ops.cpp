@@ -5588,6 +5588,12 @@ void ggml_compute_forward_clamp(
             {
                 GGML_ABORT("fatal error");
             }
+        case GGML_TYPE_TURBO2_0:
+        case GGML_TYPE_TURBO3_0:
+        case GGML_TYPE_TURBO4_0: 
+            {
+                // no-op
+            }
     }
 }
 

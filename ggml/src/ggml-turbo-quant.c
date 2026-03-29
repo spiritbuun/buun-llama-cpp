@@ -10,6 +10,10 @@
 #include "ggml-common.h"
 #include "ggml-impl.h"
 
+#if defined(_WIN32)
+#define _USE_MATH_DEFINES // for M_PI
+#endif 
+
 #include <math.h>
 #include <string.h>
 #include <assert.h>
@@ -21,10 +25,6 @@
 #define TURBO_SEED_QJL      1042
 #define TURBO_D             128  /* rotation group size = head_dim (independent of block size) */
 #define TURBO_QJL_CONST     1.2533141373155003f  /* sqrt(pi/2) */
-
-/* Optimal centroids from paper (scaled by 1/sqrt(d)) */
-/* 1-bit: ±sqrt(2/(pi*d)) */
-static const float CENTROIDS_1BIT[2] = { -0.070711f, 0.070711f };  /* for d=128 */
 
 /* 2-bit: {±0.453, ±1.51} / sqrt(d) */
 static const float CENTROIDS_2BIT[4] = { -0.133462f, -0.039994f, 0.039994f, 0.133462f };
