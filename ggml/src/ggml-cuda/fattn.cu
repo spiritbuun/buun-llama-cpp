@@ -8,15 +8,31 @@
 
 #include <atomic>
 
-// InnerQ: update the fattn-side inverse scale array from host
+// InnerQ: update the fattn-side inverse scale array from host (all devices)
 void turbo_innerq_update_fattn_scales(const float * scale_inv) {
-    cudaMemcpyToSymbol(d_innerq_channel_scale_inv_fattn, scale_inv, 128 * sizeof(float));
+    int cur_device;
+    cudaGetDevice(&cur_device);
+    int device_count;
+    cudaGetDeviceCount(&device_count);
+    for (int id = 0; id < device_count; id++) {
+        cudaSetDevice(id);
+        cudaMemcpyToSymbol(d_innerq_channel_scale_inv_fattn, scale_inv, 128 * sizeof(float));
+    }
+    cudaSetDevice(cur_device);
 }
 
 void turbo_innerq_init_fattn() {
     float ones[128];
     for (int i = 0; i < 128; i++) ones[i] = 1.0f;
-    cudaMemcpyToSymbol(d_innerq_channel_scale_inv_fattn, ones, sizeof(ones));
+    int cur_device;
+    cudaGetDevice(&cur_device);
+    int device_count;
+    cudaGetDeviceCount(&device_count);
+    for (int id = 0; id < device_count; id++) {
+        cudaSetDevice(id);
+        cudaMemcpyToSymbol(d_innerq_channel_scale_inv_fattn, ones, sizeof(ones));
+    }
+    cudaSetDevice(cur_device);
 }
 
 // Q² calibration: host-side management
@@ -28,9 +44,17 @@ void turbo_q_calibrate_init() {
 
     double zeros[128] = {};
     int zero = 0, one = 1;
-    cudaMemcpyToSymbol(d_q_channel_sq_fattn, zeros, sizeof(zeros));
-    cudaMemcpyToSymbol(d_q_channel_count_fattn, &zero, sizeof(zero));
-    cudaMemcpyToSymbol(d_q_calibrate_fattn, &one, sizeof(one));
+    int cur_device;
+    cudaGetDevice(&cur_device);
+    int device_count;
+    cudaGetDeviceCount(&device_count);
+    for (int id = 0; id < device_count; id++) {
+        cudaSetDevice(id);
+        cudaMemcpyToSymbol(d_q_channel_sq_fattn, zeros, sizeof(zeros));
+        cudaMemcpyToSymbol(d_q_channel_count_fattn, &zero, sizeof(zero));
+        cudaMemcpyToSymbol(d_q_calibrate_fattn, &one, sizeof(one));
+    }
+    cudaSetDevice(cur_device);
     q_calibrate_state = 1;
     fprintf(stderr, "TURBO_Q_CALIBRATE: collecting per-position Q² statistics\n");
 }
@@ -38,8 +62,17 @@ void turbo_q_calibrate_init() {
 void turbo_q_calibrate_finalize() {
     if (q_calibrate_state != 1) return;
 
+    int cur_device;
+    cudaGetDevice(&cur_device);
+    int device_count;
+    cudaGetDeviceCount(&device_count);
+
     int zero = 0;
-    cudaMemcpyToSymbol(d_q_calibrate_fattn, &zero, sizeof(zero));
+    for (int id = 0; id < device_count; id++) {
+        cudaSetDevice(id);
+        cudaMemcpyToSymbol(d_q_calibrate_fattn, &zero, sizeof(zero));
+    }
+    cudaSetDevice(cur_device);
 
     double sq[128];
     int count;

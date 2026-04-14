@@ -41,13 +41,21 @@ static int     h_extract_max = 0;
 static int     h_extract_state = 0;  // 0=uninit, 1=collecting, 2=done
 
 static void turbo_extract_init(int max_samples) {
+	int cur_device;
+	cudaGetDevice(&cur_device);
+	int device_count;
+	cudaGetDeviceCount(&device_count);
 	cudaMalloc(&h_extract_gpu_buf, (size_t)max_samples * sizeof(float));
 	cudaMalloc(&h_extract_gpu_pos, sizeof(int));
 	int zero = 0;
 	cudaMemcpy(h_extract_gpu_pos, &zero, sizeof(int), cudaMemcpyHostToDevice);
-	cudaMemcpyToSymbol(d_extract_buf_ptr, &h_extract_gpu_buf, sizeof(float *));
-	cudaMemcpyToSymbol(d_extract_pos_ptr, &h_extract_gpu_pos, sizeof(int *));
-	cudaMemcpyToSymbol(d_extract_max_val, &max_samples, sizeof(int));
+	for (int id = 0; id < device_count; id++) {
+		cudaSetDevice(id);
+		cudaMemcpyToSymbol(d_extract_buf_ptr, &h_extract_gpu_buf, sizeof(float *));
+		cudaMemcpyToSymbol(d_extract_pos_ptr, &h_extract_gpu_pos, sizeof(int *));
+		cudaMemcpyToSymbol(d_extract_max_val, &max_samples, sizeof(int));
+	}
+	cudaSetDevice(cur_device);
 	h_extract_max = max_samples;
 	h_extract_state = 1;
 	fprintf(stderr, "TURBO_EXTRACT: collecting up to %d post-rotation samples\n", max_samples);
@@ -71,13 +79,21 @@ static void turbo_extract_check_done() {
 				pos, path, (float)pos * sizeof(float) / (1024*1024));
 	}
 	free(host_buf);
-	// Disable extraction (set device pointers to null)
+	// Disable extraction (set device pointers to null) on all devices
 	float * null_ptr = nullptr;
 	int   * null_iptr = nullptr;
 	int     zero_max = 0;
-	cudaMemcpyToSymbol(d_extract_buf_ptr, &null_ptr, sizeof(float *));
-	cudaMemcpyToSymbol(d_extract_pos_ptr, &null_iptr, sizeof(int *));
-	cudaMemcpyToSymbol(d_extract_max_val, &zero_max, sizeof(int));
+	int cur_dev;
+	cudaGetDevice(&cur_dev);
+	int dev_count;
+	cudaGetDeviceCount(&dev_count);
+	for (int id = 0; id < dev_count; id++) {
+		cudaSetDevice(id);
+		cudaMemcpyToSymbol(d_extract_buf_ptr, &null_ptr, sizeof(float *));
+		cudaMemcpyToSymbol(d_extract_pos_ptr, &null_iptr, sizeof(int *));
+		cudaMemcpyToSymbol(d_extract_max_val, &zero_max, sizeof(int));
+	}
+	cudaSetDevice(cur_dev);
 	cudaFree(h_extract_gpu_buf); h_extract_gpu_buf = nullptr;
 	cudaFree(h_extract_gpu_pos); h_extract_gpu_pos = nullptr;
 	h_extract_state = 2;
@@ -94,19 +110,27 @@ static __device__ void turbo_extract_append(const float * x) {
 	}
 }
 
-// Host-side init: set identity scales, zero accumulators
+// Host-side init: set identity scales, zero accumulators (all devices)
 static void turbo_innerq_init() {
     float ones[128];
     for (int i = 0; i < 128; i++) ones[i] = 1.0f;
     float zeros[128] = {};
     int zero = 0;
-    cudaMemcpyToSymbol(d_innerq_channel_scale, ones, sizeof(ones));
-    cudaMemcpyToSymbol(d_innerq_channel_scale_inv, ones, sizeof(ones));
-    cudaMemcpyToSymbol(d_innerq_channel_sq, zeros, sizeof(zeros));
-    cudaMemcpyToSymbol(d_innerq_channel_max, zeros, sizeof(zeros));
-    cudaMemcpyToSymbol(d_innerq_count, &zero, sizeof(zero));
-    cudaMemcpyToSymbol(d_innerq_calibrate, &zero, sizeof(zero));
-    cudaMemcpyToSymbol(d_innerq_is_k, &zero, sizeof(zero));
+    int cur_device;
+    cudaGetDevice(&cur_device);
+    int device_count;
+    cudaGetDeviceCount(&device_count);
+    for (int id = 0; id < device_count; id++) {
+        cudaSetDevice(id);
+        cudaMemcpyToSymbol(d_innerq_channel_scale, ones, sizeof(ones));
+        cudaMemcpyToSymbol(d_innerq_channel_scale_inv, ones, sizeof(ones));
+        cudaMemcpyToSymbol(d_innerq_channel_sq, zeros, sizeof(zeros));
+        cudaMemcpyToSymbol(d_innerq_channel_max, zeros, sizeof(zeros));
+        cudaMemcpyToSymbol(d_innerq_count, &zero, sizeof(zero));
+        cudaMemcpyToSymbol(d_innerq_calibrate, &zero, sizeof(zero));
+        cudaMemcpyToSymbol(d_innerq_is_k, &zero, sizeof(zero));
+    }
+    cudaSetDevice(cur_device);
     turbo_innerq_init_fattn();
     turbo_q_calibrate_init();
 }
@@ -116,20 +140,37 @@ static void turbo_innerq_set_is_k(int is_k) {
     cudaMemcpyToSymbol(d_innerq_is_k, &is_k, sizeof(int));
 }
 
-// Host-side: enable calibration mode
+// Host-side: enable calibration mode (all devices)
 static void turbo_innerq_start_calibration() {
     float zeros[128] = {};
     int zero = 0, one = 1;
-    cudaMemcpyToSymbol(d_innerq_channel_sq, zeros, sizeof(zeros));
-    cudaMemcpyToSymbol(d_innerq_channel_max, zeros, sizeof(zeros));
-    cudaMemcpyToSymbol(d_innerq_count, &zero, sizeof(zero));
-    cudaMemcpyToSymbol(d_innerq_calibrate, &one, sizeof(one));
+    int cur_device;
+    cudaGetDevice(&cur_device);
+    int device_count;
+    cudaGetDeviceCount(&device_count);
+    for (int id = 0; id < device_count; id++) {
+        cudaSetDevice(id);
+        cudaMemcpyToSymbol(d_innerq_channel_sq, zeros, sizeof(zeros));
+        cudaMemcpyToSymbol(d_innerq_channel_max, zeros, sizeof(zeros));
+        cudaMemcpyToSymbol(d_innerq_count, &zero, sizeof(zero));
+        cudaMemcpyToSymbol(d_innerq_calibrate, &one, sizeof(one));
+    }
+    cudaSetDevice(cur_device);
 }
 
 // Host-side: finalize calibration — compute scales from accumulated stats
 static void turbo_innerq_finalize_calibration() {
+    int cur_device;
+    cudaGetDevice(&cur_device);
+    int device_count;
+    cudaGetDeviceCount(&device_count);
+
     int zero = 0;
-    cudaMemcpyToSymbol(d_innerq_calibrate, &zero, sizeof(zero));
+    for (int id = 0; id < device_count; id++) {
+        cudaSetDevice(id);
+        cudaMemcpyToSymbol(d_innerq_calibrate, &zero, sizeof(zero));
+    }
+    cudaSetDevice(cur_device);
 
     float sq[128], ch_max[128];
     int count;
@@ -210,8 +251,12 @@ static void turbo_innerq_finalize_calibration() {
         fprintf(stderr, "InnerQ: max ratio %.3f < 1.2 — channels already balanced, disabling (would hurt quality)\n", max_ratio);
         float ones[128];
         for (int i = 0; i < 128; i++) ones[i] = 1.0f;
-        cudaMemcpyToSymbol(d_innerq_channel_scale, ones, sizeof(ones));
-        cudaMemcpyToSymbol(d_innerq_channel_scale_inv, ones, sizeof(ones));
+        for (int id = 0; id < device_count; id++) {
+            cudaSetDevice(id);
+            cudaMemcpyToSymbol(d_innerq_channel_scale, ones, sizeof(ones));
+            cudaMemcpyToSymbol(d_innerq_channel_scale_inv, ones, sizeof(ones));
+        }
+        cudaSetDevice(cur_device);
         turbo_innerq_update_fattn_scales(ones);
         return;
     }
@@ -232,8 +277,12 @@ static void turbo_innerq_finalize_calibration() {
         }
     }
 
-    cudaMemcpyToSymbol(d_innerq_channel_scale, scale, sizeof(scale));
-    cudaMemcpyToSymbol(d_innerq_channel_scale_inv, scale_inv, sizeof(scale_inv));
+    for (int id = 0; id < device_count; id++) {
+        cudaSetDevice(id);
+        cudaMemcpyToSymbol(d_innerq_channel_scale, scale, sizeof(scale));
+        cudaMemcpyToSymbol(d_innerq_channel_scale_inv, scale_inv, sizeof(scale_inv));
+    }
+    cudaSetDevice(cur_device);
     turbo_innerq_update_fattn_scales(scale_inv);
 }
 
