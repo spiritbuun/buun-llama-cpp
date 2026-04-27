@@ -541,65 +541,10 @@ bool llama_memory_recurrent::resize(uint32_t new_mem_size) {
     cells.resize(new_mem_size);
     size = new_mem_size;
 
-    uint32_t used_new = 0;
-    for (auto & cell : cells) {
-        cell.tail = -1;
-
-        for (auto it = cell.seq_id.begin(); it != cell.seq_id.end();) {
-            if (*it < 0 || (uint32_t) *it >= size) {
-                LLAMA_LOG_WARN("%s: dropping seq_id %d after resize %u -> %u\n",
-                        __func__, *it, old_size, new_mem_size);
-                it = cell.seq_id.erase(it);
-            } else {
-                ++it;
-            }
-        }
-
-        if (cell.seq_id.empty()) {
-            cell.pos  = -1;
-            cell.src  = -1;
-            cell.src0 = -1;
-            continue;
-        }
-
-        if (cell.src >= (int32_t) size) {
-            LLAMA_LOG_WARN("%s: clearing out-of-range src %d after resize %u -> %u\n",
-                    __func__, cell.src, old_size, new_mem_size);
-            cell.src = -1;
-        }
-        if (cell.src0 >= (int32_t) size) {
-            LLAMA_LOG_WARN("%s: clearing out-of-range src0 %d after resize %u -> %u\n",
-                    __func__, cell.src0, old_size, new_mem_size);
-            cell.src0 = -1;
-        }
-
-        used_new++;
-    }
-
-    for (uint32_t i = 0; i < size; ++i) {
-        for (llama_seq_id seq_id : cells[i].seq_id) {
-            cells[seq_id].tail = i;
-        }
-    }
-
-    used = used_new;
-    if (size == 0) {
-        head = 0;
-        n    = 0;
-        rs_z = -1;
-    } else {
-        head = std::min(head, size - 1);
-        n    = std::min(n, size);
-        if (rs_z >= (int32_t) size) {
-            rs_z = -1;
-        }
-    }
-
     const size_t memory_size_r = size_r_bytes();
     const size_t memory_size_s = size_s_bytes();
-    LLAMA_LOG_INFO("%s: resized %u -> %u cells, used=%u, head=%u, n=%u, rs_z=%d, R: %7.2f MiB, S: %7.2f MiB\n", __func__,
+    LLAMA_LOG_INFO("%s: resized %u -> %u cells, R: %7.2f MiB, S: %7.2f MiB\n", __func__,
             old_size, new_mem_size,
-            used, head, n, rs_z,
             (float)memory_size_r / (1024.0f * 1024.0f),
             (float)memory_size_s / (1024.0f * 1024.0f));
 

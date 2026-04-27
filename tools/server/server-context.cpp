@@ -825,9 +825,7 @@ private:
         // Expanded back to 2*n_parallel before first speculative draft.
         n_parallel_user = params_base.n_parallel;
         recurrent_expanded = true;
-        if (params_base.speculative.has_dft() ||
-            (params_base.speculative.type != COMMON_SPECULATIVE_TYPE_NONE &&
-             params_base.speculative.type != COMMON_SPECULATIVE_TYPE_MTP)) {
+        if (params_base.speculative.type != COMMON_SPECULATIVE_TYPE_NONE || params_base.speculative.has_dft()) {
             params_base.n_parallel = n_parallel_user * 2;
             n_seq_max_full = params_base.n_parallel;
             recurrent_expanded = false;
