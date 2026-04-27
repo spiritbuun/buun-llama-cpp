@@ -150,6 +150,9 @@ public:
     uint32_t get_size()     const;
     uint32_t get_n_stream() const;
 
+    // DFlash decode-time sliding window for full-attention layers (0 = disabled)
+    uint32_t dflash_decode_swa = 0;
+
     bool get_has_shift() const;
 
     ggml_type type_k() const;
@@ -162,8 +165,8 @@ public:
     uint32_t get_n_kv(const slot_info & sinfo) const;
 
     // get views of the current state of the cache
-    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
-    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t kv_offset = 0) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t kv_offset = 0) const;
 
     // TurboQuant: get rotation matrices (stored as row-major C arrays)
     // turbo_rotation = R (forward rotation, for Q pre-rotate-queries)
@@ -208,7 +211,7 @@ public:
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t kv_offset = 0) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
@@ -359,6 +362,7 @@ public:
     //
 
     uint32_t get_n_kv() const;
+    uint32_t get_kv_offset() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
@@ -435,4 +439,7 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
+
+    // offset into KV cells for windowed FA (decode-time SWA)
+    uint32_t kv_offset = 0;
 };

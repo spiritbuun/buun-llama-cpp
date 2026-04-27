@@ -134,6 +134,11 @@ struct dflash_capture_data {
         return slot_hiddens(active_tape_idx);
     }
 
+    // two-phase tape deferral: skip allocation during init, materialize before first draft
+    bool tape_deferred = false;
+    int  tape_deferred_n_slots = 0;
+    int  tape_deferred_max_tokens = 0;
+
     // persistent GPU buffer for tape replay (avoids per-call alloc/free)
     ggml_backend_buffer_t replay_buf = nullptr;
     size_t replay_buf_size = 0;
@@ -391,6 +396,8 @@ public:
     // callers single-slot.
     void allocate_tape_gpu(int max_tokens) { allocate_tape_gpu(1, max_tokens); }
     void allocate_tape_gpu(int n_slots, int max_tokens);
+    void defer_tape_gpu();
+    void materialize_tape_gpu();
 
     // DFlash: select which slot's tape the next llama_decode() writes into.
     // Must be called before each decode when multi-slot tape is in use.

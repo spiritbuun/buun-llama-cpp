@@ -1328,6 +1328,13 @@ void llama_context::allocate_tape_gpu(int n_slots, int max_tokens) {
         n_slots = 1;
     }
 
+    if (dflash_capture->tape_deferred) {
+        dflash_capture->tape_deferred_n_slots = n_slots;
+        dflash_capture->tape_deferred_max_tokens = max_tokens;
+        LLAMA_LOG_INFO("%s: tape allocation deferred (%d slots, %d max_tokens)\n", __func__, n_slots, max_tokens);
+        return;
+    }
+
     // Keep layer_hiddens outer dim in sync with the slot count regardless of
     // whether GPU tape gets allocated. Hidden-state capture is needed by every
     // DFlash-enabled context (target side); tape allocation only fires for
@@ -1418,6 +1425,30 @@ void llama_context::allocate_tape_gpu(int n_slots, int max_tokens) {
 
     LLAMA_LOG_INFO("%s: allocated GPU tape buffers: %.1f MB total (%d slot%s, %d layers, %d max tokens)\n",
         __func__, total_size / (1024.0 * 1024.0), n_slots, n_slots == 1 ? "" : "s", n_rec, max_tokens);
+}
+
+void llama_context::defer_tape_gpu() {
+    if (dflash_capture) {
+        dflash_capture->tape_deferred = true;
+    }
+}
+
+void llama_context::materialize_tape_gpu() {
+    if (!dflash_capture || !dflash_capture->tape_deferred) {
+        return;
+    }
+    dflash_capture->tape_deferred = false;
+    allocate_tape_gpu(dflash_capture->tape_deferred_n_slots, dflash_capture->tape_deferred_max_tokens);
+
+    // re-run set_tape_recording to populate cparams with the new tape pointers
+    if (dflash_capture->tape_enabled) {
+        set_tape_recording(true);
+    }
+
+    // invalidate cached graph since tape tensors are now available
+    if (gf_res_prev) {
+        gf_res_prev->reset();
+    }
 }
 
 void llama_context::set_active_dflash_slot(int slot_idx) {
@@ -4909,6 +4940,14 @@ void llama_set_dflash_topk(llama_context * ctx, int k) {
 
 void llama_set_dflash_n_slots(llama_context * ctx, int n) {
     ctx->set_dflash_n_slots(n);
+}
+
+void llama_dflash_materialize_tape(llama_context * ctx) {
+    ctx->materialize_tape_gpu();
+}
+
+void llama_dflash_defer_tape(llama_context * ctx) {
+    ctx->defer_tape_gpu();
 }
 
 void llama_set_tape_recording(llama_context * ctx, bool enable) {

@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <map>
@@ -1505,6 +1506,12 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
         batch_dft = llama_batch_init(block_size, 0, 1);
 
+        // defer tape allocation to first draft() for VRAM savings during target prefill
+        const char * env_defer = getenv("GGML_DFLASH_DEFER_TAPE");
+        if (!env_defer || atoi(env_defer) != 0) {
+            llama_dflash_defer_tape(ctx_dft);
+        }
+
         // try to allocate GPU ring buffer on drafter's GPU
         gpu_ring_handle = llama_dflash_cross_ring_gpu_init(ctx_dft, n_target_layers, n_embd, ctx_window);
         if (gpu_ring_handle) {
@@ -1666,6 +1673,8 @@ struct common_speculative_state_dflash : public common_speculative_state {
         return true;
     }
 
+    bool tape_materialized = false;
+
     void draft(
             const common_params_speculative & params,
             const llama_tokens & prompt_tgt,
@@ -1673,6 +1682,11 @@ struct common_speculative_state_dflash : public common_speculative_state {
             llama_tokens & result,
             std::vector<float> * draft_log_probs = nullptr) override {
         GGML_UNUSED(prompt_tgt);
+
+        if (!tape_materialized) {
+            llama_dflash_materialize_tape(ctx_dft);
+            tape_materialized = true;
+        }
 
         const int n_draft_base = adaptive_n_draft > 0 ? adaptive_n_draft : (block_size - 1);
         const int n_draft = std::min(n_draft_base, params.n_max);
@@ -1782,6 +1796,11 @@ struct common_speculative_state_dflash : public common_speculative_state {
             llama_token id_last,
             int tree_budget,
             common_speculative_tree & tree) override {
+        if (!tape_materialized) {
+            llama_dflash_materialize_tape(ctx_dft);
+            tape_materialized = true;
+        }
+
         const int n_draft = std::min((int) params.n_max, block_size - 1);
         if (n_draft <= 0 || committed_len == 0) {
             return;

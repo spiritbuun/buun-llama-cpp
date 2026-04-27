@@ -1065,6 +1065,12 @@ extern "C" {
     // cache and forces a reserve on next decode.
     LLAMA_API void llama_set_dflash_n_slots(struct llama_context * ctx, int n);
 
+    // DFlash: materialize deferred tape GPU allocation (two-phase tape deferral)
+    LLAMA_API void llama_dflash_materialize_tape(struct llama_context * ctx);
+
+    // DFlash: defer tape allocation (call before set_tape_recording to enable two-phase)
+    LLAMA_API void llama_dflash_defer_tape(struct llama_context * ctx);
+
     // DFlash: enable/disable tape recording for DeltaNet rollback
     // When enabled, the eval callback records per-token DeltaNet inputs (k, v, gate, beta)
     // during verification decode for efficient state replay instead of full re-evaluation
