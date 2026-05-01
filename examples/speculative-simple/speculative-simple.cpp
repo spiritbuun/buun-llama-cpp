@@ -234,6 +234,21 @@ int main(int argc, char ** argv) {
     std::vector<llama_token> inp;
     inp = common_tokenize(ctx_tgt, params.prompt, true, true);
 
+    // PFlash: compress long prompts via speculative prefill (before context check)
+    if (!params.speculative.pflash_scorer_path.empty() &&
+        (int)inp.size() >= params.speculative.pflash_min_tokens) {
+        pflash_config pcfg;
+        pcfg.scorer_path = params.speculative.pflash_scorer_path;
+        pcfg.min_tokens  = params.speculative.pflash_min_tokens;
+        pcfg.keep_ratio  = params.speculative.pflash_keep_ratio;
+        pcfg.alpha       = params.speculative.pflash_alpha;
+
+        const int orig_len = (int)inp.size();
+        inp = pflash_compress(inp, pcfg);
+        LOG_INF("pflash: %d -> %d tokens (%.1f%% kept)\n",
+            orig_len, (int)inp.size(), 100.0f * inp.size() / orig_len);
+    }
+
     if (llama_n_ctx(ctx_tgt) < (uint32_t) inp.size()) {
         LOG_ERR("%s: the prompt exceeds the context size (%d tokens, ctx %d)\n", __func__, (int) inp.size(), llama_n_ctx(ctx_tgt));
 
@@ -286,21 +301,6 @@ int main(int argc, char ** argv) {
     const auto & params_spec = params.speculative;
 
     struct common_speculative * spec = common_speculative_init(params.speculative, ctx_tgt);
-
-    // PFlash: compress long prompts via speculative prefill
-    if (!params.speculative.pflash_scorer_path.empty() &&
-        (int)inp.size() >= params.speculative.pflash_min_tokens) {
-        pflash_config pcfg;
-        pcfg.scorer_path = params.speculative.pflash_scorer_path;
-        pcfg.min_tokens  = params.speculative.pflash_min_tokens;
-        pcfg.keep_ratio  = params.speculative.pflash_keep_ratio;
-        pcfg.alpha       = params.speculative.pflash_alpha;
-
-        const int orig_len = (int)inp.size();
-        inp = pflash_compress(inp, pcfg);
-        LOG_INF("pflash: %d -> %d tokens (%.1f%% kept)\n",
-            orig_len, (int)inp.size(), 100.0f * inp.size() / orig_len);
-    }
 
     // eval the prompt (with hidden state capture if DFlash is active)
     llama_decode(ctx_tgt, llama_batch_get_one(inp.data(), inp.size() - 1));
