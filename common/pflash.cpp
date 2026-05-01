@@ -9,9 +9,6 @@
 #include <cstdio>
 #include <chrono>
 
-// FlashPrefill config (from the CUDA header)
-#include "ggml-cuda/flashprefill.cuh"
-
 bool pflash_enabled(const pflash_config & cfg) {
 	return !cfg.scorer_path.empty();
 }

@@ -433,20 +433,20 @@ __global__ static void k_sparse_flash_forward(
 // Host API
 // ============================================================================
 
-extern "C" FlashPrefillBuffers flash_prefill_alloc(int seq_len, int n_heads, int n_kv_heads, int block_size) {
+FlashPrefillBuffers flash_prefill_alloc(int seq_len, int n_heads, int n_kv_heads, int block_size) {
     FlashPrefillBuffers bufs = {};
     const int n_blocks = (seq_len + block_size - 1) / block_size;
 
-    cudaMalloc(&bufs.mean_K,   (size_t)n_blocks * n_kv_heads * D_HEAD * sizeof(__nv_bfloat16));
-    cudaMalloc(&bufs.scores,   (size_t)n_blocks * n_blocks * n_kv_heads * sizeof(float));
+    cudaMalloc(&bufs->mean_K,   (size_t)n_blocks * n_kv_heads * D_HEAD * sizeof(__nv_bfloat16));
+    cudaMalloc(&bufs->scores,   (size_t)n_blocks * n_blocks * n_kv_heads * sizeof(float));
     cudaMalloc(&bufs.score_max,(size_t)n_blocks * n_blocks * n_kv_heads * sizeof(float));
-    cudaMalloc(&bufs.indices,  (size_t)n_blocks * n_blocks * n_kv_heads * sizeof(int));
-    cudaMalloc(&bufs.counts,   (size_t)n_blocks * n_kv_heads * sizeof(int));
+    cudaMalloc(&bufs->indices,  (size_t)n_blocks * n_blocks * n_kv_heads * sizeof(int));
+    cudaMalloc(&bufs->counts,   (size_t)n_blocks * n_kv_heads * sizeof(int));
 
     return bufs;
 }
 
-extern "C" void flash_prefill_free(FlashPrefillBuffers * bufs) {
+void flash_prefill_free(FlashPrefillBuffers * bufs) {
     if (bufs->mean_K)    { cudaFree(bufs->mean_K);    bufs->mean_K    = nullptr; }
     if (bufs->scores)    { cudaFree(bufs->scores);     bufs->scores    = nullptr; }
     if (bufs->score_max) { cudaFree(bufs->score_max);  bufs->score_max = nullptr; }
@@ -454,18 +454,19 @@ extern "C" void flash_prefill_free(FlashPrefillBuffers * bufs) {
     if (bufs->counts)    { cudaFree(bufs->counts);     bufs->counts    = nullptr; }
 }
 
-extern "C" void flash_prefill_forward_bf16(
+void flash_prefill_forward_bf16(
         const void * Q, const void * K, const void * V,
         void * O,
         int seq_len, int n_heads, int n_kv_heads, int d_head,
         float scale,
-        const FlashPrefillConfig & cfg,
-        FlashPrefillBuffers & bufs,
-        cudaStream_t stream) {
+        const FlashPrefillConfig * cfg,
+        FlashPrefillBuffers * bufs,
+        void * stream_ptr) {
 
     (void)d_head; // always 128
+    cudaStream_t stream = (cudaStream_t)stream_ptr;
 
-    const int n_blocks  = (seq_len + cfg.block_size - 1) / cfg.block_size;
+    const int n_blocks  = (seq_len + cfg->block_size - 1) / cfg->block_size;
 
     // 1. Compute mean K per block
     {
@@ -473,7 +474,7 @@ extern "C" void flash_prefill_forward_bf16(
         dim3 block(D_HEAD);
         k_compute_mean_K<<<grid, block, 0, stream>>>(
             (const __nv_bfloat16 *)K,
-            (__nv_bfloat16 *)bufs.mean_K,
+            (__nv_bfloat16 *)bufs->mean_K,
             seq_len, n_kv_heads);
     }
 
@@ -484,8 +485,8 @@ extern "C" void flash_prefill_forward_bf16(
         size_t smem = BLOCK_SZ * sizeof(float);
         k_compute_block_scores<<<grid, block, smem, stream>>>(
             (const __nv_bfloat16 *)Q,
-            (const __nv_bfloat16 *)bufs.mean_K,
-            (float *)bufs.scores,
+            (const __nv_bfloat16 *)bufs->mean_K,
+            (float *)bufs->scores,
             seq_len, n_heads, n_kv_heads, n_blocks, scale);
     }
 
@@ -494,9 +495,9 @@ extern "C" void flash_prefill_forward_bf16(
         dim3 grid(n_blocks, n_kv_heads);
         dim3 block(32); // one warp
         k_block_select<<<grid, block, 0, stream>>>(
-            (const float *)bufs.scores, bufs.indices, bufs.counts,
+            (const float *)bufs->scores, bufs->indices, bufs->counts,
             n_blocks, n_blocks, n_kv_heads,
-            cfg.attention_sink, cfg.local_window, cfg.last_n_full, cfg.alpha);
+            cfg->attention_sink, cfg->local_window, cfg->last_n_full, cfg->alpha);
     }
 
     // 4. Sparse flash forward
@@ -518,7 +519,7 @@ extern "C" void flash_prefill_forward_bf16(
             (const __nv_bfloat16 *)K,
             (const __nv_bfloat16 *)V,
             (__nv_bfloat16 *)O,
-            bufs.indices, bufs.counts,
+            bufs->indices, bufs->counts,
             seq_len, n_heads, n_kv_heads, n_blocks, scale);
     }
 }

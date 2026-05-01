@@ -4,8 +4,21 @@
 #include <vector>
 #include <cstdint>
 
-struct FlashPrefillConfig;
-struct FlashPrefillBuffers;
+struct FlashPrefillConfig {
+	int block_size     = 128;
+	int attention_sink = 2;
+	int local_window   = 4;
+	int last_n_full    = 2;
+	float alpha        = 0.12f;
+};
+
+struct FlashPrefillBuffers {
+	void * mean_K;
+	void * scores;
+	void * score_max;
+	int  * indices;
+	int  * counts;
+};
 
 // Run Qwen3-0.6B forward with FlashPrefill attention and extract tail scoring.
 // Returns running_max[n_lookahead][seq_len] — per-token importance scores.

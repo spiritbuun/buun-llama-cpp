@@ -19,10 +19,6 @@ struct FlashPrefillBuffers {
     int  * counts;     // [n_q_blocks, n_heads] int               (number of active blocks per query block)
 };
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 // Allocate scratch buffers for FlashPrefill. Caller must cudaFree each pointer.
 FlashPrefillBuffers flash_prefill_alloc(int seq_len, int n_heads, int n_kv_heads, int block_size);
 void flash_prefill_free(FlashPrefillBuffers * bufs);
@@ -30,15 +26,12 @@ void flash_prefill_free(FlashPrefillBuffers * bufs);
 // Run full FlashPrefill pipeline: mean_K -> score -> select -> sparse forward.
 // Q,K,V,O are all BF16, contiguous [seq_len, n_heads/n_kv_heads, D_HEAD].
 // Q shape: [seq_len, n_heads, 128], K/V shape: [seq_len, n_kv_heads, 128].
+// stream: cudaStream_t cast to void* for non-CUDA compilation units.
 void flash_prefill_forward_bf16(
     const void * Q, const void * K, const void * V,
     void * O,
     int seq_len, int n_heads, int n_kv_heads, int d_head,
     float scale,
-    const FlashPrefillConfig & cfg,
-    FlashPrefillBuffers & bufs,
-    cudaStream_t stream);
-
-#ifdef __cplusplus
-}
-#endif
+    const FlashPrefillConfig * cfg,
+    FlashPrefillBuffers * bufs,
+    void * stream);
