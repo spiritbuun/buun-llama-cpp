@@ -93,8 +93,8 @@ std::vector<int32_t> pflash_compress(
 
 	auto t4 = std::chrono::high_resolution_clock::now();
 	float dt_total = std::chrono::duration<float>(t4 - t0).count();
-	fprintf(stderr, "pflash: total %.2fs (load=%.2f, score=%.2f, select=%.2f) — %d -> %d tokens\n",
-		dt_total, dt_load, dt_score,
+	fprintf(stderr, "pflash: total %.2fs (select=%.2f) — %d -> %d tokens\n",
+		dt_total,
 		std::chrono::duration<float>(t4 - t3).count(),
 		S, (int)compressed.size());
 
