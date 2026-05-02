@@ -1,6 +1,3 @@
-// PFlash token selection pipeline.
-// Converts raw per-token importance scores into a compressed set of spans.
-
 #include "pflash-score.h"
 
 #include <algorithm>
@@ -8,7 +5,6 @@
 #include <numeric>
 #include <cstdio>
 
-// Step 1: aggregate running_max[n_lookahead, S] -> per-token score[S]
 static std::vector<float> aggregate_scores(
 		const float * running_max, int n_lookahead, int seq_len) {
 	std::vector<float> scores(seq_len, 0.0f);
@@ -22,26 +18,26 @@ static std::vector<float> aggregate_scores(
 	return scores;
 }
 
-// Step 2: average pooling smoothing
+// prefix-sum sliding window for O(S) instead of O(S*kernel)
 static std::vector<float> avgpool_smooth(
 		const std::vector<float> & scores, int kernel) {
 	const int S = (int)scores.size();
 	const int half = kernel / 2;
-	std::vector<float> smooth(S);
 
+	std::vector<float> prefix(S + 1, 0.0f);
+	for (int j = 0; j < S; j++) {
+		prefix[j + 1] = prefix[j] + scores[j];
+	}
+
+	std::vector<float> smooth(S);
 	for (int j = 0; j < S; j++) {
 		int lo = std::max(0, j - half);
 		int hi = std::min(S - 1, j + half);
-		float sum = 0.0f;
-		for (int k = lo; k <= hi; k++) {
-			sum += scores[k];
-		}
-		smooth[j] = sum / (float)(hi - lo + 1);
+		smooth[j] = (prefix[hi + 1] - prefix[lo]) / (float)(hi - lo + 1);
 	}
 	return smooth;
 }
 
-// Step 3: chunk-level scoring
 static std::vector<float> score_chunks(
 		const std::vector<float> & smooth, int chunk_size) {
 	const int S = (int)smooth.size();
@@ -68,31 +64,25 @@ std::vector<pflash_span> pflash_select_spans(
 	const int n_chunks = (seq_len + cfg.chunk_size - 1) / cfg.chunk_size;
 	const int n_keep = std::max(1, (int)(n_chunks * cfg.keep_ratio));
 
-	// smooth
 	std::vector<float> score_vec(scores, scores + seq_len);
 	auto smooth = avgpool_smooth(score_vec, cfg.pool_kernel);
-
-	// chunk scores
 	auto chunk_scores = score_chunks(smooth, cfg.chunk_size);
 
-	// top-K selection via partial sort on indices
 	std::vector<int> chunk_idx(n_chunks);
 	std::iota(chunk_idx.begin(), chunk_idx.end(), 0);
 	std::partial_sort(chunk_idx.begin(), chunk_idx.begin() + n_keep, chunk_idx.end(),
 		[&](int a, int b) { return chunk_scores[a] > chunk_scores[b]; });
 
-	// keep only top n_keep, sort by position
 	std::vector<int> selected(chunk_idx.begin(), chunk_idx.begin() + n_keep);
 	std::sort(selected.begin(), selected.end());
 
-	// merge contiguous chunks into spans
 	std::vector<pflash_span> spans;
 	for (int i = 0; i < (int)selected.size(); i++) {
 		int start = selected[i] * cfg.chunk_size;
 		int end = std::min(start + cfg.chunk_size, seq_len);
 
 		if (!spans.empty() && spans.back().end >= start) {
-			spans.back().end = end; // extend
+			spans.back().end = end;
 		} else {
 			spans.push_back({start, end});
 		}
@@ -107,13 +97,9 @@ std::vector<int32_t> pflash_compress_tokens(
 		int seq_len,
 		const int32_t * original_ids,
 		int n_original,
-		const pflash_score_config & cfg,
-		const std::string & delimiter) {
+		const pflash_score_config & cfg) {
 
-	// aggregate scores
 	auto scores = aggregate_scores(running_max, n_lookahead, seq_len);
-
-	// select spans
 	auto spans = pflash_select_spans(scores.data(), seq_len, cfg);
 
 	int total_kept = 0;
@@ -123,15 +109,6 @@ std::vector<int32_t> pflash_compress_tokens(
 
 	fprintf(stderr, "pflash: %d -> %d tokens (%.1f%% kept, %d spans)\n",
 		seq_len, total_kept, 100.0f * total_kept / seq_len, (int)spans.size());
-
-	// extract surviving token IDs
-	// For same-family (Qwen3 scorer -> Qwen3.5 target), token IDs are compatible
-	// enough that we skip the text roundtrip for now. The text roundtrip is needed
-	// for true cross-family (e.g., LLaMA scorer -> Qwen target).
-	//
-	// TODO: implement text-level roundtrip for cross-family tokenizers
-	// For Qwen3-0.6B -> Qwen3.5/3.6, the tokenizer is identical (both use the
-	// Qwen3 tokenizer with vocab 151936), so direct ID passthrough is correct.
 
 	std::vector<int32_t> compressed;
 	compressed.reserve(total_kept);

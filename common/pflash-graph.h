@@ -15,25 +15,19 @@ struct FlashPrefillConfig {
 struct FlashPrefillBuffers {
 	void * mean_K;
 	void * scores;
-	void * score_max;
 	int  * indices;
 	int  * counts;
 };
 
-// Run Qwen3-0.6B forward with FlashPrefill attention and extract tail scoring.
-// Returns running_max[n_lookahead][seq_len] — per-token importance scores.
-// Caller must free the returned vector.
 struct pflash_scorer_result {
 	std::vector<float> running_max; // [n_lookahead * seq_len]
 	int n_lookahead;
 	int seq_len;
 };
 
-// Run the scorer forward pass over the full prompt.
-// token_ids: input prompt token IDs
-// model: loaded pflash_model (weights on GPU)
-// fp_cfg: FlashPrefill configuration
-// gpu_device: CUDA device index
+void pflash_generate_placeholder_scores(float * out, int n_lookahead, int S,
+	const int32_t * token_ids);
+
 pflash_scorer_result pflash_score(
 	const std::vector<int32_t> & token_ids,
 	const pflash_model & model,

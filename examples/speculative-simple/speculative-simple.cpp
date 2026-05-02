@@ -234,15 +234,9 @@ int main(int argc, char ** argv) {
     std::vector<llama_token> inp;
     inp = common_tokenize(ctx_tgt, params.prompt, true, true);
 
-    // PFlash: compress long prompts via speculative prefill (before context check)
     if (!params.speculative.pflash_scorer_path.empty() &&
         (int)inp.size() >= params.speculative.pflash_min_tokens) {
-        pflash_config pcfg;
-        pcfg.scorer_path = params.speculative.pflash_scorer_path;
-        pcfg.min_tokens  = params.speculative.pflash_min_tokens;
-        pcfg.keep_ratio  = params.speculative.pflash_keep_ratio;
-        pcfg.alpha       = params.speculative.pflash_alpha;
-
+        auto pcfg = pflash_config::from_params(params.speculative);
         const int orig_len = (int)inp.size();
         inp = pflash_compress(inp, pcfg);
         LOG_INF("pflash: %d -> %d tokens (%.1f%% kept)\n",

@@ -12,6 +12,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "pflash.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -1469,6 +1470,21 @@ private:
             SLT_INF(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
         } else {
             slot.smpl.reset();
+        }
+
+        // PFlash: compress long prompts before task becomes const
+        if (!task.tokens.has_mtmd && task.need_logits()) {
+            const auto & sp = task.params.speculative;
+            if (!sp.pflash_scorer_path.empty() &&
+                task.n_tokens() >= sp.pflash_min_tokens) {
+                auto pcfg = pflash_config::from_params(sp);
+                const int orig_len = task.n_tokens();
+                auto compressed = pflash_compress(task.tokens.get_tokens(), pcfg);
+                task.tokens = server_tokens(compressed, false);
+                SLT_INF(slot, "pflash: %d -> %d tokens (%.1f%% kept)\n",
+                    orig_len, task.n_tokens(),
+                    100.0f * task.n_tokens() / orig_len);
+            }
         }
 
         slot.task = std::make_unique<const server_task>(std::move(task));
