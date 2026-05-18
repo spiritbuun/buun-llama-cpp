@@ -2084,19 +2084,34 @@ struct common_speculative_state_mtp : public common_speculative_state {
         return (float)(1.0 / sum);
     }
 
-    ~common_speculative_state_mtp() {
-        if (n_update_calls > 0) {
-            float accept_rate = (float)n_total_accepted / n_total_drafted * 100.0f;
-            fprintf(stderr, "\nMTP STATS: cycles=%d drafted=%d accepted=%d rate=%.1f%%\n",
-                n_update_calls, n_total_drafted, n_total_accepted, accept_rate);
-        }
-    }
+    ~common_speculative_state_mtp() override = default;
 
     void begin(const llama_tokens & /*prompt*/) override {
-        mtp_draft = LLAMA_TOKEN_NULL;
-        mtp_draft_prob = 0.0f;
         mtp_chain_drafts.clear();
         mtp_chain_probs.clear();
+
+        // Try to pre-populate draft from context's MTP output (e.g. from a previous decode).
+        // During prompt eval, MTP logits aren't produced (gate: n_outputs == n_tokens), so
+        // this will only succeed if there's a prior generation decode in the same context.
+        int64_t vocab = llama_get_mtp_n_vocab(ctx_tgt);
+        if (vocab > 0) {
+            float * logits = llama_get_mtp_logits_ith(ctx_tgt, 0);
+            if (logits) {
+                mtp_draft = (llama_token)(std::max_element(logits, logits + vocab) - logits);
+                mtp_draft_prob = top1_prob(logits, vocab);
+                int32_t chain_depth = llama_get_mtp_chain_depth(ctx_tgt);
+                for (int k = 0; k < chain_depth; ++k) {
+                    float * chain_logits = llama_get_mtp_chain_logits_ith(ctx_tgt, k, 0);
+                    if (!chain_logits) break;
+                    mtp_chain_drafts.push_back(
+                        (llama_token)(std::max_element(chain_logits, chain_logits + vocab) - chain_logits));
+                    mtp_chain_probs.push_back(top1_prob(chain_logits, vocab));
+                }
+                return;
+            }
+        }
+        mtp_draft = LLAMA_TOKEN_NULL;
+        mtp_draft_prob = 0.0f;
     }
 
     void draft(

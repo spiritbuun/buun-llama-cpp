@@ -2306,6 +2306,9 @@ void llama_context::set_mtp_enabled(bool enabled) {
     if (enabled) {
         allocate_mtp_kv((int32_t)cparams.n_ctx);
         allocate_mtp_h_prev();
+        if (mtp_n_vocab == 0) {
+            mtp_n_vocab = model.vocab.n_tokens();
+        }
     }
 }
 
@@ -3447,6 +3450,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     mtp_chain_logits[k].data(), 0, mtp_n_vocab * chain_n_tok * sizeof(float));
                 mtp_chain_depth = k + 1;
             }
+        } else if (n_outputs > 0 && mtp_n_vocab > 0) {
+            mtp_chain_depth = 0;
         }
 
         // extract embeddings

@@ -3371,14 +3371,10 @@ private:
 
                 common_sampler_accept(slot.smpl.get(), id, true);
 
-                // update DFlash hidden state ring buffer with the decoded token's hidden states.
-                // Skip on the first sample after prompt: common_speculative_begin() above already
-                // populated the ring with all prefill hiddens. The capture buffer at this point
-                // still holds prefill hiddens (no new decode happened), so ring_write(1) here would
-                // append a stale duplicate at the position that should later hold `id`'s hidden —
-                // silently corrupting the drafter's cross-attention context on every subsequent
-                // verify. Fires correctly on the fallback non-spec path during generation
-                // (draft too small → single-token decode), where slot.sampled was just decoded.
+                // Update speculative state with newly decoded token's logits.
+                // Skip on the first sample after prompt: begin() already pre-populated from
+                // the prompt eval's MTP output, and for DFlash the capture buffer still holds
+                // stale prefill hiddens (ring_write would corrupt cross-attention context).
                 if (slot.can_speculate() && slot.n_decoded > 0) {
                     if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
                         llama_dflash_set_active_slot(ctx, slot.id);
