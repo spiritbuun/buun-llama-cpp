@@ -411,6 +411,10 @@ llama_context::~llama_context() {
             }
         }
     }
+    if (mtp_kv.buffer) { ggml_backend_buffer_free(mtp_kv.buffer); }
+    if (mtp_kv.ggml_ctx) { ggml_free(mtp_kv.ggml_ctx); }
+    if (mtp_h_prev.buffer) { ggml_backend_buffer_free(mtp_h_prev.buffer); }
+    if (mtp_h_prev.ggml_ctx) { ggml_free(mtp_h_prev.ggml_ctx); }
     ggml_opt_free(opt_ctx);
 }
 
@@ -1276,7 +1280,14 @@ void llama_context::dflash_ensure_recurrent_setup() {
 
 void llama_context::set_tape_recording(bool enable) {
     if (!dflash_capture) {
-        return;
+        if (!enable) return;
+        // Lazy init for tape-only mode (MTP speculative decoding — no hidden state capture)
+        dflash_capture = std::make_unique<dflash_capture_data>();
+        dflash_capture->hiddens = &layer_hiddens;
+
+        // Install the eval callback so tape data is captured during forward passes
+        cparams.cb_eval = dflash_eval_callback;
+        cparams.cb_eval_user_data = dflash_capture.get();
     }
 
     dflash_capture->tape_enabled = enable;
@@ -2289,6 +2300,141 @@ void llama_context::tree_rollback(int commit_n, const int32_t * parents) {
     clear_tree_parent_ids();
 }
 
+void llama_context::set_mtp_enabled(bool enabled) {
+    mtp_enabled = enabled;
+    cparams.mtp_enabled = enabled;
+    if (enabled) {
+        allocate_mtp_kv((int32_t)cparams.n_ctx);
+        allocate_mtp_h_prev();
+        if (mtp_n_vocab == 0) {
+            mtp_n_vocab = model.vocab.n_tokens();
+        }
+    }
+}
+
+void llama_context::allocate_mtp_kv(int32_t n_ctx) {
+    if (mtp_kv.n_ctx_max >= n_ctx) return;
+
+    const auto & hparams = model.hparams;
+    if (hparams.nextn_predict_layers == 0) return;
+
+    const int64_t n_embd_head = hparams.n_embd_head_v();
+    const int64_t n_head_kv   = hparams.n_head_kv();
+
+    if (mtp_kv.buffer) {
+        ggml_backend_buffer_free(mtp_kv.buffer);
+        mtp_kv.buffer = nullptr;
+    }
+    if (mtp_kv.ggml_ctx) {
+        ggml_free(mtp_kv.ggml_ctx);
+        mtp_kv.ggml_ctx = nullptr;
+    }
+
+    mtp_kv.n_ctx_max = n_ctx;
+    mtp_kv.n_used = 0;
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead() * 2 + ggml_graph_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    mtp_kv.ggml_ctx = ggml_init(params);
+
+    mtp_kv.k = ggml_new_tensor_3d(mtp_kv.ggml_ctx, GGML_TYPE_F32, n_embd_head, n_head_kv, n_ctx);
+    ggml_set_name(mtp_kv.k, "mtp_kv_k");
+    mtp_kv.v = ggml_new_tensor_3d(mtp_kv.ggml_ctx, GGML_TYPE_F32, n_embd_head, n_head_kv, n_ctx);
+    ggml_set_name(mtp_kv.v, "mtp_kv_v");
+
+    auto * buft = ggml_backend_get_default_buffer_type(ggml_backend_sched_get_backend(sched.get(), 0));
+    mtp_kv.buffer = ggml_backend_alloc_ctx_tensors_from_buft(mtp_kv.ggml_ctx, buft);
+
+    if (!mtp_kv.buffer) {
+        LLAMA_LOG_WARN("%s: failed to allocate MTP KV buffer (%.1f MB)\n", __func__,
+            2.0f * n_embd_head * n_head_kv * n_ctx * sizeof(float) / (1024.0 * 1024.0));
+        ggml_free(mtp_kv.ggml_ctx);
+        mtp_kv.ggml_ctx = nullptr;
+        mtp_kv.n_ctx_max = 0;
+        return;
+    }
+
+    // Zero-initialize: unmasked garbage in FA can produce NaN even with -inf mask
+    ggml_backend_buffer_clear(mtp_kv.buffer, 0);
+
+    const float mb = 2.0f * n_embd_head * n_head_kv * n_ctx * sizeof(float) / (1024.0f * 1024.0f);
+    LLAMA_LOG_INFO("%s: allocated MTP KV buffer: [%lld, %lld, %d] × 2 = %.1f MB\n",
+        __func__, (long long)n_embd_head, (long long)n_head_kv, n_ctx, mb);
+}
+
+void llama_context::allocate_mtp_h_prev() {
+    if (mtp_h_prev.buffer) return;
+
+    const auto & hparams = model.hparams;
+    if (hparams.nextn_predict_layers == 0) return;
+
+    const int64_t n_embd = hparams.n_embd;
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead() + ggml_graph_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    mtp_h_prev.ggml_ctx = ggml_init(params);
+    mtp_h_prev.h = ggml_new_tensor_1d(mtp_h_prev.ggml_ctx, GGML_TYPE_F32, n_embd);
+    ggml_set_name(mtp_h_prev.h, "mtp_h_prev");
+
+    auto * buft = ggml_backend_get_default_buffer_type(ggml_backend_sched_get_backend(sched.get(), 0));
+    mtp_h_prev.buffer = ggml_backend_alloc_ctx_tensors_from_buft(mtp_h_prev.ggml_ctx, buft);
+
+    if (!mtp_h_prev.buffer) {
+        LLAMA_LOG_WARN("%s: failed to allocate MTP h_prev buffer\n", __func__);
+        ggml_free(mtp_h_prev.ggml_ctx);
+        mtp_h_prev.ggml_ctx = nullptr;
+        return;
+    }
+    ggml_backend_buffer_clear(mtp_h_prev.buffer, 0);
+    mtp_h_prev.valid = false;
+}
+
+void llama_context::mtp_kv_clear() {
+    mtp_kv.n_used = 0;
+    mtp_h_prev.valid = false;
+}
+
+void llama_context::mtp_kv_seq_rm(int32_t pos_start) {
+    if (pos_start < mtp_kv.n_used) {
+        mtp_kv.n_used = pos_start;
+        mtp_h_prev.valid = false;
+    }
+}
+
+float * llama_context::get_mtp_logits() {
+    if (!mtp_logits_valid || mtp_logits.empty()) {
+        return nullptr;
+    }
+    return mtp_logits.data();
+}
+
+float * llama_context::get_mtp_logits_ith(int32_t i) {
+    if (!mtp_logits_valid || mtp_logits.empty()) {
+        return nullptr;
+    }
+    return mtp_logits.data() + (int64_t)i * mtp_n_vocab;
+}
+
+int64_t llama_context::get_mtp_n_vocab() const {
+    return mtp_n_vocab;
+}
+
+float * llama_context::get_mtp_chain_logits_ith(int32_t chain_depth, int32_t /*i*/) {
+    if (chain_depth < 0 || chain_depth >= mtp_chain_depth) return nullptr;
+    if (mtp_chain_logits[chain_depth].empty()) return nullptr;
+    return mtp_chain_logits[chain_depth].data();
+}
+
+int32_t llama_context::get_mtp_chain_depth() const {
+    return mtp_chain_depth;
+}
+
 llama_token llama_context::get_sampled_token_ith(int32_t idx) {
     output_reorder();
 
@@ -3257,6 +3403,57 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
+        // extract MTP logits
+        {
+            ggml_tensor * t_logits_mtp = res->t_logits_mtp;
+            if (t_logits_mtp && n_outputs > 0) {
+                ggml_backend_t backend_mtp = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits_mtp);
+                GGML_ASSERT(backend_mtp != nullptr);
+                mtp_n_vocab = t_logits_mtp->ne[0];
+                mtp_logits.resize(mtp_n_vocab * n_outputs);
+                ggml_backend_tensor_get_async(backend_mtp, t_logits_mtp,
+                    mtp_logits.data(), 0, mtp_n_vocab * n_outputs * sizeof(float));
+                mtp_logits_valid = true;
+
+                // MTP KV buffer: increment n_used after graph writes K/V
+                if (mtp_kv.buffer && (mtp_kv.n_used + (int32_t)ubatch.n_tokens <= mtp_kv.n_ctx_max)) {
+                    int32_t old = mtp_kv.n_used;
+                    mtp_kv.n_used += ubatch.n_tokens;
+                    if (old == 0 || mtp_kv.n_used % 50 == 0) {
+                        LLAMA_LOG_DEBUG("%s: MTP n_used: %d -> %d (n_tok=%d n_out=%d)\n",
+                            __func__, old, mtp_kv.n_used, (int)ubatch.n_tokens, n_outputs);
+                    }
+                }
+                // Copy last hidden state to persistent buffer for next cycle's right-shift
+                ggml_tensor * t_h_last = res->t_mtp_h_last;
+                if (t_h_last && mtp_h_prev.buffer && mtp_h_prev.h) {
+                    ggml_backend_t backend_src = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_last);
+                    if (backend_src) {
+                        ggml_backend_tensor_copy_async(backend_src, backend_src, t_h_last, mtp_h_prev.h);
+                        mtp_h_prev.valid = true;
+                    }
+                }
+            }
+        }
+
+        // extract MTP chain logits (only when graph includes chain AND has outputs)
+        if (res->t_logits_mtp_chain[0] && n_outputs > 0 && mtp_n_vocab > 0) {
+            mtp_chain_depth = 0;
+            for (int k = 0; k < llm_graph_result::MTP_CHAIN_MAX; ++k) {
+                ggml_tensor * t_chain = res->t_logits_mtp_chain[k];
+                if (!t_chain) break;
+                ggml_backend_t backend_chain = ggml_backend_sched_get_tensor_backend(sched.get(), t_chain);
+                if (!backend_chain) break;
+                const int64_t chain_n_tok = t_chain->ne[1];
+                mtp_chain_logits[k].resize(mtp_n_vocab * chain_n_tok);
+                ggml_backend_tensor_get_async(backend_chain, t_chain,
+                    mtp_chain_logits[k].data(), 0, mtp_n_vocab * chain_n_tok * sizeof(float));
+                mtp_chain_depth = k + 1;
+            }
+        } else if (n_outputs > 0 && mtp_n_vocab > 0) {
+            mtp_chain_depth = 0;
+        }
+
         // extract embeddings
         if (embd.data && t_embd && n_outputs > 0) {
             ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
@@ -3521,6 +3718,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     std::fill(output_ids.begin(), output_ids.end(), -1);
 
     this->n_outputs = 0;
+    this->mtp_logits_valid = false;
 
     return n_outputs_max;
 }
@@ -3677,6 +3875,13 @@ llm_graph_params llama_context::graph_params(
         /*.tree_parent_ids         =*/ tree_bufs.active ? tree_bufs.parent_ids_gpu : nullptr,
         /*.tree_ssm_intermediates  =*/ tree_bufs.active ? &tree_bufs.ssm_intermediates : nullptr,
         /*.tree_n_recurrent_layers =*/ (int)tree_bufs.ssm_intermediates.size(),
+        /*.mtp_kv_k          =*/ mtp_kv.buffer ? mtp_kv.k : nullptr,
+        /*.mtp_kv_v          =*/ mtp_kv.buffer ? mtp_kv.v : nullptr,
+        /*.mtp_kv_n_used     =*/ mtp_kv.n_used,
+        /*.mtp_kv_n_ctx_max  =*/ mtp_kv.n_ctx_max,
+        /*.mtp_kv_n_used_ptr =*/ mtp_kv.buffer ? &mtp_kv.n_used : nullptr,
+        /*.mtp_h_prev        =*/ mtp_h_prev.buffer ? mtp_h_prev.h : nullptr,
+        /*.mtp_h_prev_valid  =*/ mtp_h_prev.valid,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -4851,6 +5056,49 @@ void llama_allocate_tree_buffers(llama_context * ctx, int max_tree_tokens) {
 void llama_tree_rollback(llama_context * ctx, int commit_n, const int32_t * parents, int n_seq0) {
     ctx->set_tree_seq0_count(n_seq0);
     ctx->tree_rollback(commit_n, parents);
+}
+
+void llama_set_mtp_enabled(llama_context * ctx, bool enabled) {
+    ctx->set_mtp_enabled(enabled);
+}
+
+int32_t llama_model_n_mtp_layers(const llama_model * model) {
+    return (int32_t)model->hparams.nextn_predict_layers;
+}
+
+float * llama_get_mtp_logits(llama_context * ctx) {
+    ctx->synchronize();
+    return ctx->get_mtp_logits();
+}
+
+float * llama_get_mtp_logits_ith(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+    return ctx->get_mtp_logits_ith(i);
+}
+
+int64_t llama_get_mtp_n_vocab(llama_context * ctx) {
+    return ctx->get_mtp_n_vocab();
+}
+
+float * llama_get_mtp_chain_logits_ith(llama_context * ctx, int32_t chain_depth, int32_t i) {
+    ctx->synchronize();
+    return ctx->get_mtp_chain_logits_ith(chain_depth, i);
+}
+
+int32_t llama_get_mtp_chain_depth(llama_context * ctx) {
+    return ctx->get_mtp_chain_depth();
+}
+
+int32_t llama_mtp_kv_n_used(llama_context * ctx) {
+    return ctx->get_mtp_kv_n_used();
+}
+
+void llama_mtp_kv_seq_rm(llama_context * ctx, int32_t pos_start) {
+    ctx->mtp_kv_seq_rm(pos_start);
+}
+
+void llama_mtp_kv_clear(llama_context * ctx) {
+    ctx->mtp_kv_clear();
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {

@@ -154,6 +154,54 @@ public:
     const uint32_t n_pos_per_embd = 1;
 };
 
+// MTP KV buffer: scatter-write indices and attention mask for graph-reuse-safe MTP
+class llm_graph_input_mtp_kv : public llm_graph_input_i {
+public:
+    llm_graph_input_mtp_kv(int32_t n_ctx_max, const int32_t * n_used_ptr, bool flash_attn)
+        : n_ctx_max(n_ctx_max), n_used_ptr(n_used_ptr), flash_attn(flash_attn) {}
+    virtual ~llm_graph_input_mtp_kv() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * k_idxs   = nullptr; // I64 [n_tokens]
+    ggml_tensor * kq_mask  = nullptr; // F32 [n_ctx_max, n_tokens, 1, 1]
+    ggml_tensor * kq_mask_cnv = nullptr; // F16 if flash_attn, else same as kq_mask
+
+    const int32_t n_ctx_max;
+    const int32_t * n_used_ptr;
+    const bool flash_attn;
+};
+
+// MTP causal mask for prefill: allows attending to buffer + causal within-batch
+class llm_graph_input_mtp_causal_mask : public llm_graph_input_i {
+public:
+    llm_graph_input_mtp_causal_mask(int32_t n_buffer_used)
+        : n_buffer_used(n_buffer_used) {}
+    virtual ~llm_graph_input_mtp_causal_mask() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * mask = nullptr; // F32 [n_kv_total, n_tokens, 1, 1]
+    const int32_t n_buffer_used;
+};
+
+// MTP chain positions: pos[0]+1, pos[0]+2, ..., pos[0]+n_chain
+// Used for RoPE in MTP chain iterations
+class llm_graph_input_pos_mtp_chain : public llm_graph_input_i {
+public:
+    llm_graph_input_pos_mtp_chain(int n_chain, int n_tokens) : n_chain(n_chain), n_tokens(n_tokens) {}
+    virtual ~llm_graph_input_pos_mtp_chain() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    // MRoPE chain positions for n_chain steps × n_tokens tokens × 4 sections
+    // Step k uses positions P_i + k + 1 for each token i
+    ggml_tensor * chain_pos = nullptr; // I32 [n_chain * n_tokens * 4]
+
+    const int n_chain;
+    const int n_tokens;
+};
+
 // temperature tuning, used by llama4
 class llm_graph_input_attn_temp : public llm_graph_input_i {
 public:
@@ -574,6 +622,17 @@ struct llm_graph_params {
     const std::vector<ggml_tensor *> * tree_ssm_intermediates = nullptr;
     int tree_n_recurrent_layers = 0;
 
+    // MTP persistent KV buffer (passed from llama_context)
+    ggml_tensor * mtp_kv_k = nullptr;
+    ggml_tensor * mtp_kv_v = nullptr;
+    int32_t mtp_kv_n_used = 0;
+    int32_t mtp_kv_n_ctx_max = 0;
+    const int32_t * mtp_kv_n_used_ptr = nullptr;
+
+    // MTP previous hidden state for right-shift (h_{k-1} at position 0)
+    ggml_tensor * mtp_h_prev = nullptr;
+    bool mtp_h_prev_valid = false;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -660,7 +719,8 @@ struct llm_graph_params {
             cvec  == other.cvec  &&
             loras == other.loras &&
             cross == other.cross &&
-            (tree_parent_ids != nullptr) == (other.tree_parent_ids != nullptr);
+            (tree_parent_ids != nullptr) == (other.tree_parent_ids != nullptr) &&
+            (mtp_kv_k != nullptr) == (other.mtp_kv_k != nullptr);
     }
 };
 
@@ -700,7 +760,12 @@ public:
     ggml_tensor * t_inp_tokens  = nullptr;
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
     ggml_tensor * t_logits      = nullptr;
-    ggml_tensor * t_logits_argmax = nullptr; // [n_tokens] int32, GPU argmax of logits
+    ggml_tensor * t_logits_argmax = nullptr;
+    ggml_tensor * t_logits_mtp  = nullptr;
+    ggml_tensor * t_mtp_h_last  = nullptr; // last position hidden state for h_prev update
+
+    static constexpr int MTP_CHAIN_MAX = 3;
+    ggml_tensor * t_logits_mtp_chain[MTP_CHAIN_MAX] = {};
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
 
@@ -798,6 +863,17 @@ struct llm_graph_context {
     ggml_tensor * tree_parent_ids = nullptr;
     const std::vector<ggml_tensor *> * tree_ssm_intermediates = nullptr;
     int tree_n_recurrent_layers = 0;
+
+    // MTP persistent KV buffer
+    ggml_tensor * mtp_kv_k = nullptr;
+    ggml_tensor * mtp_kv_v = nullptr;
+    int32_t mtp_kv_n_used = 0;
+    int32_t mtp_kv_n_ctx_max = 0;
+    const int32_t * mtp_kv_n_used_ptr = nullptr;
+
+    // MTP previous hidden state for right-shift
+    ggml_tensor * mtp_h_prev = nullptr;
+    bool mtp_h_prev_valid = false;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

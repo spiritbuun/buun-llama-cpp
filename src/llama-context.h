@@ -440,6 +440,24 @@ public:
     void tree_rollback(int commit_n, const int32_t * parents);
     void set_tree_seq0_count(int n) { tree_bufs.n_seq0_tokens = n; }
 
+    // MTP control
+    void set_mtp_enabled(bool enabled);
+
+    // MTP persistent KV buffer (separate from main KV cache)
+    void allocate_mtp_kv(int32_t n_ctx);
+    void mtp_kv_clear();
+    void mtp_kv_seq_rm(int32_t pos_start);
+    int32_t get_mtp_kv_n_used() const { return mtp_kv.n_used; }
+
+    // MTP logits accessors
+    float * get_mtp_logits();
+    float * get_mtp_logits_ith(int32_t i);
+    int64_t get_mtp_n_vocab() const;
+
+    // MTP chain logits (self-chained deeper predictions)
+    float * get_mtp_chain_logits_ith(int32_t chain_depth, int32_t i);
+    int32_t get_mtp_chain_depth() const;
+
 private:
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -519,16 +537,48 @@ private:
     // DDTree: tree-mode parent IDs and persistent SSM intermediate buffers
     struct {
         bool active = false;
-        bool disabled = false;                     // multi-GPU: tree ops can't span devices
+        bool disabled = false;
         int n_tokens = 0;
-        int n_seq0_tokens = 0;                     // tokens on seq_id=0 in last batch (for pos rollback)
-        std::vector<int32_t> parent_ids_cpu;       // [max_tree_tokens] host copy
-        ggml_backend_buffer_t buffer = nullptr;    // GPU allocation for all intermediates + parent_ids
-        ggml_context * ggml_ctx = nullptr;         // context owning tensor metadata
-        ggml_tensor * parent_ids_gpu = nullptr;    // [max_tree_tokens] i32 on GPU
-        std::vector<ggml_tensor *> ssm_intermediates; // per recurrent layer: [S_v*S_v*H*max_tokens] f16
+        int n_seq0_tokens = 0;
+        std::vector<int32_t> parent_ids_cpu;
+        ggml_backend_buffer_t buffer = nullptr;
+        ggml_context * ggml_ctx = nullptr;
+        ggml_tensor * parent_ids_gpu = nullptr;
+        std::vector<ggml_tensor *> ssm_intermediates;
         int max_tree_tokens = 0;
     } tree_bufs;
+
+    // MTP graph control
+    bool mtp_enabled = false;
+
+    // MTP logits buffer
+    std::vector<float> mtp_logits;
+    int64_t mtp_n_vocab = 0;
+    bool mtp_logits_valid = false;
+
+    // MTP chain logits
+    std::vector<float> mtp_chain_logits[llm_graph_result::MTP_CHAIN_MAX];
+    int32_t mtp_chain_depth = 0;
+
+    // MTP persistent KV buffer (1 layer, separate from main KV cache)
+    struct {
+        ggml_backend_buffer_t buffer = nullptr;
+        ggml_context * ggml_ctx = nullptr;
+        ggml_tensor * k = nullptr;  // [n_embd_head, n_head_kv, n_ctx_max] F32
+        ggml_tensor * v = nullptr;  // [n_embd_head, n_head_kv, n_ctx_max] F32
+        int32_t n_used = 0;
+        int32_t n_ctx_max = 0;
+    } mtp_kv;
+
+    // MTP previous hidden state (for right-shift: h_{k-1} at position 0)
+    struct {
+        ggml_backend_buffer_t buffer = nullptr;
+        ggml_context * ggml_ctx = nullptr;
+        ggml_tensor * h = nullptr;  // [n_embd] F32
+        bool valid = false;
+    } mtp_h_prev;
+
+    void allocate_mtp_h_prev();
 
     // reuse the batch_allocr to avoid unnecessary memory allocations
     std::unique_ptr<llama_batch_allocr> balloc;

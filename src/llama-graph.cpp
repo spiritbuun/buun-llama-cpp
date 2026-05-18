@@ -128,6 +128,67 @@ bool llm_graph_input_pos::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+void llm_graph_input_mtp_kv::set_input(const llama_ubatch * ubatch) {
+    const int32_t n_tokens = ubatch->n_tokens;
+    const int32_t n_used = *n_used_ptr;
+
+    if (k_idxs) {
+        std::vector<int64_t> idxs(n_tokens);
+        for (int32_t i = 0; i < n_tokens; ++i) {
+            idxs[i] = n_used + i;
+        }
+        ggml_backend_tensor_set(k_idxs, idxs.data(), 0, idxs.size() * sizeof(int64_t));
+    }
+
+    if (kq_mask) {
+        const int32_t n_valid = n_used + n_tokens;
+        std::vector<float> mask_data(n_ctx_max * n_tokens);
+        for (int32_t q = 0; q < n_tokens; ++q) {
+            for (int32_t k = 0; k < n_ctx_max; ++k) {
+                mask_data[q * n_ctx_max + k] = (k < n_valid) ? 0.0f : -INFINITY;
+            }
+        }
+        ggml_backend_tensor_set(kq_mask, mask_data.data(), 0, mask_data.size() * sizeof(float));
+    }
+}
+
+void llm_graph_input_mtp_causal_mask::set_input(const llama_ubatch * ubatch) {
+    if (!mask) return;
+    const int32_t n_tokens = ubatch->n_tokens;
+    const int64_t n_kv_total = n_buffer_used + n_tokens;
+    std::vector<float> mask_data(n_kv_total * n_tokens);
+    for (int32_t q = 0; q < n_tokens; ++q) {
+        for (int64_t k = 0; k < n_kv_total; ++k) {
+            // Buffer entries (0..n_buffer_used-1): always visible
+            // Current batch entries (n_buffer_used..): causal within batch
+            if (k < n_buffer_used) {
+                mask_data[q * n_kv_total + k] = 0.0f;
+            } else {
+                int32_t batch_k = (int32_t)(k - n_buffer_used);
+                mask_data[q * n_kv_total + k] = (batch_k <= q) ? 0.0f : -INFINITY;
+            }
+        }
+    }
+    ggml_backend_tensor_set(mask, mask_data.data(), 0, mask_data.size() * sizeof(float));
+}
+
+void llm_graph_input_pos_mtp_chain::set_input(const llama_ubatch * ubatch) {
+    if (ubatch->pos && chain_pos) {
+        // Chain runs on the LAST token. Its base MTP position is the last token's pos.
+        // Chain step k uses position P_last + k + 1 (MRoPE: 4 sections per position)
+        const int n_pos_per_embd = 4;
+        const int last_tok = (int)ubatch->n_tokens - 1;
+        int32_t last_pos = ubatch->pos[last_tok * n_pos_per_embd]; // first MRoPE section of last token
+        std::vector<int32_t> pos_data(n_chain * n_pos_per_embd);
+        for (int k = 0; k < n_chain; ++k) {
+            for (int s = 0; s < n_pos_per_embd; ++s) {
+                pos_data[k * n_pos_per_embd + s] = last_pos + k + 1;
+            }
+        }
+        ggml_backend_tensor_set(chain_pos, pos_data.data(), 0, pos_data.size() * sizeof(int32_t));
+    }
+}
+
 void llm_graph_input_attn_temp::set_input(const llama_ubatch * ubatch) {
     if (ubatch->pos && attn_scale) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -825,6 +886,8 @@ void llm_graph_result::reset() {
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
     t_logits      = nullptr;
+    t_logits_mtp  = nullptr;
+    for (int k = 0; k < MTP_CHAIN_MAX; ++k) { t_logits_mtp_chain[k] = nullptr; }
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_sampled.clear();
@@ -886,6 +949,15 @@ void llm_graph_result::set_outputs() {
     for (auto & [seq_id, t] : t_candidates) {
         if (t != nullptr) {
             ggml_set_output(t);
+        }
+    }
+    // MTP logits outputs
+    if (t_logits_mtp != nullptr) {
+        ggml_set_output(t_logits_mtp);
+    }
+    for (int k = 0; k < MTP_CHAIN_MAX; ++k) {
+        if (t_logits_mtp_chain[k] != nullptr) {
+            ggml_set_output(t_logits_mtp_chain[k]);
         }
     }
     // DFlash hidden state capture moved to eval callback (no graph outputs needed)
@@ -976,6 +1048,13 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     tree_parent_ids           (params.tree_parent_ids),
     tree_ssm_intermediates    (params.tree_ssm_intermediates),
     tree_n_recurrent_layers   (params.tree_n_recurrent_layers),
+    mtp_kv_k                  (params.mtp_kv_k),
+    mtp_kv_v                  (params.mtp_kv_v),
+    mtp_kv_n_used             (params.mtp_kv_n_used),
+    mtp_kv_n_ctx_max          (params.mtp_kv_n_ctx_max),
+    mtp_kv_n_used_ptr         (params.mtp_kv_n_used_ptr),
+    mtp_h_prev                (params.mtp_h_prev),
+    mtp_h_prev_valid          (params.mtp_h_prev_valid),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),

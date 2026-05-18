@@ -141,7 +141,8 @@ int main(int argc, char ** argv) {
             params.speculative.type != COMMON_SPECULATIVE_TYPE_NGRAM_CACHE &&
             params.speculative.type != COMMON_SPECULATIVE_TYPE_SUFFIX &&
             params.speculative.type != COMMON_SPECULATIVE_TYPE_COPYSPEC &&
-            params.speculative.type != COMMON_SPECULATIVE_TYPE_RECYCLE) {
+            params.speculative.type != COMMON_SPECULATIVE_TYPE_RECYCLE &&
+            params.speculative.type != COMMON_SPECULATIVE_TYPE_MTP) {
         LOG_ERR("%s: --model-draft is required (unless using a model-free --spec-type)\n", __func__);
         return 1;
     }
@@ -415,9 +416,41 @@ int main(int argc, char ** argv) {
                 }
 
                 llama_clear_tree_mask(ctx_tgt);
-                // Note: tree_parent_ids stays active until tree_rollback clears it
 
                 LOG_DBG("[iter %d] tree decode: n_nodes=%d, n_past=%d\n", n_iters, tree.n_nodes, n_past);
+
+                // MTP branch enrichment: add conditional next-next-token candidates
+                int n_mtp_branches = 0;
+                {
+                    int64_t mtp_vocab = llama_get_mtp_n_vocab(ctx_tgt);
+                    if (mtp_vocab > 0 && tree.main_path_len > 0) {
+                        for (int i = 0; i < tree.main_path_len; ++i) {
+                            float * mtp_logits = llama_get_mtp_logits_ith(ctx_tgt, i);
+                            if (!mtp_logits) continue;
+
+                            int parent_node = i + 1;
+                            int child_depth = i + 2;
+
+                            llama_token mtp_token = (llama_token)(std::max_element(mtp_logits, mtp_logits + mtp_vocab) - mtp_logits);
+
+                            if (tree.child_maps[parent_node].count(mtp_token)) continue;
+
+                            int new_idx = tree.n_nodes + 1;
+                            tree.tokens.push_back(mtp_token);
+                            tree.parents.push_back(parent_node);
+                            tree.depths.push_back(child_depth);
+                            tree.child_maps.push_back({});
+                            tree.child_maps[parent_node][mtp_token] = new_idx;
+                            tree.n_nodes++;
+                            n_mtp_branches++;
+                        }
+                    }
+                }
+                n_draft_this_iter += n_mtp_branches;
+                if (n_mtp_branches > 0) {
+                    LOG_INF("mtp_branches: added %d branches to tree (%d total nodes)\n",
+                            n_mtp_branches, tree.n_nodes);
+                }
 
                 // Tree walk: all logits available from single pass
                 {
@@ -567,11 +600,9 @@ int main(int argc, char ** argv) {
 
         } // end flat path
 
-        GGML_ASSERT(ids.size() > 0); // there will always be at least one accepted token
+        GGML_ASSERT(ids.size() > 0);
 
-        // check for partial draft acceptance:
-        // if the context doesn't support partial sequence removal, restore the checkpoint
-        // and make the accepted tokens the new partial draft for the next iteration
+        // check for partial draft acceptance
         if (use_ckpt && ids.size() - 1 < draft.size()) {
             LOG_DBG("partial acceptance: %zu < %zu, restoring checkpoint\n", ids.size() - 1, draft.size());
 
@@ -754,7 +785,6 @@ int main(int argc, char ** argv) {
     LOG_INF("n_drafted = %d\n", n_drafted);
     LOG_INF("n_accept  = %d\n", n_accept);
     LOG_INF("accept    = %.3f%%\n", 100.0f * n_accept / n_drafted);
-
     // per-position rejection histogram
     {
         int n_rounds_with_draft = n_all_accepted;

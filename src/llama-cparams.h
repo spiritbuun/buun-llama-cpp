@@ -72,6 +72,9 @@ struct llama_cparams {
     dflash_tape_gpu * tape_gpu_seqs[LLAMA_DFLASH_MAX_SLOTS] = {};
     int tape_gpu_n_seqs = 0;
 
+    // MTP: enable inline MTP graph computation during decode
+    bool mtp_enabled = false;
+
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
 };

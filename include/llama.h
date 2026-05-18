@@ -1160,6 +1160,30 @@ extern "C" {
     // DDTree: rollback SSM state to committed token using stored intermediates
     LLAMA_API void llama_tree_rollback(struct llama_context * ctx, int commit_n, const int32_t * parents, int n_seq0);
 
+    // MTP: enable/disable inline MTP graph computation during decode
+    LLAMA_API void llama_set_mtp_enabled(struct llama_context * ctx, bool enabled);
+
+    // MTP: get number of MTP layers in the model (0 if none)
+    LLAMA_API int32_t llama_model_n_mtp_layers(const struct llama_model * model);
+
+    // MTP: get logits from the last decode (nullptr if no MTP or not yet decoded)
+    LLAMA_API float * llama_get_mtp_logits(struct llama_context * ctx);
+
+    // MTP: get logits for a specific output position
+    LLAMA_API float * llama_get_mtp_logits_ith(struct llama_context * ctx, int32_t i);
+
+    // MTP: get the (reduced) vocabulary size used by MTP head
+    LLAMA_API int64_t llama_get_mtp_n_vocab(struct llama_context * ctx);
+
+    // MTP chain: deeper predictions from self-chained MTP head
+    LLAMA_API float * llama_get_mtp_chain_logits_ith(struct llama_context * ctx, int32_t chain_depth, int32_t i);
+    LLAMA_API int32_t llama_get_mtp_chain_depth(struct llama_context * ctx);
+
+    // MTP KV buffer: persistent attention history for MTP layer
+    LLAMA_API int32_t llama_mtp_kv_n_used(struct llama_context * ctx);
+    LLAMA_API void    llama_mtp_kv_seq_rm(struct llama_context * ctx, int32_t pos_start);
+    LLAMA_API void    llama_mtp_kv_clear(struct llama_context * ctx);
+
     // DFlash: share tok_embd and output tensors from src model to dst model
     // Used to avoid duplicating embedding/lm_head weights between target and drafter
     LLAMA_API void llama_model_share_tensors(struct llama_model * dst, const struct llama_model * src);

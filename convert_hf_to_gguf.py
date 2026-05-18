@@ -4837,6 +4837,13 @@ class Qwen3MoeModel(Qwen2MoeModel):
 class Qwen3NextModel(Qwen2MoeModel):
     model_arch = gguf.MODEL_ARCH.QWEN3NEXT
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        mtp_depth = self.hparams.get("mtp_num_hidden_layers", 0)
+        if mtp_depth > 0:
+            self.block_count = self.hparams["num_hidden_layers"] + mtp_depth
+            self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         self.gguf_writer.add_ssm_conv_kernel(self.hparams["linear_conv_kernel_dim"])
@@ -4848,10 +4855,36 @@ class Qwen3NextModel(Qwen2MoeModel):
         if (rope_dim := self.hparams.get("head_dim")) is None:
             rope_dim = self.hparams["hidden_size"] // self.hparams["num_attention_heads"]
         self.gguf_writer.add_rope_dimension_count(int(rope_dim * self.hparams.get("partial_rotary_factor", 0.25)))
+        mtp_depth = self.hparams.get("mtp_num_hidden_layers", 0)
+        if mtp_depth > 0:
+            self.gguf_writer.add_nextn_predict_layers(mtp_depth)
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         if name.startswith("mtp"):
-            return  # ignore MTP layers for now
+            mtp_depth = self.hparams.get("mtp_num_hidden_layers", 0)
+            if mtp_depth == 0:
+                return  # no MTP support in this model
+            num_hidden = self.hparams["num_hidden_layers"]
+            if "layers." in name:
+                # mtp.layers.0.* → model.layers.{num_hidden + bid}.*
+                name = name.replace(f"mtp.layers.{bid}", f"model.layers.{bid + num_hidden}")
+            else:
+                # nextn-specific tensors: broadcast to all MTP layers
+                # Apply +1 to norm weights here since super().modify_tensors()
+                # bypasses the norm offset code below
+                remapper = {
+                    "mtp.fc":                    "model.layers.{bid}.eh_proj",
+                    "mtp.pre_fc_norm_embedding": "model.layers.{bid}.enorm",
+                    "mtp.pre_fc_norm_hidden":    "model.layers.{bid}.hnorm",
+                    "mtp.norm":                  "model.layers.{bid}.shared_head.norm",
+                }
+                stem, dot, suffix = name.rpartition(".")
+                new_name = remapper[stem] + dot + suffix
+                if name.endswith("norm.weight") or name.endswith("norm_embedding.weight") or name.endswith("norm_hidden.weight"):
+                    data_torch = data_torch + 1
+                for b in range(num_hidden, self.block_count):
+                    yield from super().modify_tensors(data_torch, new_name.format(bid=b), b)
+                return
         if name.endswith(".A_log"):
             data_torch = -torch.exp(data_torch)
         elif name.endswith(".dt_bias"):
