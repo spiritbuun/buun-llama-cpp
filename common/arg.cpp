@@ -954,7 +954,8 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
         // We scan argv instead of comparing to params_org because the stock
         // default is 2048 — a user passing `-b 2048` to lift the cap would
         // look identical to not passing anything with a naive value check.
-        if (params.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+        if (std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                      COMMON_SPECULATIVE_TYPE_DFLASH) != params.speculative.types.end()) {
             auto arg_passed = [argc, argv](std::initializer_list<const char *> names) {
                 for (int i = 1; i < argc; ++i) {
                     for (const char * n : names) {
@@ -4223,7 +4224,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--spec-dflash-default"},
         string_format("enable default DFlash speculative decoding config (requires -md)"),
         [](common_params & params) {
-            params.speculative.type = COMMON_SPECULATIVE_TYPE_DFLASH;
+            params.speculative.types = { COMMON_SPECULATIVE_TYPE_DFLASH };
             params.speculative.p_min = 0.0f;
             params.speculative.n_max = 7;
             params.speculative.n_min = 0;

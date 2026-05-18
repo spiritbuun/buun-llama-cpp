@@ -325,6 +325,12 @@ struct common_params_speculative_draft {
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
 
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
+
+    // fork: drafter context size override (0 = use model default)
+    int32_t n_ctx = 0;
+
+    // fork: string replacements for cross-model compat
+    std::vector<std::pair<std::string, std::string>> replacements;
 };
 
 struct common_params_speculative_ngram_mod {
@@ -387,6 +393,18 @@ struct common_params_speculative {
 
     bool has_dft() const {
         return !draft.mparams.path.empty() || !draft.mparams.hf_repo.empty();
+    }
+
+    // fork: single-type compat helper (most fork code checks one type at a time)
+    common_speculative_type type() const {
+        if (types.empty() || (types.size() == 1 && types[0] == COMMON_SPECULATIVE_TYPE_NONE)) {
+            return COMMON_SPECULATIVE_TYPE_NONE;
+        }
+        return types.back();
+    }
+
+    void set_type(common_speculative_type t) {
+        types = { t };
     }
 
     uint32_t need_n_rs_seq() const {
@@ -1089,6 +1107,7 @@ struct common_prompt_checkpoint {
 
     std::vector<uint8_t> data_tgt;
     std::vector<uint8_t> data_dft;
+    std::vector<uint8_t> ring_data; // fork: DFlash ring buffer state
 
     size_t size() const;
 

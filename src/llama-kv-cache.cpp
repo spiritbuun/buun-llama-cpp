@@ -2619,14 +2619,14 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
     }
     if (has_tcq) {
         uint32_t magic_ref = 0;
-        io.read_to(&magic_ref, sizeof(magic_ref));
+        io.read(&magic_ref, sizeof(magic_ref));
         if (magic_ref != 0x54514346) { // "TQCF"
             LLAMA_LOG_ERROR("%s: turbo TCQ cache file missing codebook fingerprint — "
                             "file may have been saved by an older build without TCQ safety checks\n", __func__);
             return false;
         }
         uint32_t fp_ref = 0;
-        io.read_to(&fp_ref, sizeof(fp_ref));
+        io.read(&fp_ref, sizeof(fp_ref));
         const uint32_t fp_now = turbo_tcq_fingerprint();
         if (fp_ref != fp_now) {
             LLAMA_LOG_ERROR("%s: turbo TCQ codebook mismatch — cache was saved with fingerprint "

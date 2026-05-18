@@ -819,7 +819,7 @@ private:
         // Expanded back to 2*n_parallel before first speculative draft.
         n_parallel_user = params_base.n_parallel;
         recurrent_expanded = true;
-        if (params_base.speculative.type != COMMON_SPECULATIVE_TYPE_NONE || params_base.speculative.has_dft()) {
+        if (params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_NONE || params_base.speculative.has_dft()) {
             params_base.n_parallel = n_parallel_user * 2;
             n_seq_max_full = params_base.n_parallel;
             recurrent_expanded = false;
@@ -878,13 +878,13 @@ private:
 
             // Auto-detect DFlash from drafter model architecture
             if (llama_model_dflash_block_size(model_dft.get()) > 0 &&
-                params_base.speculative.type != COMMON_SPECULATIVE_TYPE_DFLASH) {
-                params_base.speculative.type = COMMON_SPECULATIVE_TYPE_DFLASH;
+                params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH) {
+                params_base.speculative.set_type(COMMON_SPECULATIVE_TYPE_DFLASH);
                 SRV_INF("auto-detected DFlash drafter (block_size=%d)\n",
                         llama_model_dflash_block_size(model_dft.get()));
             }
 
-            if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+            if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
                 const int block_size = llama_model_dflash_block_size(model_dft.get());
                 params_dft.n_ubatch = LLAMA_DFLASH_MAX_SLOTS * block_size;
                 params_dft.n_parallel = std::max(1,
@@ -894,7 +894,7 @@ private:
             params_base.speculative.model_dft = model_dft.get();
             params_base.speculative.cparams_dft = common_context_params_to_llama(params_dft);
 
-            if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+            if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
                 llama_model_share_tensors(model_dft.get(), llama_get_model(ctx_tgt));
             }
 
@@ -902,7 +902,7 @@ private:
             const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                             params_base.speculative.types.end(),
                                             COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
-            if (spec_mtp && params_base.speculative.type != COMMON_SPECULATIVE_TYPE_DFLASH) {
+            if (spec_mtp && params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH) {
                 auto cparams = common_context_params_to_llama(params_dft);
                 cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
                 cparams.n_rs_seq = 0;
@@ -962,8 +962,8 @@ private:
                 SRV_WRN("%s\n", "cache_reuse is not supported by multimodal, it will be disabled");
             }
 
-            if (params_base.speculative.type != COMMON_SPECULATIVE_TYPE_NONE) {
-                params_base.speculative.type      = COMMON_SPECULATIVE_TYPE_NONE;
+            if (params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_NONE) {
+                params_base.speculative.set_type(COMMON_SPECULATIVE_TYPE_NONE);
                 params_base.speculative.model_dft  = nullptr;
                 model_dft.reset();
                 SRV_WRN("%s\n", "speculative decoding is not supported by multimodal, it will be disabled");
@@ -1016,14 +1016,14 @@ private:
             SRV_WRN("%s", "speculative decoding will use checkpoints\n");
         }
 
-        const bool can_spec = (ctx_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO);
+        const bool can_spec = (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO);
 
         // DFlash multi-slot: --dflash-max-slots caps how many server slots keep DFlash state;
         // slots above the cap fall back to non-speculative decode (slot.spec stays null). The
         // matching tape/hidden buffers are allocated after the per-slot init loop (set_dflash_capture
         // runs inside common_speculative_init for slot 0, so dflash_capture must exist first).
         int dflash_slots_cap = 0;
-        if (can_spec && params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+        if (can_spec && params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
             dflash_slots_cap = std::max(1, std::min(params_base.speculative.dflash_max_slots, params_base.n_parallel));
             if (dflash_slots_cap < params_base.n_parallel) {
                 SRV_INF("DFlash enabled for slots 0..%d; slots %d+ will use non-speculative decode\n",
@@ -1072,14 +1072,13 @@ private:
             slot.id      = i;
             slot.ctx_tgt = ctx_tgt;
             slot.ctx_dft = ctx_dft.get();
-            slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot;
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
 
             const bool slot_can_spec = can_spec &&
-                (params_base.speculative.type != COMMON_SPECULATIVE_TYPE_DFLASH || i < dflash_slots_cap);
+                (params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH || i < dflash_slots_cap);
 
             if (slot_can_spec) {
                 slot.spec.reset(common_speculative_init(params_base.speculative, slot.ctx_tgt, ctx_dft_shared.get()));
@@ -2494,7 +2493,7 @@ private:
             }
             llama_set_dflash_n_slots(ctx_dft_shared.get(), std::max(1, n_drafting));
 
-            if (n_drafting >= 2 && params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+            if (n_drafting >= 2 && params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
                 std::vector<common_speculative *> batch_specs;
                 std::vector<llama_token>          batch_id_lasts;
                 std::vector<int>                  batch_slot_ids;
@@ -2569,7 +2568,7 @@ private:
                     slot.n_draft_total += draft.size();
 
                     if (needs_reeval) {
-                        if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                        if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
                             llama_tape_replay_sync(ctx_tgt);
                             const int n_batch_tokens = 1 + (int) draft.size();
                             std::vector<int32_t> linear_parents(n_batch_tokens);
@@ -2879,7 +2878,7 @@ private:
                                             // for hybrid/recurrent models (DeltaNet, Mamba), pos_min always equals
                                             // the full sequence length, so the SWA-based pos_min check always fails.
                                             // use pos_max <= pos_next instead to find the most recent valid checkpoint.
-                                            if (llama_model_is_recurrent(model) || llama_model_is_hybrid(model)) {
+                                            if (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt)) {
                                                 return cur.pos_max <= pos_next;
                                             }
                                             return cur.pos_min < pos_min_thold || cur.pos_min == 0;
@@ -2890,8 +2889,8 @@ private:
 
                                     if (!do_reset) {
                                         // restore the context checkpoint
-                                        const size_t checkpoint_size = it->data.size();
-                                        const size_t n = llama_state_seq_set_data_ext(ctx_tgt, it->data.data(), checkpoint_size, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        const size_t checkpoint_size = it->data_tgt.size();
+                                        const size_t n = llama_state_seq_set_data_ext(ctx_tgt, it->data_tgt.data(), checkpoint_size, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                                         if (n != checkpoint_size) {
                                             SLT_ERR(slot, "failed to restore context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, (float) checkpoint_size / 1024 / 1024);
@@ -3129,7 +3128,7 @@ private:
 
                     // no need for empty or small checkpoints
                     // for hybrid/recurrent models, lower the checkpoint threshold so short prompts also get checkpointed
-                    const int checkpoint_min_tokens = (llama_model_is_recurrent(model) || llama_model_is_hybrid(model)) ? 4 : 64;
+                    const int checkpoint_min_tokens = (llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt)) ? 4 : 64;
                     do_checkpoint = do_checkpoint && (pos_min >= 0 && slot.prompt.n_tokens() >= checkpoint_min_tokens);
 
                     // do not checkpoint after mtmd chunks
@@ -3149,7 +3148,7 @@ private:
                             SLT_WRN(slot,
                                     "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64
                                     ", size = %.3f MiB)\n",
-                                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.data.size() / 1024 / 1024);
+                                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.data_tgt.size() / 1024 / 1024);
 
                             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
                         }
@@ -3157,14 +3156,13 @@ private:
                         const size_t checkpoint_size =
                             llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
-                        auto & cur = slot.prompt.checkpoints.emplace_back(server_prompt_checkpoint{
-                            /*.pos_min  = */ pos_min,
-                            /*.pos_max  = */ pos_max,
-                            /*.n_tokens = */ slot.prompt.n_tokens() - n_tokens_cur,
-                            /*.data     = */ std::vector<uint8_t>(checkpoint_size),
-                        });
+                        auto & cur = slot.prompt.checkpoints.emplace_back();
+                        cur.pos_min  = pos_min;
+                        cur.pos_max  = pos_max;
+                        cur.n_tokens = slot.prompt.n_tokens() - n_tokens_cur;
+                        cur.data_tgt.resize(checkpoint_size);
 
-                        llama_state_seq_get_data_ext(ctx_tgt, cur.data.data(), checkpoint_size, slot.id,
+                        llama_state_seq_get_data_ext(ctx_tgt, cur.data_tgt.data(), checkpoint_size, slot.id,
                                                      LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                         // save DFlash ring buffer alongside the recurrent state checkpoint
@@ -3227,7 +3225,7 @@ private:
 
         // DFlash: enable tape recording if any slot has draft backup (needs tape replay for rollback)
         const bool dflash_tape_active = needs_reeval
-            && params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH
+            && params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH
             && std::any_of(slots.begin(), slots.end(), [](const server_slot & s) { return s.has_draft_backup; });
         if (dflash_tape_active) {
             llama_set_tape_recording(ctx_tgt, true);
@@ -3239,7 +3237,7 @@ private:
         // This lets concurrent slots' verify tokens be processed in a single
         // multi-seq ubatch instead of N sequential per-seq ubatches.
         const bool can_batch_multiseq = (n_tg_tokens == batch.n_tokens && n_tg_tokens > 0
-            && params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH);
+            && params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH);
         if (can_batch_multiseq) {
             llama_set_force_split_seq(ctx_tgt, false);
         }
@@ -3440,7 +3438,7 @@ private:
                     slot.state = SLOT_STATE_GENERATING;
 
                     if (slot.can_speculate()) {
-                        if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                        if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
                             llama_dflash_set_active_slot(ctx_tgt, slot.id);
                         }
                         common_speculative_begin(slot.spec.get(), slot.prompt.tokens.get_text_tokens());
@@ -3470,7 +3468,7 @@ private:
                 // verify. Fires correctly on the fallback non-spec path during generation
                 // (draft too small → single-token decode), where slot.sampled was just decoded.
                 if (slot.can_speculate() && slot.n_decoded > 0) {
-                    if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                    if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
                         llama_dflash_set_active_slot(ctx_tgt, slot.id);
                     }
                     llama_tokens batch_tokens = { id };
@@ -3529,7 +3527,7 @@ private:
                 // Must run BEFORE rollback (matches speculative-simple ordering) and BEFORE clearing
                 // slot.spec_draft so batch_tokens reflects the full verification batch [id_last, drafts].
                 {
-                    if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                    if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
                         llama_dflash_set_active_slot(ctx_tgt, slot.id);
                     }
                     llama_tokens batch_tokens;
@@ -3556,7 +3554,7 @@ private:
                     const llama_seq_id seq_backup = slot.seq_id_backup;
                     const bool all_accepted = (ids.size() == n_draft + 1);
 
-                    if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                    if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
                         llama_dflash_set_active_slot(ctx_tgt, slot.id);
                         if (all_accepted) {
                             llama_clear_tree_parent_ids(ctx_tgt);

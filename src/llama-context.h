@@ -215,6 +215,11 @@ struct llama_context {
     float * get_logits();
     float * get_logits_ith(int32_t i);
 
+    int32_t * get_logits_argmax();
+    int32_t   get_logits_argmax_n();
+    int32_t   get_logits_argmax_k();
+    float   * get_logits_argmax_probs();
+
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
@@ -509,4 +514,73 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+public:
+    // --- fork: DFlash / tree speculative decoding ---
+
+    float * get_layer_hidden(int layer_idx);
+    int64_t get_layer_hidden_n_tokens(int layer_idx) const;
+    int64_t get_layer_hidden_n_embd(int layer_idx) const;
+    int32_t get_n_layer_hiddens() const;
+
+    void set_dflash_capture(const int32_t * layer_ids, int32_t n_layers);
+    void set_dflash_sample_temp(float temp);
+    void set_dflash_topk(int k);
+    void set_dflash_n_slots(int n);
+
+    void dflash_reset_hidden_capture();
+    void dflash_ensure_recurrent_setup();
+
+    void set_tape_recording(bool enable);
+    void allocate_tape_gpu(int max_tokens) { allocate_tape_gpu(1, max_tokens); }
+    void allocate_tape_gpu(int n_slots, int max_tokens);
+    void set_active_dflash_slot(int slot_idx);
+
+    void tape_replay(llama_seq_id seq_id, int n_accepted);
+    void tape_replay_sync();
+    void tape_replay_conv(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted, llama_seq_id seq_id = 0);
+    void tape_replay_cpu(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted);
+
+    void dflash_rollback(llama_seq_id seq_id, llama_seq_id seq_backup, int n_past_before, int n_accepted);
+    void dflash_prepare_branch(llama_seq_id seq_id, llama_seq_id seq_backup, int depth);
+
+    void set_cross_data(const float * data, int64_t n_embd, int64_t n_tokens);
+    void set_cross_data_seq(llama_seq_id seq_id, const float * data, int64_t n_embd, int64_t n_tokens);
+    void * init_cross_ring_gpu(int n_layers, int n_embd, int ring_size);
+
+    using set_tensor_d2d_fn_t = void (*)(void *, const void *, size_t, size_t);
+    void set_cross_data_gpu(llama_seq_id seq_id, const void * d_staging, int cross_len,
+                            int n_layers, int n_embd, set_tensor_d2d_fn_t fn_d2d);
+
+    void set_tree_mask(const uint8_t * visibility, int n_tree_tokens);
+    void clear_tree_mask();
+    void set_tree_parent_ids(const int32_t * parents, int n_tokens);
+    void clear_tree_parent_ids();
+    void allocate_tree_buffers(int max_tree_tokens);
+    void tree_rollback(int commit_n, const int32_t * parents);
+    void set_tree_seq0_count(int n) { tree_bufs.n_seq0_tokens = n; }
+
+    // fork data members
+    std::vector<int32_t> logits_argmax_buf;
+    std::vector<float>   logits_argmax_prob_buf;
+    int32_t logits_argmax_count = 0;
+    int32_t logits_argmax_k = 1;
+
+    std::vector<std::vector<dflash_layer_hidden_buf>> layer_hiddens;
+    std::unique_ptr<dflash_capture_data> dflash_capture;
+
+    llama_tree_mask tree_mask;
+
+    struct {
+        bool active = false;
+        bool disabled = false;
+        int n_seq0_tokens = 0;
+        int n_tokens = 0;
+        std::vector<int32_t> parent_ids_cpu;
+        ggml_backend_buffer_t buffer = nullptr;
+        ggml_context * ggml_ctx = nullptr;
+        ggml_tensor * parent_ids_gpu = nullptr;
+        std::vector<ggml_tensor *> ssm_intermediates;
+        int max_tree_tokens = 0;
+    } tree_bufs;
 };
