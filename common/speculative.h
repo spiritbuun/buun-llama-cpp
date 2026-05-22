@@ -94,7 +94,8 @@ llama_tokens common_speculative_draft(
         const common_params_speculative & params,
         const llama_tokens              & prompt_tgt,
         llama_token                       id_last,
-        std::vector<float>              * draft_log_probs = nullptr);
+        std::vector<float>              * draft_log_probs = nullptr,
+        llama_pos                         n_past_override = -1);
 
 // fork: batched multi-slot DFlash drafting
 void common_speculative_draft_batch(

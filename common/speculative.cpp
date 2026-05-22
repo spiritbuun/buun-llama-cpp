@@ -2900,11 +2900,12 @@ void common_speculative_set_seq_id(common_speculative * spec, llama_seq_id seq_i
 }
 
 llama_tokens common_speculative_draft(
-        common_speculative * spec,
+        common_speculative              * spec,
         const common_params_speculative & params,
-        const llama_tokens & prompt_tgt,
-        llama_token id_last,
-        std::vector<float> * draft_log_probs) {
+        const llama_tokens              & prompt_tgt,
+        llama_token                       id_last,
+        std::vector<float>              * draft_log_probs,
+        llama_pos                         n_past_override) {
     llama_tokens result;
 
     if (spec == nullptr) {
@@ -2917,7 +2918,10 @@ llama_tokens common_speculative_draft(
     auto & dp = spec->dparams[0];
     dp.drafting = true;
     dp.n_max    = params.n_max;
-    dp.n_past   = (llama_pos)prompt_tgt.size();
+    // Use explicit n_past when provided (needed for vision tokens where
+    // actual positions exceed text token count due to M-RoPE spatial dims).
+    // Fall back to prompt_tgt.size() for text-only prompts.
+    dp.n_past   = n_past_override >= 0 ? n_past_override : (llama_pos)prompt_tgt.size();
     dp.id_last  = id_last;
     dp.prompt   = &prompt_tgt;
     dp.result   = &result;

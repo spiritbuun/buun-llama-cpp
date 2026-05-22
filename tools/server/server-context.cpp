@@ -2704,7 +2704,9 @@ private:
                 } else {
                     const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
                     const auto & params_spec = slot.task->params.speculative;
-                    draft = common_speculative_draft(slot.get_spec(), params_spec, cached_text_tokens, slot.sampled);
+                    // Pass actual position (accounts for image tokens in M-RoPE) instead of text token count.
+                    const llama_pos n_past = slot.prompt.tokens.pos_next();
+                    draft = common_speculative_draft(slot.get_spec(), params_spec, cached_text_tokens, slot.sampled, nullptr, n_past);
                 }
 
                 if (draft.size() > (size_t) n_draft_max) {
@@ -3777,7 +3779,7 @@ private:
                             llama_clear_tree_parent_ids(ctx_tgt);
                             auto * mem = llama_get_memory(ctx_tgt);
                             llama_memory_seq_rm(mem, seq_backup, -1, -1);
-                            llama_memory_seq_rm(mem, slot.id, slot.prompt.n_tokens(), -1);
+                            llama_memory_seq_rm(mem, slot.id, slot.prompt.tokens.pos_next(), -1);
                         } else {
                             llama_clear_tree_parent_ids(ctx_tgt);
                             llama_dflash_rollback(ctx_tgt, slot.id, seq_backup, slot.n_tokens_before_draft, (int) ids.size());
@@ -3787,7 +3789,7 @@ private:
 
                         if (all_accepted) {
                             llama_memory_seq_rm(mem, seq_backup, -1, -1);
-                            llama_memory_seq_rm(mem, slot.id, slot.prompt.n_tokens(), -1);
+                            llama_memory_seq_rm(mem, slot.id, slot.prompt.tokens.pos_next(), -1);
                         } else {
                             const int n_past_before = slot.n_tokens_before_draft;
 
@@ -3811,7 +3813,7 @@ private:
                     slot.has_draft_backup = false;
                     slot.seq_id_backup = -1;
                 } else {
-                    llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, slot.prompt.n_tokens(), -1);
+                    llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, slot.prompt.tokens.pos_next(), -1);
                 }
 
                 common_speculative_rollback_dft(slot.get_spec(), slot.id, slot.prompt.n_tokens(), (uint16_t)(ids.size() - 1));
