@@ -1539,7 +1539,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         return true;
     }();
     const bool turbo_matched = K->type == V->type && turbo_kv;
-    if (turbo_mma_fused && turbo_matched && (Q->ne[0] == 128 || Q->ne[0] == 256) &&
+    if (turbo_mma_fused && turbo_matched && Q->ne[1] <= 4 &&
+        (Q->ne[0] == 128 || Q->ne[0] == 256) &&
         turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
         cudaStream_t stream = ctx.stream();
         int device;
