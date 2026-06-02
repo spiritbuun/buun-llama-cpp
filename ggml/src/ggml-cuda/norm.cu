@@ -150,6 +150,49 @@ static __global__ void rms_norm_f32(const float * x,
     }
 }
 
+// Lean fast-path for the common fused rms_norm+mul: `mul` is a contiguous per-column
+// weight broadcast across all rows/channels/samples, with no add. The minimal parameter
+// list keeps register pressure low (recovering occupancy on the 1024-thread block that the
+// general rms_norm_f32 loses), and indexing mul[col] directly drops the per-element
+// fastmodulo. Reduction is the identical block_reduce<SUM> as the general kernel, so output
+// is bit-for-bit the same in this case.
+template <int block_size>
+static __global__ void rms_norm_mul_bcast_f32(const float * __restrict__ x,
+                                              const float * __restrict__ mul,
+                                              float       * __restrict__ dst,
+                                              const int     ncols,
+                                              const int64_t stride_row,
+                                              const int64_t stride_channel,
+                                              const int64_t stride_sample,
+                                              const float   eps) {
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+
+    const int row     = blockIdx.x;
+    const int channel = blockIdx.y;
+    const int sample  = blockIdx.z;
+    const int tid     = threadIdx.x;
+
+    x   += sample*stride_sample + channel*stride_channel + row*stride_row;
+    dst += ((sample*nchannels + channel)*nrows + row)*ncols;
+
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    for (int col = tid; col < ncols; col += block_size) {
+        dst[col] = scale * x[col] * mul[col];
+    }
+}
+
 template <int block_size>
 static __global__ void rms_norm_bf16(const nv_bfloat16 * x,
                                      nv_bfloat16 *       dst,
@@ -387,6 +430,22 @@ static void rms_norm_mul_f32_cuda(const float *  x,
     const dim3 blocks_num(nrows, nchannels, nsamples);
     if (mul == nullptr) {
         rms_norm_f32_cuda(x, dst, ncols, nrows, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, stream);
+        return;
+    }
+    // Lean fast-path: mul is a contiguous per-column weight broadcast across all
+    // rows/channels/samples (the standard rms_norm weight), no add. Bit-identical to the
+    // general kernel here but with far fewer params -> higher occupancy on the big block.
+    if (add == nullptr && mul_nrows == 1 && mul_nchannels == 1 && mul_nsamples == 1 && mul_ncols == ncols) {
+        const int block_size = ncols < 1024 ? 256 : 1024;
+        const dim3 block_dims(block_size, 1, 1);
+        const size_t nbytes_shared = block_size > WARP_SIZE ? 32 * sizeof(float) : 0;
+        if (block_size == 256) {
+            rms_norm_mul_bcast_f32<256><<<blocks_num, block_dims, nbytes_shared, stream>>>(
+                x, mul, dst, ncols, stride_row, stride_channel, stride_sample, eps);
+        } else {
+            rms_norm_mul_bcast_f32<1024><<<blocks_num, block_dims, nbytes_shared, stream>>>(
+                x, mul, dst, ncols, stride_row, stride_channel, stride_sample, eps);
+        }
         return;
     }
     if (add == nullptr) {
