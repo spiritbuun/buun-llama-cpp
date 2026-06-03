@@ -1,0 +1,22 @@
+[Unit]
+Description=grepai watcher - semantic code index maintainer
+After=network.target qwen3-embedded.service
+Wants=qwen3-embedded.service
+
+[Service]
+Type=simple
+User=homelabserver
+Group=homelabserver
+WorkingDirectory=/home/homelabserver/apply
+Environment="HOME=/home/homelabserver"
+Environment="PATH=/home/homelabserver/.local/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="OPENAI_API_KEY=local"
+ExecStart=/usr/local/bin/grepai-watch-wrapper.sh
+Restart=always
+RestartSec=10
+TimeoutStartSec=120
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

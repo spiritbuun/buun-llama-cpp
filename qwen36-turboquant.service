@@ -1,0 +1,51 @@
+[Unit]
+Description=Qwen3.6 27B TurboQuant server (ROCm, 131K ctx, port 18080)
+After=network.target
+StartLimitBurst=3
+StartLimitIntervalSec=300
+
+[Service]
+Type=simple
+WorkingDirectory=/home/homelabserver/src/llama.cpp-turboquant
+
+Environment=ROCR_VISIBLE_DEVICES=0
+Environment=HIP_VISIBLE_DEVICES=0
+Environment=GPU_DEVICE_ORDINAL=0
+Environment=CUDA_VISIBLE_DEVICES=0
+Environment=LD_LIBRARY_PATH=/opt/rocm/lib
+Environment=PATH=/opt/rocm/bin:/usr/local/bin:/usr/bin:/bin
+
+ExecStartPre=/home/homelabserver/bin/qwen36-turboquant-preflight.sh
+ExecStart=/home/homelabserver/src/llama.cpp-turboquant/build/bin/llama-server \
+  -m /home/homelabserver/models/Qwen3.6-27B-UD-Q5_K_XL.gguf \
+  -ngl 99 \
+  -c 131072 \
+  -np 1 \
+  -b 512 \
+  -ub 128 \
+  -ctk turbo4 \
+  -ctv turbo4 \
+  --cache-ram 0 \
+  --no-cache-prompt \
+  -ctxcp 0 \
+  -cpent -1 \
+  --timeout 7200 \
+  --temp 0 \
+  --reasoning off \
+  --host 0.0.0.0 \
+  --port 18080 \
+  --alias qwen3.6-27b-q5-turboquant \
+  --metrics \
+  --jinja \
+  --no-webui
+
+StandardOutput=append:/home/homelabserver/logs/llama/qwen36-turboquant-18080.log
+StandardError=append:/home/homelabserver/logs/llama/qwen36-turboquant-18080.log
+
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=600
+TimeoutStopSec=120
+
+[Install]
+WantedBy=default.target

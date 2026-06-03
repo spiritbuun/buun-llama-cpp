@@ -1,0 +1,16 @@
+[Unit]
+Description=Explicit health check for local embedding endpoint (/v1/embeddings)
+After=network.target qwen3-embedded.service
+Wants=qwen3-embedded.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/local/bin/embedding-watchdog.sh 8083 qwen3-embedded
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=45
+
+[Install]
+WantedBy=multi-user.target

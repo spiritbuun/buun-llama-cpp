@@ -506,7 +506,7 @@ void llama_context::sched_reserve() {
             if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
                 ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
                 const char * reg_name = ggml_backend_reg_name(reg);
-                if (reg_name && strncmp(reg_name, "CUDA", 4) == 0) {
+                if (reg_name && (strncmp(reg_name, "CUDA", 4) == 0 || strncmp(reg_name, "ROCm", 4) == 0)) {
                     have_cuda_gpu = true;
                 }
                 break;

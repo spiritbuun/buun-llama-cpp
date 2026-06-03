@@ -1,0 +1,43 @@
+[Unit]
+Description=Qwen3 embedding server for JustApply MCP (CPU-only, port 8083)
+After=network.target
+
+[Service]
+Type=simple
+User=homelabserver
+Group=homelabserver
+WorkingDirectory=/home/homelabserver/src/llama.cpp
+
+Environment=HIP_VISIBLE_DEVICES=-1
+Environment=ROCR_VISIBLE_DEVICES=-1
+Environment=CUDA_VISIBLE_DEVICES=-1
+Environment=LD_LIBRARY_PATH=/opt/rocm/lib
+Environment=PATH=/opt/rocm/bin:/usr/local/bin:/usr/bin:/bin
+
+ExecStart=/home/homelabserver/src/llama.cpp/build/bin/llama-server \
+  -m /home/homelabserver/models/Qwen3-Embedding-0.6B-Q8_0.gguf \
+  --embedding \
+  --pooling mean \
+  --embd-normalize 2 \
+  -ngl 0 \
+  --no-op-offload \
+  -c 8192 \
+  -b 512 \
+  -ub 512 \
+  --threads 8 \
+  --host 127.0.0.1 \
+  --port 8083 \
+  --alias qwen3-embedding-0.6b \
+  --metrics \
+  --no-webui
+
+StandardOutput=append:/home/homelabserver/logs/llama/qwen3-embedded.log
+StandardError=append:/home/homelabserver/logs/llama/qwen3-embedded.log
+
+Restart=always
+RestartSec=10
+StartLimitBurst=3
+StartLimitIntervalSec=300
+
+[Install]
+WantedBy=multi-user.target
