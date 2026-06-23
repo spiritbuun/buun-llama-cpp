@@ -571,7 +571,7 @@ void quantize_turbo4_0(device const float * src, device block_turbo4_0 & dst) {
 
     // Step 3: 3-bit quantization
     for (int j = 0; j < QK_TURBO4 * 3 / 8; j++) dst.qs[j] = 0;
-    for (int j = 0; j < QK_TURBO4 / 8; j++) dst.signs[j] = 0;
+    for (int j = 0; j < QK_TURBO4 / 8; j++) dst.qs[j] = 0; // turbo4 unused on Metal: stub signs->qs to compile
 
     float recon[128];
     for (int j = 0; j < 128; j++) {
@@ -603,13 +603,13 @@ void quantize_turbo4_0(device const float * src, device block_turbo4_0 & dst) {
         x[j] = normalized[j] - recon[j]; // residual in x buffer
         rnorm_sq += x[j] * x[j];
     }
-    dst.rnorm = half(sqrt(rnorm_sq));
+    dst.norm = half(sqrt(rnorm_sq)); // turbo4 unused on Metal: stub rnorm->norm to compile
 
     // Step 5: QJL WHT signs
     turbo_rotate_forward(x, turbo_qjl_wht_signs1, turbo_qjl_wht_signs2);
     for (int i = 0; i < 128; i++) {
         if (x[i] >= 0.0f) {
-            dst.signs[i / 8] |= (1 << (i % 8));
+            dst.qs[i / 8] |= (1 << (i % 8)); // turbo4 unused on Metal: stub signs->qs to compile
         }
     }
 }
@@ -716,7 +716,7 @@ void dequantize_turbo3_0_t4(device const block_turbo3_0 * xb, short il, thread t
 
 static void turbo4_dequantize_full_block(device const block_turbo4_0 * xb, thread float * cache) {
     const float norm  = float(xb->norm);
-    const float rnorm = float(xb->rnorm);
+    const float rnorm = float(xb->norm); // turbo4 unused on Metal: stub rnorm->norm to compile
     const float qjl_scale = 1.2533141f / 128.0f * rnorm;
 
     // Unpack 3-bit indices → centroids, then inverse WHT
@@ -737,7 +737,7 @@ static void turbo4_dequantize_full_block(device const block_turbo4_0 * xb, threa
     // QJL: unpack signs, inverse WHT, scale
     float signs_f[128];
     for (int j = 0; j < 128; j++) {
-        signs_f[j] = (xb->signs[j / 8] & (1 << (j % 8))) ? 1.0f : -1.0f;
+        signs_f[j] = (xb->qs[j / 8] & (1 << (j % 8))) ? 1.0f : -1.0f; // turbo4 unused on Metal: stub signs->qs to compile
     }
     // turbo_rotate_inverse(QJL) REMOVED — pre-rotate-queries handles this
 
@@ -10690,8 +10690,13 @@ typedef decltype(kernel_set_rows_turbo<int64_t, block_turbo3_0, QK_TURBO3, quant
 
 template [[host_name("kernel_set_rows_turbo3_i64")]] kernel set_rows_turbo_t kernel_set_rows_turbo<int64_t, block_turbo3_0, QK_TURBO3, quantize_turbo3_0>;
 template [[host_name("kernel_set_rows_turbo3_i32")]] kernel set_rows_turbo_t kernel_set_rows_turbo<int32_t, block_turbo3_0, QK_TURBO3, quantize_turbo3_0>;
-template [[host_name("kernel_set_rows_turbo4_i64")]] kernel set_rows_turbo_t kernel_set_rows_turbo<int64_t, block_turbo4_0, QK_TURBO4, quantize_turbo4_0>;
-template [[host_name("kernel_set_rows_turbo4_i32")]] kernel set_rows_turbo_t kernel_set_rows_turbo<int32_t, block_turbo4_0, QK_TURBO4, quantize_turbo4_0>;
+// turbo4 set_rows disabled: kernel_set_rows_turbo's body assumes the turbo3 layout
+// (writes blk.signs, a 2-bit-index + 1-bit-sign packing), but block_turbo4_0 has no
+// `signs` member (struct is {norm, qs[64]}). Instantiating it for turbo4 fails to
+// compile, which breaks the *entire* Metal library. Re-enable once a turbo4-specific
+// set_rows kernel matching block_turbo4_0 exists.
+// template [[host_name("kernel_set_rows_turbo4_i64")]] kernel set_rows_turbo_t kernel_set_rows_turbo<int64_t, block_turbo4_0, QK_TURBO4, quantize_turbo4_0>;
+// template [[host_name("kernel_set_rows_turbo4_i32")]] kernel set_rows_turbo_t kernel_set_rows_turbo<int32_t, block_turbo4_0, QK_TURBO4, quantize_turbo4_0>;
 
 //
 // matrix-matrix multiplication
