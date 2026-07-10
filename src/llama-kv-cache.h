@@ -341,6 +341,8 @@ private:
     uint64_t vbr_boundary_count_   = 0;
     size_t   vbr_growth_headroom_  = 0;
     bool     vbr_budget_explicit_  = false;
+    // Fast-path stability tracking: skip per-batch VBR bookkeeping when settled (avoids ~1ms/token)
+    uint32_t vbr_last_used_        = 0;   // observed cell count last prepare() pass
     void     vbr_rederive_budget();
     // sink-stash staleness guard: set when any cell below stash_rows is freed (its content can be
     // rewritten by another request; injecting the old snapshot would corrupt the new rows)

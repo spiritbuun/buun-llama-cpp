@@ -1736,91 +1736,108 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             }
             vbr_stash_dirty_ = false;
         }
-        // auto budgets track reality: re-derive from live free VRAM once per boundary
-        // (explicit budgets are a hard contract and never move)
-        if (!vbr_budget_explicit_) {
-            vbr_rederive_budget();
+        // -- Stability fast-path: skip per-batch bookkeeping when settled (avoids ~1ms/token) --
+        uint32_t used_now = 0;
+        for (uint32_t st = 0; st < n_stream; ++st) {
+            used_now += v_cells[st].get_used();
         }
-        // Degrades are one-way and lossy — the two honest recovery levers both live here, at the
-        // decode boundary, BEFORE the budget check:
-        //  - full-clear reset: the cache is EMPTY, so undoing every degrade is free and lossless;
-        //  - container promotion: occupancy dropped (seq_rm) far enough that a higher tier fits
-        //    with headroom — old rows keep their degraded quality (re-encoded recon, no
-        //    information restored), but FUTURE rows encode at the higher tier.
-        if (vbr_degrade_cursor_ > 0) {
-            uint32_t used = 0;
-            for (uint32_t st = 0; st < n_stream; ++st) {
-                used += v_cells[st].get_used();
+        // Stable when: budget fully explored, quiet for N boundaries, occupancy hasn't meaningfully moved.
+        static const uint32_t VBR_STABLE_QUICK = 10; // quiet-boundary threshold for fast path
+        static const int32_t  VBR_USED_DELTA   = 512; // occupancy delta below which we're stable
+        bool vbr_stable = (vbr_degrade_cursor_ >= std::min(vbr_degrade_order_.size(), vbr_degrade_limit_) &&
+                           vbr_quiet_boundaries_ >= VBR_STABLE_QUICK &&
+                           std::abs((int64_t)used_now - (int64_t)vbr_last_used_) < VBR_USED_DELTA);
+
+        if (!vbr_stable) {
+            // auto budgets track reality: throttle re-derive from live free VRAM — during steady
+            // decode occupancy barely changes, so querying every token is waste. Fire on the first
+            // boundary (lazy cuBLAS init), or when a degrades/promotes happen, or every 8th token.
+            if (!vbr_budget_explicit_) {
+                const bool budget_dirty = vbr_degrade_cursor_ > 0 && vbr_quiet_boundaries_ < VBR_STABLE_QUICK;
+                const bool budget_periodic = (vbr_boundary_count_ == 0 || vbr_boundary_count_ % 8 == 0);
+                if (budget_dirty || budget_periodic) {
+                    vbr_rederive_budget();
+                }
             }
-            if (used == 0) {
+            // Degrades are one-way and lossy — the two honest recovery levers both live here, at the
+            // decode boundary, BEFORE the budget check:
+            //  - full-clear reset: the cache is EMPTY, so undoing every degrade is free and lossless;
+            //  - container promotion: occupancy dropped (seq_rm) far enough that a higher tier fits
+            //    with headroom — old rows keep their degraded quality (re-encoded recon, no
+            //    information restored), but FUTURE rows encode at the higher tier.
+            if (vbr_degrade_cursor_ > 0 && used_now == 0) {
                 vbr_full_reset();
             }
-        }
-        const uint32_t wm_next = vbr_watermark_cells(n_tokens);
-        vbr_shrink_watermark(); // occupancy drops release phantom tail pages first
-        static const bool vbr_promote_on = [] {
-            const char * e = getenv("VBR_PROMOTE"); // kill switch for experiments; default ON
-            return e == nullptr || atoi(e) != 0;
-        }();
-        // promote pacing: ONE step per boundary, and only after a quiet window (no degrade in
-        // the last 4 boundaries). Promotes re-encode aged rows from degraded recon — error
-        // compounds per hop — so waves spread out and a clamp-driven degrade vetoes the
-        // immediate bounce-back. Boundary counting keeps the cooldown deterministic.
-        vbr_quiet_boundaries_++;
-        if (vbr_promote_on && vbr_degrade_cursor_ > 0 && vbr_quiet_boundaries_ >= 4) {
-            vbr_promote_next(wm_next);
-        }
-        // budget trigger: degrade while ANY pool exceeds its share. A step only shrinks the pool
-        // that owns its tensor, but the cursor is a global price order — advancing it while any
-        // pool is over budget is the simplest rule that terminates and preserves the price order.
-        while (vbr_over_budget(wm_next)) {
-            vbr_quiet_boundaries_ = 0; // degrade pressure this boundary — cool the promote path
-            if (!vbr_degrade_next(wm_next)) {
-                if (!vbr_budget_warned_) { // terminal state — one warning, not one per batch
-                    vbr_budget_warned_ = true;
-                    size_t projected_total = 0;
-                    for (const auto & p : vbr_pools_) {
-                        projected_total += p.vmm != nullptr ? vbr_vmm_projected_bytes(p, wm_next) : 0;
+            const uint32_t wm_next = vbr_watermark_cells(n_tokens);
+            vbr_shrink_watermark(); // occupancy drops release phantom tail pages first
+            static const bool vbr_promote_on = [] {
+                const char * e = getenv("VBR_PROMOTE"); // kill switch for experiments; default ON
+                return e == nullptr || atoi(e) != 0;
+            }();
+            // promote pacing: ONE step per boundary, and only after a quiet window (no degrade in
+            // the last 4 boundaries). Promotes re-encode aged rows from degraded recon — error
+            // compounds per hop — so waves spread out and a clamp-driven degrade vetoes the
+            // immediate bounce-back. Boundary counting keeps the cooldown deterministic.
+            vbr_quiet_boundaries_++;
+            if (vbr_promote_on && vbr_degrade_cursor_ > 0 && vbr_quiet_boundaries_ >= 4) {
+                vbr_promote_next(wm_next);
+            }
+            // budget trigger: degrade while ANY pool exceeds its share. A step only shrinks the pool
+            // that owns its tensor, but the cursor is a global price order — advancing it while any
+            // pool is over budget is the simplest rule that terminates and preserves the price order.
+            while (vbr_over_budget(wm_next)) {
+                vbr_quiet_boundaries_ = 0; // degrade pressure this boundary — cool the promote path
+                if (!vbr_degrade_next(wm_next)) {
+                    if (!vbr_budget_warned_) { // terminal state — one warning, not one per batch
+                        vbr_budget_warned_ = true;
+                        size_t projected_total = 0;
+                        for (const auto & p : vbr_pools_) {
+                            projected_total += p.vmm != nullptr ? vbr_vmm_projected_bytes(p, wm_next) : 0;
+                        }
+                        LLAMA_LOG_WARN("%s: VBR budget %.2f MiB exceeded with the degrade order %s (projected %.2f MiB at %u cells)\n",
+                                __func__, vbr_budget_bytes_/1024.0/1024.0,
+                                vbr_degrade_limit_ < vbr_degrade_order_.size() ? "clamped at the --vbr-floor" : "exhausted",
+                                projected_total/1024.0/1024.0, wm_next);
                     }
-                    LLAMA_LOG_WARN("%s: VBR budget %.2f MiB exceeded with the degrade order %s (projected %.2f MiB at %u cells)\n",
-                            __func__, vbr_budget_bytes_/1024.0/1024.0,
-                            vbr_degrade_limit_ < vbr_degrade_order_.size() ? "clamped at the --vbr-floor" : "exhausted",
-                            projected_total/1024.0/1024.0, wm_next);
+                    break;
                 }
-                break;
             }
-        }
-        // per-pool budget/occupancy trace for multi-GPU verification (visible with -v)
-        for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
-            const auto & p = vbr_pools_[pi];
-            if (p.vmm == nullptr) {
-                continue;
+            // per-pool budget/occupancy trace for multi-GPU verification (visible with -v)
+            for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
+                const auto & p = vbr_pools_[pi];
+                if (p.vmm == nullptr) {
+                    continue;
+                }
+                LLAMA_LOG_DEBUG("%s: VBR pool #%zu (device %d): projected %.2f / budget %.2f MiB (mapped %.2f) at %u cells\n",
+                        __func__, pi, p.device, vbr_vmm_projected_bytes(p, wm_next)/1024.0/1024.0,
+                        p.budget/1024.0/1024.0, p.be->vmm_pool_mapped(p.vmm)/1024.0/1024.0, wm_next);
             }
-            LLAMA_LOG_DEBUG("%s: VBR pool #%zu (device %d): projected %.2f / budget %.2f MiB (mapped %.2f) at %u cells\n",
-                    __func__, pi, p.device, vbr_vmm_projected_bytes(p, wm_next)/1024.0/1024.0,
-                    p.budget/1024.0/1024.0, p.be->vmm_pool_mapped(p.vmm)/1024.0/1024.0, wm_next);
-        }
-        // S5: the wave's transcodes/scrubs are queued on each pool's side stream — arm that
-        // device's fence so the next graph_compute GPU-waits on them; the host proceeds straight
-        // to graph build.
-        for (auto & p : vbr_pools_) {
-            if (p.wave_pending) {
-                p.be->fence_arm(p.backend);
-                p.wave_pending = false;
+            // S5: the wave's transcodes/scrubs are queued on each pool's side stream — arm that
+            // device's fence so the next graph_compute GPU-waits on them; the host proceeds straight
+            // to graph build.
+            for (auto & p : vbr_pools_) {
+                if (p.wave_pending) {
+                    p.be->fence_arm(p.backend);
+                    p.wave_pending = false;
+                }
             }
+            // Eager physical backing to the predicted watermark: map failures surface HERE, where no
+            // graphs exist and init_batch can fail RECOVERABLY (llama_decode returns an error; the
+            // server's decode-failure ladder — idle purge, batch halving — finally works under VBR
+            // instead of a process abort killing every client). Runs after the fence arm so an
+            // already-queued transcode wave stays fenced for the NEXT batch's graph either way.
+            // apply_ubatch's ensure_mapped remains as the mid-batch backstop for placements past
+            // the prediction.
+            if (!vbr_vmm_try_map(wm_next)) {
+                LLAMA_LOG_ERROR("%s: VBR VMM: physical map to %u cells failed (device memory exhausted) — "
+                        "failing this batch recoverably\n", __func__, wm_next);
+                return {};
+            }
+        } else {
+            // Fast path: settled, no work to do — just increment boundary counter and update last_used
+            vbr_quiet_boundaries_++;
         }
-        // Eager physical backing to the predicted watermark: map failures surface HERE, where no
-        // graphs exist and init_batch can fail RECOVERABLY (llama_decode returns an error; the
-        // server's decode-failure ladder — idle purge, batch halving — finally works under VBR
-        // instead of a process abort killing every client). Runs after the fence arm so an
-        // already-queued transcode wave stays fenced for the NEXT batch's graph either way.
-        // apply_ubatch's ensure_mapped remains as the mid-batch backstop for placements past
-        // the prediction.
-        if (!vbr_vmm_try_map(wm_next)) {
-            LLAMA_LOG_ERROR("%s: VBR VMM: physical map to %u cells failed (device memory exhausted) — "
-                    "failing this batch recoverably\n", __func__, wm_next);
-            return {};
-        }
+        vbr_last_used_ = used_now;
     }
 
     llama_kv_cache::slot_info_vec_t res;

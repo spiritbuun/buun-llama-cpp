@@ -309,6 +309,19 @@ extern "C" void ggml_backend_cuda_vbr_fence_arm(ggml_backend_t backend) {
 }
 
 void ggml_cuda_vbr_fence_consume(int device, cudaStream_t stream) {
+    // Fast-path early-out: skip CUDA runtime calls entirely when no fences are armed on this device.
+    // At steady state (settled VBR, no degrades in flight) this eliminates ~4 driver transitions per token.
+    bool any_armed = false;
+    for (auto & f : g_vbr_fences) {
+        if (f.armed && f.device == device) {
+            any_armed = true;
+            break;
+        }
+    }
+    if (!any_armed) {
+        return;
+    }
+
     for (auto & f : g_vbr_fences) {
         if (!f.armed || f.device != device) {
             continue;
