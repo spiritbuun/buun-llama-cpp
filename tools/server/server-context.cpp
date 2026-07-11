@@ -1015,6 +1015,7 @@ private:
     // MTP↔mmproj GPU swap state
     bool mmproj_gpu_swap = false;
     bool mmproj_is_on_gpu = false;
+    bool mtp_was_active_before_swap = false;
 
     int64_t t_last_load_progress_ms = 0;
 
@@ -1089,6 +1090,7 @@ private:
         }
         spec.reset();
 
+        mtp_was_active_before_swap = ctx_dft != nullptr;
         if (ctx_dft) {
             ctx_dft.reset();
             params_base.speculative.draft.ctx_dft = nullptr;
@@ -1112,7 +1114,7 @@ private:
         mmproj_is_on_gpu = false;
         reload_mmproj(false);
 
-        if (ctx_dft) {
+        if (mtp_was_active_before_swap) {
             // Already had MTP before the swap — recreate it
             ctx_dft.reset(create_mtp_context());
             if (!ctx_dft) {
