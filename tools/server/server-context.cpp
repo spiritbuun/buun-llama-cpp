@@ -4597,7 +4597,7 @@ private:
         const int ret = llama_decode(ctx_tgt, batch_view);
         const int64_t t_verify_elapsed = ggml_time_us() - t_verify_start;
         t_verify_total += t_verify_elapsed;
-        SRV_INF("  verify ubatch: %d tok, %.1fms (%.2fms/tok)\n",
+        SRV_DBG("  verify ubatch: %d tok, %.1fms (%.2fms/tok)\n",
                 batch_view.n_tokens, t_verify_elapsed / 1e3, t_verify_elapsed / 1e3 / std::max(1, batch_view.n_tokens));
 
         metrics.on_decoded(slots);
@@ -5430,7 +5430,7 @@ private:
         if (n_slots_drafted > 0) {
             const int64_t t_cycle_total = ggml_time_us() - t_cycle_start;
             const int64_t t_other = t_cycle_total - t_draft_total - t_verify_total - t_accept_total;
-            SRV_INF("spec cycle (%d slots): draft=%.1fms verify=%.1fms accept=%.1fms other=%.1fms total=%.1fms\n",
+            SRV_DBG("spec cycle (%d slots): draft=%.1fms verify=%.1fms accept=%.1fms other=%.1fms total=%.1fms\n",
                     n_slots_drafted,
                     t_draft_total / 1e3, t_verify_total / 1e3, t_accept_total / 1e3,
                     t_other / 1e3, t_cycle_total / 1e3);
