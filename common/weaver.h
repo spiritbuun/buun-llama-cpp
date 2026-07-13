@@ -79,11 +79,13 @@ bool weaver_expand_token(weaver_scorer * ws,
                          const int32_t * ancestor_slots, int n_ancestors, int self_slot,
                          float * logits_out);
 
-// Batched expansion: one graph for a whole frontier round of n_nodes nodes stored at
-// the CONSECUTIVE slots [slot_base, slot_base + n_nodes). tokens/depths: [n_nodes]
-// (depths pre-clamped to the pool horizon). Node r's ancestors (all < slot_base) are
-// anc_slots[anc_offs[r] .. anc_offs[r+1]); anc_offs has n_nodes+1 entries. Writes
-// logits_out[n_nodes * n_cand] node-major, n_cand = the (uniform) pool size per depth.
+// Batched expansion: one graph for n_nodes nodes stored at the CONSECUTIVE slots
+// [slot_base, slot_base + n_nodes). tokens/depths: [n_nodes] (depths pre-clamped to
+// the pool horizon). Node r's ancestors are anc_slots[anc_offs[r] .. anc_offs[r+1])
+// (anc_offs has n_nodes+1 entries); an ancestor may be any persisted slot OR an
+// earlier member of THIS batch (slot < slot_base + r), so a whole speculative chain
+// can be expanded in one graph. Writes logits_out[n_nodes * n_cand] node-major,
+// n_cand = the (uniform) pool size per depth.
 bool weaver_expand_batch(weaver_scorer * ws,
                          const int32_t * tokens, const int32_t * depths, int n_nodes,
                          const int32_t * anc_slots, const int32_t * anc_offs,

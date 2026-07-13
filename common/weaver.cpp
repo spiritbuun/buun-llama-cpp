@@ -348,8 +348,10 @@ static bool wvr_expand_batch_impl(weaver_scorer * ws,
         if (depths[r] < 0 || depths[r] >= p.depth_cap || ws->cand_n[depths[r]] != n_cand) {
             return false;
         }
+        // ancestors may be persisted slots OR earlier members of this batch (a chain
+        // can be expanded in one graph: K/V depend only on each node's own input)
         for (int a = anc_offs[r]; a < anc_offs[r + 1]; ++a) {
-            if (anc_slots[a] < 0 || anc_slots[a] >= S) {
+            if (anc_slots[a] < 0 || anc_slots[a] >= slot_base + r) {
                 return false;
             }
         }
