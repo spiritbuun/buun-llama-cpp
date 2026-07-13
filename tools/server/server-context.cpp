@@ -338,6 +338,7 @@ struct server_slot {
     int64_t t_tree_reeval_us  = 0; // accepted-path re-decode (includes sync)
     int32_t n_tree_cycles     = 0;
     int32_t n_tree_onmain     = 0; // accepts that never left the backbone
+    int32_t n_tree_replay     = 0; // cycles resolved by tape-aware rollback (no re-decode)
     int64_t n_tree_nodes_total = 0;
 
     void reset() {
@@ -379,6 +380,7 @@ struct server_slot {
         t_tree_reeval_us  = 0;
         n_tree_cycles     = 0;
         n_tree_onmain     = 0;
+        n_tree_replay     = 0;
         n_tree_nodes_total = 0;
 
         task_prev = std::move(task);
@@ -712,8 +714,8 @@ struct server_slot {
         if (n_tree_cycles > 0) {
             const double c = n_tree_cycles;
             SLT_INF(*this,
-                    "    tree profile = %d cycles, %.1f nodes/cycle, %.1f%% on-backbone | per cycle: draft=%.2f verify=%.2f walk=%.2f restore=%.2f reeval=%.2f ms\n",
-                    n_tree_cycles, n_tree_nodes_total / c, 100.0 * n_tree_onmain / c,
+                    "    tree profile = %d cycles, %.1f nodes/cycle, %.1f%% on-backbone, %.1f%% tape-replayed | per cycle: draft=%.2f verify=%.2f walk=%.2f rollback=%.2f reeval=%.2f ms\n",
+                    n_tree_cycles, n_tree_nodes_total / c, 100.0 * n_tree_onmain / c, 100.0 * n_tree_replay / c,
                     t_tree_draft_us / 1e3 / c, t_tree_verify_us / 1e3 / c, t_tree_walk_us / 1e3 / c,
                     t_tree_restore_us / 1e3 / c, t_tree_reeval_us / 1e3 / c);
         }
@@ -1961,8 +1963,11 @@ private:
 
         // Allocate DFlash per-slot tape + hidden buffers now that common_speculative_init
         // (run for slot 0 above) has created dflash_capture on the target context.
+        // DDTree verify batches hold tree_budget + 1 tokens — size the tape to cover them
+        // or the tape-aware tree rollback silently degrades to restore + re-decode.
         if (dflash_slots_cap > 0) {
-            llama_dflash_allocate_slots(ctx_tgt, dflash_slots_cap);
+            llama_dflash_allocate_slots_cap(ctx_tgt, dflash_slots_cap,
+                    params_base.speculative.tree_budget + 1);
         }
 
         // DFlash + hybrid target: expand the recurrent state to its full backup-cell count
@@ -4808,20 +4813,43 @@ private:
             llama_dflash_set_active_slot(ctx_tgt, slot.id);
         }
 
-        // rollback. Trees here always have branch nodes (pure chains take the flat path),
-        // so the post-decode recurrent state belongs to the last batch token — a branch —
-        // and on an off-backbone accept the slot-seq KV tail holds rejected backbone nodes
-        // at the accepted positions. Both are handled the same way: drop everything from
-        // the root, restore the pre-verify state, and re-decode the accepted tokens.
-        // (A tree-aware tape replay could avoid the re-decode for on-backbone accepts —
-        // the accepted tokens are a batch prefix — but the tape currently interleaves
-        // branch nodes; see the EXP-37 ledger.)
+        // rollback. Preferred: tape-aware — prune rejected tree cells by identity
+        // (attention) + path-indexed tape replay to the accepted state (recurrent).
+        // Fallback (tape can't cover the tree / stale ubatch stash / attention-only
+        // target): drop everything from the root, restore the pre-verify state, and
+        // re-decode the accepted tokens (the SD-060 "decode2" tax).
         SLT_DBG(slot, "tree accept: nodes=%d backbone=%d commit=%d on_main=%d accepted=%d\n",
                 tree.n_nodes, tree.main_path_len, commit_n, on_main_path ? 1 : 0, (int) ids.size() - 1);
 
         llama_clear_tree_parent_ids(ctx_tgt);
 
+        bool rolled_back = false;
         if (needs_reeval && slot.has_draft_backup) {
+            // ubatch-local indices of the accepted tokens: root at 0, node i at i
+            // (the tree verify ubatch is exactly [root, nodes...], asserted at decode)
+            const int64_t t_rollback_start = ggml_time_us();
+            std::vector<int32_t> path_idxs;
+            path_idxs.reserve(ids.size());
+            path_idxs.push_back(0);
+            for (int node = commit_n; node > 0; node = tree.parents[node]) {
+                path_idxs.push_back(node);
+            }
+            std::reverse(path_idxs.begin() + 1, path_idxs.end());
+
+            rolled_back = llama_dflash_rollback_tree(ctx_tgt, slot.id, slot.seq_id_backup,
+                    pos_root, path_idxs.data(), (int) path_idxs.size(), tree.n_nodes + 1);
+            slot.t_tree_restore_us += ggml_time_us() - t_rollback_start;
+
+            if (rolled_back) {
+                slot.n_tree_replay += 1;
+            } else {
+                SLT_DBG(slot, "%s", "tape-aware tree rollback unavailable, re-decoding\n");
+            }
+        }
+
+        if (rolled_back) {
+            // tape-aware rollback done; nothing to re-decode
+        } else if (needs_reeval && slot.has_draft_backup) {
             const int64_t t_restore_start = ggml_time_us();
             llama_memory_seq_rm(mem, slot.id, pos_root, -1);
             llama_memory_seq_cp(mem, slot.seq_id_backup, slot.id, -1, -1);

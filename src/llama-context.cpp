@@ -1586,7 +1586,7 @@ void llama_context::set_active_dflash_slot(int slot_idx) {
     }
 }
 
-void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
+void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted, const int32_t * path) {
     if (!dflash_capture || n_accepted <= 0) {
         return;
     }
@@ -1639,9 +1639,18 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
         }
     }
 
+    // highest tape entry the replay touches (path entries are ubatch-local indices)
+    int need_tokens = n_accepted;
+    if (path) {
+        need_tokens = 0;
+        for (int i = 0; i < n_accepted; ++i) {
+            need_tokens = std::max(need_tokens, (int) path[i] + 1);
+        }
+    }
+
     if (!gpu_backend) {
-        tape_replay_cpu(mem_recurrent, cell_idx, n_accepted);
-        tape_replay_conv(mem_recurrent, cell_idx, n_accepted, seq_id);
+        tape_replay_cpu(mem_recurrent, cell_idx, n_accepted, path);
+        tape_replay_conv(mem_recurrent, cell_idx, n_accepted, seq_id, path);
         return;
     }
 
@@ -1671,8 +1680,8 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
             }
         }
         if (has_host || multi_device) {
-            tape_replay_cpu(mem_recurrent, cell_idx, n_accepted);
-            tape_replay_conv(mem_recurrent, cell_idx, n_accepted, seq_id);
+            tape_replay_cpu(mem_recurrent, cell_idx, n_accepted, path);
+            tape_replay_conv(mem_recurrent, cell_idx, n_accepted, seq_id, path);
             return;
         }
     }
@@ -1683,11 +1692,26 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
 
     {
         // per layer: k_view + v_view + g_view + b_view + q + b_sigmoid + s_view + GDN + result_state + s_write + cpy = ~11 tensors
-        size_t ctx_mem = ggml_tensor_overhead() * ((size_t)n_rec * 14 + 4) + ggml_graph_overhead_custom(n_rec * 12, false);
+        // path mode adds reshape + get_rows + reshape per k/v/g/b input (+12/layer) and one shared index tensor
+        size_t ctx_mem = ggml_tensor_overhead() * ((size_t)n_rec * 28 + 6) + ggml_graph_overhead_custom(n_rec * 24, false);
         struct ggml_init_params ctx_params = { ctx_mem, nullptr, true };
         struct ggml_context * ctx = ggml_init(ctx_params);
 
-        struct ggml_cgraph * graph = ggml_new_graph_custom(ctx, n_rec * 12, false);
+        struct ggml_cgraph * graph = ggml_new_graph_custom(ctx, n_rec * 24, false);
+
+        // shared gather-index tensor for path-indexed replay (DDTree accepted path)
+        ggml_tensor * path_idx = nullptr;
+        if (path) {
+            path_idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) n_accepted);
+            ggml_set_input(path_idx);
+        }
+
+        // gather the path's tape entries along the token dim: [S, H, T] → rows [S*H, T]
+        auto gather_path = [&](ggml_tensor * tape_t, int64_t n0, int64_t n1) -> ggml_tensor * {
+            ggml_tensor * t2d  = ggml_reshape_2d(ctx, tape_t, n0 * n1, tape_t->ne[2]);
+            ggml_tensor * rows = ggml_get_rows(ctx, t2d, path_idx);
+            return ggml_reshape_3d(ctx, rows, n0, n1, (int64_t) n_accepted);
+        };
 
         struct replay_input {
             ggml_tensor * q;
@@ -1711,7 +1735,7 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
             int il = rec_ids[li];
 
             auto & tape = tape_layers[li];
-            if (tape.n_tokens <= 0 || n_accepted > tape.n_tokens) continue;
+            if (tape.n_tokens <= 0 || need_tokens > tape.n_tokens) continue;
 
             // find this layer in GPU tape (if available)
             int gpu_li = -1;
@@ -1730,15 +1754,25 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
                 S   = tl.k->ne[0];
                 H_k = tl.k->ne[1];
                 H_v = tl.v->ne[1];
-                // views into GPU tape buffers — already populated by graph-embedded copies
-                k_in = ggml_view_3d(ctx, tl.k, S, H_k, (int64_t)n_accepted,
-                                    tl.k->nb[1], tl.k->nb[2], 0);
-                v_in = ggml_view_3d(ctx, tl.v, S, H_v, (int64_t)n_accepted,
-                                    tl.v->nb[1], tl.v->nb[2], 0);
-                g_in = ggml_view_3d(ctx, tl.gate, (int64_t)1, H_v, (int64_t)n_accepted,
-                                    tl.gate->nb[1], tl.gate->nb[2], 0);
-                b_in = ggml_view_3d(ctx, tl.beta, (int64_t)1, H_v, (int64_t)n_accepted,
-                                    tl.beta->nb[1], tl.beta->nb[2], 0);
+                if (need_tokens > tgpu->max_tokens) continue;
+                if (path) {
+                    // gather the accepted path's entries (graph-embedded copies wrote
+                    // per-node inputs in ubatch order)
+                    k_in = gather_path(tl.k, S, H_k);
+                    v_in = gather_path(tl.v, S, H_v);
+                    g_in = gather_path(tl.gate, 1, H_v);
+                    b_in = gather_path(tl.beta, 1, H_v);
+                } else {
+                    // views into GPU tape buffers — already populated by graph-embedded copies
+                    k_in = ggml_view_3d(ctx, tl.k, S, H_k, (int64_t)n_accepted,
+                                        tl.k->nb[1], tl.k->nb[2], 0);
+                    v_in = ggml_view_3d(ctx, tl.v, S, H_v, (int64_t)n_accepted,
+                                        tl.v->nb[1], tl.v->nb[2], 0);
+                    g_in = ggml_view_3d(ctx, tl.gate, (int64_t)1, H_v, (int64_t)n_accepted,
+                                        tl.gate->nb[1], tl.gate->nb[2], 0);
+                    b_in = ggml_view_3d(ctx, tl.beta, (int64_t)1, H_v, (int64_t)n_accepted,
+                                        tl.beta->nb[1], tl.beta->nb[2], 0);
+                }
             } else {
                 S   = tape.S_k;
                 H_k = tape.H_k;
@@ -1834,6 +1868,9 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
         }
 
         // upload data for tensors that need it
+        if (path_idx) {
+            ggml_backend_tensor_set(path_idx, path, 0, (size_t) n_accepted * sizeof(int32_t));
+        }
         for (auto & inp : inputs) {
             // Q: always needs zeros
             {
@@ -1852,10 +1889,21 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
                 const int64_t H_k = tape.H_k;
                 const int64_t H_v = tape.H_v;
 
-                ggml_backend_tensor_set(inp.k, tape.k.data(), 0, S * H_k * n_accepted * sizeof(float));
-                ggml_backend_tensor_set(inp.v, tape.v.data(), 0, S * H_v * n_accepted * sizeof(float));
-                ggml_backend_tensor_set(inp.g, tape.gate.data(), 0, H_v * n_accepted * sizeof(float));
-                ggml_backend_tensor_set(inp.b, tape.beta.data(), 0, H_v * n_accepted * sizeof(float));
+                if (path) {
+                    // gather the accepted path's entries CPU-side at upload time
+                    for (int t = 0; t < n_accepted; ++t) {
+                        const size_t s = (size_t) path[t];
+                        ggml_backend_tensor_set(inp.k, tape.k.data()    + s * S * H_k, (size_t) t * S * H_k * sizeof(float), S * H_k * sizeof(float));
+                        ggml_backend_tensor_set(inp.v, tape.v.data()    + s * S * H_v, (size_t) t * S * H_v * sizeof(float), S * H_v * sizeof(float));
+                        ggml_backend_tensor_set(inp.g, tape.gate.data() + s * H_v,     (size_t) t * H_v * sizeof(float),     H_v * sizeof(float));
+                        ggml_backend_tensor_set(inp.b, tape.beta.data() + s * H_v,     (size_t) t * H_v * sizeof(float),     H_v * sizeof(float));
+                    }
+                } else {
+                    ggml_backend_tensor_set(inp.k, tape.k.data(), 0, S * H_k * n_accepted * sizeof(float));
+                    ggml_backend_tensor_set(inp.v, tape.v.data(), 0, S * H_v * n_accepted * sizeof(float));
+                    ggml_backend_tensor_set(inp.g, tape.gate.data(), 0, H_v * n_accepted * sizeof(float));
+                    ggml_backend_tensor_set(inp.b, tape.beta.data(), 0, H_v * n_accepted * sizeof(float));
+                }
             }
         }
 
@@ -1870,25 +1918,38 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
         dflash_capture->replay_cell_idx = cell_idx;
         dflash_capture->replay_seq_id = seq_id;
         dflash_capture->replay_mem_recurrent = mem_recurrent;
+        if (path) {
+            dflash_capture->replay_path.assign(path, path + n_accepted);
+        } else {
+            dflash_capture->replay_path.clear();
+        }
         return; // conv rebuild deferred to tape_replay_sync()
     }
 
 conv_rebuild:
-    tape_replay_conv(mem_recurrent, cell_idx, n_accepted, seq_id);
+    tape_replay_conv(mem_recurrent, cell_idx, n_accepted, seq_id, path);
 }
 
-void llama_context::tape_replay_conv(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted, llama_seq_id seq_id) {
+void llama_context::tape_replay_conv(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted, llama_seq_id seq_id, const int32_t * path) {
     const auto & hparams = model.hparams;
     const auto & rec_ids = dflash_capture->recurrent_layer_ids;
     auto & tape_layers   = dflash_capture->tape_layers;
     const uint32_t n_embd_r = hparams.n_embd_r();
+
+    int need_tokens = n_accepted;
+    if (path) {
+        need_tokens = 0;
+        for (int i = 0; i < n_accepted; ++i) {
+            need_tokens = std::max(need_tokens, (int) path[i] + 1);
+        }
+    }
 
     // rebuild conv state from qkv_mixed tape (small, CPU is fine)
     for (size_t li = 0; li < rec_ids.size(); ++li) {
         int il = rec_ids[li];
         auto & tape = tape_layers[li];
 
-        if (tape.n_tokens <= 0 || n_accepted > tape.n_tokens) continue;
+        if (tape.n_tokens <= 0 || need_tokens > tape.n_tokens) continue;
         if (tape.qkv_mixed.empty() || !mem_recurrent->r_l[il]) continue;
 
         // for multi-seq verify, QKV mixed has per-seq data packed
@@ -1920,7 +1981,10 @@ void llama_context::tape_replay_conv(llama_memory_recurrent * mem_recurrent, int
                 if (src_pos < (int)conv_window) {
                     val = old_window[ch * conv_window + src_pos];
                 } else {
-                    val = tape.qkv_mixed[qkv_seq_offset + (src_pos - conv_window) * conv_ch + ch];
+                    // path-indexed (DDTree): the accepted stream is the path through the
+                    // tree-shaped ubatch, not the ubatch prefix
+                    const int src_tok = path ? (int) path[src_pos - conv_window] : (src_pos - (int) conv_window);
+                    val = tape.qkv_mixed[qkv_seq_offset + (size_t) src_tok * conv_ch + ch];
                 }
                 new_conv[ch * conv_window + w] = val;
             }
@@ -1948,23 +2012,32 @@ void llama_context::tape_replay_sync() {
     tape_replay_conv(dflash_capture->replay_mem_recurrent,
                      dflash_capture->replay_cell_idx,
                      dflash_capture->replay_n_accepted,
-                     dflash_capture->replay_seq_id);
+                     dflash_capture->replay_seq_id,
+                     dflash_capture->replay_path.empty() ? nullptr : dflash_capture->replay_path.data());
 
     dflash_capture->replay_pending = false;
 }
 
 // CPU fallback for tape replay (used when no GPU backend available)
-void llama_context::tape_replay_cpu(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted) {
+void llama_context::tape_replay_cpu(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted, const int32_t * path) {
     const auto & hparams = model.hparams;
     const auto & rec_ids = dflash_capture->recurrent_layer_ids;
     auto & tape_layers   = dflash_capture->tape_layers;
     const uint32_t n_embd_s = hparams.n_embd_s();
 
+    int need_tokens = n_accepted;
+    if (path) {
+        need_tokens = 0;
+        for (int i = 0; i < n_accepted; ++i) {
+            need_tokens = std::max(need_tokens, (int) path[i] + 1);
+        }
+    }
+
     for (size_t li = 0; li < rec_ids.size(); ++li) {
         int il = rec_ids[li];
         auto & tape = tape_layers[li];
 
-        if (tape.n_tokens <= 0 || n_accepted > tape.n_tokens) continue;
+        if (tape.n_tokens <= 0 || need_tokens > tape.n_tokens) continue;
 
         const int64_t S = tape.S_k;
         const int64_t H_k = tape.H_k;
@@ -1976,7 +2049,8 @@ void llama_context::tape_replay_cpu(llama_memory_recurrent * mem_recurrent, int3
         std::vector<float> state(n_embd_s);
         ggml_backend_tensor_get(s_tensor, state.data(), s_offset, n_embd_s * sizeof(float));
 
-        for (int tok = 0; tok < n_accepted; ++tok) {
+        for (int t = 0; t < n_accepted; ++t) {
+            const int tok = path ? (int) path[t] : t;
             for (int64_t hv = 0; hv < H_v; ++hv) {
                 int64_t hk = hv / head_ratio;
                 float g_val = expf(tape.gate[tok * H_v + hv]);
@@ -2034,6 +2108,65 @@ void llama_context::dflash_rollback(llama_seq_id seq_id, llama_seq_id seq_backup
 
     // Replay DeltaNet state updates for accepted tokens
     tape_replay(seq_id, n_accepted);
+}
+
+// DDTree tape-aware rollback. path[] = ubatch-local indices of the accepted tokens
+// (root + accepted nodes, ancestor order); n_tree_tokens = size of the tree verify
+// ubatch. Returns false — with NO state mutated — when any precondition fails, so the
+// caller can fall back to the nuclear restore + re-decode.
+bool llama_context::dflash_rollback_tree(llama_seq_id seq_id, llama_seq_id seq_backup, int n_past_before,
+                                         const int32_t * path, int n_path, int n_tree_tokens) {
+    GGML_UNUSED(n_past_before); // pruning is by cell identity, not position (kept for API symmetry)
+
+    auto * mem_hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get());
+    if (!mem_hybrid || !dflash_capture || n_path <= 0) {
+        return false;
+    }
+
+    for (int i = 0; i < n_path; ++i) {
+        if (path[i] < 0 || path[i] >= n_tree_tokens) {
+            return false;
+        }
+    }
+
+    // the tape must cover the WHOLE tree ubatch on every recurrent layer — a layer
+    // whose replay silently skipped would leave that layer's state at the root while
+    // the others advance (worse than the nuclear path, and quiet about it)
+    const auto & rec_ids = dflash_capture->recurrent_layer_ids;
+    for (size_t li = 0; li < rec_ids.size(); ++li) {
+        const auto & tape = dflash_capture->tape_layers[li];
+        if (tape.n_tokens != n_tree_tokens || tape.n_seqs != 1) {
+            return false;
+        }
+    }
+    // GPU tape: graph-embedded k/v/g/b copies are skipped when the ubatch exceeds the
+    // tape capacity — the tensors would hold stale entries from an earlier pass
+    if (dflash_tape_gpu * tgpu = dflash_capture->active_tape()) {
+        if (tgpu->max_tokens < n_tree_tokens) {
+            return false;
+        }
+    } else if (!dflash_capture->tape_layers.empty() && dflash_capture->tape_layers[0].k.empty()) {
+        // no GPU tape and no CPU k/v capture either — nothing to replay from
+        return false;
+    }
+
+    // attention: prune rejected tree cells by identity (rejected siblings share
+    // positions with accepted nodes). Validates its ubatch stash before mutating.
+    auto * mem_attn = mem_hybrid->get_mem_attn();
+    if (!mem_attn->prune_last_ubatch(seq_id, path, n_path, n_tree_tokens)) {
+        return false;
+    }
+    mem_attn->seq_rm(seq_backup, -1, -1);
+
+    // recurrent: restore the pre-verify state, then replay the accepted path
+    auto * mem_recr = mem_hybrid->get_mem_recr();
+    mem_recr->seq_rm(seq_id, -1, -1);
+    mem_recr->seq_cp(seq_backup, seq_id, -1, -1);
+    mem_recr->seq_rm(seq_backup, -1, -1);
+
+    tape_replay(seq_id, n_path, path);
+
+    return true;
 }
 
 void llama_context::dflash_prepare_branch(llama_seq_id seq_id, llama_seq_id seq_backup, int depth) {
@@ -5427,6 +5560,10 @@ void llama_set_force_split_seq(llama_context * ctx, bool force) {
     }
 }
 
+void llama_dflash_allocate_slots_cap(llama_context * ctx, int n_slots, int max_verify_tokens) {
+    ctx->allocate_tape_gpu(n_slots, std::max(max_verify_tokens, (int) LLAMA_DFLASH_MAX_VERIFY_TOKENS));
+}
+
 void llama_dflash_allocate_slots(llama_context * ctx, int n_slots) {
     ctx->allocate_tape_gpu(n_slots, LLAMA_DFLASH_MAX_VERIFY_TOKENS);
 }
@@ -5441,6 +5578,11 @@ void llama_tape_replay(llama_context * ctx, llama_seq_id seq_id, int n_accepted)
 
 void llama_tape_replay_sync(llama_context * ctx) {
     ctx->tape_replay_sync();
+}
+
+bool llama_dflash_rollback_tree(llama_context * ctx, llama_seq_id seq_id, llama_seq_id seq_backup,
+                                int n_past_before, const int32_t * path, int32_t n_path, int32_t n_tree_tokens) {
+    return ctx->dflash_rollback_tree(seq_id, seq_backup, n_past_before, path, n_path, n_tree_tokens);
 }
 
 void llama_dflash_rollback(llama_context * ctx, llama_seq_id seq_id, llama_seq_id seq_backup, int n_past_before, int n_accepted) {

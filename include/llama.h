@@ -1160,6 +1160,11 @@ extern "C" {
     // single-slot workloads this is optional — a 1-slot allocation is created lazily.
     LLAMA_API void llama_dflash_allocate_slots(struct llama_context * ctx, int n_slots);
 
+    // Same, with an explicit tape capacity (floored at LLAMA_DFLASH_MAX_VERIFY_TOKENS).
+    // DDTree verify batches need tree_budget + 1 entries — an undersized tape silently
+    // skips recording and disables the tape-aware tree rollback.
+    LLAMA_API void llama_dflash_allocate_slots_cap(struct llama_context * ctx, int n_slots, int max_verify_tokens);
+
     // DFlash: select which slot's GPU tape the next llama_decode() writes into.
     // For multi-slot servers (llama-server -np > 1), each slot has its own tape so
     // concurrent slots don't clobber each other. Must be called before each decode
@@ -1182,6 +1187,23 @@ extern "C" {
             llama_seq_id           seq_backup,
             int                    n_past_before,
             int                    n_accepted);
+
+    // DDTree tape-aware rollback after a tree-shaped verify. path[] holds the
+    // ubatch-local indices of the accepted tokens (root = 0, then the accepted
+    // nodes in ancestor order); n_tree_tokens = size of the tree verify ubatch.
+    //   - KV cache: prunes rejected tree cells by identity (rejected siblings share
+    //     positions with accepted nodes), keeps the accepted cells as-is
+    //   - Recurrent state: restores from backup + path-indexed tape replay
+    // Returns false — with no state mutated — when the tape or the ubatch stash
+    // can't support it; the caller must then restore + re-decode instead.
+    LLAMA_API bool llama_dflash_rollback_tree(
+            struct llama_context * ctx,
+            llama_seq_id           seq_id,
+            llama_seq_id           seq_backup,
+            int                    n_past_before,
+            const int32_t *        path,
+            int32_t                n_path,
+            int32_t                n_tree_tokens);
 
     // DFlash: wait for async tape replay to complete (must be called before next verify)
     LLAMA_API void llama_tape_replay_sync(struct llama_context * ctx);

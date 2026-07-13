@@ -183,6 +183,14 @@ public:
 
     bool get_has_shift() const;
 
+    // DDTree: remove seq_id's membership from every cell of the LAST applied ubatch
+    // whose ubatch-local token index is not in keep[]. Rejected tree siblings share
+    // positions with accepted nodes, so positional seq_rm cannot separate them —
+    // this prunes by cell identity instead. Returns false (without mutating) when the
+    // stashed ubatch does not match n_ubatch_tokens; caller falls back to positional
+    // removal + re-decode.
+    bool prune_last_ubatch(llama_seq_id seq_id, const int32_t * keep, int n_keep, int n_ubatch_tokens);
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 
@@ -404,6 +412,11 @@ private:
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
     std::vector<uint32_t> v_heads;
+
+    // DDTree: token→cell mapping of the last applied ubatch (single-stream ubatches
+    // only), consumed one-shot by prune_last_ubatch(). Not part of the KV state.
+    std::vector<uint32_t> last_ubatch_cells;
+    uint32_t              last_ubatch_strm = 0;
 
     // TODO: temporary until we refactor to be able to share the same cells between 2 kv caches [TAG_KV_CACHE_SHARE_CELLS]
     llama_kv_cache * other;

@@ -163,6 +163,7 @@ struct dflash_capture_data {
     int32_t replay_cell_idx = -1;
     llama_seq_id replay_seq_id = 0;
     llama_memory_recurrent * replay_mem_recurrent = nullptr;
+    std::vector<int32_t> replay_path; // non-empty → path-indexed deferred conv rebuild (DDTree)
 
     ~dflash_capture_data() {
         if (replay_graph_ctx) {
@@ -550,12 +551,21 @@ public:
     void allocate_tape_gpu(int n_slots, int max_tokens);
     void set_active_dflash_slot(int slot_idx);
 
-    void tape_replay(llama_seq_id seq_id, int n_accepted);
+    // path == nullptr → replay the tape prefix [0, n_accepted) (flat drafts).
+    // path != nullptr → replay the n_accepted tape entries at path[0..n_accepted)
+    // (DDTree accepted path through a tree-shaped verify batch).
+    void tape_replay(llama_seq_id seq_id, int n_accepted, const int32_t * path = nullptr);
     void tape_replay_sync();
-    void tape_replay_conv(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted, llama_seq_id seq_id = 0);
-    void tape_replay_cpu(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted);
+    void tape_replay_conv(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted, llama_seq_id seq_id = 0, const int32_t * path = nullptr);
+    void tape_replay_cpu(llama_memory_recurrent * mem_recurrent, int32_t cell_idx, int n_accepted, const int32_t * path = nullptr);
 
     void dflash_rollback(llama_seq_id seq_id, llama_seq_id seq_backup, int n_past_before, int n_accepted);
+    // DDTree tape-aware rollback: prune rejected tree cells by identity (attention) +
+    // path-indexed tape replay (recurrent). Returns false WITHOUT mutating state when
+    // preconditions fail (tape doesn't cover the tree, stale ubatch stash, ...) —
+    // caller falls back to restore + re-decode.
+    bool dflash_rollback_tree(llama_seq_id seq_id, llama_seq_id seq_backup, int n_past_before,
+                              const int32_t * path, int n_path, int n_tree_tokens);
     void dflash_prepare_branch(llama_seq_id seq_id, llama_seq_id seq_backup, int depth);
 
     void set_cross_data(const float * data, int64_t n_embd, int64_t n_tokens);

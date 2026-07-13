@@ -1418,6 +1418,61 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     return true;
 }
 
+bool llama_kv_cache::prune_last_ubatch(llama_seq_id seq_id, const int32_t * keep, int n_keep, int n_ubatch_tokens) {
+    // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+    if (other) {
+        return false;
+    }
+
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    // validate before mutating anything — a false return must leave the cache
+    // untouched so the caller can fall back to positional removal + re-decode
+    if ((int) last_ubatch_cells.size() != n_ubatch_tokens) {
+        return false;
+    }
+    if (seq_to_stream[seq_id] != last_ubatch_strm) {
+        return false;
+    }
+
+    std::vector<bool> keep_tok(last_ubatch_cells.size(), false);
+    for (int i = 0; i < n_keep; ++i) {
+        if (keep[i] < 0 || keep[i] >= (int) last_ubatch_cells.size()) {
+            return false;
+        }
+        keep_tok[keep[i]] = true;
+    }
+
+    auto & cells = v_cells[last_ubatch_strm];
+    auto & head  = v_heads[last_ubatch_strm];
+
+    uint32_t new_head = cells.size();
+
+    for (size_t t = 0; t < last_ubatch_cells.size(); ++t) {
+        if (keep_tok[t]) {
+            continue;
+        }
+
+        const uint32_t i = last_ubatch_cells[t];
+
+        if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
+            if (i < vbr_stash_rows_) {
+                vbr_stash_dirty_ = true; // a sink cell can now be rewritten by another request
+            }
+            new_head = std::min(new_head, i);
+        }
+    }
+
+    if (new_head != cells.size() && new_head < head) {
+        head = new_head;
+    }
+
+    // one-shot: a second prune against the same stash would be a caller bug
+    last_ubatch_cells.clear();
+
+    return true;
+}
+
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
@@ -2294,6 +2349,14 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
         auto & head = v_heads[sinfo.strm[s]];
 
         head = sinfo.idxs[s].back() + 1;
+    }
+
+    // DDTree: stash the token→cell mapping for prune_last_ubatch()
+    if (sinfo.n_stream() == 1) {
+        last_ubatch_cells.assign(sinfo.idxs[0].begin(), sinfo.idxs[0].end());
+        last_ubatch_strm = sinfo.strm[0];
+    } else {
+        last_ubatch_cells.clear();
     }
 
     // VBR VMM: the graph compute that follows reads/writes cells up to the padded watermark —
