@@ -1368,9 +1368,15 @@ void llama_context::set_dflash_capture(const int32_t * layer_ids, int32_t n_laye
 
     for (int32_t i = 0; i < n_layers; ++i) {
         dflash_capture->layer_ids.push_back(layer_ids[i]);
-        // sentinel -2 = the model's final-norm output (Weaver tree-draft scorer input)
+        // sentinel -2 = the model's final-norm output (Weaver tree-draft scorer input).
+        // When the context extracts embeddings, build_pooling() renames that same
+        // tensor to result_embd_pooled (POOLING_TYPE_NONE reuses it) — register both;
+        // exactly one of the two names exists in any executed graph.
         std::string name = layer_ids[i] == -2 ? "result_norm"
                                               : "l_out-" + std::to_string(layer_ids[i]);
+        if (layer_ids[i] == -2) {
+            dflash_capture->hidden_name_idx["result_embd_pooled"] = i;
+        }
         dflash_capture->hidden_name_idx[name] = i;
         dflash_capture->tensor_names.push_back(std::move(name));
     }

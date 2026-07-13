@@ -3456,7 +3456,10 @@ private:
     }
 
     // Weaver: copy the target final-norm hidden (capture sentinel, index
-    // n_target_layers) at the given verify-batch row
+    // n_target_layers) at the given row. NOTE: result_norm is computed over the
+    // OUTPUT rows only (inp_out_ids gathers before the final norm), so rows here
+    // are output-order — identical to batch order for all-output verify batches,
+    // and a single row after prefill (row -1 = last captured row).
     void weaver_stash_tgt_hidden(int row) {
         if (!weaver) {
             return;
@@ -3469,7 +3472,13 @@ private:
         float * data = llama_get_layer_hidden(ctx_tgt, idx);
         int64_t embd = llama_get_layer_hidden_n_embd(ctx_tgt, idx);
         int64_t ntok = llama_get_layer_hidden_n_tokens(ctx_tgt, idx);
+        if (row < 0) {
+            row = (int) ntok - 1;
+        }
         if (!data || embd != n_embd || row < 0 || row >= ntok) {
+            LOG_INF("weaver: stash MISS idx=%d data=%p embd=%" PRId64 " (n_embd %d) ntok=%" PRId64 " row=%d n_slots=%d l0_ntok=%" PRId64 "\n",
+                    idx, (void *) data, embd, n_embd, ntok, row, llama_get_n_layer_hiddens(ctx_tgt),
+                    llama_get_layer_hidden_n_tokens(ctx_tgt, 0));
             return;
         }
         weaver_tgt_hidden.assign(data + (size_t) row * embd, data + (size_t) (row + 1) * embd);
@@ -3494,7 +3503,7 @@ private:
         ring_filled = 0;
         ring_write(to_store, start_offset);
         committed_len = (int)n_tokens;
-        weaver_stash_tgt_hidden((int) n_tokens - 1);
+        weaver_stash_tgt_hidden(-1); // prefill: only the last token is an output row
     }
 
     // called after each verification decode — append only the accepted tokens' hidden states
