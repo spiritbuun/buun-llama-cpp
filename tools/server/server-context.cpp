@@ -3873,18 +3873,24 @@ private:
                 const int64_t t_draft_slot_start = ggml_time_us();
 
                 // DDTree: try a tree draft first (single-slot only, enforced at startup);
-                // an empty tree falls through to the flat draft path
+                // an empty tree falls through to the flat draft path, a pure-chain tree
+                // is reused as the flat draft (no second drafter pass)
+                llama_tokens tree_chain_fallback;
                 if (params_base.speculative.tree_budget > 0 &&
+                    params_base.speculative.draft_topk > 1 &&
                     params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
-                    batched_drafts[slot.id].empty() &&
-                    try_tree_draft(slot, n_draft_max)) {
-                    t_draft_total += ggml_time_us() - t_draft_slot_start;
-                    n_slots_drafted++;
-                    return;
+                    batched_drafts[slot.id].empty()) {
+                    if (try_tree_draft(slot, n_draft_max, tree_chain_fallback)) {
+                        t_draft_total += ggml_time_us() - t_draft_slot_start;
+                        n_slots_drafted++;
+                        return;
+                    }
                 }
 
                 llama_tokens draft;
-                if (!batched_drafts[slot.id].empty()) {
+                if (!tree_chain_fallback.empty()) {
+                    draft = std::move(tree_chain_fallback);
+                } else if (!batched_drafts[slot.id].empty()) {
                     draft = std::move(batched_drafts[slot.id]);
                 } else {
                     const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
@@ -4622,8 +4628,10 @@ private:
     // DDTree: draft a token tree for the slot and add it to the batch as a tree-shaped
     // verify request (root + backbone on the slot seq, off-backbone nodes on the branch
     // seq, siblings sharing positions). Returns false when no tree was produced or it
-    // doesn't fit — the caller falls back to the flat draft path.
-    bool try_tree_draft(server_slot & slot, int n_draft_max) {
+    // doesn't fit — the caller falls back to the flat draft path. A tree that degenerates
+    // to a pure chain is returned via flat_fallback instead (the flat path handles chains
+    // exactly, and the drafter forward pass need not be repeated).
+    bool try_tree_draft(server_slot & slot, int n_draft_max, llama_tokens & flat_fallback) {
         const auto & params_spec = slot.task->params.speculative;
         const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
 
@@ -4634,6 +4642,10 @@ private:
                 n_max_eff, params_base.speculative.tree_budget);
 
         if (tree.n_nodes == 0) {
+            return false;
+        }
+        if (tree.n_nodes == tree.main_path_len) {
+            flat_fallback.assign(tree.tokens.begin(), tree.tokens.end());
             return false;
         }
         if (tree.n_nodes > n_draft_max) {
@@ -4764,71 +4776,27 @@ private:
             llama_dflash_set_active_slot(ctx_tgt, slot.id);
         }
 
-        if (on_main_path) {
-            // accepted nodes are the backbone prefix, already on the slot seq at the right
-            // positions. Since the backbone leads the batch, the accepted tokens are also a
-            // tape prefix — the flat rollback (backup restore + fp32 tape replay of the first
-            // ids.size() entries) applies unchanged. Clearing the parent ids first routes
-            // dflash_rollback to its flat branch, which keeps the accepted attention KV.
-            llama_clear_tree_parent_ids(ctx_tgt);
-            if (slot.seq_id_branch >= 0) {
-                llama_memory_seq_rm(mem, slot.seq_id_branch, -1, -1);
-            }
+        // rollback. Trees here always have branch nodes (pure chains take the flat path),
+        // so the post-decode recurrent state belongs to the last batch token — a branch —
+        // and on an off-backbone accept the slot-seq KV tail holds rejected backbone nodes
+        // at the accepted positions. Both are handled the same way: drop everything from
+        // the root, restore the pre-verify state, and re-decode the accepted tokens.
+        // (A tree-aware tape replay could avoid the re-decode for on-backbone accepts —
+        // the accepted tokens are a batch prefix — but the tape currently interleaves
+        // branch nodes; see the EXP-37 ledger.)
+        if (!on_main_path) {
+            SLT_DBG(slot, "tree: off-backbone accept (commit_n = %d, accepted = %d)\n", commit_n, (int) ids.size() - 1);
+        }
 
-            // a fully-accepted pure chain leaves the recurrent state exactly at the last
-            // accepted token — no restore needed (mirrors the flat all-accepted path). Any
-            // off-backbone node makes the post-decode recurrent state unpredictable (the
-            // tree kernel processes nodes in batch order), so restore + replay.
-            const bool state_clean = (tree.n_nodes == tree.main_path_len) && (commit_n == tree.n_nodes);
+        llama_clear_tree_parent_ids(ctx_tgt);
+        if (slot.seq_id_branch >= 0) {
+            llama_memory_seq_rm(mem, slot.seq_id_branch, -1, -1);
+        }
 
-            // branchy batches poison the tape shortcut: the tree kernels interleave branch
-            // nodes through the DeltaNet/conv tape, so replaying the "first ids.size()
-            // entries" no longer reproduces the accepted-prefix state (validated empirically:
-            // tape replay diverges, full restore + re-decode is bit-exact). Until the tape
-            // capture is tree-aware, branchy accepts restore the pre-verify state and
-            // re-decode the accepted tokens; pure chains keep the fast flat rollback.
-            const bool branchy = tree.n_nodes != tree.main_path_len;
-
-            if (branchy && needs_reeval && slot.has_draft_backup) {
-                llama_memory_seq_rm(mem, slot.id, pos_root, -1);
-                llama_memory_seq_cp(mem, slot.seq_id_backup, slot.id, -1, -1);
-                llama_memory_seq_rm(mem, slot.seq_id_backup, -1, -1);
-                if (dflash_tape_active) {
-                    llama_set_tape_recording(ctx_tgt, false);
-                    dflash_tape_active = false;
-                }
-                const int n_reeval = slot.prompt.n_tokens() - pos_root;
-                if (n_reeval > 0) {
-                    llama_batch batch_reeval = llama_batch_init(n_reeval, 0, 1);
-                    const auto & toks = slot.prompt.tokens.get_text_tokens();
-                    for (int j = pos_root; j < slot.prompt.n_tokens(); ++j) {
-                        common_batch_add(batch_reeval, toks[j], j, { slot.id }, false);
-                    }
-                    llama_decode(ctx_tgt, batch_reeval);
-                    llama_batch_free(batch_reeval);
-                }
-            } else if (needs_reeval && slot.has_draft_backup && !state_clean) {
-                llama_dflash_rollback(ctx_tgt, slot.id, slot.seq_id_backup, pos_root, (int) ids.size());
-            } else {
-                llama_memory_seq_rm(mem, slot.id, slot.prompt.tokens.pos_next(), -1);
-                if (slot.has_draft_backup) {
-                    llama_memory_seq_rm(mem, slot.seq_id_backup, -1, -1);
-                }
-            }
-        } else {
-            // accepted path left the backbone: rejected backbone nodes sit on the slot seq
-            // at the SAME positions as accepted branch nodes, so the slot-seq tail is
-            // unusable. Restore the pre-verify state and re-decode the accepted tokens.
-            SLT_INF(slot, "tree: off-backbone accept (commit_n = %d, accepted = %d)\n", commit_n, (int) ids.size() - 1);
-            llama_clear_tree_parent_ids(ctx_tgt);
-            if (slot.seq_id_branch >= 0) {
-                llama_memory_seq_rm(mem, slot.seq_id_branch, -1, -1);
-            }
+        if (needs_reeval && slot.has_draft_backup) {
             llama_memory_seq_rm(mem, slot.id, pos_root, -1);
-            if (slot.has_draft_backup) {
-                llama_memory_seq_cp(mem, slot.seq_id_backup, slot.id, -1, -1);
-                llama_memory_seq_rm(mem, slot.seq_id_backup, -1, -1);
-            }
+            llama_memory_seq_cp(mem, slot.seq_id_backup, slot.id, -1, -1);
+            llama_memory_seq_rm(mem, slot.seq_id_backup, -1, -1);
 
             // the re-decode must not be tape-recorded (the tape belongs to the verify pass)
             if (dflash_tape_active) {
@@ -4836,6 +4804,29 @@ private:
                 dflash_tape_active = false;
             }
 
+            const int n_reeval = slot.prompt.n_tokens() - pos_root;
+            if (n_reeval > 0) {
+                llama_batch batch_reeval = llama_batch_init(n_reeval, 0, 1);
+                const auto & toks = slot.prompt.tokens.get_text_tokens();
+                for (int j = pos_root; j < slot.prompt.n_tokens(); ++j) {
+                    common_batch_add(batch_reeval, toks[j], j, { slot.id }, false);
+                }
+                llama_decode(ctx_tgt, batch_reeval);
+                llama_batch_free(batch_reeval);
+            }
+        } else if (on_main_path) {
+            // attention-only target, accepted nodes already on the slot seq — drop the tail
+            llama_memory_seq_rm(mem, slot.id, slot.prompt.tokens.pos_next(), -1);
+            if (slot.has_draft_backup) {
+                llama_memory_seq_rm(mem, slot.seq_id_backup, -1, -1);
+            }
+        } else {
+            // attention-only target, off-backbone accept: the KV prefix below the root is
+            // untouched — drop the tree tail and re-decode the accepted tokens
+            llama_memory_seq_rm(mem, slot.id, pos_root, -1);
+            if (slot.has_draft_backup) {
+                llama_memory_seq_rm(mem, slot.seq_id_backup, -1, -1);
+            }
             const int n_reeval = slot.prompt.n_tokens() - pos_root;
             if (n_reeval > 0) {
                 llama_batch batch_reeval = llama_batch_init(n_reeval, 0, 1);
