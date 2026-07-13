@@ -250,7 +250,30 @@ function(hf_download version out_var out_resolved)
     endforeach()
 endfunction()
 
+# HF prebuilt dist.tar.gz can lag behind embed.cpp's required-asset list
+# (e.g. loading.html). Copy any missing root-level files from tools/ui/static/
+# so provisioned packages still embed successfully.
+function(ensure_static_fallbacks dist_dir)
+    if(NOT EXISTS "${dist_dir}/index.html")
+        return()
+    endif()
+    set(static_dir "${UI_SOURCE_DIR}/static")
+    if(NOT IS_DIRECTORY "${static_dir}")
+        return()
+    endif()
+    file(GLOB static_files LIST_DIRECTORIES false "${static_dir}/*")
+    foreach(src ${static_files})
+        get_filename_component(name "${src}" NAME)
+        if(NOT EXISTS "${dist_dir}/${name}")
+            message(STATUS "UI: copying missing static asset '${name}' from ${static_dir}")
+            file(COPY "${src}" DESTINATION "${dist_dir}")
+        endif()
+    endforeach()
+endfunction()
+
 function(emit_files dist_dir)
+    ensure_static_fallbacks("${dist_dir}")
+
     # If gzip is requested, compress every asset into a parallel _gzip/ tree
     # the structure stays the same; for ex: /abc/def --> /_gzip/abc/def
     # embed.cpp will check for _gzip and will pick it up
