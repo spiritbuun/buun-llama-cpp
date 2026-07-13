@@ -3149,7 +3149,7 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
         std::vector<llama_token> spec_tok(n_spec);
         std::vector<int32_t>     spec_depth(n_spec);
         std::vector<int32_t>     spec_anc;
-        std::vector<int32_t>     spec_offs(1, 0);
+        std::vector<int32_t>     spec_offs = { 0, 0 }; // root (node 0) has no ancestors
         spec_tok[0]   = id_last;
         spec_depth[0] = 0;
         for (int d = 1; d < n_spec; ++d) {
