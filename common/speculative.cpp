@@ -3104,67 +3104,115 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
         };
         std::priority_queue<heap_entry> heap;
 
-        const int expand_width = 8; // children pushed per expanded node (their EXPAND_WIDTH)
-        std::vector<float> logits(n_cand);
+        const int expand_width = 8; // frontier nodes per round AND children pushed per node (their EXPAND_WIDTH)
         std::vector<int>   order(n_cand);
+        std::vector<float> round_logits;
         std::vector<std::vector<int32_t>> node_anc(1); // ancestor slots per node; root has none
+        int n_rounds = 0;
 
-        // Weaver forward for one node → pool log-softmax → push its top children
-        auto expand_node = [&](int node, llama_token token, int node_depth, float path_score) {
-            const int depth_idx = std::min(node_depth, n_depths - 1);
-            const auto & anc = node_anc[node];
-            if (!weaver_expand_token(weaver, token, depth_idx,
-                                     anc.data(), (int) anc.size(), node, logits.data())) {
-                return;
+        // one Weaver graph for a frontier round (nodes at consecutive slots), then a
+        // pool log-softmax per node → push its top children
+        auto expand_round = [&](const std::vector<int32_t>     & rnodes,
+                                const std::vector<llama_token> & rtokens,
+                                const std::vector<int32_t>     & rdepths,
+                                const std::vector<float>       & rscores) -> bool {
+            const int R = (int) rnodes.size();
+            std::vector<int32_t> depth_idx(R);
+            std::vector<int32_t> anc_flat;
+            std::vector<int32_t> anc_offs(1, 0);
+            for (int r = 0; r < R; ++r) {
+                depth_idx[r] = std::min((int) rdepths[r], n_depths - 1);
+                const auto & anc = node_anc[rnodes[r]];
+                anc_flat.insert(anc_flat.end(), anc.begin(), anc.end());
+                anc_offs.push_back((int32_t) anc_flat.size());
             }
-            const size_t base = (size_t) depth_idx * n_cand;
-            float mx = -INFINITY;
-            for (int i = 0; i < n_cand; ++i) {
-                if (pool_ids[base + i] >= 0 && logits[i] > mx) mx = logits[i];
+            round_logits.resize((size_t) R * n_cand);
+            if (!weaver_expand_batch(weaver, rtokens.data(), depth_idx.data(), R,
+                                     anc_flat.data(), anc_offs.data(), rnodes[0],
+                                     round_logits.data())) {
+                return false;
             }
-            if (mx == -INFINITY) {
-                return;
-            }
-            double sum = 0.0;
-            for (int i = 0; i < n_cand; ++i) {
-                if (pool_ids[base + i] >= 0) sum += expf(logits[i] - mx);
-            }
-            const float log_denom = logf((float) sum) + mx;
+            n_rounds++;
+            for (int r = 0; r < R; ++r) {
+                if (rdepths[r] >= n_depths) {
+                    continue; // children would exceed the pool horizon
+                }
+                const float * logits = round_logits.data() + (size_t) r * n_cand;
+                const size_t   base  = (size_t) depth_idx[r] * n_cand;
+                float mx = -INFINITY;
+                for (int i = 0; i < n_cand; ++i) {
+                    if (pool_ids[base + i] >= 0 && logits[i] > mx) mx = logits[i];
+                }
+                if (mx == -INFINITY) {
+                    continue;
+                }
+                double sum = 0.0;
+                for (int i = 0; i < n_cand; ++i) {
+                    if (pool_ids[base + i] >= 0) sum += expf(logits[i] - mx);
+                }
+                const float log_denom = logf((float) sum) + mx;
 
-            for (int i = 0; i < n_cand; ++i) order[i] = i;
-            const int top = std::min(expand_width, n_cand);
-            std::partial_sort(order.begin(), order.begin() + top, order.end(),
-                    [&](int a, int b) { return logits[a] > logits[b]; });
-            for (int r = 0; r < top; ++r) {
-                const int i = order[r];
-                if (pool_ids[base + i] < 0) continue;
-                heap.push({path_score + logits[i] - log_denom, node, node_depth + 1,
-                           (llama_token) pool_ids[base + i]});
+                for (int i = 0; i < n_cand; ++i) order[i] = i;
+                const int top = std::min(expand_width, n_cand);
+                std::partial_sort(order.begin(), order.begin() + top, order.end(),
+                        [&](int a, int b) { return logits[a] > logits[b]; });
+                for (int c = 0; c < top; ++c) {
+                    const int i = order[c];
+                    if (pool_ids[base + i] < 0) continue;
+                    heap.push({rscores[r] + logits[i] - log_denom, rnodes[r], (int) rdepths[r] + 1,
+                               (llama_token) pool_ids[base + i]});
+                }
             }
+            return true;
         };
 
-        // root = the bonus token (depth 0, Weaver KV slot 0)
-        expand_node(0, id_last, 0, 0.0f);
+        // root round = the bonus token alone (depth 0, Weaver KV slot 0)
+        if (!expand_round({0}, {id_last}, {0}, {0.0f})) {
+            LOG_ERR("weaver: root expansion failed\n");
+            return;
+        }
 
         while (!heap.empty() && tree.n_nodes < tree_budget) {
-            const heap_entry e = heap.top();
-            heap.pop();
-            if (tree.child_maps[e.parent].count(e.token)) {
-                continue;
+            // accept the top expand_width heap entries as this round's nodes
+            std::vector<int32_t>     rnodes;
+            std::vector<llama_token> rtokens;
+            std::vector<int32_t>     rdepths;
+            std::vector<float>       rscores;
+            while (!heap.empty() && (int) rnodes.size() < expand_width && tree.n_nodes < tree_budget) {
+                const heap_entry e = heap.top();
+                heap.pop();
+                if (tree.child_maps[e.parent].count(e.token)) {
+                    continue;
+                }
+                const int node = tree.n_nodes + 1;
+                tree.tokens.push_back(e.token);
+                tree.parents.push_back(e.parent);
+                tree.depths.push_back(e.depth);
+                tree.child_maps.push_back({});
+                tree.child_maps[e.parent][e.token] = node;
+                tree.n_nodes++;
+
+                node_anc.push_back(node_anc[e.parent]);
+                node_anc.back().push_back(e.parent);
+
+                rnodes.push_back(node);
+                rtokens.push_back(e.token);
+                rdepths.push_back(e.depth);
+                rscores.push_back(e.log_w);
             }
-            const int node = tree.n_nodes + 1;
-            tree.tokens.push_back(e.token);
-            tree.parents.push_back(e.parent);
-            tree.depths.push_back(e.depth);
-            tree.child_maps.push_back({});
-            tree.child_maps[e.parent][e.token] = node;
-            tree.n_nodes++;
-
-            node_anc.push_back(node_anc[e.parent]);
-            node_anc.back().push_back(e.parent);
-
-            if (e.depth < n_depths) {
-                expand_node(node, e.token, e.depth, e.log_w);
+            if (rnodes.empty()) {
+                break;
+            }
+            // skip the graph when nothing in this round can still produce children
+            bool need = tree.n_nodes < tree_budget;
+            if (need) {
+                need = false;
+                for (int32_t d : rdepths) {
+                    if (d < n_depths) { need = true; break; }
+                }
+            }
+            if (need && !expand_round(rnodes, rtokens, rdepths, rscores)) {
+                break;
             }
         }
 
@@ -3188,8 +3236,8 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
         }
 
         const int64_t t1 = ggml_time_us();
-        LOG_INF("weaver: built tree with %d nodes (chain prefix %d, budget %d, pool %d) in %.1fms\n",
-                tree.n_nodes, tree.main_path_len, tree_budget, n_cand, (t1 - t0) / 1e3);
+        LOG_INF("weaver: built tree with %d nodes (chain prefix %d, budget %d, pool %d, %d rounds) in %.1fms\n",
+                tree.n_nodes, tree.main_path_len, tree_budget, n_cand, n_rounds, (t1 - t0) / 1e3);
     }
 
     void draft_tree(

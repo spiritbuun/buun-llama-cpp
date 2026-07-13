@@ -50,9 +50,9 @@ void weaver_set_candidates(weaver_scorer * ws, int depth,
                            const float * lm_rows, const float * scores, int n_cand);
 
 // Expand one node: embed_row = raw target token-embedding row [d_model] of the node's
-// token; ancestor_slots = node-pool slots of the root->parent path (ascending depth);
-// this node's K/V are stored at self_slot. Writes logits_out[n_cand of that depth]
-// (prior + residual). Returns false on invalid args.
+// token; ancestor_slots = node-pool slots of the root->parent path (ascending depth,
+// all < self_slot); this node's K/V are stored at self_slot. Writes logits_out[n_cand
+// of that depth] (prior + residual). Returns false on invalid args.
 bool weaver_expand(weaver_scorer * ws,
                    const float * embed_row, int depth,
                    const int32_t * ancestor_slots, int n_ancestors, int self_slot,
@@ -78,3 +78,13 @@ bool weaver_expand_token(weaver_scorer * ws,
                          int32_t token, int depth,
                          const int32_t * ancestor_slots, int n_ancestors, int self_slot,
                          float * logits_out);
+
+// Batched expansion: one graph for a whole frontier round of n_nodes nodes stored at
+// the CONSECUTIVE slots [slot_base, slot_base + n_nodes). tokens/depths: [n_nodes]
+// (depths pre-clamped to the pool horizon). Node r's ancestors (all < slot_base) are
+// anc_slots[anc_offs[r] .. anc_offs[r+1]); anc_offs has n_nodes+1 entries. Writes
+// logits_out[n_nodes * n_cand] node-major, n_cand = the (uniform) pool size per depth.
+bool weaver_expand_batch(weaver_scorer * ws,
+                         const int32_t * tokens, const int32_t * depths, int n_nodes,
+                         const int32_t * anc_slots, const int32_t * anc_offs,
+                         int slot_base, float * logits_out);
