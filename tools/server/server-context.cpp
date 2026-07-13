@@ -328,7 +328,6 @@ struct server_slot {
     // Hybrid model: recurrent state backup for speculative decoding
     bool has_draft_backup = false;
     llama_seq_id seq_id_backup = -1;
-    llama_seq_id seq_id_branch = -1; // DDTree: seq holding off-backbone tree nodes during verify
     int  n_tokens_before_draft = 0; // prompt token count before draft tokens were added
 
     void reset() {
@@ -361,7 +360,6 @@ struct server_slot {
         n_accepted_per_pos.clear();
         has_draft_backup = false;
         seq_id_backup = -1;
-        seq_id_branch = -1;
         n_tokens_before_draft = 0;
 
         task_prev = std::move(task);
@@ -544,9 +542,6 @@ struct server_slot {
             // clean up speculative backup sequence to avoid orphaned KV cells
             if (has_draft_backup && seq_id_backup >= 0) {
                 llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id_backup, -1, -1);
-            }
-            if (seq_id_branch >= 0) {
-                llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id_branch, -1, -1);
             }
 
             // do not keep context of the child slots - the parent's context is enough
@@ -1551,9 +1546,7 @@ private:
         if (params_base.speculative.has_dft() ||
             params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) ||
             params_base.speculative.has_model_free_type()) {
-            // +1: DDTree needs a branch sequence so rejected off-backbone nodes can be
-            // dropped with a single seq_rm
-            params_base.n_parallel = n_parallel_user * 2 + (params_base.speculative.tree_budget > 0 ? 1 : 0);
+            params_base.n_parallel = n_parallel_user * 2;
             n_seq_max_full = params_base.n_parallel;
             recurrent_expanded = false;
 
@@ -4691,8 +4684,13 @@ private:
         tree_mask_armed = true;
 
         const llama_pos pos_root = slot.prompt.tokens.pos_next();
-        slot.seq_id_branch = 2 * n_parallel_user + slot.id;
 
+        // ALL tree tokens go on the slot seq (siblings share positions). Attention is fully
+        // governed by the visibility overwrite, and the recurrent layers need the tree to be
+        // ONE sequence: a separate branch seq makes the ubatch group branch tokens into their
+        // own recurrent sequence with its own cell state and seq-LOCAL parent indexing —
+        // exactly wrong states for branch nodes (the original SD-071 design had this bug).
+        // Rejected nodes at duplicate positions are cleaned by the restore + re-decode accept.
         bool add_ok = true;
 
         slot.spec_i_batch.push_back(batch.size());
@@ -4701,8 +4699,7 @@ private:
 
         for (int i = 0; i < tree.n_nodes; ++i) {
             slot.spec_i_batch.push_back(batch.size());
-            const llama_seq_id sid = (i < tree.main_path_len) ? slot.id : slot.seq_id_branch;
-            add_ok &= batch.add(sid, tree.tokens[i], pos_root + tree.depths[i], true);
+            add_ok &= batch.add(slot.id, tree.tokens[i], pos_root + tree.depths[i], true);
         }
         GGML_ASSERT(add_ok && "batch must be large enough to hold the tree verify tokens");
 
@@ -4784,14 +4781,10 @@ private:
         // (A tree-aware tape replay could avoid the re-decode for on-backbone accepts —
         // the accepted tokens are a batch prefix — but the tape currently interleaves
         // branch nodes; see the EXP-37 ledger.)
-        if (!on_main_path) {
-            SLT_DBG(slot, "tree: off-backbone accept (commit_n = %d, accepted = %d)\n", commit_n, (int) ids.size() - 1);
-        }
+        SLT_DBG(slot, "tree accept: nodes=%d backbone=%d commit=%d on_main=%d accepted=%d\n",
+                tree.n_nodes, tree.main_path_len, commit_n, on_main_path ? 1 : 0, (int) ids.size() - 1);
 
         llama_clear_tree_parent_ids(ctx_tgt);
-        if (slot.seq_id_branch >= 0) {
-            llama_memory_seq_rm(mem, slot.seq_id_branch, -1, -1);
-        }
 
         if (needs_reeval && slot.has_draft_backup) {
             llama_memory_seq_rm(mem, slot.id, pos_root, -1);
@@ -4814,15 +4807,10 @@ private:
                 llama_decode(ctx_tgt, batch_reeval);
                 llama_batch_free(batch_reeval);
             }
-        } else if (on_main_path) {
-            // attention-only target, accepted nodes already on the slot seq — drop the tail
-            llama_memory_seq_rm(mem, slot.id, slot.prompt.tokens.pos_next(), -1);
-            if (slot.has_draft_backup) {
-                llama_memory_seq_rm(mem, slot.seq_id_backup, -1, -1);
-            }
         } else {
-            // attention-only target, off-backbone accept: the KV prefix below the root is
-            // untouched — drop the tree tail and re-decode the accepted tokens
+            // attention-only target: rejected nodes share the slot seq at duplicate
+            // positions, so the tree cells can't be kept — drop everything from the root
+            // (the KV prefix below it is untouched) and re-decode the accepted tokens
             llama_memory_seq_rm(mem, slot.id, pos_root, -1);
             if (slot.has_draft_backup) {
                 llama_memory_seq_rm(mem, slot.seq_id_backup, -1, -1);
@@ -4838,7 +4826,6 @@ private:
                 llama_batch_free(batch_reeval);
             }
         }
-        slot.seq_id_branch = -1;
         slot.has_draft_backup = false;
         slot.seq_id_backup = -1;
 

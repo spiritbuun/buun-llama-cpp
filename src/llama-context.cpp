@@ -3242,9 +3242,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
-    // DDTree verify batches put off-backbone nodes on a branch sequence whose positions
-    // legitimately have gaps and duplicates — the tree visibility mask governs attention
-    if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all, tree_mask.active)) {
+    if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
