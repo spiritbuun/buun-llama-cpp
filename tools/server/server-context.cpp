@@ -1699,6 +1699,15 @@ private:
                 params_dft.n_ubatch = LLAMA_DFLASH_MAX_SLOTS * block_size;
                 params_dft.n_parallel = std::max(1,
                     std::min(params_base.speculative.dflash_max_slots, params_base.n_parallel));
+
+                // --spec-dflash-default leaves draft-max at -1 = auto: the drafter emits
+                // at most block_size - 1 tokens per step and the full depth strictly wins
+                // (EXP-37i depth sweep) — resolve it here so slot task defaults see it
+                if (params_base.speculative.n_max < 0) {
+                    params_base.speculative.n_max = block_size > 1 ? block_size - 1 : 12;
+                    SRV_INF("draft-max auto (DFlash): %d (drafter block_size %d)\n",
+                            params_base.speculative.n_max, block_size);
+                }
             }
 
             params_base.speculative.model_dft = model_dft.get();

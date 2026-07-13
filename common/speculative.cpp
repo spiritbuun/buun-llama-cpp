@@ -993,6 +993,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             mask_token_id = (llama_token) llama_model_dflash_mask_token_id(model_dft);
         }
 
+        // n_max < 0 = auto (--spec-dflash-default): the full block depth strictly wins
+        // (EXP-37i). The server resolves this at model load; this covers the other
+        // binaries (llama-cli, speculative-simple).
+        if (this->params.n_max < 0) {
+            this->params.n_max = block_size > 1 ? block_size - 1 : 12;
+        }
+
         LOG_INF("%s: adding speculative implementation 'draft-dflash'\n", __func__);
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u\n", __func__, block_size, mask_token_id, target_layer_ids_n);

@@ -5127,14 +5127,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
 
     add_opt(common_arg(
         {"--spec-dflash-default"},
-        string_format("enable default DFlash speculative decoding config (requires -md)"),
+        string_format("enable default DFlash speculative decoding config (requires -md); draft depth defaults to the drafter's block_size - 1 (override with --draft-max)"),
         [](common_params & params) {
             params.speculative.types = { COMMON_SPECULATIVE_TYPE_DFLASH };
             params.speculative.p_min = 0.0f;
-            // n_max=12: EXP-37 re-tune (2026-07-13, Qwen3.6-27B-Q4_K_M + dflash-draft-3.6-q8_0,
-            // RTX 3090, code prompts): n_max=7 -> ~66 t/s, 12 -> 110-120 t/s, 15 -> 116-121 t/s
-            // (workload-dependent past 12). 12 is the robust middle; 7 left ~2x on the table.
-            params.speculative.n_max = 12;
+            // n_max=-1 = auto: resolved to the drafter's block_size - 1 at model load.
+            // The drafter can't emit more than block_size - 1 tokens per step, and the
+            // EXP-37i depth sweep (2026-07-13, chat endpoint with thinking disabled,
+            // Qwen3.6-27B + dflash-draft-3.6, RTX 3090) showed the full depth strictly
+            // wins (dm12 176 -> dm15 222 t/s quicksort, 151 -> 185 linked-list) with
+            // every dm >= block-1 identical (the draft horizon clamps there). The
+            // earlier n_max=12 tune was measured on raw /completion probes whose
+            // acceptance was depressed by thinking-mode near-ties.
+            params.speculative.n_max = -1;
             params.speculative.n_min = 0;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SPECULATIVE}));
