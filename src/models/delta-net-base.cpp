@@ -433,6 +433,43 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         int           il) {
     const int64_t n_seq_tokens = q->ne[2];
 
+    // DDTree verify: the running state follows parent pointers instead of batch order,
+    // storing per-node states in the persistent f16 intermediates buffer
+    if (tree_parent_ids && n_seq_tokens > 1 && tree_ssm_intermediates) {
+        int recurrent_idx = 0;
+        for (int i = 0; i < il; i++) {
+            if (hparams.is_recr(i)) {
+                recurrent_idx++;
+            }
+        }
+
+        GGML_ASSERT(recurrent_idx < tree_n_recurrent_layers);
+        ggml_tensor * persist_inter = (*tree_ssm_intermediates)[recurrent_idx];
+
+        const int64_t S_v      = v->ne[0];
+        const int64_t H_v      = v->ne[1];
+        const int64_t n_tokens = v->ne[2];
+        const int64_t n_seqs   = v->ne[3];
+
+        ggml_tensor * result = ggml_gated_delta_net_tree(ctx0, q, k, v, g, b, s, tree_parent_ids, persist_inter);
+        cb(result, "fgdn_tree", il);
+
+        ggml_tensor * output = ggml_view_4d(ctx0, result,
+                S_v, H_v, n_tokens, n_seqs,
+                ggml_row_size(result->type, S_v),
+                ggml_row_size(result->type, S_v * H_v),
+                ggml_row_size(result->type, S_v * H_v * n_tokens), 0);
+
+        ggml_tensor * new_state = ggml_view_4d(ctx0, result,
+                S_v, S_v, H_v, n_seqs,
+                ggml_row_size(result->type, S_v),
+                ggml_row_size(result->type, S_v * S_v),
+                ggml_row_size(result->type, S_v * S_v * H_v),
+                ggml_row_size(result->type, S_v * H_v * n_tokens * n_seqs));
+
+        return {output, new_state};
+    }
+
     if (n_seq_tokens == 1) {
         if (cparams.fused_gdn_ar) {
             return build_delta_net_fused(q, k, v, g, b, s, il);
@@ -476,6 +513,12 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     const int64_t row_count = (conv_kernel_size - 1) * conv_channels;
 
     const size_t row_size  = ggml_row_size(conv_states_all->type, row_count);
+
+    // DDTree verify: don't write the conv state cache — the batch is a tree (last tokens
+    // are branches), and the accept path restores/rebuilds the state after the walk
+    if (tree_parent_ids && ubatch.n_tokens > 1) {
+        return conv_input;
+    }
 
     if (cparams.n_rs_seq == 0) {
         const int64_t s_idx  = conv_input->ne[0] - conv_states->ne[0];

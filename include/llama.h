@@ -1227,6 +1227,11 @@ extern "C" {
     // DDTree: allocate persistent SSM intermediate buffers for tree verification
     LLAMA_API void llama_allocate_tree_buffers(struct llama_context * ctx, int max_tree_tokens);
 
+    // true if tree verify buffers are usable (allocates on demand; false on multi-GPU,
+    // where recurrent layers can't read the GPU-0 parent ids and tree verification
+    // would silently run the linear kernels)
+    LLAMA_API bool llama_tree_buffers_available(struct llama_context * ctx, int max_tree_tokens);
+
     // DDTree: rollback SSM state to committed token using stored intermediates
     LLAMA_API void llama_tree_rollback(struct llama_context * ctx, int commit_n, const int32_t * parents, int n_seq0);
 

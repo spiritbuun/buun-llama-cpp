@@ -5563,6 +5563,11 @@ void llama_allocate_tree_buffers(llama_context * ctx, int max_tree_tokens) {
     ctx->allocate_tree_buffers(max_tree_tokens);
 }
 
+bool llama_tree_buffers_available(llama_context * ctx, int max_tree_tokens) {
+    ctx->allocate_tree_buffers(max_tree_tokens);
+    return ctx->tree_buffers_usable(max_tree_tokens);
+}
+
 void llama_tree_rollback(llama_context * ctx, int commit_n, const int32_t * parents, int n_seq0) {
     ctx->set_tree_seq0_count(n_seq0);
     ctx->tree_rollback(commit_n, parents);

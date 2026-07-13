@@ -4106,6 +4106,11 @@ llama_tokens common_speculative_tree_accept(
             break; // no drafted child matches — this token is the bonus token
         }
 
+        // TEMP DIAG: refuse off-backbone accepts (branch-node logits suspect)
+        if (it->second > tree.main_path_len) {
+            break;
+        }
+
         current  = it->second;
         commit_n = current;
 

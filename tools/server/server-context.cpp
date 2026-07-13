@@ -1610,6 +1610,15 @@ private:
             params_base.speculative.tree_budget = 0;
         }
 
+        // hybrid targets additionally need the tree SSM buffers (GPU-0-only; unavailable
+        // under multi-GPU splits) — without them the recurrent layers would silently run
+        // the linear kernels and verify branch nodes against wrong states
+        if (params_base.speculative.tree_budget > 0 && needs_reeval &&
+            !llama_tree_buffers_available(ctx_tgt, params_base.speculative.tree_budget + 1)) {
+            SRV_WRN("%s", "DDTree SSM buffers unavailable (multi-GPU split?); disabling tree verification\n");
+            params_base.speculative.tree_budget = 0;
+        }
+
         if (is_diffusion) {
             SRV_INF("%s", "diffusion model detected — enabling self-speculation\n");
         }

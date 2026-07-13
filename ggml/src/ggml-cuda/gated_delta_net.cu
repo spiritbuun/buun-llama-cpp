@@ -330,10 +330,313 @@ static void ggml_cuda_op_gated_delta_net_impl(
     }
 }
 
+// ---- DDTree: tree-aware GDN ----
+// Same per-token scan as gated_delta_net_cuda, but the running state follows the tree's
+// parent pointers instead of batch order: a branch transition reloads the parent's state
+// from the f16 intermediates buffer, and every token stores its post-update state there.
+// The final cell-state write is that of the LAST batch token (a branch, in general) —
+// callers must not rely on it (the server restores from backup after tree verifies).
+
+#define GDN_TREE_ROOT_PARENT (-1)
+
+template <int S_v, bool KDA>
+__global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, GGML_GDN_MIN_BLOCKS_PER_SM)
+gated_delta_net_tree_cuda(const float * q,
+                          const float * k,
+                          const float * v,
+                          const float * g,
+                          const float * beta,
+                          const float * curr_state,
+                          const int32_t * parent_ids,
+                          half *        persist_inter,
+                          float *       dst,
+                          float *       state,
+                          int64_t       H,
+                          int64_t       n_tokens,
+                          int64_t       n_seqs,
+                          int64_t       sq1,
+                          int64_t       sq2,
+                          int64_t       sq3,
+                          int64_t       sv1,
+                          int64_t       sv2,
+                          int64_t       sv3,
+                          int64_t       sb1,
+                          int64_t       sb2,
+                          int64_t       sb3,
+                          const uint3   neqk1_magic,
+                          const uint3   rq3_magic,
+                          float         scale) {
+    const uint32_t h_idx    = blockIdx.x;
+    const uint32_t sequence = blockIdx.y;
+    const int      lane     = threadIdx.x;
+    const int      col      = blockIdx.z * blockDim.y + threadIdx.y;
+
+    const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
+    const uint32_t iq3 = fastdiv(sequence, rq3_magic);
+
+    float * attn_data = dst;
+
+    const int64_t state_offset = (sequence * H + h_idx) * S_v * S_v;
+    state += state_offset;
+    curr_state += sequence * H * S_v * S_v + h_idx * S_v * S_v + col * S_v;
+    attn_data += (sequence * n_tokens * H + h_idx) * S_v;
+
+    // persist_inter layout: [S_v, S_v, H, n_tokens, n_seqs]
+    const int64_t inter_stride_token = H * S_v * S_v;
+    half * inter_seq_base = persist_inter + sequence * n_tokens * inter_stride_token;
+
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v;
+    static_assert(S_v % warp_size == 0, "S_v must be a multiple of warp_size");
+    constexpr int rows_per_lane = (S_v + warp_size - 1) / warp_size;
+    float         s_shard[rows_per_lane];
+
+    ggml_cuda_pdl_sync();
+#pragma unroll
+    for (int r = 0; r < rows_per_lane; r++) {
+        const int i = r * warp_size + lane;
+        s_shard[r]  = curr_state[i];
+    }
+
+    for (int t = 0; t < n_tokens; t++) {
+        if (t > 0) {
+            const int parent_t = parent_ids[t];
+            if (parent_t == GDN_TREE_ROOT_PARENT) {
+                // sibling of the root token: restart from the initial state
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    const int i = r * warp_size + lane;
+                    s_shard[r] = curr_state[i];
+                }
+            } else if (parent_t != t - 1) {
+                // branch transition: reload the parent's stored state (f16 → f32)
+                const half * parent_inter = inter_seq_base + parent_t * inter_stride_token + h_idx * S_v * S_v;
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    const int i = r * warp_size + lane;
+                    s_shard[r] = __half2float(parent_inter[col * S_v + i]);
+                }
+            }
+            // parent_t == t-1: sequential, state already in registers
+        }
+
+        const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
+        const float * k_t = k + iq3 * sq3 + t * sq2 + iq1 * sq1;
+        const float * v_t = v + sequence * sv3 + t * sv2 + h_idx * sv1;
+
+        const int64_t gb_offset = sequence * sb3 + t * sb2 + h_idx * sb1;
+        const float * beta_t = beta + gb_offset;
+        const float * g_t    = g    + gb_offset * (KDA ? S_v : 1);
+
+        const float beta_val = *beta_t;
+
+        float k_reg[rows_per_lane];
+        float q_reg[rows_per_lane];
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            const int i = r * warp_size + lane;
+            k_reg[r] = k_t[i];
+            q_reg[r] = q_t[i];
+        }
+
+        if constexpr (!KDA) {
+            const float g_val = GDN_EXPF(*g_t);
+
+            float kv_shard = 0.0f;
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                kv_shard += s_shard[r] * k_reg[r];
+            }
+            float kv_col = warp_reduce_sum<warp_size>(kv_shard);
+
+            float delta_col = (v_t[col] - g_val * kv_col) * beta_val;
+
+            float attn_partial = 0.0f;
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                s_shard[r]  = g_val * s_shard[r] + k_reg[r] * delta_col;
+                attn_partial += s_shard[r] * q_reg[r];
+            }
+
+            float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+
+            if (lane == 0) {
+                attn_data[col] = attn_col * scale;
+            }
+        } else {
+            float kv_shard = 0.0f;
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                const int i = r * warp_size + lane;
+                kv_shard += GDN_EXPF(g_t[i]) * s_shard[r] * k_reg[r];
+            }
+
+            float kv_col = warp_reduce_sum<warp_size>(kv_shard);
+
+            float delta_col = (v_t[col] - kv_col) * beta_val;
+
+            float attn_partial = 0.0f;
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                const int i = r * warp_size + lane;
+                s_shard[r]  = GDN_EXPF(g_t[i]) * s_shard[r] + k_reg[r] * delta_col;
+                attn_partial += s_shard[r] * q_reg[r];
+            }
+
+            float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+
+            if (lane == 0) {
+                attn_data[col] = attn_col * scale;
+            }
+        }
+
+        // store this token's post-update state for its children (f32 → f16)
+        {
+            half * inter_t = inter_seq_base + t * inter_stride_token + h_idx * S_v * S_v;
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                const int i = r * warp_size + lane;
+                inter_t[col * S_v + i] = __float2half(s_shard[r]);
+            }
+        }
+
+        attn_data += S_v * H;
+    }
+
+#pragma unroll
+    for (int r = 0; r < rows_per_lane; r++) {
+        const int i          = r * warp_size + lane;
+        state[col * S_v + i] = s_shard[r];
+    }
+}
+
+template <bool KDA>
+static void launch_gated_delta_net_tree(
+        const float * q_d, const float * k_d, const float * v_d,
+        const float * g_d, const float * b_d, const float * s_d,
+        const int32_t * p_d, half * i_d,
+        float * dst_d, float * state_d,
+        int64_t S_v,   int64_t H, int64_t n_tokens, int64_t n_seqs,
+        int64_t sq1,   int64_t sq2, int64_t sq3,
+        int64_t sv1,   int64_t sv2, int64_t sv3,
+        int64_t sb1,   int64_t sb2, int64_t sb3,
+        int64_t neqk1, int64_t rq3,
+        float scale, cudaStream_t stream) {
+    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+    const int num_warps = 4;
+    dim3      grid_dims(H, n_seqs, (S_v + num_warps - 1) / num_warps);
+    dim3      block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
+
+    const uint3 neqk1_magic = init_fastdiv_values(neqk1);
+    const uint3 rq3_magic   = init_fastdiv_values(rq3);
+
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
+    switch (S_v) {
+        case 16:
+            ggml_cuda_kernel_launch(gated_delta_net_tree_cuda<16, KDA>, launch_params,
+                q_d, k_d, v_d, g_d, b_d, s_d, p_d, i_d, dst_d, state_d, H,
+                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+            break;
+        case 32:
+            ggml_cuda_kernel_launch(gated_delta_net_tree_cuda<32, KDA>, launch_params,
+                q_d, k_d, v_d, g_d, b_d, s_d, p_d, i_d, dst_d, state_d, H,
+                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+            break;
+        case 64:
+            ggml_cuda_kernel_launch(gated_delta_net_tree_cuda<64, KDA>, launch_params,
+                q_d, k_d, v_d, g_d, b_d, s_d, p_d, i_d, dst_d, state_d, H,
+                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+            break;
+        case 128:
+            ggml_cuda_kernel_launch(gated_delta_net_tree_cuda<128, KDA>, launch_params,
+                q_d, k_d, v_d, g_d, b_d, s_d, p_d, i_d, dst_d, state_d, H,
+                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+            break;
+        default:
+            GGML_ABORT("fatal error");
+            break;
+    }
+}
+
 void ggml_cuda_op_gated_delta_net_tree(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    GGML_ABORT("tree GDN kernel not yet ported to upstream state layout");
-    GGML_UNUSED(ctx);
-    GGML_UNUSED(dst);
+    ggml_tensor * src_q      = dst->src[0];
+    ggml_tensor * src_k      = dst->src[1];
+    ggml_tensor * src_v      = dst->src[2];
+    ggml_tensor * src_g      = dst->src[3];
+    ggml_tensor * src_beta   = dst->src[4];
+    ggml_tensor * src_state  = dst->src[5];
+    ggml_tensor * src_parent = dst->src[6];
+    ggml_tensor * src_inter  = dst->src[7];
+
+    GGML_TENSOR_LOCALS(int64_t, neq, src_q, ne);
+    GGML_TENSOR_LOCALS(size_t , nbq, src_q, nb);
+    GGML_TENSOR_LOCALS(int64_t, nek, src_k, ne);
+    GGML_TENSOR_LOCALS(int64_t, nev, src_v, ne);
+    GGML_TENSOR_LOCALS(size_t,  nbv, src_v, nb);
+    GGML_TENSOR_LOCALS(size_t,  nbb, src_beta, nb);
+
+    const int64_t S_v      = nev0;
+    const int64_t H        = nev1;
+    const int64_t n_tokens = nev2;
+    const int64_t n_seqs   = nev3;
+
+    const bool kda = (src_g->ne[0] == S_v);
+
+    GGML_ASSERT(neq1 == nek1);
+    const int64_t neqk1 = neq1;
+
+    const int64_t rq3 = nev3 / neq3;
+
+    const float   * q_d = (const float   *) src_q->data;
+    const float   * k_d = (const float   *) src_k->data;
+    const float   * v_d = (const float   *) src_v->data;
+    const float   * g_d = (const float   *) src_g->data;
+    const float   * b_d = (const float   *) src_beta->data;
+    const float   * s_d = (const float   *) src_state->data;
+    const int32_t * p_d = (const int32_t *) src_parent->data;
+    half          * i_d = (half          *) src_inter->data;
+
+    float * dst_d = (float *) dst->data;
+
+    GGML_ASSERT(ggml_is_contiguous_rows(src_q));
+    GGML_ASSERT(ggml_is_contiguous_rows(src_k));
+    GGML_ASSERT(ggml_is_contiguous_rows(src_v));
+    GGML_ASSERT(ggml_are_same_stride(src_q, src_k));
+    GGML_ASSERT(src_g->ne[0] == 1 || kda);
+    GGML_ASSERT(ggml_is_contiguous(src_g));
+    GGML_ASSERT(ggml_is_contiguous(src_beta));
+    GGML_ASSERT(ggml_is_contiguous(src_state));
+    GGML_ASSERT(src_parent->type == GGML_TYPE_I32);
+    GGML_ASSERT(src_inter->type == GGML_TYPE_F16);
+
+    const int64_t sq1 = nbq1 / sizeof(float);
+    const int64_t sq2 = nbq2 / sizeof(float);
+    const int64_t sq3 = nbq3 / sizeof(float);
+    const int64_t sv1 = nbv1 / sizeof(float);
+    const int64_t sv2 = nbv2 / sizeof(float);
+    const int64_t sv3 = nbv3 / sizeof(float);
+    const int64_t sb1 = nbb1 / sizeof(float);
+    const int64_t sb2 = nbb2 / sizeof(float);
+    const int64_t sb3 = nbb3 / sizeof(float);
+
+    const float scale = 1.0f / sqrtf((float) S_v);
+
+    cudaStream_t stream = ctx.stream();
+
+    float * state_d = dst_d + S_v * H * n_tokens * n_seqs;
+
+    if (kda) {
+        launch_gated_delta_net_tree<true>(q_d, k_d, v_d, g_d, b_d, s_d, p_d, i_d, dst_d, state_d,
+            S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+            sb1, sb2, sb3, neqk1, rq3, scale, stream);
+    } else {
+        launch_gated_delta_net_tree<false>(q_d, k_d, v_d, g_d, b_d, s_d, p_d, i_d, dst_d, state_d,
+            S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+            sb1, sb2, sb3, neqk1, rq3, scale, stream);
+    }
 }
 
 void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

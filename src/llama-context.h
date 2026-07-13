@@ -573,6 +573,9 @@ public:
     void allocate_tree_buffers(int max_tree_tokens);
     void tree_rollback(int commit_n, const int32_t * parents);
     void set_tree_seq0_count(int n) { tree_bufs.n_seq0_tokens = n; }
+    bool tree_buffers_usable(int max_tree_tokens) const {
+        return !tree_bufs.disabled && tree_bufs.max_tree_tokens >= max_tree_tokens;
+    }
 
     // fork data members
     std::vector<int32_t> logits_argmax_buf;
