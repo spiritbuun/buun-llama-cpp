@@ -2628,6 +2628,14 @@ void llama_model_share_tensors(llama_model * dst, const llama_model * src) {
     dst->output   = src->output;
 }
 
+ggml_tensor * llama_model_tok_embd_tensor(const llama_model * model) {
+    return model->tok_embd;
+}
+
+ggml_tensor * llama_model_output_tensor(const llama_model * model) {
+    return model->output;
+}
+
 int32_t llama_model_dflash_block_size(const llama_model * model) {
     return (int32_t) model->hparams.dflash_block_size;
 }

@@ -399,6 +399,10 @@ struct common_params_speculative {
     float   sample_temp = 0.0f; // drafter sampling temperature (0 = greedy, >0 = Gumbel sampling)
     int32_t draft_topk  = 1;   // top-K candidates per drafter position (1 = argmax only)
 
+    // Weaver tree-draft scorer (EXP-40): conditional rescoring of DFlash candidate pools
+    std::string weaver_model;    // scorer GGUF path ("" = raw-marginal DDTree)
+    int32_t     weaver_topk = 64; // candidate pool per depth (kernel cap 64; paper uses 512)
+
     // DFlash draft model (separate from upstream's draft.model)
     struct common_params_model mparams_dft;
     llama_model * model_dft = nullptr;

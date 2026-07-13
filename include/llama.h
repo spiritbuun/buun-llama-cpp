@@ -1261,6 +1261,11 @@ extern "C" {
     // Used to avoid duplicating embedding/lm_head weights between target and drafter
     LLAMA_API void llama_model_share_tensors(struct llama_model * dst, const struct llama_model * src);
 
+    // Weaver: direct access to the model's token-embedding / lm_head tensors
+    // (device-side row gathers by the tree-draft scorer)
+    LLAMA_API struct ggml_tensor * llama_model_tok_embd_tensor(const struct llama_model * model);
+    LLAMA_API struct ggml_tensor * llama_model_output_tensor  (const struct llama_model * model);
+
     //
     // backend sampling API [EXPERIMENTAL]
     // note: use only if the llama_context was created with at least one llama_sampler_seq_config
