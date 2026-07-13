@@ -4009,7 +4009,10 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
-        /*.tree_mask   =*/ tree_mask.active ? &tree_mask : nullptr,
+        // always pass the (stable) tree-mask address — set_input gates on ->active.
+        // Gating the pointer here instead would bake a stale nullptr into reused graphs'
+        // input objects and silently skip the visibility overwrite on tree verify decodes.
+        /*.tree_mask   =*/ &tree_mask,
         /*.tree_parent_ids         =*/ tree_bufs.active ? tree_bufs.parent_ids_gpu : nullptr,
         /*.tree_ssm_intermediates  =*/ tree_bufs.active ? &tree_bufs.ssm_intermediates : nullptr,
         /*.tree_n_recurrent_layers =*/ (int)tree_bufs.ssm_intermediates.size(),

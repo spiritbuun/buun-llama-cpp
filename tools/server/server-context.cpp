@@ -4760,18 +4760,28 @@ private:
 
         if (on_main_path) {
             // accepted nodes are the backbone prefix, already on the slot seq at the right
-            // positions — restore SSM/conv state from the tree-kernel intermediates at the
-            // deepest accepted node (also clears the parent-ids wiring), then drop the
-            // rejected tail, the branch nodes, and the backup
-            if (needs_reeval) {
-                llama_tree_rollback(ctx_tgt, commit_n, tree.parents.data(), pos_root + commit_n);
-            }
+            // positions. Since the backbone leads the batch, the accepted tokens are also a
+            // tape prefix — the flat rollback (backup restore + fp32 tape replay of the first
+            // ids.size() entries) applies unchanged. Clearing the parent ids first routes
+            // dflash_rollback to its flat branch, which keeps the accepted attention KV.
+            llama_clear_tree_parent_ids(ctx_tgt);
             if (slot.seq_id_branch >= 0) {
                 llama_memory_seq_rm(mem, slot.seq_id_branch, -1, -1);
             }
-            llama_memory_seq_rm(mem, slot.id, slot.prompt.tokens.pos_next(), -1);
-            if (slot.has_draft_backup) {
-                llama_memory_seq_rm(mem, slot.seq_id_backup, -1, -1);
+
+            // a fully-accepted pure chain leaves the recurrent state exactly at the last
+            // accepted token — no restore needed (mirrors the flat all-accepted path). Any
+            // off-backbone node makes the post-decode recurrent state unpredictable (the
+            // tree kernel processes nodes in batch order), so restore + replay.
+            const bool state_clean = (tree.n_nodes == tree.main_path_len) && (commit_n == tree.n_nodes);
+
+            if (needs_reeval && slot.has_draft_backup && !state_clean) {
+                llama_dflash_rollback(ctx_tgt, slot.id, slot.seq_id_backup, pos_root, (int) ids.size());
+            } else {
+                llama_memory_seq_rm(mem, slot.id, slot.prompt.tokens.pos_next(), -1);
+                if (slot.has_draft_backup) {
+                    llama_memory_seq_rm(mem, slot.seq_id_backup, -1, -1);
+                }
             }
         } else {
             // accepted path left the backbone: rejected backbone nodes sit on the slot seq
