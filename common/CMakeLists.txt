@@ -100,6 +100,8 @@ add_library(${TARGET}
     sampling.h
     speculative.cpp
     speculative.h
+    weaver.cpp
+    weaver.h
     suffix-tree.cpp
     suffix-tree.h
     int32-map.h

@@ -20,6 +20,7 @@ else()
     add_subdirectory(eval-callback)
 
     add_subdirectory(gguf-hash)
+    add_subdirectory(weaver-parity)
     add_subdirectory(gguf)
     add_subdirectory(idle)
     add_subdirectory(lookahead)
