@@ -653,18 +653,27 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     if (tree_mask && tree_mask->active) {
         GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask->buffer));
 
-        float   * mask_data = (float *)   self_kq_mask->data;
-        int64_t * k_idxs    = (int64_t *) self_k_idxs->data;
+        int64_t * k_idxs = (int64_t *) self_k_idxs->data;
 
         const int n = tree_mask->n_tree_tokens;
         const int64_t n_kv = self_kq_mask->ne[0];
 
         GGML_ASSERT((int) ubatch->n_tokens == n);
 
-        for (int i = 0; i < n; ++i) {
-            for (int j = 0; j < n; ++j) {
-                float val = tree_mask->visibility[i * n + j] ? 0.0f : -INFINITY;
-                mask_data[i * n_kv + k_idxs[j]] = val;
+        // the mask dtype follows the flash-attention path (f16 post-sync, f32 otherwise)
+        if (self_kq_mask->type == GGML_TYPE_F16) {
+            ggml_fp16_t * mask_data = (ggml_fp16_t *) self_kq_mask->data;
+            for (int i = 0; i < n; ++i) {
+                for (int j = 0; j < n; ++j) {
+                    mask_data[i * n_kv + k_idxs[j]] = ggml_fp32_to_fp16(tree_mask->visibility[i * n + j] ? 0.0f : -INFINITY);
+                }
+            }
+        } else {
+            float * mask_data = (float *) self_kq_mask->data;
+            for (int i = 0; i < n; ++i) {
+                for (int j = 0; j < n; ++j) {
+                    mask_data[i * n_kv + k_idxs[j]] = tree_mask->visibility[i * n + j] ? 0.0f : -INFINITY;
+                }
             }
         }
     }
