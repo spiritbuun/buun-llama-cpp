@@ -559,12 +559,19 @@ bool weaver_set_candidates_ids(weaver_scorer * ws,
         ws->cand_n[d] = 0;
     }
 
+    // padding ids (< 0) gather row 0 — their scores are masked at expansion
+    const int N = n_depths * n_cand;
+    std::vector<int32_t> ids_cl(ids, ids + N);
+    for (auto & id : ids_cl) {
+        if (id < 0) id = 0;
+    }
+
     const size_t row = (size_t) p.d_model * sizeof(float);
     if (ws->output_host) {
         std::vector<float> stage((size_t) n_cand * p.d_model);
         for (int d = 0; d < n_depths; ++d) {
             for (int i = 0; i < n_cand; ++i) {
-                if (!wvr_dequant_row(ws->tgt_output, ids[(size_t) d * n_cand + i],
+                if (!wvr_dequant_row(ws->tgt_output, ids_cl[(size_t) d * n_cand + i],
                                      stage.data() + (size_t) i * p.d_model, p.d_model)) {
                     return false;
                 }
@@ -576,7 +583,6 @@ bool weaver_set_candidates_ids(weaver_scorer * ws,
     }
 
     // device: one get_rows over all depths, copied into the strided pool views
-    const int N = n_depths * n_cand;
     ggml_init_params ip = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
     ggml_context * ctx = ggml_init(ip);
     ggml_cgraph * gf = ggml_new_graph(ctx);
@@ -591,7 +597,7 @@ bool weaver_set_candidates_ids(weaver_scorer * ws,
 
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, ws->backend);
     GGML_ASSERT(buf && "weaver: candidate gather alloc failed");
-    ggml_backend_tensor_set(ids_t, ids, 0, (size_t) N * sizeof(int32_t));
+    ggml_backend_tensor_set(ids_t, ids_cl.data(), 0, (size_t) N * sizeof(int32_t));
     ggml_backend_graph_compute(ws->backend, gf);
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
@@ -602,7 +608,7 @@ bool weaver_expand_token(weaver_scorer * ws,
                          int32_t token, int depth,
                          const int32_t * ancestor_slots, int n_ancestors, int self_slot,
                          float * logits_out) {
-    if (!ws->tgt_tok_embd) {
+    if (!ws->tgt_tok_embd || token < 0 || token >= ws->tgt_tok_embd->ne[1]) {
         return false;
     }
     if (ws->tok_embd_host) {
