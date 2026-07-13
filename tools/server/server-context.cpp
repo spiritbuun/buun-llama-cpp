@@ -1403,6 +1403,16 @@ private:
             }
         }
 
+        // DDTree constraint: the tree attention mask is context-global and requires the
+        // verify decode to contain exactly the tree tokens, so tree verification only
+        // works with a single user slot. --tree-budget is an explicit opt-in — force
+        // single-slot rather than silently dropping the tree.
+        if (params_base.speculative.tree_budget > 0 && params_base.n_parallel > 1) {
+            SRV_WRN("DDTree (--tree-budget %d) requires a single slot — forcing -np 1 (was %d)\n",
+                    params_base.speculative.tree_budget, params_base.n_parallel);
+            params_base.n_parallel = 1;
+        }
+
         n_parallel_user = params_base.n_parallel;
         recurrent_expanded = true;
         // optionally reserve VRAM for the draft / MTP context before fitting the target model
@@ -1538,19 +1548,11 @@ private:
         // n_parallel_user and llama_memory_recurrent::seq_cp silently no-ops on the
         // out-of-range backup seq — rollback then WIPES the recurrent state instead of
         // restoring it (#74: output stays plausible but wrong, degrading over time).
-        // DDTree constraints: the tree attention mask is context-global and requires the
-        // verify decode to contain exactly the tree tokens, so tree verification only
-        // works with a single user slot. The off-backbone tree nodes also need one extra
-        // sequence (seq_branch) so rejected branches can be dropped with a single seq_rm.
-        if (params_base.speculative.tree_budget > 0 && n_parallel_user > 1) {
-            SRV_WRN("DDTree (--tree-budget %d) requires a single slot; disabling tree verification (np = %d)\n",
-                    params_base.speculative.tree_budget, n_parallel_user);
-            params_base.speculative.tree_budget = 0;
-        }
-
         if (params_base.speculative.has_dft() ||
             params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) ||
             params_base.speculative.has_model_free_type()) {
+            // +1: DDTree needs a branch sequence so rejected off-backbone nodes can be
+            // dropped with a single seq_rm
             params_base.n_parallel = n_parallel_user * 2 + (params_base.speculative.tree_budget > 0 ? 1 : 0);
             n_seq_max_full = params_base.n_parallel;
             recurrent_expanded = false;
