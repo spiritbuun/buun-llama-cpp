@@ -3930,13 +3930,10 @@ private:
                     if (needs_reeval) {
                         if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
                             llama_tape_replay_sync(ctx_tgt);
-                            const int n_batch_tokens = 1 + (int) draft.size();
-                            std::vector<int32_t> linear_parents(n_batch_tokens);
-                            linear_parents[0] = -1;
-                            for (int i = 1; i < n_batch_tokens; i++) {
-                                linear_parents[i] = i - 1;
-                            }
-                            llama_set_tree_parent_ids(ctx_tgt, linear_parents.data(), n_batch_tokens);
+                            // note: the flat path deliberately does NOT arm tree parent ids —
+                            // armed parent ids now route the graph through the tree SSM ops
+                            // (which skip the conv-cache write); flat rollback runs off the
+                            // tape and doesn't need the tree intermediates
                         }
 
                         // RS contexts handle rollback internally via seq_rm snapshots
