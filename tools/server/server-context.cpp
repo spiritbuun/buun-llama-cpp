@@ -4775,7 +4775,33 @@ private:
             // tree kernel processes nodes in batch order), so restore + replay.
             const bool state_clean = (tree.n_nodes == tree.main_path_len) && (commit_n == tree.n_nodes);
 
-            if (needs_reeval && slot.has_draft_backup && !state_clean) {
+            // branchy batches poison the tape shortcut: the tree kernels interleave branch
+            // nodes through the DeltaNet/conv tape, so replaying the "first ids.size()
+            // entries" no longer reproduces the accepted-prefix state (validated empirically:
+            // tape replay diverges, full restore + re-decode is bit-exact). Until the tape
+            // capture is tree-aware, branchy accepts restore the pre-verify state and
+            // re-decode the accepted tokens; pure chains keep the fast flat rollback.
+            const bool branchy = tree.n_nodes != tree.main_path_len;
+
+            if (branchy && needs_reeval && slot.has_draft_backup) {
+                llama_memory_seq_rm(mem, slot.id, pos_root, -1);
+                llama_memory_seq_cp(mem, slot.seq_id_backup, slot.id, -1, -1);
+                llama_memory_seq_rm(mem, slot.seq_id_backup, -1, -1);
+                if (dflash_tape_active) {
+                    llama_set_tape_recording(ctx_tgt, false);
+                    dflash_tape_active = false;
+                }
+                const int n_reeval = slot.prompt.n_tokens() - pos_root;
+                if (n_reeval > 0) {
+                    llama_batch batch_reeval = llama_batch_init(n_reeval, 0, 1);
+                    const auto & toks = slot.prompt.tokens.get_text_tokens();
+                    for (int j = pos_root; j < slot.prompt.n_tokens(); ++j) {
+                        common_batch_add(batch_reeval, toks[j], j, { slot.id }, false);
+                    }
+                    llama_decode(ctx_tgt, batch_reeval);
+                    llama_batch_free(batch_reeval);
+                }
+            } else if (needs_reeval && slot.has_draft_backup && !state_clean) {
                 llama_dflash_rollback(ctx_tgt, slot.id, slot.seq_id_backup, pos_root, (int) ids.size());
             } else {
                 llama_memory_seq_rm(mem, slot.id, slot.prompt.tokens.pos_next(), -1);
@@ -4787,6 +4813,7 @@ private:
             // accepted path left the backbone: rejected backbone nodes sit on the slot seq
             // at the SAME positions as accepted branch nodes, so the slot-seq tail is
             // unusable. Restore the pre-verify state and re-decode the accepted tokens.
+            SLT_INF(slot, "tree: off-backbone accept (commit_n = %d, accepted = %d)\n", commit_n, (int) ids.size() - 1);
             llama_clear_tree_parent_ids(ctx_tgt);
             if (slot.seq_id_branch >= 0) {
                 llama_memory_seq_rm(mem, slot.seq_id_branch, -1, -1);
