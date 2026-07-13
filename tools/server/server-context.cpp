@@ -4779,22 +4779,26 @@ private:
         slot.n_tree_nodes_total += tree.n_nodes;
 
         // update the DFlash hidden-state ring with the accepted-path tokens.
-        // Must run BEFORE rollback (matches the flat path ordering).
+        // Must run BEFORE rollback (matches the flat path ordering). The accepted
+        // path is not a ubatch prefix, so the capture rows are gathered by node
+        // index (the tree verify ubatch is exactly [root, nodes...]).
         {
             if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
                 llama_dflash_set_active_slot(ctx_tgt, slot.id);
             }
             llama_tokens path_tokens;
             path_tokens.push_back(slot.sampled);
-            std::vector<int> path;
+            std::vector<int32_t> path_rows;
+            path_rows.push_back(0);
             for (int node = commit_n; node > 0; node = tree.parents[node]) {
-                path.push_back(node);
+                path_rows.push_back(node);
             }
-            std::reverse(path.begin(), path.end());
-            for (int idx : path) {
-                path_tokens.push_back(tree.tokens[idx - 1]);
+            std::reverse(path_rows.begin() + 1, path_rows.end());
+            for (size_t i = 1; i < path_rows.size(); ++i) {
+                path_tokens.push_back(tree.tokens[path_rows[i] - 1]);
             }
-            common_speculative_update_logits(slot.get_spec(), ctx_tgt, path_tokens, (int) ids.size());
+            common_speculative_update_logits_tree(slot.get_spec(), ctx_tgt,
+                    path_tokens, path_rows.data(), (int) path_rows.size());
         }
 
         slot.spec_i_batch.clear();

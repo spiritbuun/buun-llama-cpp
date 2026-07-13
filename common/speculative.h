@@ -166,6 +166,12 @@ void common_speculative_draft_batch(
 
 // fork: logit/state management
 void   common_speculative_update_logits(common_speculative * spec, llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted);
+
+// fork: tree-verify variant — the accepted path is not a ubatch prefix, so the
+// DFlash ring gathers the given capture rows (path_rows[k] = ubatch row of the
+// k-th accepted token, row 0 = the root). path_tokens feeds the non-capture impls.
+void   common_speculative_update_logits_tree(common_speculative * spec, llama_context * ctx,
+        const llama_tokens & path_tokens, const int32_t * path_rows, int n_rows);
 void   common_speculative_flush_prefill(common_speculative * spec);
 
 void   common_speculative_rollback_dft(common_speculative * spec, llama_seq_id seq_id, llama_pos n_past, uint16_t n_accepted);

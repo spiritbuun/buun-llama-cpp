@@ -5,6 +5,7 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 
+#include <cinttypes>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -47,6 +48,12 @@ struct weaver_scorer {
     ggml_tensor * cand_rows = nullptr;  // [d_model, pool, depth_cap] raw lm_head rows
     std::vector<std::vector<float>> cand_scores; // host prior logits per depth
     std::vector<int> cand_n;            // valid candidates per depth
+
+    // serving path: borrowed target tensors (weaver_attach_target)
+    ggml_tensor * tgt_tok_embd = nullptr;
+    ggml_tensor * tgt_output   = nullptr;
+    bool tok_embd_host = false; // host-side dequant gather vs device get_rows
+    bool output_host   = false;
 
     int max_nodes  = 0;
     int prefix_len = 0; // tokens in the current prefix (n_steps + 1)
@@ -337,10 +344,12 @@ void weaver_set_candidates(weaver_scorer * ws, int depth,
     ws->cand_n[depth] = n_cand;
 }
 
-bool weaver_expand(weaver_scorer * ws,
-                   const float * embed_row, int depth,
-                   const int32_t * ancestor_slots, int n_ancestors, int self_slot,
-                   float * logits_out) {
+// embed_row != nullptr → host f32 input; else the row is gathered on-device
+// from the attached tok_embd by token id
+static bool wvr_expand_impl(weaver_scorer * ws,
+                            const float * embed_row, int32_t token, int depth,
+                            const int32_t * ancestor_slots, int n_ancestors, int self_slot,
+                            float * logits_out) {
     const auto & p = ws->params;
     const auto & w = ws->w;
     const int hd = p.d_rank / p.n_head;
@@ -359,8 +368,17 @@ bool weaver_expand(weaver_scorer * ws,
     ggml_context * ctx = ggml_init(ip);
     ggml_cgraph * gf = ggml_new_graph(ctx);
 
-    ggml_tensor * emb = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, p.d_model);
-    ggml_set_input(emb);
+    ggml_tensor * emb;
+    if (embed_row) {
+        emb = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, p.d_model);
+        ggml_set_input(emb);
+        ggml_set_name(emb, "wvr_emb");
+    } else {
+        ggml_tensor * emb_id = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+        ggml_set_input(emb_id);
+        ggml_set_name(emb_id, "wvr_emb_id");
+        emb = ggml_reshape_1d(ctx, ggml_get_rows(ctx, ws->tgt_tok_embd, emb_id), p.d_model);
+    }
 
     // x = token_in(embed_norm(emb)) + pos_emb[depth]
     ggml_tensor * x = wvr_linear(ctx, w.token_in_w,
@@ -428,7 +446,11 @@ bool weaver_expand(weaver_scorer * ws,
 
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, ws->backend);
     GGML_ASSERT(buf && "weaver: expand alloc failed");
-    ggml_backend_tensor_set(emb, embed_row, 0, (size_t) p.d_model * sizeof(float));
+    if (embed_row) {
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "wvr_emb"), embed_row, 0, (size_t) p.d_model * sizeof(float));
+    } else {
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "wvr_emb_id"), &token, 0, sizeof(int32_t));
+    }
     if (n_ancestors > 0) {
         ggml_tensor * anc = ggml_get_tensor(ctx, "wvr_anc");
         ggml_backend_tensor_set(anc, ancestor_slots, 0, (size_t) n_ancestors * sizeof(int32_t));
@@ -445,4 +467,150 @@ bool weaver_expand(weaver_scorer * ws,
         logits_out[i] = prior[i] + resid_host[i];
     }
     return true;
+}
+
+bool weaver_expand(weaver_scorer * ws,
+                   const float * embed_row, int depth,
+                   const int32_t * ancestor_slots, int n_ancestors, int self_slot,
+                   float * logits_out) {
+    return wvr_expand_impl(ws, embed_row, -1, depth, ancestor_slots, n_ancestors, self_slot, logits_out);
+}
+
+// dequantize one row of a host-resident (possibly quantized) 2D tensor to f32
+static bool wvr_dequant_row(const ggml_tensor * t, int64_t row, float * dst, int64_t n) {
+    const char * src = (const char *) t->data + row * t->nb[1];
+    switch (t->type) {
+        case GGML_TYPE_F32:
+            memcpy(dst, src, n * sizeof(float));
+            return true;
+        case GGML_TYPE_F16:
+            ggml_fp16_to_fp32_row((const ggml_fp16_t *) src, dst, n);
+            return true;
+        default: {
+            const auto * traits = ggml_get_type_traits(t->type);
+            if (!traits || !traits->to_float) {
+                return false;
+            }
+            traits->to_float(src, dst, n);
+            return true;
+        }
+    }
+}
+
+// host gather usable / device gather usable for a borrowed target tensor
+static bool wvr_gather_mode(const weaver_scorer * ws, const ggml_tensor * t, bool & host) {
+    if (!t || !t->buffer) {
+        return false;
+    }
+    host = ggml_backend_buffer_is_host(t->buffer);
+    if (host) {
+        if (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16) {
+            const auto * traits = ggml_get_type_traits(t->type);
+            if (!traits || !traits->to_float) {
+                WVR_LOG("weaver: no host dequant for %s (%s)\n", t->name, ggml_type_name(t->type));
+                return false;
+            }
+        }
+        return true;
+    }
+    if (!ggml_backend_supports_buft(ws->backend, ggml_backend_buffer_get_type(t->buffer))) {
+        WVR_LOG("weaver: %s buffer (%s) not accessible from %s\n",
+                t->name, ggml_backend_buffer_name(t->buffer), ggml_backend_name(ws->backend));
+        return false;
+    }
+    return true;
+}
+
+bool weaver_attach_target(weaver_scorer * ws, ggml_tensor * tok_embd, ggml_tensor * output) {
+    if (!tok_embd || !output) {
+        WVR_LOG("weaver: target tok_embd/output tensor missing\n");
+        return false;
+    }
+    if (tok_embd->ne[0] != ws->params.d_model || output->ne[0] != ws->params.d_model) {
+        WVR_LOG("weaver: target width %" PRId64 "/%" PRId64 " != d_model %d\n",
+                tok_embd->ne[0], output->ne[0], ws->params.d_model);
+        return false;
+    }
+    if (!wvr_gather_mode(ws, tok_embd, ws->tok_embd_host) ||
+        !wvr_gather_mode(ws, output,   ws->output_host)) {
+        return false;
+    }
+    ws->tgt_tok_embd = tok_embd;
+    ws->tgt_output   = output;
+    WVR_LOG("weaver: target attached — tok_embd %s (%s gather), output %s (%s gather)\n",
+            ggml_type_name(tok_embd->type), ws->tok_embd_host ? "host" : "device",
+            ggml_type_name(output->type),   ws->output_host   ? "host" : "device");
+    return true;
+}
+
+bool weaver_set_candidates_ids(weaver_scorer * ws,
+                               const int32_t * ids, const float * scores,
+                               int n_depths, int n_cand) {
+    const auto & p = ws->params;
+    if (!ws->tgt_output || n_depths <= 0 || n_depths > p.depth_cap ||
+        n_cand <= 0 || n_cand > p.pool_size) {
+        return false;
+    }
+    for (int d = 0; d < n_depths; ++d) {
+        ws->cand_scores[d].assign(scores + (size_t) d * n_cand, scores + (size_t) (d + 1) * n_cand);
+        ws->cand_n[d] = n_cand;
+    }
+    for (int d = n_depths; d < p.depth_cap; ++d) {
+        ws->cand_n[d] = 0;
+    }
+
+    const size_t row = (size_t) p.d_model * sizeof(float);
+    if (ws->output_host) {
+        std::vector<float> stage((size_t) n_cand * p.d_model);
+        for (int d = 0; d < n_depths; ++d) {
+            for (int i = 0; i < n_cand; ++i) {
+                if (!wvr_dequant_row(ws->tgt_output, ids[(size_t) d * n_cand + i],
+                                     stage.data() + (size_t) i * p.d_model, p.d_model)) {
+                    return false;
+                }
+            }
+            ggml_backend_tensor_set(ws->cand_rows, stage.data(),
+                    (size_t) d * p.pool_size * row, (size_t) n_cand * row);
+        }
+        return true;
+    }
+
+    // device: one get_rows over all depths, copied into the strided pool views
+    const int N = n_depths * n_cand;
+    ggml_init_params ip = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+
+    ggml_tensor * ids_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, N);
+    ggml_set_input(ids_t);
+    ggml_tensor * rows = ggml_get_rows(ctx, ws->tgt_output, ids_t);        // [d_model, N] f32
+    rows = ggml_reshape_3d(ctx, rows, p.d_model, n_cand, n_depths);
+    ggml_tensor * dst = ggml_view_3d(ctx, ws->cand_rows, p.d_model, n_cand, n_depths,
+            ws->cand_rows->nb[1], ws->cand_rows->nb[2], 0);
+    ggml_build_forward_expand(gf, ggml_cpy(ctx, rows, dst));
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, ws->backend);
+    GGML_ASSERT(buf && "weaver: candidate gather alloc failed");
+    ggml_backend_tensor_set(ids_t, ids, 0, (size_t) N * sizeof(int32_t));
+    ggml_backend_graph_compute(ws->backend, gf);
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return true;
+}
+
+bool weaver_expand_token(weaver_scorer * ws,
+                         int32_t token, int depth,
+                         const int32_t * ancestor_slots, int n_ancestors, int self_slot,
+                         float * logits_out) {
+    if (!ws->tgt_tok_embd) {
+        return false;
+    }
+    if (ws->tok_embd_host) {
+        std::vector<float> row(ws->params.d_model);
+        if (!wvr_dequant_row(ws->tgt_tok_embd, token, row.data(), ws->params.d_model)) {
+            return false;
+        }
+        return wvr_expand_impl(ws, row.data(), -1, depth, ancestor_slots, n_ancestors, self_slot, logits_out);
+    }
+    return wvr_expand_impl(ws, nullptr, token, depth, ancestor_slots, n_ancestors, self_slot, logits_out);
 }

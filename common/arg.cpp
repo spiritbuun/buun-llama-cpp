@@ -4466,6 +4466,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DRAFT_TOPK"));
     add_opt(common_arg(
+        {"--spec-weaver"}, "FNAME",
+        "path to a Weaver tree-draft scorer GGUF: rescores DFlash candidate pools with "
+        "conditional log-probs for tree drafting (requires --tree-budget > 0)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.weaver_model = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_WEAVER"));
+    add_opt(common_arg(
+        {"--spec-weaver-topk"}, "N",
+        string_format("Weaver candidate pool size per depth (default: %d, max 64)", params.speculative.weaver_topk),
+        [](common_params & params, int value) {
+            params.speculative.weaver_topk = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_WEAVER_TOPK"));
+    add_opt(common_arg(
         {"--spec-draft-type-k", "-ctkd", "--cache-type-k-draft"}, "TYPE",
         string_format(
             "KV cache data type for K for the draft model\n"

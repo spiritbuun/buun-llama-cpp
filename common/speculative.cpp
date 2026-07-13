@@ -9,6 +9,7 @@
 #include "ngram-mod.h"
 #include "sampling.h"
 #include "suffix-tree.h"
+#include "weaver.h"
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
@@ -2644,6 +2645,13 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
     int n_draft_last = 0;
     int adaptive_n_draft = -1; // -1 = use default
 
+    // Weaver tree-draft scorer (EXP-40): conditional rescoring of the drafter's
+    // per-depth top-K pools. When loaded, draft_tree() uses the Weaver builder.
+    weaver_scorer * weaver = nullptr;
+    int weaver_topk = 64;
+    std::vector<float> weaver_tgt_hidden;  // target final-norm hidden at the committed token
+    bool weaver_tgt_hidden_valid = false;
+
     // build interleaved cross-attention data from ring buffer (GPU or CPU path)
     int build_cross_data(llama_context * ctx) {
         if (gpu_ring_handle) {
@@ -2677,7 +2685,10 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
             llama_context * ctx_dft_,
             llama_model   * model_dft_,
             bool            owns_ctx_dft_ = true,
-            float           p_min_ = 0.0f)
+            float           p_min_ = 0.0f,
+            const std::string & weaver_path = "",
+            int             weaver_topk_ = 64,
+            int             tree_budget_ = 0)
         : common_speculative_impl(type, n_seq)
         , ctx_tgt(ctx_tgt_)
         , ctx_dft(ctx_dft_)
@@ -2699,10 +2710,32 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
         // tok_embd/output sharing must happen BEFORE context creation
         // (done in speculative-simple.cpp before common_speculative_init)
 
+        // Weaver tree-draft scorer (optional; falls back to raw-marginal DDTree)
+        if (!weaver_path.empty()) {
+            weaver_topk = std::min(weaver_topk_, 64); // ggml_topk_ext kernel cap
+            weaver = weaver_init(weaver_path.c_str(), /*prefer_gpu=*/true, tree_budget_ + 1);
+            if (weaver) {
+                const llama_model * model_tgt = llama_get_model(ctx_tgt);
+                if (!weaver_attach_target(weaver,
+                        llama_model_tok_embd_tensor(model_tgt),
+                        llama_model_output_tensor(model_tgt))) {
+                    weaver_free(weaver);
+                    weaver = nullptr;
+                }
+            }
+            if (!weaver) {
+                LOG_WRN("weaver: scorer disabled (load/attach failed), using raw-marginal tree draft\n");
+            }
+        }
+
         // configure target context to capture hidden states
+        // (with Weaver: also the final-norm output, sentinel -2, at index n_target_layers)
         std::vector<int32_t> capture_layers(n_target_layers);
         llama_model_dflash_target_layer_ids(model_dft_, capture_layers.data(), n_target_layers);
-        llama_set_dflash_capture(ctx_tgt, capture_layers.data(), n_target_layers);
+        if (weaver) {
+            capture_layers.push_back(-2);
+        }
+        llama_set_dflash_capture(ctx_tgt, capture_layers.data(), (int32_t) capture_layers.size());
 
         batch_dft = llama_batch_init(block_size, 0, 1);
 
@@ -2725,6 +2758,9 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
     }
 
     ~common_speculative_impl_dflash() override {
+        if (weaver) {
+            weaver_free(weaver);
+        }
         llama_dflash_cross_ring_gpu_free(gpu_ring_handle);
         llama_batch_free(batch_dft);
         if (owns_ctx_dft) {
@@ -2986,12 +3022,187 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
         }
     }
 
+    // Weaver tree draft (EXP-40, arXiv 2607.06763): best-first expansion where a
+    // child's priority is the path-sum of Weaver CONDITIONAL log-probs — the
+    // scorer rescores the drafter's per-depth top-K pool given the actual tree
+    // path — instead of the drafter's path-independent marginals.
+    void draft_tree_weaver(
+            llama_token id_last,
+            int n_max_eff,
+            int tree_budget,
+            common_speculative_tree & tree) {
+        const int n_draft = std::min(n_max_eff, block_size - 1);
+        if (n_draft <= 0 || committed_len == 0 || !weaver_tgt_hidden_valid) {
+            return;
+        }
+        const auto & wp = weaver_get_params(weaver);
+        if (wp.d_model != n_embd) {
+            return;
+        }
+
+        const int64_t t0 = ggml_time_us();
+
+        // drafter forward — always the full block (the Weaver prefix conditions
+        // every expansion on all depths' hiddens)
+        int cross_len = build_cross_data(ctx_dft);
+        common_batch_clear(batch_dft);
+        common_batch_add(batch_dft, id_last, cross_len, { seq_id }, true);
+        for (int i = 1; i < block_size; ++i) {
+            common_batch_add(batch_dft, mask_token_id, cross_len + i, { seq_id }, true);
+        }
+        if (llama_decode(ctx_dft, batch_dft) != 0) {
+            LOG_ERR("weaver: drafter decode failed\n");
+            return;
+        }
+
+        int32_t * argmax       = llama_get_logits_argmax(ctx_dft);
+        float   * argmax_probs = llama_get_logits_argmax_probs(ctx_dft);
+        const int K            = llama_get_logits_argmax_k(ctx_dft);
+        const float * embd     = llama_get_embeddings(ctx_dft);
+        if (!argmax || !argmax_probs || K < 2 || !embd) {
+            LOG_ERR("weaver: drafter top-K/embeddings unavailable\n");
+            return;
+        }
+
+        // prefix: [target final-norm hidden ; drafter hiddens at positions 1..n_steps]
+        const int n_steps = std::min(block_size - 1, wp.depth_cap);
+        weaver_begin_step(weaver, weaver_tgt_hidden.data(), embd + (size_t) n_embd, n_steps);
+
+        // candidate pools: depth d ← drafter position d+1. Scores are top-K
+        // log-probs; the per-position logsumexp shift cancels in the pool softmax.
+        const int n_depths = std::min(n_draft, wp.depth_cap);
+        const int n_cand   = std::min(K, weaver_topk);
+        std::vector<int32_t> pool_ids((size_t) n_depths * n_cand);
+        std::vector<float>   pool_scores((size_t) n_depths * n_cand);
+        for (int d = 0; d < n_depths; ++d) {
+            for (int i = 0; i < n_cand; ++i) {
+                pool_ids   [(size_t) d * n_cand + i] = argmax[(d + 1) * K + i];
+                pool_scores[(size_t) d * n_cand + i] = argmax_probs[(d + 1) * K + i];
+            }
+        }
+        if (!weaver_set_candidates_ids(weaver, pool_ids.data(), pool_scores.data(), n_depths, n_cand)) {
+            LOG_ERR("weaver: candidate pool upload failed\n");
+            return;
+        }
+
+        tree.tokens.clear();
+        tree.parents.clear();
+        tree.depths.clear();
+        tree.child_maps.clear();
+        tree.visibility.clear();
+        tree.parents.push_back(-1);
+        tree.child_maps.push_back({});
+        tree.n_nodes = 0;
+        tree.main_path_len = 0;
+
+        struct heap_entry {
+            float log_w;   // path-sum of Weaver pool log-probs
+            int   parent;  // parent node index (== its Weaver KV slot)
+            int   depth;   // 1-based depth of the would-be node
+            llama_token token;
+            bool operator<(const heap_entry & o) const { return log_w < o.log_w; }
+        };
+        std::priority_queue<heap_entry> heap;
+
+        const int expand_width = 8; // children pushed per expanded node (their EXPAND_WIDTH)
+        std::vector<float> logits(n_cand);
+        std::vector<int>   order(n_cand);
+        std::vector<std::vector<int32_t>> node_anc(1); // ancestor slots per node; root has none
+
+        // Weaver forward for one node → pool log-softmax → push its top children
+        auto expand_node = [&](int node, llama_token token, int node_depth, float path_score) {
+            const int depth_idx = std::min(node_depth, n_depths - 1);
+            const auto & anc = node_anc[node];
+            if (!weaver_expand_token(weaver, token, depth_idx,
+                                     anc.data(), (int) anc.size(), node, logits.data())) {
+                return;
+            }
+            const size_t base = (size_t) depth_idx * n_cand;
+            float mx = -INFINITY;
+            for (int i = 0; i < n_cand; ++i) {
+                if (pool_ids[base + i] >= 0 && logits[i] > mx) mx = logits[i];
+            }
+            if (mx == -INFINITY) {
+                return;
+            }
+            double sum = 0.0;
+            for (int i = 0; i < n_cand; ++i) {
+                if (pool_ids[base + i] >= 0) sum += expf(logits[i] - mx);
+            }
+            const float log_denom = logf((float) sum) + mx;
+
+            for (int i = 0; i < n_cand; ++i) order[i] = i;
+            const int top = std::min(expand_width, n_cand);
+            std::partial_sort(order.begin(), order.begin() + top, order.end(),
+                    [&](int a, int b) { return logits[a] > logits[b]; });
+            for (int r = 0; r < top; ++r) {
+                const int i = order[r];
+                if (pool_ids[base + i] < 0) continue;
+                heap.push({path_score + logits[i] - log_denom, node, node_depth + 1,
+                           (llama_token) pool_ids[base + i]});
+            }
+        };
+
+        // root = the bonus token (depth 0, Weaver KV slot 0)
+        expand_node(0, id_last, 0, 0.0f);
+
+        while (!heap.empty() && tree.n_nodes < tree_budget) {
+            const heap_entry e = heap.top();
+            heap.pop();
+            if (tree.child_maps[e.parent].count(e.token)) {
+                continue;
+            }
+            const int node = tree.n_nodes + 1;
+            tree.tokens.push_back(e.token);
+            tree.parents.push_back(e.parent);
+            tree.depths.push_back(e.depth);
+            tree.child_maps.push_back({});
+            tree.child_maps[e.parent][e.token] = node;
+            tree.n_nodes++;
+
+            node_anc.push_back(node_anc[e.parent]);
+            node_anc.back().push_back(e.parent);
+
+            if (e.depth < n_depths) {
+                expand_node(node, e.token, e.depth, e.log_w);
+            }
+        }
+
+        // main path = maximal chain prefix (stats + the server's pure-chain fallback)
+        tree.main_path_len = 0;
+        for (int i = 1; i <= tree.n_nodes; ++i) {
+            if (tree.parents[i] != i - 1) break;
+            tree.main_path_len = i;
+        }
+
+        // build visibility matrix [(n_nodes+1) × (n_nodes+1)]
+        int n = tree.n_nodes + 1;
+        tree.visibility.assign(n * n, false);
+        tree.visibility[0] = true; // root sees itself
+        for (int i = 1; i < n; ++i) {
+            int parent = tree.parents[i];
+            for (int j = 0; j < i; ++j) {
+                tree.visibility[i * n + j] = tree.visibility[parent * n + j];
+            }
+            tree.visibility[i * n + i] = true; // see itself
+        }
+
+        const int64_t t1 = ggml_time_us();
+        LOG_INF("weaver: built tree with %d nodes (chain prefix %d, budget %d, pool %d) in %.1fms\n",
+                tree.n_nodes, tree.main_path_len, tree_budget, n_cand, (t1 - t0) / 1e3);
+    }
+
     void draft_tree(
             const llama_tokens & prompt_tgt,
             llama_token id_last,
             int n_max_eff,
             int tree_budget,
             common_speculative_tree & tree) override {
+        if (weaver) {
+            draft_tree_weaver(id_last, n_max_eff, tree_budget, tree);
+            GGML_UNUSED(prompt_tgt);
+            return;
+        }
         const int n_draft = std::min(n_max_eff, block_size - 1);
         if (n_draft <= 0 || committed_len == 0) {
             return;
@@ -3163,6 +3374,23 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
         // the verification batch had (1 + n_draft) tokens
         // only the first n_accepted tokens' hidden states should be kept
         append_target_hiddens(n_accepted);
+        // the bonus token was sampled from the last accepted row's logits — its
+        // final-norm hidden roots the next Weaver prefix
+        weaver_stash_tgt_hidden(n_accepted - 1);
+    }
+
+    // tree-verify variant: the accepted path is NOT a prefix of the verify ubatch,
+    // so the ring (and the Weaver root hidden) must gather the path rows by index.
+    // rows[k] = ubatch row of the k-th accepted token (row 0 = the root).
+    void update_logits_tree(llama_context * ctx, const int32_t * rows, int n_rows) {
+        GGML_UNUSED(ctx);
+        llama_dflash_set_active_slot(ctx_tgt, seq_id);
+        if (llama_get_n_layer_hiddens(ctx_tgt) == 0 || n_rows <= 0) {
+            return;
+        }
+        ring_write_rows(rows, n_rows);
+        committed_len += n_rows;
+        weaver_stash_tgt_hidden(rows[n_rows - 1]);
     }
 
     bool need_embd() const override {
@@ -3200,6 +3428,54 @@ private:
         ring_filled = std::min(ring_filled + n_tokens, RING_SIZE);
     }
 
+    // ring_write for tree accepts: gather arbitrary capture-buffer rows (the
+    // accepted path) instead of a contiguous prefix
+    void ring_write_rows(const int32_t * rows, int n_rows) {
+        int32_t n_slots = llama_get_n_layer_hiddens(ctx_tgt);
+        for (int layer = 0; layer < n_target_layers && layer < n_slots; ++layer) {
+            float * data = llama_get_layer_hidden(ctx_tgt, layer);
+            int64_t embd = llama_get_layer_hidden_n_embd(ctx_tgt, layer);
+            int64_t ntok = llama_get_layer_hidden_n_tokens(ctx_tgt, layer);
+            if (!data || ntok <= 0) continue;
+
+            for (int t = 0; t < n_rows; ++t) {
+                if (rows[t] < 0 || rows[t] >= ntok) continue;
+                int slot = (ring_write_pos + t) % RING_SIZE;
+                memcpy(ring_buf[layer].data() + (size_t) slot * embd,
+                       data + (size_t) rows[t] * embd,
+                       embd * sizeof(float));
+                if (gpu_ring_handle) {
+                    int gpu_pos = (ring_write_pos + t) % ctx_window;
+                    llama_dflash_cross_ring_gpu_write(gpu_ring_handle, layer, gpu_pos,
+                        data + (size_t) rows[t] * embd, 1, embd);
+                }
+            }
+        }
+        ring_write_pos = (ring_write_pos + n_rows) % RING_SIZE;
+        ring_filled = std::min(ring_filled + n_rows, RING_SIZE);
+    }
+
+    // Weaver: copy the target final-norm hidden (capture sentinel, index
+    // n_target_layers) at the given verify-batch row
+    void weaver_stash_tgt_hidden(int row) {
+        if (!weaver) {
+            return;
+        }
+        weaver_tgt_hidden_valid = false;
+        const int idx = n_target_layers;
+        if (llama_get_n_layer_hiddens(ctx_tgt) <= idx) {
+            return;
+        }
+        float * data = llama_get_layer_hidden(ctx_tgt, idx);
+        int64_t embd = llama_get_layer_hidden_n_embd(ctx_tgt, idx);
+        int64_t ntok = llama_get_layer_hidden_n_tokens(ctx_tgt, idx);
+        if (!data || embd != n_embd || row < 0 || row >= ntok) {
+            return;
+        }
+        weaver_tgt_hidden.assign(data + (size_t) row * embd, data + (size_t) (row + 1) * embd);
+        weaver_tgt_hidden_valid = true;
+    }
+
     // called after initial prefill — grab all hidden states
     void capture_target_hiddens() {
         llama_dflash_set_active_slot(ctx_tgt, seq_id);
@@ -3218,6 +3494,7 @@ private:
         ring_filled = 0;
         ring_write(to_store, start_offset);
         committed_len = (int)n_tokens;
+        weaver_stash_tgt_hidden((int) n_tokens - 1);
     }
 
     // called after each verification decode — append only the accepted tokens' hidden states
@@ -3806,14 +4083,21 @@ llama_context * common_speculative_create_ctx_dft(const common_params_speculativ
     }
     llama_context_params cparams_dft = params.cparams_dft;
     cparams_dft.dflash_n_slots = dflash_n_slots;
+    if (!params.weaver_model.empty()) {
+        // Weaver reads the drafter's post-norm hiddens via llama_get_embeddings
+        cparams_dft.embeddings = true;
+    }
     llama_context * ctx_dft = llama_init_from_model(params.model_dft, cparams_dft);
     if (ctx_dft == nullptr) {
         LOG_ERR("%s", "failed to create draft context\n");
         return nullptr;
     }
-    if (params.draft_topk > 1) {
-        llama_set_dflash_topk(ctx_dft, params.draft_topk);
-        LOG_INF("dflash: top-K=%d enabled for tree branching\n", params.draft_topk);
+    // Weaver rescores a per-depth candidate pool — widen the drafter top-K to it
+    const int32_t topk_eff = std::max(params.draft_topk,
+            params.weaver_model.empty() ? 1 : std::min(params.weaver_topk, 64));
+    if (topk_eff > 1) {
+        llama_set_dflash_topk(ctx_dft, topk_eff);
+        LOG_INF("dflash: top-K=%d enabled for tree branching\n", topk_eff);
     }
     if (params.sample_temp > 0.0f) {
         llama_set_dflash_sample_temp(ctx_dft, params.sample_temp);
@@ -3896,7 +4180,8 @@ common_speculative * common_speculative_init(
                 GGML_ASSERT(ctx_dft != nullptr);
                 impls.push_back(std::make_unique<common_speculative_impl_dflash>(
                     config.type, n_seq, ctx_tgt, ctx_dft, params.model_dft,
-                    owns_ctx_dft, params.p_min));
+                    owns_ctx_dft, params.p_min,
+                    params.weaver_model, params.weaver_topk, params.tree_budget));
                 if (owns_ctx_dft) {
                     ctx_dft = nullptr;
                 }
@@ -4278,6 +4563,23 @@ void common_speculative_update_logits(common_speculative * spec, llama_context *
             static_cast<common_speculative_impl_copyspec *>(impl.get())->update_logits(ctx, batch_tokens, n_accepted);
         } else if (impl->type == COMMON_SPECULATIVE_TYPE_RECYCLE) {
             static_cast<common_speculative_impl_recycle *>(impl.get())->update_logits(ctx, batch_tokens, n_accepted);
+        }
+    }
+}
+
+void common_speculative_update_logits_tree(common_speculative * spec, llama_context * ctx,
+        const llama_tokens & path_tokens, const int32_t * path_rows, int n_rows) {
+    if (spec == nullptr) {
+        return;
+    }
+    for (auto & impl : spec->impls) {
+        if (impl->type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+            // gather the accepted path's capture rows (not a ubatch prefix)
+            static_cast<common_speculative_impl_dflash *>(impl.get())->update_logits_tree(ctx, path_rows, n_rows);
+        } else if (impl->type == COMMON_SPECULATIVE_TYPE_COPYSPEC) {
+            static_cast<common_speculative_impl_copyspec *>(impl.get())->update_logits(ctx, path_tokens, n_rows);
+        } else if (impl->type == COMMON_SPECULATIVE_TYPE_RECYCLE) {
+            static_cast<common_speculative_impl_recycle *>(impl.get())->update_logits(ctx, path_tokens, n_rows);
         }
     }
 }

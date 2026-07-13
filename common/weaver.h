@@ -18,6 +18,7 @@
 
 #include <cstdint>
 
+struct ggml_tensor;
 struct weaver_scorer;
 
 struct weaver_params {
@@ -56,3 +57,24 @@ bool weaver_expand(weaver_scorer * ws,
                    const float * embed_row, int depth,
                    const int32_t * ancestor_slots, int n_ancestors, int self_slot,
                    float * logits_out);
+
+// --- serving path: candidate lm_head rows and token-embedding rows are gathered
+// from the target model's (possibly quantized) tensors — on-device via get_rows
+// when the tensor lives on the scorer's backend, host-side dequant otherwise.
+
+// Borrow the target model's tok_embd/output tensors (llama_model_*_tensor()).
+bool weaver_attach_target(weaver_scorer * ws,
+                          struct ggml_tensor * tok_embd, struct ggml_tensor * output);
+
+// Candidate pools for all depths in one call. ids/scores: [n_depths * n_cand],
+// depth-major; scores = drafter logits (any per-depth constant shift cancels in
+// the pool softmax, so top-K log-probs work as-is).
+bool weaver_set_candidates_ids(weaver_scorer * ws,
+                               const int32_t * ids, const float * scores,
+                               int n_depths, int n_cand);
+
+// weaver_expand with the embed row gathered from the attached tok_embd by token id.
+bool weaver_expand_token(weaver_scorer * ws,
+                         int32_t token, int depth,
+                         const int32_t * ancestor_slots, int n_ancestors, int self_slot,
+                         float * logits_out);
