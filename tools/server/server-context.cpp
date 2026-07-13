@@ -201,6 +201,9 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
 
+    // DDTree: tree drafted this cycle (n_nodes > 0 routes the accept loop to the tree walk)
+    common_speculative_tree spec_tree;
+
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
     std::unique_ptr<const server_task> task;
@@ -325,6 +328,7 @@ struct server_slot {
     // Hybrid model: recurrent state backup for speculative decoding
     bool has_draft_backup = false;
     llama_seq_id seq_id_backup = -1;
+    llama_seq_id seq_id_branch = -1; // DDTree: seq holding off-backbone tree nodes during verify
     int  n_tokens_before_draft = 0; // prompt token count before draft tokens were added
 
     void reset() {
@@ -344,6 +348,7 @@ struct server_slot {
             spec_draft.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
+            spec_tree = {};
         }
         generated_tokens.clear();
         generated_token_probs.clear();
@@ -356,6 +361,7 @@ struct server_slot {
         n_accepted_per_pos.clear();
         has_draft_backup = false;
         seq_id_backup = -1;
+        seq_id_branch = -1;
         n_tokens_before_draft = 0;
 
         task_prev = std::move(task);
@@ -538,6 +544,9 @@ struct server_slot {
             // clean up speculative backup sequence to avoid orphaned KV cells
             if (has_draft_backup && seq_id_backup >= 0) {
                 llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id_backup, -1, -1);
+            }
+            if (seq_id_branch >= 0) {
+                llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id_branch, -1, -1);
             }
 
             // do not keep context of the child slots - the parent's context is enough
@@ -1529,10 +1538,20 @@ private:
         // n_parallel_user and llama_memory_recurrent::seq_cp silently no-ops on the
         // out-of-range backup seq — rollback then WIPES the recurrent state instead of
         // restoring it (#74: output stays plausible but wrong, degrading over time).
+        // DDTree constraints: the tree attention mask is context-global and requires the
+        // verify decode to contain exactly the tree tokens, so tree verification only
+        // works with a single user slot. The off-backbone tree nodes also need one extra
+        // sequence (seq_branch) so rejected branches can be dropped with a single seq_rm.
+        if (params_base.speculative.tree_budget > 0 && n_parallel_user > 1) {
+            SRV_WRN("DDTree (--tree-budget %d) requires a single slot; disabling tree verification (np = %d)\n",
+                    params_base.speculative.tree_budget, n_parallel_user);
+            params_base.speculative.tree_budget = 0;
+        }
+
         if (params_base.speculative.has_dft() ||
             params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) ||
             params_base.speculative.has_model_free_type()) {
-            params_base.n_parallel = n_parallel_user * 2;
+            params_base.n_parallel = n_parallel_user * 2 + (params_base.speculative.tree_budget > 0 ? 1 : 0);
             n_seq_max_full = params_base.n_parallel;
             recurrent_expanded = false;
 
@@ -1581,6 +1600,13 @@ private:
 
         needs_reeval = llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt);
         is_diffusion = llama_model_is_diffusion(model_tgt);
+
+        // the tree visibility mask is only injected into the regular attention mask, not
+        // the SWA variant — sliding-window models would verify branches with a wrong mask
+        if (params_base.speculative.tree_budget > 0 && llama_model_n_swa(model_tgt) > 0) {
+            SRV_WRN("%s", "DDTree is not supported for SWA models; disabling tree verification\n");
+            params_base.speculative.tree_budget = 0;
+        }
 
         if (is_diffusion) {
             SRV_INF("%s", "diffusion model detected — enabling self-speculation\n");
@@ -3554,6 +3580,9 @@ private:
 
     // DFlash tape recording armed for this cycle (turned off in post_cycle())
     bool dflash_tape_active = false;
+
+    // DDTree: a tree-shaped verify batch is in flight (tree mask + parent ids set on ctx_tgt)
+    bool tree_mask_armed = false;
     // pure-TG batch → multi-seq ubatch allowed (force_split_seq restored in post_cycle())
     bool can_batch_multiseq = false;
 // #define DEBUG_TIMINGS
@@ -3831,6 +3860,17 @@ private:
             const int n_draft_max = slot.get_n_draft_max();
             if (n_draft_max > 0) {
                 const int64_t t_draft_slot_start = ggml_time_us();
+
+                // DDTree: try a tree draft first (single-slot only, enforced at startup);
+                // an empty tree falls through to the flat draft path
+                if (params_base.speculative.tree_budget > 0 &&
+                    params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
+                    batched_drafts[slot.id].empty() &&
+                    try_tree_draft(slot, n_draft_max)) {
+                    t_draft_total += ggml_time_us() - t_draft_slot_start;
+                    n_slots_drafted++;
+                    return;
+                }
 
                 llama_tokens draft;
                 if (!batched_drafts[slot.id].empty()) {
@@ -4571,6 +4611,228 @@ private:
         }
     }
 
+    // DDTree: draft a token tree for the slot and add it to the batch as a tree-shaped
+    // verify request (root + backbone on the slot seq, off-backbone nodes on the branch
+    // seq, siblings sharing positions). Returns false when no tree was produced or it
+    // doesn't fit — the caller falls back to the flat draft path.
+    bool try_tree_draft(server_slot & slot, int n_draft_max) {
+        const auto & params_spec = slot.task->params.speculative;
+        const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
+
+        const int n_max_eff = params_spec.n_max > 0 ? std::min(n_draft_max, params_spec.n_max) : n_draft_max;
+
+        common_speculative_tree tree = common_speculative_draft_tree(
+                slot.get_spec(), params_spec, cached_text_tokens, slot.sampled,
+                n_max_eff, params_base.speculative.tree_budget);
+
+        if (tree.n_nodes == 0) {
+            return false;
+        }
+        if (tree.n_nodes > n_draft_max) {
+            SLT_DBG(slot, "tree size %d exceeds max draft %d, falling back to flat\n", tree.n_nodes, n_draft_max);
+            return false;
+        }
+
+        slot.n_tokens_before_draft = slot.prompt.n_tokens();
+        slot.n_draft_total += tree.n_nodes;
+
+        slot.spec_ckpt.update_pos(
+                slot.n_tokens_before_draft,
+                llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id),
+                llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
+
+        if (needs_reeval) {
+            // tree-aware SSM kernels take the parent ids; the tape records conv inputs for rollback
+            llama_tape_replay_sync(ctx_tgt);
+            llama_set_tree_parent_ids(ctx_tgt, tree.parents.data(), tree.n_nodes + 1);
+
+            if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
+                if (!recurrent_expanded) {
+                    auto * mem = llama_get_memory(ctx_tgt);
+                    if (llama_memory_recurrent_expand(mem, n_seq_max_full)) {
+                        SRV_INF("expanded recurrent state to %d cells for speculative backup\n", n_seq_max_full);
+                    } else {
+                        SRV_ERR("failed to expand recurrent state to %d cells\n", n_seq_max_full);
+                    }
+                    recurrent_expanded = true;
+                }
+                const llama_seq_id seq_backup = slot.id + n_parallel_user;
+                auto * mem = llama_get_memory(ctx_tgt);
+                llama_memory_seq_rm(mem, seq_backup, -1, -1);
+                llama_memory_seq_cp(mem, slot.id, seq_backup, -1, -1);
+                slot.has_draft_backup = true;
+                slot.seq_id_backup = seq_backup;
+            }
+        }
+
+        // the visibility matrix overrides the causal mask for the tree block; it applies to
+        // the next decode only and requires the ubatch to be exactly the tree tokens
+        llama_set_tree_mask(ctx_tgt, tree.visibility.data(), tree.n_nodes + 1);
+        tree_mask_armed = true;
+
+        const llama_pos pos_root = slot.prompt.tokens.pos_next();
+        slot.seq_id_branch = 2 * n_parallel_user + slot.id;
+
+        bool add_ok = true;
+
+        slot.spec_i_batch.push_back(batch.size());
+        add_ok &= batch.add(slot.id, slot.sampled, pos_root, true);
+        slot.prompt.tokens.push_back(slot.sampled);
+
+        for (int i = 0; i < tree.n_nodes; ++i) {
+            slot.spec_i_batch.push_back(batch.size());
+            const llama_seq_id sid = (i < tree.main_path_len) ? slot.id : slot.seq_id_branch;
+            add_ok &= batch.add(sid, tree.tokens[i], pos_root + tree.depths[i], true);
+        }
+        GGML_ASSERT(add_ok && "batch must be large enough to hold the tree verify tokens");
+
+        SLT_DBG(slot, "tree draft: %d nodes (%d backbone), pos_root = %d\n",
+                tree.n_nodes, tree.main_path_len, (int) pos_root);
+
+        slot.spec_tree = std::move(tree);
+
+        return true;
+    }
+
+    // DDTree acceptance: walk the verified tree, commit the accepted path, clean up
+    // rejected nodes. Mirrors the flat accept path in update_slots() but the accepted
+    // tokens were never inserted into slot.prompt at draft time.
+    void tree_accept(server_slot & slot, const std::function<bool(server_slot &, llama_token)> & accept_special_token) {
+        const common_speculative_tree tree = std::move(slot.spec_tree);
+        slot.spec_tree = {};
+
+        // the tree mask applied to the verify decode that just ran
+        llama_clear_tree_mask(ctx_tgt);
+        tree_mask_armed = false;
+
+        const int n_draft = tree.n_nodes;
+
+        int  commit_n     = 0;
+        bool on_main_path = true;
+        const auto ids = common_speculative_tree_accept(
+                slot.smpl.get(), ctx_tgt, tree, slot.spec_i_batch, commit_n, on_main_path);
+
+        // update the DFlash hidden-state ring with the accepted-path tokens.
+        // Must run BEFORE rollback (matches the flat path ordering).
+        {
+            if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                llama_dflash_set_active_slot(ctx_tgt, slot.id);
+            }
+            llama_tokens path_tokens;
+            path_tokens.push_back(slot.sampled);
+            std::vector<int> path;
+            for (int node = commit_n; node > 0; node = tree.parents[node]) {
+                path.push_back(node);
+            }
+            std::reverse(path.begin(), path.end());
+            for (int idx : path) {
+                path_tokens.push_back(tree.tokens[idx - 1]);
+            }
+            common_speculative_update_logits(slot.get_spec(), ctx_tgt, path_tokens, (int) ids.size());
+        }
+
+        slot.spec_i_batch.clear();
+
+        slot.t_token_generation = std::max<int64_t>(1, ggml_time_us() - slot.t_start_generation) / 1e3;
+
+        slot.n_draft_accepted += ids.size() - 1;
+        slot.n_draft_verif_steps += 1;
+
+        // per-depth acceptance histogram (accepted path token i sits at depth i+1)
+        if (slot.n_accepted_per_pos.empty()) {
+            slot.n_accepted_per_pos.resize(common_speculative_n_max(&params_base.speculative), 0);
+        }
+        for (size_t i = 0; i < ids.size() - 1 && i < slot.n_accepted_per_pos.size(); ++i) {
+            slot.n_accepted_per_pos[i]++;
+        }
+
+        // accepted tokens extend the prompt (tree tokens were never inserted at draft time)
+        slot.prompt.tokens.insert(llama_tokens(ids.begin(), ids.end() - 1));
+
+        const int pos_root = slot.n_tokens_before_draft;
+        auto * mem = llama_get_memory(ctx_tgt);
+
+        if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
+            llama_dflash_set_active_slot(ctx_tgt, slot.id);
+        }
+
+        if (on_main_path) {
+            // accepted nodes are the backbone prefix, already on the slot seq at the right
+            // positions — restore SSM/conv state from the tree-kernel intermediates at the
+            // deepest accepted node (also clears the parent-ids wiring), then drop the
+            // rejected tail, the branch nodes, and the backup
+            if (needs_reeval) {
+                llama_tree_rollback(ctx_tgt, commit_n, tree.parents.data(), pos_root + commit_n);
+            }
+            if (slot.seq_id_branch >= 0) {
+                llama_memory_seq_rm(mem, slot.seq_id_branch, -1, -1);
+            }
+            llama_memory_seq_rm(mem, slot.id, slot.prompt.tokens.pos_next(), -1);
+            if (slot.has_draft_backup) {
+                llama_memory_seq_rm(mem, slot.seq_id_backup, -1, -1);
+            }
+        } else {
+            // accepted path left the backbone: rejected backbone nodes sit on the slot seq
+            // at the SAME positions as accepted branch nodes, so the slot-seq tail is
+            // unusable. Restore the pre-verify state and re-decode the accepted tokens.
+            llama_clear_tree_parent_ids(ctx_tgt);
+            if (slot.seq_id_branch >= 0) {
+                llama_memory_seq_rm(mem, slot.seq_id_branch, -1, -1);
+            }
+            llama_memory_seq_rm(mem, slot.id, pos_root, -1);
+            if (slot.has_draft_backup) {
+                llama_memory_seq_cp(mem, slot.seq_id_backup, slot.id, -1, -1);
+                llama_memory_seq_rm(mem, slot.seq_id_backup, -1, -1);
+            }
+
+            // the re-decode must not be tape-recorded (the tape belongs to the verify pass)
+            if (dflash_tape_active) {
+                llama_set_tape_recording(ctx_tgt, false);
+                dflash_tape_active = false;
+            }
+
+            const int n_reeval = slot.prompt.n_tokens() - pos_root;
+            if (n_reeval > 0) {
+                llama_batch batch_reeval = llama_batch_init(n_reeval, 0, 1);
+                const auto & toks = slot.prompt.tokens.get_text_tokens();
+                for (int j = pos_root; j < slot.prompt.n_tokens(); ++j) {
+                    common_batch_add(batch_reeval, toks[j], j, { slot.id }, false);
+                }
+                llama_decode(ctx_tgt, batch_reeval);
+                llama_batch_free(batch_reeval);
+            }
+        }
+        slot.seq_id_branch = -1;
+        slot.has_draft_backup = false;
+        slot.seq_id_backup = -1;
+
+        common_speculative_rollback_dft(slot.get_spec(), slot.id, slot.prompt.n_tokens(), (uint16_t) (ids.size() - 1));
+
+        for (size_t i = 0; i < ids.size(); ++i) {
+            completion_token_output result;
+
+            result.tok          = ids[i];
+            result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
+            result.prob         = 1.0f;
+
+            slot.n_decoded += 1;
+
+            if (!process_token(result, slot)) {
+                slot.print_timings();
+                send_final_response(slot);
+                metrics.on_prediction(slot);
+                slot.release();
+
+                break;
+            }
+        }
+
+        slot.print_timings_tg();
+
+        SLT_DBG(slot, "tree accepted %d/%d nodes (backbone = %d), new n_tokens = %d\n",
+                (int) ids.size() - 1, n_draft, on_main_path ? 1 : 0, slot.prompt.n_tokens());
+    }
+
     // returns true = success ; false = retry with smaller batch size
     // throw std::runtime_error on fatal error
     bool decode(int32_t & n_batch, int32_t off, llama_batch & batch_view) {
@@ -4642,7 +4904,20 @@ private:
 
                 // TODO: handle ret == 2 (abort) when we start aborting
 
+                // DDTree: a tree-shaped verify batch cannot be split — the tree mask covers
+                // the whole ubatch — so the retry-with-smaller-batch path below is not an
+                // option. Fail the affected slots instead.
+                if (err.empty() && tree_mask_armed) {
+                    err = "KV cache full during tree verification.";
+                }
+
                 if (!err.empty()) {
+                    if (tree_mask_armed) {
+                        llama_clear_tree_mask(ctx_tgt);
+                        llama_clear_tree_parent_ids(ctx_tgt);
+                        tree_mask_armed = false;
+                    }
+
                     SRV_ERR("%s off = %d, n_batch = %d, ret = %d\n", err.c_str(), off, n_batch, ret);
 
                     for (auto & slot : slots) {
@@ -4910,7 +5185,17 @@ private:
         // speculative decoding - main model sample and accept
         const int64_t t_accept_start = ggml_time_us();
         for (auto & slot : slots) {
-            if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() || slot.spec_draft.empty()) {
+            if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate()) {
+                continue;
+            }
+
+            // DDTree: tree-shaped drafts take the tree walk instead of the linear accept
+            if (slot.spec_tree.n_nodes > 0) {
+                tree_accept(slot, accept_special_token);
+                continue;
+            }
+
+            if (slot.spec_draft.empty()) {
                 continue;
             }
 
@@ -5462,6 +5747,16 @@ private:
         // verify batch spans more than one ubatch.
         if (dflash_tape_active) {
             llama_set_tape_recording(ctx_tgt, false);
+        }
+
+        // DDTree safety net: the tree mask must never survive the cycle it was armed in
+        // (the accept path clears it; this covers early exits, e.g. a slot released
+        // between draft and accept). A stale mask would poison the next decode.
+        if (tree_mask_armed) {
+            SRV_WRN("%s", "tree mask still armed at end of cycle — clearing\n");
+            llama_clear_tree_mask(ctx_tgt);
+            llama_clear_tree_parent_ids(ctx_tgt);
+            tree_mask_armed = false;
         }
 
         // restore force_split_seq for the next cycle (prompt batches need it)

@@ -3,7 +3,22 @@
 #include "llama.h"
 #include "common.h"
 
+#include <unordered_map>
+
 struct common_speculative;
+struct common_sampler;
+
+// DDTree: tree of likely continuations built from drafter top-K logits.
+// Node 0 is the root (the last sampled target token); drafted nodes are 1-based.
+struct common_speculative_tree {
+    std::vector<llama_token> tokens;   // [n_nodes] node tokens (topological order)
+    std::vector<int32_t>     parents;  // [n_nodes+1] parent node index (-1 for root)
+    std::vector<int32_t>     depths;   // [n_nodes] 1-based depth (root's children = 1)
+    std::vector<std::unordered_map<llama_token, int>> child_maps; // [n_nodes+1] token → child node index
+    std::vector<uint8_t>     visibility; // [(n_nodes+1)²] row-major: node i may attend to node j
+    int n_nodes = 0;
+    int main_path_len = 0; // chain-seed backbone length (nodes 1..main_path_len form a chain from the root)
+};
 
 // comma separated list the provided types
 std::string common_speculative_type_name_str(const std::vector<enum common_speculative_type> & types);
@@ -116,6 +131,30 @@ llama_tokens common_speculative_draft(
         llama_token                       id_last,
         std::vector<float>              * draft_log_probs = nullptr,
         llama_pos                         n_past_override = -1);
+
+// fork: DDTree draft — build a tree of continuations from the drafter's top-K logits
+// (requires an impl with tree support, currently DFlash). Returns an empty tree
+// (n_nodes == 0) when no impl produced one; callers fall back to the flat path.
+common_speculative_tree common_speculative_draft_tree(
+        common_speculative              * spec,
+        const common_params_speculative & params,
+        const llama_tokens              & prompt_tgt,
+        llama_token                       id_last,
+        int                               n_max_eff,
+        int                               tree_budget);
+
+// fork: DDTree acceptance — greedy walk from the root following the target's sampled
+// tokens through the tree. i_batch[k] is the verify-batch output index of tree node k
+// (k = 0 is the root token). Returns the accepted tokens plus the bonus token; sets
+// commit_n to the deepest accepted node index (0 = none) and on_main_path to whether
+// the accepted path stayed on the chain-seed backbone.
+llama_tokens common_speculative_tree_accept(
+        common_sampler                * smpl,
+        llama_context                 * ctx_tgt,
+        const common_speculative_tree & tree,
+        const std::vector<int32_t>    & i_batch,
+        int                           & commit_n,
+        bool                          & on_main_path);
 
 // fork: batched multi-slot DFlash drafting
 void common_speculative_draft_batch(

@@ -75,13 +75,17 @@ public:
 
     // sanitize and auto-gen missing data in the input batch
     // memory is optional. if provided will be used to check for sequence continuity and to determine the positions
+    // allow_pos_gaps relaxes the per-sequence position-continuity check for DDTree verify
+    // batches: the branch sequence holds off-backbone tree nodes whose parents live on the
+    // main sequence, so its positions can legitimately have gaps and duplicates
     bool init(
             const llama_batch & batch_inp,
             const llama_vocab & vocab,
             const llama_memory_i * memory,
             uint32_t n_embd,
             uint32_t n_seq_max,
-            bool output_all);
+            bool output_all,
+            bool allow_pos_gaps = false);
 
     const llama_batch & get_batch() const;
 

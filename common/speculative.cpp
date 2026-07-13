@@ -181,6 +181,15 @@ struct common_speculative_impl {
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
 
+    // (optional) DDTree: build a tree of continuations instead of a flat draft.
+    // Implementations without tree support leave the tree empty.
+    virtual void draft_tree(
+            const llama_tokens & /*prompt_tgt*/,
+            llama_token /*id_last*/,
+            int /*n_max_eff*/,
+            int /*tree_budget*/,
+            common_speculative_tree & /*tree*/) {}
+
     // true if this implementation requires the target context to extract post-norm embeddings
     virtual bool need_embd() const = 0;
 
@@ -2587,16 +2596,6 @@ struct common_speculative_impl_recycle : public common_speculative_impl {
 // ---- DFlash block-diffusion speculative decoding ----
 // Uses an external drafter model conditioned on target hidden states via KV injection
 
-struct common_speculative_tree {
-    std::vector<llama_token> tokens;
-    std::vector<int32_t>     parents;
-    std::vector<int32_t>     depths;
-    std::vector<std::unordered_map<llama_token, int>> child_maps;
-    std::vector<uint8_t>     visibility;
-    int n_nodes = 0;
-    int main_path_len = 0;
-};
-
 struct common_speculative_impl_dflash : public common_speculative_impl {
     llama_context * ctx_tgt;
     llama_context * ctx_dft;
@@ -2985,7 +2984,7 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
             llama_token id_last,
             int n_max_eff,
             int tree_budget,
-            common_speculative_tree & tree) {
+            common_speculative_tree & tree) override {
         const int n_draft = std::min(n_max_eff, block_size - 1);
         if (n_draft <= 0 || committed_len == 0) {
             return;
@@ -3142,7 +3141,7 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
         }
 
         const int64_t t1 = ggml_time_us();
-        LOG_INF("ddtree: built tree with %d nodes (%d main + %d branch, budget %d) in %.1fms\n",
+        LOG_DBG("ddtree: built tree with %d nodes (%d main + %d branch, budget %d) in %.1fms\n",
                 tree.n_nodes, tree.main_path_len, tree.n_nodes - tree.main_path_len,
                 tree_budget, (t1 - t0) / 1e3);
 
@@ -4047,6 +4046,75 @@ llama_tokens common_speculative_draft(
 
     GGML_UNUSED(draft_log_probs);
     return result;
+}
+
+common_speculative_tree common_speculative_draft_tree(
+        common_speculative              * spec,
+        const common_params_speculative & params,
+        const llama_tokens              & prompt_tgt,
+        llama_token                       id_last,
+        int                               n_max_eff,
+        int                               tree_budget) {
+    common_speculative_tree tree;
+
+    if (spec == nullptr || tree_budget <= 0) {
+        return tree;
+    }
+
+    spec->curr_impl = nullptr;
+
+    for (auto & impl : spec->impls) {
+        {
+            common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
+            impl->draft_tree(prompt_tgt, id_last, n_max_eff, tree_budget, tree);
+            impl->n_call_draft++;
+        }
+
+        if (tree.n_nodes > 0) {
+            spec->curr_impl = impl.get();
+            impl->n_gen_drafts++;
+            impl->n_gen_tokens += tree.n_nodes;
+            break;
+        }
+    }
+
+    GGML_UNUSED(params);
+    return tree;
+}
+
+llama_tokens common_speculative_tree_accept(
+        common_sampler                * smpl,
+        llama_context                 * ctx_tgt,
+        const common_speculative_tree & tree,
+        const std::vector<int32_t>    & i_batch,
+        int                           & commit_n,
+        bool                          & on_main_path) {
+    GGML_ASSERT((int) i_batch.size() == tree.n_nodes + 1);
+
+    llama_tokens ids;
+    commit_n     = 0;
+    on_main_path = true;
+
+    int current = 0; // node index; the sampled token at node k decides which child (if any) is accepted
+    while (true) {
+        const llama_token tok = common_sampler_sample(smpl, ctx_tgt, i_batch[current]);
+        common_sampler_accept(smpl, tok, true);
+        ids.push_back(tok);
+
+        const auto it = tree.child_maps[current].find(tok);
+        if (it == tree.child_maps[current].end()) {
+            break; // no drafted child matches — this token is the bonus token
+        }
+
+        current  = it->second;
+        commit_n = current;
+
+        if (current > tree.main_path_len) {
+            on_main_path = false;
+        }
+    }
+
+    return ids;
 }
 
 void common_speculative_draft_batch(
