@@ -330,6 +330,16 @@ struct server_slot {
     llama_seq_id seq_id_backup = -1;
     int  n_tokens_before_draft = 0; // prompt token count before draft tokens were added
 
+    // DDTree per-request phase profile (us), reported in print_timings
+    int64_t t_tree_draft_us   = 0; // draft_tree calls
+    int64_t t_tree_verify_us  = 0; // tree verify decode (launch side)
+    int64_t t_tree_walk_us    = 0; // acceptance walk (includes verify GPU tail via sampling sync)
+    int64_t t_tree_restore_us = 0; // backup restore seq ops
+    int64_t t_tree_reeval_us  = 0; // accepted-path re-decode (includes sync)
+    int32_t n_tree_cycles     = 0;
+    int32_t n_tree_onmain     = 0; // accepts that never left the backbone
+    int64_t n_tree_nodes_total = 0;
+
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
@@ -361,6 +371,15 @@ struct server_slot {
         has_draft_backup = false;
         seq_id_backup = -1;
         n_tokens_before_draft = 0;
+
+        t_tree_draft_us   = 0;
+        t_tree_verify_us  = 0;
+        t_tree_walk_us    = 0;
+        t_tree_restore_us = 0;
+        t_tree_reeval_us  = 0;
+        n_tree_cycles     = 0;
+        n_tree_onmain     = 0;
+        n_tree_nodes_total = 0;
 
         task_prev = std::move(task);
         task.reset();
@@ -688,6 +707,15 @@ struct server_slot {
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
             SLT_TRC(*this,
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
+        }
+
+        if (n_tree_cycles > 0) {
+            const double c = n_tree_cycles;
+            SLT_INF(*this,
+                    "    tree profile = %d cycles, %.1f nodes/cycle, %.1f%% on-backbone | per cycle: draft=%.2f verify=%.2f walk=%.2f restore=%.2f reeval=%.2f ms\n",
+                    n_tree_cycles, n_tree_nodes_total / c, 100.0 * n_tree_onmain / c,
+                    t_tree_draft_us / 1e3 / c, t_tree_verify_us / 1e3 / c, t_tree_walk_us / 1e3 / c,
+                    t_tree_restore_us / 1e3 / c, t_tree_reeval_us / 1e3 / c);
         }
 
         common_speculative_print_stats(spec.get());
@@ -4630,9 +4658,11 @@ private:
 
         const int n_max_eff = params_spec.n_max > 0 ? std::min(n_draft_max, params_spec.n_max) : n_draft_max;
 
+        const int64_t t_tree_draft_start = ggml_time_us();
         common_speculative_tree tree = common_speculative_draft_tree(
                 slot.get_spec(), params_spec, cached_text_tokens, slot.sampled,
                 n_max_eff, params_base.speculative.tree_budget);
+        slot.t_tree_draft_us += ggml_time_us() - t_tree_draft_start;
 
         if (tree.n_nodes == 0) {
             return false;
@@ -4726,8 +4756,13 @@ private:
 
         int  commit_n     = 0;
         bool on_main_path = true;
+        const int64_t t_walk_start = ggml_time_us();
         const auto ids = common_speculative_tree_accept(
                 slot.smpl.get(), ctx_tgt, tree, slot.spec_i_batch, commit_n, on_main_path);
+        slot.t_tree_walk_us += ggml_time_us() - t_walk_start;
+        slot.n_tree_cycles  += 1;
+        slot.n_tree_onmain  += on_main_path ? 1 : 0;
+        slot.n_tree_nodes_total += tree.n_nodes;
 
         // update the DFlash hidden-state ring with the accepted-path tokens.
         // Must run BEFORE rollback (matches the flat path ordering).
@@ -4787,9 +4822,11 @@ private:
         llama_clear_tree_parent_ids(ctx_tgt);
 
         if (needs_reeval && slot.has_draft_backup) {
+            const int64_t t_restore_start = ggml_time_us();
             llama_memory_seq_rm(mem, slot.id, pos_root, -1);
             llama_memory_seq_cp(mem, slot.seq_id_backup, slot.id, -1, -1);
             llama_memory_seq_rm(mem, slot.seq_id_backup, -1, -1);
+            slot.t_tree_restore_us += ggml_time_us() - t_restore_start;
 
             // the re-decode must not be tape-recorded (the tape belongs to the verify pass)
             if (dflash_tape_active) {
@@ -4799,6 +4836,7 @@ private:
 
             const int n_reeval = slot.prompt.n_tokens() - pos_root;
             if (n_reeval > 0) {
+                const int64_t t_reeval_start = ggml_time_us();
                 llama_batch batch_reeval = llama_batch_init(n_reeval, 0, 1);
                 const auto & toks = slot.prompt.tokens.get_text_tokens();
                 for (int j = pos_root; j < slot.prompt.n_tokens(); ++j) {
@@ -4806,6 +4844,8 @@ private:
                 }
                 llama_decode(ctx_tgt, batch_reeval);
                 llama_batch_free(batch_reeval);
+                llama_synchronize(ctx_tgt);
+                slot.t_tree_reeval_us += ggml_time_us() - t_reeval_start;
             }
         } else {
             // attention-only target: rejected nodes share the slot seq at duplicate
@@ -4817,6 +4857,7 @@ private:
             }
             const int n_reeval = slot.prompt.n_tokens() - pos_root;
             if (n_reeval > 0) {
+                const int64_t t_reeval_start = ggml_time_us();
                 llama_batch batch_reeval = llama_batch_init(n_reeval, 0, 1);
                 const auto & toks = slot.prompt.tokens.get_text_tokens();
                 for (int j = pos_root; j < slot.prompt.n_tokens(); ++j) {
@@ -4824,6 +4865,8 @@ private:
                 }
                 llama_decode(ctx_tgt, batch_reeval);
                 llama_batch_free(batch_reeval);
+                llama_synchronize(ctx_tgt);
+                slot.t_tree_reeval_us += ggml_time_us() - t_reeval_start;
             }
         }
         slot.has_draft_backup = false;
@@ -4901,6 +4944,9 @@ private:
         const int ret = llama_decode(ctx_tgt, batch_view);
         const int64_t t_verify_elapsed = ggml_time_us() - t_verify_start;
         t_verify_total += t_verify_elapsed;
+        if (tree_mask_armed && slot_batched) {
+            slot_batched->t_tree_verify_us += t_verify_elapsed;
+        }
         SRV_DBG("  verify ubatch: %d tok, %.1fms (%.2fms/tok)\n",
                 batch_view.n_tokens, t_verify_elapsed / 1e3, t_verify_elapsed / 1e3 / std::max(1, batch_view.n_tokens));
 
