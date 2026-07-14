@@ -3385,7 +3385,7 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
         LOG_INF("weaver: built tree with %d nodes (chain prefix %d, budget %d, pool %d, %d rounds, spec %d/%d, open %d) in %.1fms (dft %.1f beg %.1f cand %.1f chain %.1f)\n",
                 tree.n_nodes, tree.main_path_len, tree_budget, n_cand, n_rounds, spec_hits, n_spec - 1, n_open, (t1 - t0) / 1e3,
                 (t_dft - t0) / 1e3, (t_beg - t_dft) / 1e3, (t_cand - t_beg) / 1e3, (t_chain - t_cand) / 1e3);
-        LOG_INF("weaver: dft split: cross %.1f dec %.1f get %.1f\n",
+        LOG_DBG("weaver: dft split: cross %.1f dec %.1f get %.1f\n",
                 (t_cross - t0) / 1e3, (t_dec - t_cross) / 1e3, (t_dft - t_dec) / 1e3);
     }
 
