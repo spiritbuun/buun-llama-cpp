@@ -36,6 +36,7 @@ weaver_scorer * weaver_init(const char * gguf_path, bool prefer_gpu, int max_nod
 void            weaver_free(weaver_scorer * ws);
 
 const weaver_params & weaver_get_params(const weaver_scorer * ws);
+int                   weaver_max_nodes(const weaver_scorer * ws);
 
 // Build the 16-token prefix KV for this drafting step.
 // target_final_hidden: [d_model] — verifier final-norm hidden at the committed token.

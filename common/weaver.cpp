@@ -232,6 +232,10 @@ const weaver_params & weaver_get_params(const weaver_scorer * ws) {
     return ws->params;
 }
 
+int weaver_max_nodes(const weaver_scorer * ws) {
+    return ws->max_nodes;
+}
+
 // rms(x)*w + b, fp32 (WeaverRMSNorm has a bias)
 static ggml_tensor * wvr_rmsnorm(ggml_context * ctx, ggml_tensor * x,
                                  ggml_tensor * w, ggml_tensor * b, float eps) {
