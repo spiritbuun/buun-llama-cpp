@@ -3264,7 +3264,7 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
         std::vector<float>       round_logits;
 
         run_selection();
-        while (n_rounds < 4) {
+        while (n_rounds < 8) {
             bat_ids.clear();
             for (int rid : sel_reg) {
                 if (!reg[rid].expanded && reg[rid].depth < n_depths) {
@@ -3275,9 +3275,10 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
                 break;
             }
             // re-speculate the drafter-argmax continuation under the best (= earliest
-            // accepted) unexpanded node, chaining through this batch
-            {
-                int cur = bat_ids[0];
+            // accepted) unexpanded nodes, chaining through this batch
+            const int n_respec = std::min((int) bat_ids.size(), 2);
+            for (int s = 0; s < n_respec; ++s) {
+                int cur = bat_ids[s];
                 for (int d = reg[cur].depth + 1; d < n_depths; ++d) {
                     const llama_token t = pool_ids[(size_t) (d - 1) * n_cand];
                     if (t < 0) break;
@@ -3341,10 +3342,12 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
             run_selection();
         }
 
-        // count final-selection nodes that came from the phase-1 speculation
+        // final-selection stats: phase-1 spec reuse + still-unexpanded accepts
         int spec_hits = 0;
+        int n_open    = 0;
         for (int rid : sel_reg) {
             if (rid < n_spec) spec_hits++;
+            if (!reg[rid].expanded && reg[rid].depth < n_depths) n_open++;
         }
 
         // emit the final selection as the draft tree
@@ -3379,8 +3382,8 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
         }
 
         const int64_t t1 = ggml_time_us();
-        LOG_INF("weaver: built tree with %d nodes (chain prefix %d, budget %d, pool %d, %d rounds, spec %d/%d) in %.1fms (dft %.1f beg %.1f cand %.1f chain %.1f)\n",
-                tree.n_nodes, tree.main_path_len, tree_budget, n_cand, n_rounds, spec_hits, n_spec - 1, (t1 - t0) / 1e3,
+        LOG_INF("weaver: built tree with %d nodes (chain prefix %d, budget %d, pool %d, %d rounds, spec %d/%d, open %d) in %.1fms (dft %.1f beg %.1f cand %.1f chain %.1f)\n",
+                tree.n_nodes, tree.main_path_len, tree_budget, n_cand, n_rounds, spec_hits, n_spec - 1, n_open, (t1 - t0) / 1e3,
                 (t_dft - t0) / 1e3, (t_beg - t_dft) / 1e3, (t_cand - t_beg) / 1e3, (t_chain - t_cand) / 1e3);
         LOG_INF("weaver: dft split: cross %.1f dec %.1f get %.1f\n",
                 (t_cross - t0) / 1e3, (t_dec - t_cross) / 1e3, (t_dft - t_dec) / 1e3);
