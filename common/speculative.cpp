@@ -2713,8 +2713,10 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
         // Weaver tree-draft scorer (optional; falls back to raw-marginal DDTree)
         if (!weaver_path.empty()) {
             weaver_topk = std::min(weaver_topk_, 64); // ggml_topk_ext kernel cap
-            // slots: phase-1 chain + up to 3 refine rounds of (budget + re-spec chain) each
-            weaver = weaver_init(weaver_path.c_str(), /*prefer_gpu=*/true, 4 * tree_budget_ + 64);
+            // slots: phase-1 chain + refine rounds of (budget + re-spec chain) each;
+            // horizon covers 2 chained drafter blocks (--draft-max past block_size-1)
+            weaver = weaver_init(weaver_path.c_str(), /*prefer_gpu=*/true, 6 * tree_budget_ + 128,
+                                 /*max_depth=*/ 2 * (block_size - 1), /*pool_cap=*/ weaver_topk);
             if (weaver) {
                 const llama_model * model_tgt = llama_get_model(ctx_tgt);
                 if (!weaver_attach_target(weaver,
@@ -2926,8 +2928,12 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
             const llama_token id_last = dp.id_last;
             const int32_t n_max_eff = dp.n_max > 0 ? dp.n_max : (block_size - 1);
 
-            const int n_draft_base = adaptive_n_draft > 0 ? adaptive_n_draft : (block_size - 1);
-            const int n_draft = std::min(n_draft_base, n_max_eff);
+            // chained drafting: n_max past block_size-1 runs a second block seeded
+            // with the first block's argmax tail (stale cross context — the drafter
+            // sees the chain only through the seed token)
+            const int horizon  = 2 * (block_size - 1);
+            const int n_max_c  = std::min((int) n_max_eff, horizon);
+            const int n_draft  = adaptive_n_draft > 0 ? std::min(adaptive_n_draft, n_max_c) : n_max_c;
             if (committed_len == 0) {
                 continue;
             }
@@ -2938,41 +2944,47 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
 
             const int64_t t1 = ggml_time_us();
 
-            // build drafter batch: [id_last, mask, mask, ..., mask]
-            // positions are relative to the context window fed to the drafter
-            // batch size adapts to n_draft+1 (saves compute when n_max < block_size-1)
-            const int batch_len = n_draft + 1;
-            common_batch_clear(batch_dft);
-            common_batch_add(batch_dft, id_last, cross_len, { seq_id }, true);
-            for (int i = 1; i < batch_len; ++i) {
-                common_batch_add(batch_dft, mask_token_id, cross_len + i, { seq_id }, true);
-            }
+            int64_t t_dec_sum = 0;
+            llama_token seed = id_last;
+            bool stopped = false;
+            while ((int) result.size() < n_draft && !stopped) {
+                const int done      = (int) result.size();
+                const int batch_len = std::min(n_draft - done, block_size - 1) + 1;
 
-            const int64_t t2 = ggml_time_us();
+                // build drafter batch: [seed, mask, mask, ..., mask]
+                // positions are relative to the context window fed to the drafter
+                // batch size adapts to the remaining depth (saves compute when n_max < block_size-1)
+                common_batch_clear(batch_dft);
+                common_batch_add(batch_dft, seed, cross_len + done, { seq_id }, true);
+                for (int i = 1; i < batch_len; ++i) {
+                    common_batch_add(batch_dft, mask_token_id, cross_len + done + i, { seq_id }, true);
+                }
 
-            // run drafter forward pass
-            int ret = llama_decode(ctx_dft, batch_dft);
-            if (ret != 0) {
-                LOG_ERR("dflash: drafter decode failed with %d\n", ret);
-                continue;
-            }
+                const int64_t t2 = ggml_time_us();
 
-            const int64_t t3 = ggml_time_us();
+                // run drafter forward pass
+                int ret = llama_decode(ctx_dft, batch_dft);
+                if (ret != 0) {
+                    LOG_ERR("dflash: drafter decode failed with %d\n", ret);
+                    break;
+                }
 
-            // read argmax tokens for positions 1..batch_len-1 (skip position 0 = staged_first)
-            {
+                t_dec_sum += ggml_time_us() - t2;
+
+                // read argmax tokens for positions 1..batch_len-1 (skip position 0 = the seed)
                 int32_t * argmax = llama_get_logits_argmax(ctx_dft);
                 float * argmax_probs = llama_get_logits_argmax_probs(ctx_dft);
                 const int K_flat = llama_get_logits_argmax_k(ctx_dft);
                 if (argmax) {
                     // GPU argmax path — only 64-128 bytes transferred instead of 15.9MB
                     for (int i = 1; i < batch_len && (int) result.size() < n_draft; ++i) {
-                        if (argmax_probs && p_min > 0.0f && i > 1) {
+                        if (argmax_probs && p_min > 0.0f && (int) result.size() > 0) {
                             float log_prob = argmax_probs[i * K_flat];
                             float log_p_min = logf(p_min);
                             if (log_prob < log_p_min) {
-                                LOG_DBG("dflash: early stop at position %d/%d (prob %.3f < p_min %.3f)\n",
-                                        i, batch_len, expf(log_prob), p_min);
+                                LOG_DBG("dflash: early stop at depth %d/%d (prob %.3f < p_min %.3f)\n",
+                                        done + i, n_draft, expf(log_prob), p_min);
+                                stopped = true;
                                 break;
                             }
                         }
@@ -2984,21 +2996,28 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
                     for (int i = 1; i < batch_len && (int) result.size() < n_draft; ++i) {
                         float * logits = llama_get_logits_ith(ctx_dft, i);
                         if (!logits) {
+                            stopped = true;
                             break;
                         }
                         llama_token best = (llama_token)(std::max_element(logits, logits + n_vocab_dft) - logits);
                         result.push_back(best);
                     }
                 }
+
+                // a partial block means an early stop — don't chain past it
+                if ((int) result.size() - done < batch_len - 1) {
+                    break;
+                }
+                seed = result.back();
             }
 
             const int64_t t4 = ggml_time_us();
 
             n_draft_last = (int) result.size();
 
-            LOG_DBG("dflash draft breakdown (ctx=%d): concat=%.1fms cross=%.1fms decode=%.1fms argmax=%.1fms total=%.1fms\n",
+            LOG_DBG("dflash draft breakdown (ctx=%d): cross=%.1fms decode=%.1fms other=%.1fms total=%.1fms\n",
                     committed_len,
-                    (t1 - t0) / 1e3, (t2 - t1) / 1e3, (t3 - t2) / 1e3, (t4 - t3) / 1e3, (t4 - t0) / 1e3);
+                    (t1 - t0) / 1e3, t_dec_sum / 1e3, (t4 - t1 - t_dec_sum) / 1e3, (t4 - t0) / 1e3);
         }
     }
 
@@ -3017,7 +3036,9 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
             } else {
                 n_low_accept = 0;
                 if (f_acc > 0.6f && adaptive_n_draft > 0) {
-                    adaptive_n_draft = std::min(block_size - 1, adaptive_n_draft + 1);
+                    // n_max still caps the effective depth; this only lets adaptive
+                    // recover a chained (2-block) horizon after a low-accept streak
+                    adaptive_n_draft = std::min(2 * (block_size - 1), adaptive_n_draft + 1);
                 }
             }
         }
@@ -3032,7 +3053,8 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
             int n_max_eff,
             int tree_budget,
             common_speculative_tree & tree) {
-        const int n_draft = std::min(n_max_eff, block_size - 1);
+        const int horizon = std::min(2 * (block_size - 1), weaver_max_depth(weaver));
+        const int n_draft = std::min(n_max_eff, horizon);
         if (n_draft <= 0 || committed_len == 0 || !weaver_tgt_hidden_valid) {
             return;
         }
@@ -3043,49 +3065,79 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
 
         const int64_t t0 = ggml_time_us();
 
-        // drafter forward — always the full block (the Weaver prefix conditions
-        // every expansion on all depths' hiddens)
+        // drafter forward — full blocks, chained when n_draft > block_size-1: block b
+        // is seeded with block b-1's argmax tail (its cross context is b*(bs-1) tokens
+        // stale — that uncertainty is exactly what the Weaver rescoring absorbs).
+        // Pools and hiddens are copied out per block: the next decode overwrites the
+        // drafter's argmax/embeddings buffers.
         int cross_len = build_cross_data(ctx_dft);
         const int64_t t_cross = ggml_time_us();
-        common_batch_clear(batch_dft);
-        common_batch_add(batch_dft, id_last, cross_len, { seq_id }, true);
-        for (int i = 1; i < block_size; ++i) {
-            common_batch_add(batch_dft, mask_token_id, cross_len + i, { seq_id }, true);
-        }
-        if (llama_decode(ctx_dft, batch_dft) != 0) {
-            LOG_ERR("weaver: drafter decode failed\n");
-            return;
-        }
-        const int64_t t_dec = ggml_time_us();
 
-        int32_t * argmax       = llama_get_logits_argmax(ctx_dft);
-        float   * argmax_probs = llama_get_logits_argmax_probs(ctx_dft);
-        const int K            = llama_get_logits_argmax_k(ctx_dft);
-        const float * embd     = llama_get_embeddings(ctx_dft);
-        if (!argmax || !argmax_probs || K < 2 || !embd) {
-            LOG_ERR("weaver: drafter top-K/embeddings unavailable\n");
+        int n_depths = n_draft;
+        int n_cand   = 0;
+        std::vector<int32_t> pool_ids;
+        std::vector<float>   pool_scores;
+        std::vector<float>   chain_hiddens((size_t) n_depths * n_embd);
+        int64_t t_dec_sum = 0;
+
+        llama_token seed = id_last;
+        int d_done = 0;
+        while (d_done < n_depths) {
+            const int nd = std::min(block_size - 1, n_depths - d_done);
+            common_batch_clear(batch_dft);
+            common_batch_add(batch_dft, seed, cross_len + d_done, { seq_id }, true);
+            for (int i = 1; i <= nd; ++i) {
+                common_batch_add(batch_dft, mask_token_id, cross_len + d_done + i, { seq_id }, true);
+            }
+            const int64_t t_d0 = ggml_time_us();
+            if (llama_decode(ctx_dft, batch_dft) != 0) {
+                LOG_ERR("weaver: drafter decode failed\n");
+                return;
+            }
+            t_dec_sum += ggml_time_us() - t_d0;
+
+            int32_t * argmax       = llama_get_logits_argmax(ctx_dft);
+            float   * argmax_probs = llama_get_logits_argmax_probs(ctx_dft);
+            const int K            = llama_get_logits_argmax_k(ctx_dft);
+            const float * embd     = llama_get_embeddings(ctx_dft);
+            if (!argmax || !argmax_probs || K < 2 || !embd) {
+                LOG_ERR("weaver: drafter top-K/embeddings unavailable\n");
+                return;
+            }
+            if (n_cand == 0) {
+                n_cand = std::min(K, weaver_topk);
+                pool_ids.resize((size_t) n_depths * n_cand);
+                pool_scores.resize((size_t) n_depths * n_cand);
+            }
+
+            // candidate pools: depth d_done+d ← this block's position d+1. Scores are
+            // top-K log-probs; the per-position logsumexp shift cancels in the pool softmax.
+            for (int d = 0; d < nd; ++d) {
+                for (int i = 0; i < n_cand; ++i) {
+                    pool_ids   [(size_t) (d_done + d) * n_cand + i] = argmax[(d + 1) * K + i];
+                    pool_scores[(size_t) (d_done + d) * n_cand + i] = argmax_probs[(d + 1) * K + i];
+                }
+            }
+            memcpy(chain_hiddens.data() + (size_t) d_done * n_embd,
+                   embd + (size_t) n_embd, (size_t) nd * n_embd * sizeof(float));
+
+            seed = (llama_token) argmax[nd * K]; // next block's seed = this block's argmax tail
+            d_done += nd;
+            if (seed < 0) {
+                n_depths = d_done;
+                break;
+            }
+        }
+        if (n_depths <= 0 || n_cand == 0) {
             return;
         }
 
         const int64_t t_dft = ggml_time_us();
 
-        // prefix: [target final-norm hidden ; drafter hiddens at positions 1..n_steps]
-        const int n_steps = std::min(block_size - 1, wp.depth_cap);
-        weaver_begin_step(weaver, weaver_tgt_hidden.data(), embd + (size_t) n_embd, n_steps);
+        // prefix: [target final-norm hidden ; drafter hiddens at chain depths 1..n_depths]
+        weaver_begin_step(weaver, weaver_tgt_hidden.data(), chain_hiddens.data(), n_depths);
         const int64_t t_beg = ggml_time_us();
 
-        // candidate pools: depth d ← drafter position d+1. Scores are top-K
-        // log-probs; the per-position logsumexp shift cancels in the pool softmax.
-        const int n_depths = std::min(n_draft, wp.depth_cap);
-        const int n_cand   = std::min(K, weaver_topk);
-        std::vector<int32_t> pool_ids((size_t) n_depths * n_cand);
-        std::vector<float>   pool_scores((size_t) n_depths * n_cand);
-        for (int d = 0; d < n_depths; ++d) {
-            for (int i = 0; i < n_cand; ++i) {
-                pool_ids   [(size_t) d * n_cand + i] = argmax[(d + 1) * K + i];
-                pool_scores[(size_t) d * n_cand + i] = argmax_probs[(d + 1) * K + i];
-            }
-        }
         if (!weaver_set_candidates_ids(weaver, pool_ids.data(), pool_scores.data(), n_depths, n_cand)) {
             LOG_ERR("weaver: candidate pool upload failed\n");
             return;
@@ -3386,7 +3438,7 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
                 tree.n_nodes, tree.main_path_len, tree_budget, n_cand, n_rounds, spec_hits, n_spec - 1, n_open, (t1 - t0) / 1e3,
                 (t_dft - t0) / 1e3, (t_beg - t_dft) / 1e3, (t_cand - t_beg) / 1e3, (t_chain - t_cand) / 1e3);
         LOG_DBG("weaver: dft split: cross %.1f dec %.1f get %.1f\n",
-                (t_cross - t0) / 1e3, (t_dec - t_cross) / 1e3, (t_dft - t_dec) / 1e3);
+                (t_cross - t0) / 1e3, t_dec_sum / 1e3, (t_dft - t_cross - t_dec_sum) / 1e3);
     }
 
     void draft_tree(

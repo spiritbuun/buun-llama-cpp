@@ -31,12 +31,18 @@ struct weaver_params {
     float rms_eps   = 1e-6f;
 };
 
-// loads the weaver GGUF onto a GPU backend when available (CPU otherwise)
-weaver_scorer * weaver_init(const char * gguf_path, bool prefer_gpu, int max_nodes);
+// loads the weaver GGUF onto a GPU backend when available (CPU otherwise).
+// max_depth > depth_cap extends the scoring horizon past the trained pos_emb
+// rows (deeper depths reuse the last row — untrained extrapolation, used for
+// chained multi-block drafting); pool_cap > 0 shrinks the candidate-pool
+// state to that many entries per depth (the topk actually served).
+weaver_scorer * weaver_init(const char * gguf_path, bool prefer_gpu, int max_nodes,
+                            int max_depth = 0, int pool_cap = 0);
 void            weaver_free(weaver_scorer * ws);
 
 const weaver_params & weaver_get_params(const weaver_scorer * ws);
 int                   weaver_max_nodes(const weaver_scorer * ws);
+int                   weaver_max_depth(const weaver_scorer * ws);
 
 // Build the 16-token prefix KV for this drafting step.
 // target_final_hidden: [d_model] — verifier final-norm hidden at the committed token.

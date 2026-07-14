@@ -5,6 +5,7 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
@@ -57,6 +58,7 @@ struct weaver_scorer {
     bool output_host   = false;
 
     int max_nodes  = 0;
+    int max_depth  = 0; // scoring horizon (>= depth_cap; deeper rows reuse pos_emb[depth_cap-1])
     int prefix_len = 0; // tokens in the current prefix (n_steps + 1)
 
     ~weaver_scorer() {
@@ -84,7 +86,8 @@ static bool wvr_kv_i32(gguf_context * g, const char * key, int & out) {
     return true;
 }
 
-weaver_scorer * weaver_init(const char * gguf_path, bool prefer_gpu, int max_nodes) {
+weaver_scorer * weaver_init(const char * gguf_path, bool prefer_gpu, int max_nodes,
+                            int max_depth, int pool_cap) {
     auto * ws = new weaver_scorer();
     ws->max_nodes = max_nodes > 0 ? max_nodes : 257;
 
@@ -114,6 +117,10 @@ weaver_scorer * weaver_init(const char * gguf_path, bool prefer_gpu, int max_nod
         WVR_LOG("weaver: %s is missing weaver-scorer metadata\n", gguf_path);
         gguf_free(g); ggml_free(ctx_meta); delete ws;
         return nullptr;
+    }
+    ws->max_depth = std::max(max_depth, p.depth_cap);
+    if (pool_cap > 0 && pool_cap < p.pool_size) {
+        p.pool_size = pool_cap;
     }
 
     // --- backend ---
@@ -192,14 +199,14 @@ weaver_scorer * weaver_init(const char * gguf_path, bool prefer_gpu, int max_nod
     // --- persistent state ---
     {
         const int hd = p.d_rank / p.n_head;
-        const int prefix_max = p.depth_cap + 1;
+        const int prefix_max = ws->max_depth + 1;
         ggml_init_params ip = { 8 * ggml_tensor_overhead(), nullptr, true };
         ws->ctx_s = ggml_init(ip);
         ws->ext_k     = ggml_new_tensor_3d(ws->ctx_s, GGML_TYPE_F32, hd, p.n_head, prefix_max);
         ws->ext_v     = ggml_new_tensor_3d(ws->ctx_s, GGML_TYPE_F32, hd, p.n_head, prefix_max);
         ws->node_k    = ggml_new_tensor_2d(ws->ctx_s, GGML_TYPE_F32, p.d_rank, ws->max_nodes);
         ws->node_v    = ggml_new_tensor_2d(ws->ctx_s, GGML_TYPE_F32, p.d_rank, ws->max_nodes);
-        ws->cand_rows = ggml_new_tensor_3d(ws->ctx_s, GGML_TYPE_F32, p.d_model, p.pool_size, p.depth_cap);
+        ws->cand_rows = ggml_new_tensor_3d(ws->ctx_s, GGML_TYPE_F32, p.d_model, p.pool_size, ws->max_depth);
         ggml_set_name(ws->ext_k, "wvr_ext_k");
         ggml_set_name(ws->ext_v, "wvr_ext_v");
         ggml_set_name(ws->node_k, "wvr_node_k");
@@ -214,12 +221,12 @@ weaver_scorer * weaver_init(const char * gguf_path, bool prefer_gpu, int max_nod
         // node slots may be read (masked to -inf) before ever being written when a
         // round's expansion is skipped — they must hold finite values, not NaN garbage
         ggml_backend_buffer_clear(ws->buf_s, 0);
-        ws->cand_scores.resize(p.depth_cap);
-        ws->cand_n.assign(p.depth_cap, 0);
+        ws->cand_scores.resize(ws->max_depth);
+        ws->cand_n.assign(ws->max_depth, 0);
     }
 
-    WVR_LOG("weaver: loaded %s (d_model=%d d_rank=%d heads=%d depth_cap=%d pool=%d) on %s\n",
-            gguf_path, p.d_model, p.d_rank, p.n_head, p.depth_cap, p.pool_size,
+    WVR_LOG("weaver: loaded %s (d_model=%d d_rank=%d heads=%d depth_cap=%d horizon=%d pool=%d) on %s\n",
+            gguf_path, p.d_model, p.d_rank, p.n_head, p.depth_cap, ws->max_depth, p.pool_size,
             ggml_backend_name(ws->backend));
     return ws;
 }
@@ -234,6 +241,10 @@ const weaver_params & weaver_get_params(const weaver_scorer * ws) {
 
 int weaver_max_nodes(const weaver_scorer * ws) {
     return ws->max_nodes;
+}
+
+int weaver_max_depth(const weaver_scorer * ws) {
+    return ws->max_depth;
 }
 
 // rms(x)*w + b, fp32 (WeaverRMSNorm has a bias)
@@ -267,6 +278,7 @@ void weaver_begin_step(weaver_scorer * ws,
     const auto & p = ws->params;
     const auto & w = ws->w;
     const int hd = p.d_rank / p.n_head;
+    GGML_ASSERT(n_steps >= 1 && n_steps <= ws->max_depth);
     const int T  = n_steps + 1;
     ws->prefix_len = T;
     for (auto & n : ws->cand_n) n = 0;
@@ -285,7 +297,11 @@ void weaver_begin_step(weaver_scorer * ws,
             wvr_rmsnorm(ctx, tfh, w.output_norm_w, w.output_norm_b, p.rms_eps), w.proposal_in_b);
     ggml_tensor * tp = wvr_linear(ctx, w.proposal_in_w,
             wvr_rmsnorm(ctx, dh, w.output_norm_w, w.output_norm_b, p.rms_eps), w.proposal_in_b);
-    ggml_tensor * pe = ggml_view_2d(ctx, w.pos_emb, p.d_rank, n_steps, w.pos_emb->nb[1], 0);
+    // pos_emb rows for steps 0..n_steps-1; rows past depth_cap-1 (chained-block
+    // horizon extension) clamp to the last trained row
+    ggml_tensor * pe_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_steps);
+    ggml_set_input(pe_ids);
+    ggml_tensor * pe = ggml_get_rows(ctx, w.pos_emb, pe_ids);
     tp = ggml_add(ctx, tp, pe);
     ggml_tensor * x = ggml_concat(ctx, ggml_reshape_2d(ctx, t0, p.d_rank, 1), tp, 1); // [d_rank, T]
 
@@ -307,6 +323,13 @@ void weaver_begin_step(weaver_scorer * ws,
     GGML_ASSERT(alloc_ok && "weaver: prompt alloc failed");
     ggml_backend_tensor_set(tfh, target_final_hidden, 0, (size_t) p.d_model * sizeof(float));
     ggml_backend_tensor_set(dh, drafter_hiddens, 0, (size_t) p.d_model * n_steps * sizeof(float));
+    {
+        std::vector<int32_t> pids(n_steps);
+        for (int i = 0; i < n_steps; ++i) {
+            pids[i] = std::min(i, p.depth_cap - 1);
+        }
+        ggml_backend_tensor_set(pe_ids, pids.data(), 0, (size_t) n_steps * sizeof(int32_t));
+    }
     ggml_backend_graph_compute(ws->backend, gf);
     ggml_free(ctx);
 }
@@ -314,7 +337,7 @@ void weaver_begin_step(weaver_scorer * ws,
 void weaver_set_candidates(weaver_scorer * ws, int depth,
                            const float * lm_rows, const float * scores, int n_cand) {
     const auto & p = ws->params;
-    GGML_ASSERT(depth >= 0 && depth < p.depth_cap);
+    GGML_ASSERT(depth >= 0 && depth < ws->max_depth);
     GGML_ASSERT(n_cand > 0 && n_cand <= p.pool_size);
     const size_t row = (size_t) p.d_model * sizeof(float);
     ggml_backend_tensor_set(ws->cand_rows, lm_rows,
@@ -349,7 +372,7 @@ static bool wvr_expand_batch_impl(weaver_scorer * ws,
     const int S = slot_base; // persisted node slots visible to this round
     const int T = P + S + R;
     for (int r = 0; r < R; ++r) {
-        if (depths[r] < 0 || depths[r] >= p.depth_cap || ws->cand_n[depths[r]] != n_cand) {
+        if (depths[r] < 0 || depths[r] >= ws->max_depth || ws->cand_n[depths[r]] != n_cand) {
             return false;
         }
         // ancestors may be persisted slots OR earlier members of this batch (a chain
@@ -428,7 +451,7 @@ static bool wvr_expand_batch_impl(weaver_scorer * ws,
     ggml_tensor * cand_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) n_cand * R);
     ggml_set_input(cand_ids);
     ggml_tensor * flat = ggml_reshape_2d(ctx, ws->cand_rows,
-            p.d_model, (int64_t) p.pool_size * p.depth_cap);
+            p.d_model, (int64_t) p.pool_size * ws->max_depth);
     ggml_tensor * rows = ggml_reshape_3d(ctx, ggml_get_rows(ctx, flat, cand_ids),
             p.d_model, n_cand, R);
     ggml_tensor * resid = ggml_mul_mat(ctx, rows,
@@ -453,7 +476,15 @@ static bool wvr_expand_batch_impl(weaver_scorer * ws,
     } else {
         ggml_backend_tensor_set(emb_ids, tokens, 0, (size_t) R * sizeof(int32_t));
     }
-    ggml_backend_tensor_set(depth_ids, depths, 0, (size_t) R * sizeof(int32_t));
+    {
+        // pos_emb row per node — depths past depth_cap-1 clamp to the last trained row
+        // (the REAL depth still indexes the candidate pool below)
+        std::vector<int32_t> dclamp(R);
+        for (int r = 0; r < R; ++r) {
+            dclamp[r] = std::min(depths[r], p.depth_cap - 1);
+        }
+        ggml_backend_tensor_set(depth_ids, dclamp.data(), 0, (size_t) R * sizeof(int32_t));
+    }
     {
         std::vector<float> m((size_t) R * T, -INFINITY);
         std::vector<int32_t> cids((size_t) R * n_cand);
@@ -569,7 +600,7 @@ bool weaver_set_candidates_ids(weaver_scorer * ws,
                                const int32_t * ids, const float * scores,
                                int n_depths, int n_cand) {
     const auto & p = ws->params;
-    if (!ws->tgt_output || n_depths <= 0 || n_depths > p.depth_cap ||
+    if (!ws->tgt_output || n_depths <= 0 || n_depths > ws->max_depth ||
         n_cand <= 0 || n_cand > p.pool_size) {
         return false;
     }
@@ -577,7 +608,7 @@ bool weaver_set_candidates_ids(weaver_scorer * ws,
         ws->cand_scores[d].assign(scores + (size_t) d * n_cand, scores + (size_t) (d + 1) * n_cand);
         ws->cand_n[d] = n_cand;
     }
-    for (int d = n_depths; d < p.depth_cap; ++d) {
+    for (int d = n_depths; d < ws->max_depth; ++d) {
         ws->cand_n[d] = 0;
     }
 
