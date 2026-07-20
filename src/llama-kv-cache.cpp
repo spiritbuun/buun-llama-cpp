@@ -3688,10 +3688,10 @@ void llama_kv_cache::vbr_transcode_anchor_test() {
                 for (size_t i = 0; i < bytesTo; ++i) {
                     if (hb[i] == ib[i]) { same++; } else if (first_bad == bytesTo) { first_bad = i; }
                 }
-                fprintf(stderr, "VBR SELFTEST PROMOTE %s %s->%s in-place==separate: %.3f%% (%zu/%zu)%s first-diff byte %zd (row %lld)\n",
+                fprintf(stderr, "VBR SELFTEST PROMOTE %s %s->%s in-place==separate: %.3f%% (%zu/%zu)%s first-diff byte %lld (row %lld)\n",
                         nm, ggml_type_name(ladder[h]), ggml_type_name(tto),
                         100.0*(double)same/(double)bytesTo, same, bytesTo,
-                        same == bytesTo ? "" : " byte-MISMATCH", same == bytesTo ? (ssize_t) -1 : (ssize_t) first_bad,
+                        same == bytesTo ? "" : " byte-MISMATCH", same == bytesTo ? -1LL : (long long) first_bad,
                         same == bytesTo ? -1LL : (long long)(first_bad / ggml_row_size(tto, ne0)));
                 if (same != bytesTo) {
                     // TCQ trellis blocks carry trailing don't-care bits the decode never reads, so a
