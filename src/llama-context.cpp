@@ -603,8 +603,17 @@ void llama_context::sched_reserve() {
     if (cparams.auto_fgdn) {
         // Fused GDN kernels are only tested on NVIDIA CUDA. Disable on ROCm/MUSA/other.
         bool have_cuda_gpu = false;
+        ggml_backend_dev_t gpu_dev = nullptr;
         if (ggml_backend_t gpu_backend = find_gpu_backend()) {
-            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(gpu_backend));
+            gpu_dev = ggml_backend_get_device(gpu_backend);
+        } else if (ggml_backend_t meta_backend = find_meta_backend()) {
+            // --split-mode tensor: the compute device is the meta device, which
+            // find_gpu_backend rejects by type — judge by its first simple device
+            // (the meta backend has a dedicated GDN split handler, head-parallel)
+            gpu_dev = ggml_backend_meta_dev_simple_dev(ggml_backend_get_device(meta_backend), 0);
+        }
+        if (gpu_dev) {
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(gpu_dev);
             const char * reg_name = ggml_backend_reg_name(reg);
             if (reg_name && (strncmp(reg_name, "CUDA", 4) == 0 || strncmp(reg_name, "ROCm", 4) == 0)) {
                 // HIP builds register as "ROCm": the fused-GDN path compiles and runs there
@@ -1190,7 +1199,9 @@ static bool dflash_eval_callback(struct ggml_tensor * t, bool ask, void * user_d
 
     if (ask) {
         if (h_it != cap->hidden_name_idx.end()) {
-            return true;
+            // graph-embedded staging copies capture this ubatch — skipping here avoids
+            // the per-layer graph chop + full-device sync the callback would force
+            return !cap->stage_active;
         }
         if (cap->tape_enabled && cap->tape_name_map.count(t->name)) {
             if (cap->active_tape()) {
@@ -1198,7 +1209,13 @@ static bool dflash_eval_callback(struct ggml_tensor * t, bool ask, void * user_d
                 // Only QKV mixed needs eval callback (for CPU-side conv state rebuild).
                 // Multi-seq is supported — tensor stored with per-seq metadata.
                 auto it = cap->tape_name_map.find(t->name);
-                return (it != cap->tape_name_map.end() && it->second.second == DFLASH_TAPE_QKV);
+                if (it == cap->tape_name_map.end() || it->second.second != DFLASH_TAPE_QKV) {
+                    return false;
+                }
+                // Tensor split: QKV is graph-staged too (single-seq) — the callback's
+                // meta get_tensor gather would misorder the segmented channels, and the
+                // chop would force a per-layer all-device sync
+                return !(cap->active_tape()->qkv_staged() && n_seqs_unq <= 1);
             }
             // CPU tape fallback: no multi-seq support
             if (n_seqs_unq > 1) {
@@ -1381,6 +1398,86 @@ void llama_context::set_dflash_capture(const int32_t * layer_ids, int32_t n_laye
     if (memory) {
         memory->set_force_split_seq(true);
     }
+
+    allocate_capture_stage_gpu();
+}
+
+// GPU capture staging: one [n_embd, LLAMA_DFLASH_MAX_VERIFY_TOKENS] tensor per captured
+// layer, allocated on the GPU (or in a meta buffer under --split-mode tensor, where the
+// split-state callback defaults unknown names to MIRRORED — the post-allreduce l_out is
+// mirrored too, so the graph-embedded copy is a device-local write on every GPU and the
+// consumer reads shard 0). Failure to allocate just leaves the eval-callback path active.
+void llama_context::allocate_capture_stage_gpu() {
+    if (!dflash_capture || dflash_capture->layer_ids.empty() || !dflash_capture->stage_tensors.empty()) {
+        return;
+    }
+
+    ggml_backend_buffer_type_t buft = nullptr;
+    if (ggml_backend_t gpu_backend = find_gpu_backend()) {
+        buft = ggml_backend_get_default_buffer_type(gpu_backend);
+    } else if (ggml_backend_t meta_backend = find_meta_backend()) {
+        buft = ggml_backend_get_default_buffer_type(meta_backend);
+    }
+    if (!buft) {
+        return; // CPU-only context: host capture is already free of device syncs
+    }
+
+    const int n_layers   = (int) dflash_capture->layer_ids.size();
+    const int max_tokens = (int) LLAMA_DFLASH_MAX_VERIFY_TOKENS;
+    const int64_t n_embd = model.hparams.n_embd;
+
+    size_t ctx_mem = ggml_tensor_overhead() * (n_layers + 2);
+    struct ggml_init_params ctx_params = { ctx_mem, nullptr, true };
+    ggml_context * stage_ctx = ggml_init(ctx_params);
+
+    dflash_capture->stage_tensors.reserve(n_layers);
+    for (int i = 0; i < n_layers; ++i) {
+        ggml_tensor * t = ggml_new_tensor_2d(stage_ctx, GGML_TYPE_F32, n_embd, max_tokens);
+        ggml_format_name(t, "dflash_stage-%d", i);
+        dflash_capture->stage_tensors.push_back(t);
+    }
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(stage_ctx, buft);
+    if (!buf) {
+        LLAMA_LOG_WARN("%s: failed to allocate GPU capture staging — falling back to eval-callback capture\n", __func__);
+        dflash_capture->stage_tensors.clear();
+        ggml_free(stage_ctx);
+        return;
+    }
+
+    dflash_capture->stage_ctx = stage_ctx;
+    dflash_capture->stage_buf = buf;
+    dflash_capture->stage_max_tokens = max_tokens;
+
+    // cparams.capture_stage stays null until the decode loop marks a covered ubatch
+
+    LLAMA_LOG_INFO("%s: allocated GPU capture staging: %d layers x %d tokens x %" PRId64 " embd (%.1f MB)\n",
+        __func__, n_layers, max_tokens, n_embd, ggml_backend_buffer_get_size(buf) / (1024.0 * 1024.0));
+}
+
+void llama_context::set_capture_stage_enabled(bool enabled) {
+    if (!dflash_capture) {
+        return;
+    }
+    dflash_capture->stage_enabled = enabled;
+}
+
+int32_t llama_context::dflash_capture_stage_get(int32_t layer_idx, const void ** data) {
+    if (!dflash_capture || dflash_capture->stage_n_tokens <= 0 ||
+        layer_idx < 0 || layer_idx >= (int32_t) dflash_capture->stage_tensors.size()) {
+        return 0;
+    }
+    ggml_tensor * t = dflash_capture->stage_tensors[layer_idx];
+    if (t->buffer && ggml_backend_buffer_is_meta(t->buffer)) {
+        ggml_tensor * shard = ggml_backend_meta_buffer_simple_tensor(t, 0);
+        if (!shard || !shard->data) {
+            return 0;
+        }
+        *data = shard->data;
+    } else {
+        *data = t->data;
+    }
+    return dflash_capture->stage_n_tokens;
 }
 
 void llama_context::dflash_reset_hidden_capture() {
@@ -1396,6 +1493,10 @@ void llama_context::dflash_reset_hidden_capture() {
     // The decode loop sets ubatch per iteration; null it here so a callback
     // that fires outside the loop can't read a stale pointer.
     dflash_capture->ubatch = nullptr;
+    // Staging validity is per-decode: the decode loop re-arms it for staged ubatches.
+    dflash_capture->stage_active = false;
+    dflash_capture->stage_n_tokens = 0;
+    dflash_capture->tape_stage_n_tokens = 0;
 }
 
 // idempotent: populates recurrent-layer ids + tape name map the first time it's called.
@@ -1489,18 +1590,30 @@ void llama_context::allocate_tape_gpu(int n_slots, int max_tokens) {
         return;
     }
 
-    ggml_backend_t gpu_backend = find_gpu_backend();
-    if (!gpu_backend) {
+    ggml_backend_t gpu_backend  = find_gpu_backend();
+    ggml_backend_t meta_backend = gpu_backend ? nullptr : find_meta_backend();
+    if (!gpu_backend && !meta_backend) {
         return; // no GPU, fall back to CPU tape via eval callback
+    }
+
+    // The meta tape split rules assume the fused-GDN k layout (H_k = n_group, not
+    // repeated). With decomposed GDN under tensor split, skip the tape — the server
+    // then rolls back via exact re-decode.
+    if (meta_backend && !(cparams.fused_gdn_ar && cparams.fused_gdn_ch)) {
+        if (dflash_capture) {
+            dflash_capture->tape_meta_failed = true;
+        }
+        return;
     }
 
     // Once a GPU tape exists, the eval callback stops capturing k/v/gate/beta on the CPU —
     // so only allocate it when replay can actually use it (states on one non-host device,
-    // see llama_dflash_tape_replay_available). Otherwise fall back to the CPU tape, which
+    // or head-sharded behind one meta buffer where replay runs per simple device — see
+    // llama_dflash_tape_replay_available). Otherwise fall back to the CPU tape, which
     // captures everything the CPU replay needs.
     {
         auto * mem_recurrent = get_recurrent_mem(memory.get());
-        if (!mem_recurrent || !dflash_states_on_one_device(model.hparams, mem_recurrent)) {
+        if (!mem_recurrent || (!meta_backend && !dflash_states_on_one_device(model.hparams, mem_recurrent))) {
             return;
         }
     }
@@ -1525,8 +1638,8 @@ void llama_context::allocate_tape_gpu(int n_slots, int max_tokens) {
     size_t total_size = 0;
 
     for (int slot = 0; slot < n_slots; ++slot) {
-        // allocate ggml context for this slot's tensor descriptors
-        size_t ctx_mem = ggml_tensor_overhead() * (n_rec * 4 + 2);
+        // allocate ggml context for this slot's tensor descriptors (k/v/gate/beta + qkv staging)
+        size_t ctx_mem = ggml_tensor_overhead() * (n_rec * 5 + 2);
         struct ggml_init_params ctx_params = { ctx_mem, nullptr, true };
         struct ggml_context * tape_ctx = ggml_init(ctx_params);
 
@@ -1538,13 +1651,31 @@ void llama_context::allocate_tape_gpu(int n_slots, int max_tokens) {
 
         for (int li = 0; li < n_rec; ++li) {
             auto & tl = tape->layers[li];
+            const int il = rec_ids[li];
             tl.k    = ggml_new_tensor_3d(tape_ctx, GGML_TYPE_F32, S, H_k, (int64_t)max_tokens);
             tl.v    = ggml_new_tensor_3d(tape_ctx, GGML_TYPE_F32, S, H_v, (int64_t)max_tokens);
             tl.gate = ggml_new_tensor_3d(tape_ctx, GGML_TYPE_F32, (int64_t)1, H_v, (int64_t)max_tokens);
             tl.beta = ggml_new_tensor_3d(tape_ctx, GGML_TYPE_F32, (int64_t)1, H_v, (int64_t)max_tokens);
+            // names drive the meta split-state rules (llama_meta_device_get_split_state):
+            // shards must line up with the GDN input tensors the graph copies slice from
+            ggml_format_name(tl.k,    "dflash_tape_k_l%d",   il);
+            ggml_format_name(tl.v,    "dflash_tape_v_l%d",   il);
+            ggml_format_name(tl.gate, "dflash_tape_g_l%d",   il);
+            ggml_format_name(tl.beta, "dflash_tape_b_l%d",   il);
+            if (meta_backend) {
+                // qkv staging (meta only): the conv rebuild's eval-callback capture reads
+                // the qkv compute tensor via meta get_tensor, whose INFERRED split state
+                // can lose the channel-segment interleave (canonically misordered gather
+                // → corrupted conv window). Stage it in a tape tensor instead — its
+                // name-rule split is authoritative, so write and gather agree. Also
+                // removes the per-recurrent-layer graph chop the callback forced.
+                const int64_t conv_ch = (int64_t) hparams.n_embd_r() / (hparams.ssm_d_conv - 1);
+                tl.qkv = ggml_new_tensor_2d(tape_ctx, GGML_TYPE_F32, conv_ch, (int64_t)max_tokens);
+                ggml_format_name(tl.qkv, "dflash_tape_qkv_l%d", il);
+            }
         }
 
-        tape->buf = ggml_backend_alloc_ctx_tensors(tape_ctx, gpu_backend);
+        tape->buf = ggml_backend_alloc_ctx_tensors(tape_ctx, gpu_backend ? gpu_backend : meta_backend);
 
         if (!tape->buf) {
             LLAMA_LOG_WARN("%s: failed to allocate GPU tape buffer for slot %d, falling back to CPU tape\n",
@@ -1556,6 +1687,38 @@ void llama_context::allocate_tape_gpu(int n_slots, int max_tokens) {
 
         total_size += ggml_backend_buffer_get_size(tape->buf);
         dflash_capture->tapes.push_back(std::move(tape));
+    }
+
+    // Under tensor split, replay runs one graph per simple device over shard views. That
+    // is only sound when the tape's per-device head shards line up with the state cache's:
+    // device j's tape v/gate/beta heads must be exactly the heads whose S x S state blocks
+    // live in device j's s_l shard. Verify once here; on mismatch (unusual --tensor-split
+    // ratios can round shard boundaries differently) drop the tape — the server then uses
+    // the exact re-decode rollback.
+    if (meta_backend) {
+        auto * mem_recurrent = get_recurrent_mem(memory.get());
+        const size_t n_devs = ggml_backend_meta_n_backends(meta_backend);
+        bool consistent = mem_recurrent != nullptr;
+        for (size_t j = 0; consistent && j < n_devs; ++j) {
+            for (int li = 0; consistent && li < n_rec; ++li) {
+                const int il = rec_ids[li];
+                ggml_tensor * v_shard = ggml_backend_meta_buffer_simple_tensor(dflash_capture->tapes[0]->layers[li].v, j);
+                ggml_tensor * g_shard = ggml_backend_meta_buffer_simple_tensor(dflash_capture->tapes[0]->layers[li].gate, j);
+                ggml_tensor * s_shard = ggml_backend_meta_buffer_simple_tensor(mem_recurrent->s_l[il], j);
+                if (!v_shard || !g_shard || !s_shard ||
+                    v_shard->ne[1] != g_shard->ne[1] ||
+                    s_shard->ne[0] != S * S * v_shard->ne[1]) {
+                    LLAMA_LOG_WARN("%s: tape/state shard mismatch (dev %zu, layer %d: tape H_v=%" PRId64 ", state n_embd=%" PRId64 ") — dropping GPU tape, rollback falls back to re-decode\n",
+                        __func__, j, il, v_shard ? v_shard->ne[1] : -1, s_shard ? s_shard->ne[0] : -1);
+                    consistent = false;
+                }
+            }
+        }
+        if (!consistent) {
+            dflash_capture->tapes.clear();
+            dflash_capture->tape_meta_failed = true;
+            return;
+        }
     }
 
     dflash_capture->active_tape_idx = 0;
@@ -1598,6 +1761,18 @@ ggml_backend_t llama_context::find_gpu_backend() {
     return nullptr;
 }
 
+// --split-mode tensor: the compute backend is the meta backend (device type META,
+// invisible to find_gpu_backend). Tape/replay code paths that can operate per-device
+// use this to detect it.
+ggml_backend_t llama_context::find_meta_backend() {
+    for (auto & backend : backends) {
+        if (ggml_backend_is_meta(backend.get())) {
+            return backend.get();
+        }
+    }
+    return nullptr;
+}
+
 // true iff every recurrent state buffer is resident on one non-host device — the
 // precondition for the GPU tape-replay graph (views into s_l, one compute backend)
 static bool dflash_states_on_one_device(const llama_hparams & hparams, llama_memory_recurrent * mem_recurrent) {
@@ -1627,16 +1802,214 @@ static bool dflash_states_on_one_device(const llama_hparams & hparams, llama_mem
 }
 
 bool llama_context::tape_replay_available() {
-    if (!find_gpu_backend()) {
-        return false;
-    }
-
     auto * mem_recurrent = get_recurrent_mem(memory.get());
     if (!mem_recurrent) {
         return false;
     }
 
-    return dflash_states_on_one_device(model.hparams, mem_recurrent);
+    if (find_gpu_backend()) {
+        return dflash_states_on_one_device(model.hparams, mem_recurrent);
+    }
+
+    if (find_meta_backend()) {
+        // tensor split: replay runs per simple device over shard views. Before capture
+        // setup exists this is a predictive answer; once it does, the tape allocation
+        // (with its shard-consistency check) is the authority — callers should re-probe
+        // after speculative init.
+        if (!dflash_capture) {
+            return true;
+        }
+        if (dflash_capture->tape_meta_failed) {
+            return false;
+        }
+        if (dflash_capture->tapes.empty()) {
+            allocate_tape_gpu(1, LLAMA_DFLASH_MAX_VERIFY_TOKENS);
+        }
+        return !dflash_capture->tapes.empty();
+    }
+
+    return false;
+}
+
+// Tensor-split GDN rollback: one small graph per simple device, entirely over that
+// device's shards — tape k/v/gate/beta shards (written by the graph-embedded copies,
+// sharded by the dflash_tape_* split rules) and the s_l state shard. GDN heads are
+// independent, so no cross-device communication is needed; correctness of the
+// tape-shard/state-shard head alignment is verified once in allocate_tape_gpu.
+// Shared tail of a tape-replay layer graph: sigmoid(beta) → 4D state view at the cell →
+// gated_delta_net (K=1; caller supplies Q with zero semantics — the attention output is
+// discarded, only the state update matters) → extract the new state from the result
+// (layout: [attn_output | new_state]) and copy it back over the cell. The state-view
+// stride math must match the forward pass's ggml_reshape_4d layout (see qwen3next.cpp);
+// a flat [S*S*H_v,1,1,1] view is rejected by the synced op's state-shape asserts.
+// Used by both the single-backend and the per-device meta replay paths — keep the
+// subtle offset/layout math in one place.
+static void dflash_build_gdn_state_update(
+        ggml_context * ctx, ggml_cgraph * graph,
+        ggml_tensor * q_in, ggml_tensor * k_in, ggml_tensor * v_in,
+        ggml_tensor * g_in, ggml_tensor * b_in,
+        ggml_tensor * s_tensor, size_t s_byte_offset,
+        int64_t S, int64_t H_v, int n_accepted) {
+    const int64_t n_embd_s = S * S * H_v;
+    const size_t  s_esz    = ggml_element_size(s_tensor);
+
+    ggml_tensor * b_sigmoid = ggml_sigmoid(ctx, b_in);
+    ggml_tensor * s_view = ggml_view_4d(ctx, s_tensor, S, S, H_v, (int64_t) 1,
+        S * s_esz, S * S * s_esz, n_embd_s * s_esz, s_byte_offset);
+
+    ggml_tensor * result = ggml_gated_delta_net(ctx, q_in, k_in, v_in, g_in, b_sigmoid, s_view, /*K=*/1);
+
+    const size_t attn_bytes = (size_t) (S * H_v * n_accepted) * ggml_element_size(result);
+    ggml_tensor * result_state = ggml_view_1d(ctx, result, n_embd_s, attn_bytes);
+    ggml_tensor * s_write = ggml_view_1d(ctx, s_tensor, n_embd_s, s_byte_offset);
+
+    ggml_build_forward_expand(graph, ggml_cpy(ctx, result_state, s_write));
+}
+
+void llama_context::tape_replay_meta(ggml_backend_t meta_backend, llama_memory_recurrent * mem_recurrent,
+                                     int32_t cell_idx, int n_accepted, llama_seq_id seq_id) {
+    const auto & hparams = model.hparams;
+    const auto & rec_ids = dflash_capture->recurrent_layer_ids;
+    auto & tape_layers   = dflash_capture->tape_layers;
+
+    dflash_tape_gpu * tgpu = nullptr;
+    if (seq_id >= 0 && seq_id < (int) dflash_capture->tapes.size()) {
+        tgpu = dflash_capture->tapes[seq_id].get();
+    }
+    if (!tgpu) {
+        LLAMA_LOG_WARN("%s: no tape for seq %d — GDN replay skipped, recurrent state will be stale\n", __func__, seq_id);
+        tape_replay_conv(mem_recurrent, cell_idx, n_accepted, seq_id);
+        return;
+    }
+
+    // with graph-staged qkv the eval callback no longer sets per-layer token counts —
+    // every recurrent layer of a staged decode covers the same tokens
+    if (tgpu->qkv_staged() && dflash_capture->tape_stage_n_tokens > 0) {
+        for (auto & tape : tape_layers) {
+            tape.n_tokens = dflash_capture->tape_stage_n_tokens;
+        }
+    }
+
+    const int64_t S = hparams.ssm_d_state;
+    const size_t n_devs = ggml_backend_meta_n_backends(meta_backend);
+    const int n_rec = (int) rec_ids.size();
+
+    GGML_ASSERT(dflash_capture->replay_meta_ctxs.empty()); // tape_replay_sync ran (tape_replay entry syncs)
+    dflash_capture->replay_meta_bufs.resize(n_devs, nullptr);
+    dflash_capture->replay_meta_buf_sizes.resize(n_devs, 0);
+
+    // tape index for each recurrent layer (device-invariant)
+    std::vector<int> li_to_gpu(n_rec, -1);
+    for (int li = 0; li < n_rec; ++li) {
+        for (int i = 0; i < (int) tgpu->layer_ids.size(); ++i) {
+            if (tgpu->layer_ids[i] == rec_ids[li]) { li_to_gpu[li] = i; break; }
+        }
+    }
+
+    bool launched = false;
+    for (size_t j = 0; j < n_devs; ++j) {
+        ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(meta_backend, j);
+
+        // per layer: 4 tape views + q scale + b sigmoid + s view + GDN + result view +
+        // s write + cpy = 11 graph nodes (views are ops); size with headroom
+        size_t ctx_mem = ggml_tensor_overhead() * ((size_t) n_rec * 16 + 4) + ggml_graph_overhead_custom(n_rec * 14, false);
+        struct ggml_init_params ctx_params = { ctx_mem, nullptr, true };
+        struct ggml_context * ctx = ggml_init(ctx_params);
+        struct ggml_cgraph * graph = ggml_new_graph_custom(ctx, n_rec * 14, false);
+
+        int n_nodes = 0;
+        for (int li = 0; li < n_rec; ++li) {
+            const int il = rec_ids[li];
+            auto & tape = tape_layers[li];
+            // n_tokens comes from the qkv_mixed capture (or qkv staging) for this decode
+            if (tape.n_tokens <= 0 || n_accepted > tape.n_tokens) continue;
+
+            const int gpu_li = li_to_gpu[li];
+            if (gpu_li < 0) continue;
+            auto & tl = tgpu->layers[gpu_li];
+
+            ggml_tensor * k_shard = ggml_backend_meta_buffer_simple_tensor(tl.k, j);
+            ggml_tensor * v_shard = ggml_backend_meta_buffer_simple_tensor(tl.v, j);
+            ggml_tensor * g_shard = ggml_backend_meta_buffer_simple_tensor(tl.gate, j);
+            ggml_tensor * b_shard = ggml_backend_meta_buffer_simple_tensor(tl.beta, j);
+            ggml_tensor * s_shard = ggml_backend_meta_buffer_simple_tensor(mem_recurrent->s_l[il], j);
+            if (!k_shard || !v_shard || !g_shard || !b_shard || !s_shard) continue;
+
+            const int64_t H_k_j = k_shard->ne[1];
+            const int64_t H_v_j = v_shard->ne[1];
+            if (H_k_j <= 0 || H_v_j <= 0) continue; // this device holds no heads of this layer
+
+            const int64_t n_embd_s_j = S * S * H_v_j;
+            GGML_ASSERT(s_shard->ne[0] == n_embd_s_j); // verified at allocate_tape_gpu
+
+            ggml_tensor * k_in = ggml_view_3d(ctx, k_shard, S, H_k_j, (int64_t) n_accepted,
+                                              k_shard->nb[1], k_shard->nb[2], 0);
+            ggml_tensor * v_in = ggml_view_3d(ctx, v_shard, S, H_v_j, (int64_t) n_accepted,
+                                              v_shard->nb[1], v_shard->nb[2], 0);
+            ggml_tensor * g_in = ggml_view_3d(ctx, g_shard, (int64_t) 1, H_v_j, (int64_t) n_accepted,
+                                              g_shard->nb[1], g_shard->nb[2], 0);
+            ggml_tensor * b_in = ggml_view_3d(ctx, b_shard, (int64_t) 1, H_v_j, (int64_t) n_accepted,
+                                              b_shard->nb[1], b_shard->nb[2], 0);
+
+            // Q: zeros of k's shape — produced in-graph, no host upload
+            ggml_tensor * q_in = ggml_scale(ctx, k_in, 0.0f);
+
+            dflash_build_gdn_state_update(ctx, graph, q_in, k_in, v_in, g_in, b_in,
+                s_shard, (size_t) cell_idx * s_shard->nb[1], S, H_v_j, n_accepted);
+            n_nodes++;
+        }
+
+        if (n_nodes == 0) {
+            ggml_free(ctx);
+            continue;
+        }
+
+        // allocate intermediates (scale/sigmoid/GDN results) in this device's persistent
+        // grow-only scratch (same scheme as the single-backend path's replay_buf)
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(simple_backend);
+        const size_t needed = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx, buft);
+        if (needed > dflash_capture->replay_meta_buf_sizes[j]) {
+            if (dflash_capture->replay_meta_bufs[j]) {
+                ggml_backend_buffer_free(dflash_capture->replay_meta_bufs[j]);
+            }
+            dflash_capture->replay_meta_bufs[j] = ggml_backend_buft_alloc_buffer(buft, needed);
+            dflash_capture->replay_meta_buf_sizes[j] = dflash_capture->replay_meta_bufs[j]
+                ? ggml_backend_buffer_get_size(dflash_capture->replay_meta_bufs[j]) : 0;
+        }
+        if (!dflash_capture->replay_meta_bufs[j]) {
+            LLAMA_LOG_WARN("%s: failed to allocate replay buffer on device %zu — GDN replay incomplete, recurrent state will be stale\n", __func__, j);
+            ggml_free(ctx);
+            continue;
+        }
+        {
+            struct ggml_tallocr talloc = ggml_tallocr_new(dflash_capture->replay_meta_bufs[j]);
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+                if (t->data == nullptr && t->view_src == nullptr) {
+                    ggml_tallocr_alloc(&talloc, t);
+                } else if (t->view_src != nullptr && t->buffer == nullptr) {
+                    ggml_backend_view_init(t);
+                }
+            }
+        }
+
+        ggml_backend_graph_compute_async(simple_backend, graph);
+
+        dflash_capture->replay_meta_ctxs.push_back(ctx);
+        launched = true;
+    }
+
+    if (!launched) {
+        tape_replay_conv(mem_recurrent, cell_idx, n_accepted, seq_id);
+        return;
+    }
+
+    // conv rebuild + pos advance deferred to tape_replay_sync()
+    dflash_capture->replay_pending = true;
+    dflash_capture->replay_gpu_backend = meta_backend; // synchronize() fans out to all simple backends
+    dflash_capture->replay_n_accepted = n_accepted;
+    dflash_capture->replay_cell_idx = cell_idx;
+    dflash_capture->replay_seq_id = seq_id;
+    dflash_capture->replay_mem_recurrent = mem_recurrent;
 }
 
 void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
@@ -1680,6 +2053,17 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
     ggml_backend_t gpu_backend = find_gpu_backend();
 
     if (!gpu_backend) {
+        // tensor split: replay per simple device over shard views (host reads of the
+        // head-sharded meta tensors would be the #22 corruption class — never CPU here)
+        if (ggml_backend_t meta_backend = find_meta_backend()) {
+            if (dflash_capture->active_tape()) {
+                tape_replay_meta(meta_backend, mem_recurrent, cell_idx, n_accepted, seq_id);
+            } else {
+                LLAMA_LOG_WARN("%s: tensor-split rollback without a GPU tape — GDN replay skipped, recurrent state will be stale\n", __func__);
+                tape_replay_conv(mem_recurrent, cell_idx, n_accepted, seq_id);
+            }
+            return;
+        }
         tape_replay_cpu(mem_recurrent, cell_idx, n_accepted);
         tape_replay_conv(mem_recurrent, cell_idx, n_accepted, seq_id);
         return;
@@ -1780,40 +2164,14 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
             ggml_tensor * q_in = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H_k, (int64_t)n_accepted, (int64_t)1);
             ggml_set_input(q_in);
 
-            // apply sigmoid to beta on GPU
-            ggml_tensor * b_sigmoid = ggml_sigmoid(ctx, b_in);
-
-            // state view: reads directly from recurrent memory GPU buffer (zero-copy).
-            // ggml_gated_delta_net requires a 4D initial state [S_v, S_v, H, n_seqs] (same
-            // layout the forward pass builds via ggml_reshape_4d, see qwen3next.cpp). The
-            // recurrent cell holds S*S*H_v contiguous f32, so view it as [S, S, H_v, 1].
-            // (Was a flat [S*S*H_v,1,1,1] view for the pre-sync op, which the synced op's
-            // state-shape asserts now reject.)
-            ggml_tensor * s_tensor = mem_recurrent->s_l[il];
-            const size_t s_esz = ggml_element_size(s_tensor);
-            size_t s_byte_offset = (size_t)cell_idx * n_embd_s * s_esz;
-            // one recurrent cell (n_embd_s) must be exactly the 4D state — the 1d
-            // read-back views below rely on the same equality
+            // one recurrent cell (n_embd_s) must be exactly the 4D state the shared
+            // builder views — its read-back views rely on the same equality
             GGML_ASSERT((int64_t) n_embd_s == S * S * H_v);
-            ggml_tensor * s_view = ggml_view_4d(ctx, s_tensor, S, S, H_v, (int64_t)1,
-                S * s_esz,
-                S * S * s_esz,
-                S * S * H_v * s_esz,
-                s_byte_offset);
+            ggml_tensor * s_tensor = mem_recurrent->s_l[il];
+            const size_t s_byte_offset = (size_t) cell_idx * n_embd_s * ggml_element_size(s_tensor);
 
-            // GDN op: same kernel as forward pass, bit-identical state update
-            ggml_tensor * result = ggml_gated_delta_net(ctx, q_in, k_in, v_in, g_in, b_sigmoid, s_view, /*K=*/1);
-
-            // extract state from result (layout: [attn_output | new_state])
-            size_t attn_bytes = (size_t)(S * H_v * n_accepted) * ggml_element_size(result);
-            ggml_tensor * result_state = ggml_view_1d(ctx, result, n_embd_s, attn_bytes);
-
-            // write-back view: points to same location in s_l[il]
-            ggml_tensor * s_write = ggml_view_1d(ctx, s_tensor, n_embd_s, s_byte_offset);
-
-            // copy result state back to recurrent memory (GPU→GPU)
-            ggml_tensor * cpy = ggml_cpy(ctx, result_state, s_write);
-            ggml_build_forward_expand(graph, cpy);
+            dflash_build_gdn_state_update(ctx, graph, q_in, k_in, v_in, g_in, b_in,
+                s_tensor, s_byte_offset, S, H_v, n_accepted);
 
             inputs.push_back({ q_in, k_in, v_in, g_in, b_in, (size_t)li, use_gpu_tape });
         }
@@ -1962,12 +2320,41 @@ void llama_context::tape_replay_sync() {
         return;
     }
 
-    // wait for async GDN graph to complete
+    // wait for async GDN graph(s) to complete (a meta backend fans out to every device)
     ggml_backend_synchronize(dflash_capture->replay_gpu_backend);
 
-    // free the graph context
+    // free the graph context(s) — the meta scratch buffers are persistent (freed in dtor)
     ggml_free(dflash_capture->replay_graph_ctx);
     dflash_capture->replay_graph_ctx = nullptr;
+    for (auto * ctx : dflash_capture->replay_meta_ctxs) {
+        ggml_free(ctx);
+    }
+    dflash_capture->replay_meta_ctxs.clear();
+
+    // qkv staged on GPU (tensor split): gather it for the host conv rebuild. The tape
+    // tensor's name-rule split state makes this gather channel-order-correct — reading
+    // the qkv compute tensor directly (old path) misordered the segment interleave.
+    {
+        dflash_tape_gpu * tg = nullptr;
+        const llama_seq_id rsid = dflash_capture->replay_seq_id;
+        if (rsid >= 0 && rsid < (llama_seq_id) dflash_capture->tapes.size()) {
+            tg = dflash_capture->tapes[rsid].get();
+        }
+        const int n_tok = dflash_capture->tape_stage_n_tokens;
+        if (tg && tg->qkv_staged() && n_tok > 0) {
+            for (size_t li = 0; li < tg->layers.size(); ++li) {
+                ggml_tensor * qkv = tg->layers[li].qkv;
+                auto & tape = dflash_capture->tape_layers[li];
+                const int64_t conv_ch = qkv->ne[0];
+                tape.qkv_mixed.resize((size_t) conv_ch * n_tok);
+                ggml_backend_tensor_get(qkv, tape.qkv_mixed.data(), 0, (size_t) n_tok * qkv->nb[1]);
+                tape.conv_channels = conv_ch;
+                tape.n_tokens = n_tok;
+                tape.n_seqs = 1;
+                tape.seq_ids[0] = rsid;
+            }
+        }
+    }
 
     // finish conv rebuild + position advance
     tape_replay_conv(dflash_capture->replay_mem_recurrent,
@@ -2870,6 +3257,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
+    // Staged DFlash decodes answer every eval-callback ask with "no" (hiddens are
+    // graph-staged, GPU tape k/v/g/b are graph-copied, qkv is graph-staged). A set
+    // sched callback still forces chunked execution with a full backend synchronize
+    // per chunk (ggml-backend.cpp compute_splits), so install a null callback for
+    // fully-covered decodes and restore it otherwise. Set on both reuse and rebuild
+    // paths — the sched retains the previous value across calls.
+    if (cparams.cb_eval == dflash_eval_callback && dflash_capture) {
+        const bool cb_dormant = dflash_capture->eval_callback_dormant();
+        ggml_backend_sched_set_eval_callback(sched.get(),
+                cb_dormant ? nullptr : cparams.cb_eval,
+                cb_dormant ? nullptr : cparams.cb_eval_user_data);
+    }
+
     // set the input data for the input tensors
     {
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
@@ -3389,6 +3789,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 // sentinel for "GPU tape is enabled"
                 cparams.tape_gpu = cparams.tape_gpu_seqs[0];
 
+                // graph-staged qkv coverage for this decode (mirrors the builder guard:
+                // single-seq and within tape capacity)
+                if (cparams.tape_gpu && ubatch.n_seqs_unq == 1 &&
+                    (int) ubatch.n_tokens <= cparams.tape_gpu->max_tokens) {
+                    dflash_capture->tape_stage_n_tokens = (int) ubatch.n_tokens;
+                }
+
                 // graph nodes hold references to tape tensors — invalidate if set changed
                 if (seqs_changed && gf_res_prev) {
                     gf_res_prev->reset();
@@ -3400,6 +3807,31 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 const llama_seq_id seq = ubatch.seq_id_unq[0];
                 if (seq >= 0 && seq < (int) dflash_capture->tapes.size()) {
                     dflash_capture->active_tape_idx = seq;
+                }
+            }
+
+            // GPU capture staging covers this ubatch iff it is the whole batch (single
+            // ubatch), single-slot single-seq, and fits the staging capacity. Toggling
+            // changes graph topology (embedded copies), so invalidate the graph cache
+            // on a switch.
+            {
+                const bool stage_ok = dflash_capture->stage_enabled
+                    && !dflash_capture->stage_tensors.empty()
+                    && ubatch.n_seqs_unq == 1
+                    && ubatch.seq_id_unq[0] == 0
+                    && dflash_capture->hiddens && dflash_capture->hiddens->size() == 1
+                    && (int64_t) ubatch.n_tokens == n_tokens_all
+                    && (int) ubatch.n_tokens <= dflash_capture->stage_max_tokens;
+                dflash_capture->stage_active = stage_ok;
+                ggml_tensor ** stage_want = stage_ok ? dflash_capture->stage_tensors.data() : nullptr;
+                if (stage_want != cparams.capture_stage) {
+                    cparams.capture_stage = stage_want;
+                    if (gf_res_prev) {
+                        gf_res_prev->reset();
+                    }
+                }
+                if (stage_ok) {
+                    dflash_capture->stage_n_tokens = (int) ubatch.n_tokens;
                 }
             }
         }
@@ -5487,6 +5919,8 @@ struct dflash_cross_ring_handle {
     void   (*fn_write)(void *, int, int, const float *, int, int);
     const float * (*fn_interleave)(void *, int, int, int);
     void   (*fn_set_tensor)(void *, const void *, size_t, size_t);
+    void   (*fn_write_d2d)(void *, int, int, const void *, int, int);
+    void   (*fn_read)(void *, int, int, float *, int, int);
 };
 
 void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_size) {
@@ -5510,6 +5944,11 @@ void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_siz
     auto fn_interleave = (interleave_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_interleave");
     auto fn_set_tensor = (set_tensor_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_set_tensor");
 
+    using write_d2d_fn_t = void (*)(void *, int, int, const void *, int, int);
+    using read_fn_t      = void (*)(void *, int, int, float *, int, int);
+    auto fn_write_d2d = (write_d2d_fn_t) ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_write_d2d");
+    auto fn_read      = (read_fn_t)      ggml_backend_reg_get_proc_address(cuda_reg, "dflash_cross_ring_gpu_read");
+
     if (!fn_alloc || !fn_free || !fn_write || !fn_interleave || !fn_set_tensor) {
         return nullptr;
     }
@@ -5523,11 +5962,21 @@ void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_siz
     handle->fn_write      = fn_write;
     handle->fn_interleave = fn_interleave;
     handle->fn_set_tensor = fn_set_tensor;
+    handle->fn_write_d2d  = fn_write_d2d;  // optional: null on backends without the proc
+    handle->fn_read       = fn_read;
     return handle;
 }
 
 void * llama_dflash_cross_ring_gpu_init(llama_context * ctx, int n_layers, int n_embd, int ring_size) {
     return ctx->init_cross_ring_gpu(n_layers, n_embd, ring_size);
+}
+
+void llama_dflash_set_capture_stage_enabled(llama_context * ctx, bool enabled) {
+    ctx->set_capture_stage_enabled(enabled);
+}
+
+int32_t llama_dflash_capture_stage_get(llama_context * ctx, int32_t layer_idx, const void ** data) {
+    return ctx->dflash_capture_stage_get(layer_idx, data);
 }
 
 void llama_dflash_cross_ring_gpu_free(void * handle) {
@@ -5541,6 +5990,22 @@ void llama_dflash_cross_ring_gpu_write(void * handle, int layer, int ring_pos, c
     if (!handle) return;
     auto * h = (dflash_cross_ring_handle *)handle;
     h->fn_write(h->gpu_ring, layer, ring_pos, data, n_tokens, n_embd);
+}
+
+bool llama_dflash_cross_ring_gpu_write_d2d(void * handle, int layer, int ring_pos, const void * dev_src, int n_tokens, int n_embd) {
+    if (!handle) return false;
+    auto * h = (dflash_cross_ring_handle *)handle;
+    if (!h->fn_write_d2d) return false;
+    h->fn_write_d2d(h->gpu_ring, layer, ring_pos, dev_src, n_tokens, n_embd);
+    return true;
+}
+
+bool llama_dflash_cross_ring_gpu_read(void * handle, int layer, int ring_pos, float * host_dst, int n_tokens, int n_embd) {
+    if (!handle) return false;
+    auto * h = (dflash_cross_ring_handle *)handle;
+    if (!h->fn_read) return false;
+    h->fn_read(h->gpu_ring, layer, ring_pos, host_dst, n_tokens, n_embd);
+    return true;
 }
 
 void llama_dflash_cross_ring_gpu_set_cross(

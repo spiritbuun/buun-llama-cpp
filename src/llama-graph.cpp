@@ -1565,6 +1565,25 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
     if (cb_func) {
         cb_func(ubatch, cur, name, il);
     }
+
+    // DFlash GPU capture staging: embed a copy of this captured layer's output into
+    // its staging tensor. This replaces the eval-callback capture for staged ubatches
+    // — the callback would otherwise chop the graph at every captured layer (a full
+    // all-device sync each under --split-mode tensor) and gather the data to host.
+    // Generic here in cb() so every architecture that names "l_out" gets it.
+    if (cparams.capture_stage && il >= 0 && strcmp(name, "l_out") == 0) {
+        const auto & layers = cparams.dflash_capture_layers;
+        for (size_t i = 0; i < layers.size(); ++i) {
+            if (layers[i] == il) {
+                ggml_tensor * st = cparams.capture_stage[i];
+                if (cur->ne[1] <= st->ne[1]) {
+                    ggml_tensor * dst = ggml_view_2d(ctx0, st, st->ne[0], cur->ne[1], st->nb[1], 0);
+                    ggml_build_forward_expand(gf, ggml_cpy(ctx0, cur, dst));
+                }
+                break;
+            }
+        }
+    }
 }
 
 ggml_tensor * llm_graph_context::build_cvec(

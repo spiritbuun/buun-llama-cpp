@@ -1222,6 +1222,17 @@ extern "C" {
     LLAMA_API void   llama_dflash_cross_ring_gpu_free(void * handle);
     LLAMA_API void   llama_dflash_cross_ring_gpu_write(void * handle, int layer, int ring_pos, const float * data, int n_tokens, int n_embd);
     LLAMA_API void   llama_dflash_cross_ring_gpu_set_cross(struct llama_context * ctx, void * handle, llama_seq_id seq_id, int ring_write_pos, int ring_filled, int n_layers, int n_embd, int ctx_window);
+    // D2D ring write from a device pointer (e.g. GPU capture staging) and D2H ring read
+    // (checkpoint save). Both return false when the backend lacks the proc address.
+    LLAMA_API bool   llama_dflash_cross_ring_gpu_write_d2d(void * handle, int layer, int ring_pos, const void * dev_src, int n_tokens, int n_embd);
+    LLAMA_API bool   llama_dflash_cross_ring_gpu_read(void * handle, int layer, int ring_pos, float * host_dst, int n_tokens, int n_embd);
+
+    // DFlash GPU capture staging: graph-embedded l_out copies on the target context.
+    // Enable only when a device-side consumer route exists (see write_d2d); the getter
+    // reports tokens staged by the last staged decode (0 = host capture was used) and
+    // the layer's staging device pointer.
+    LLAMA_API void    llama_dflash_set_capture_stage_enabled(struct llama_context * ctx, bool enabled);
+    LLAMA_API int32_t llama_dflash_capture_stage_get(struct llama_context * ctx, int32_t layer_idx, const void ** data);
 
     // DDTree: set tree attention mask for verification decode
     // visibility: bool[n_tree_tokens * n_tree_tokens] row-major, true = can attend

@@ -68,6 +68,7 @@ struct dflash_tape_gpu_layer {
     ggml_tensor * v    = nullptr;  // [S_v, H_v, max_tokens]
     ggml_tensor * gate = nullptr;  // [1, H_v, max_tokens]
     ggml_tensor * beta = nullptr;  // [1, H_v, max_tokens]
+    ggml_tensor * qkv  = nullptr;  // [conv_channels, max_tokens] (conv rebuild staging; null = eval-callback capture)
 };
 
 struct dflash_tape_gpu {
@@ -77,6 +78,12 @@ struct dflash_tape_gpu {
     ggml_context * ctx = nullptr;               // owns the tensor descriptors
     int max_tokens = 0;                         // allocated capacity
     int n_tokens = 0;                           // actual tokens recorded this pass
+
+    // qkv is graph-staged for this tape (single-seq staged decodes bypass the eval
+    // callback entirely) — the one predicate every staging consumer must agree on
+    bool qkv_staged() const {
+        return !layers.empty() && layers[0].qkv != nullptr;
+    }
 
     ~dflash_tape_gpu() {
         if (buf) ggml_backend_buffer_free(buf);
@@ -120,6 +127,9 @@ struct dflash_capture_data {
     // byte-identical to the pre-multi-slot singleton.
     std::vector<std::unique_ptr<dflash_tape_gpu>> tapes;
     int active_tape_idx = 0;
+    // set when the meta-path shard-consistency check rejected the tape (unusual
+    // --tensor-split ratios) — capability then reports false instead of re-probing
+    bool tape_meta_failed = false;
 
     // Active ubatch for the in-flight process_ubatch() call. The eval callback
     // reads ubatch->n_seqs_unq / ubatch->seq_id to route hidden-state captures
@@ -131,10 +141,42 @@ struct dflash_capture_data {
     // Reused scratch for the multi-seq scatter path (avoid per-ubatch alloc).
     std::vector<float> scatter_buf;
 
+    // GPU capture staging: per-captured-layer [n_embd, stage_max_tokens] tensors the
+    // graph copies l_out into directly (single-seq whole-batch decodes). While a staged
+    // ubatch is in flight the eval callback skips l_out entirely — no graph chop, no
+    // device→host gather. stage_n_tokens reports how many tokens the last staged
+    // decode captured (0 = staging did not cover the last decode; read the host
+    // buffers instead).
+    std::vector<ggml_tensor *> stage_tensors;
+    ggml_context * stage_ctx = nullptr;
+    ggml_backend_buffer_t stage_buf = nullptr;
+    int stage_max_tokens = 0;
+    bool stage_enabled = false;  // consumer opted in (a D2D route out of staging exists)
+    bool stage_active = false;
+    int stage_n_tokens = 0;
+
+    // tokens covered by the graph-staged qkv tape copies in the last tape-enabled decode
+    // (0 = staging did not cover it; the eval-callback capture holds the data instead)
+    int tape_stage_n_tokens = 0;
+
     dflash_tape_gpu * active_tape() const {
         return (active_tape_idx >= 0 && active_tape_idx < (int) tapes.size())
                    ? tapes[active_tape_idx].get()
                    : nullptr;
+    }
+
+    // true iff a staged decode fully covers every eval-callback ask (hiddens graph-staged,
+    // GPU tape k/v/g/b graph-copied, qkv graph-staged) — the callback can go dormant for
+    // this decode. Must mirror the ask-paths in dflash_eval_callback.
+    bool eval_callback_dormant() const {
+        if (!stage_active) {
+            return false;
+        }
+        if (!tape_enabled) {
+            return true;
+        }
+        dflash_tape_gpu * tg = active_tape();
+        return tg && tg->qkv_staged();
     }
 
     std::vector<dflash_layer_hidden_buf> * slot_hiddens(int slot) const {
@@ -157,8 +199,15 @@ struct dflash_capture_data {
 
     // async tape replay state (GDN launched, waiting for sync before conv rebuild)
     bool replay_pending = false;
-    ggml_backend_t replay_gpu_backend = nullptr;
+    ggml_backend_t replay_gpu_backend = nullptr;  // meta backend under --split-mode tensor (sync fans out)
     ggml_context * replay_graph_ctx = nullptr;
+
+    // per-device replay resources for the meta (tensor-split) path: graph contexts are
+    // per-rollback (freed in tape_replay_sync); the intermediate buffers are persistent
+    // grow-only scratch per simple device (same scheme as replay_buf above)
+    std::vector<ggml_context *> replay_meta_ctxs;
+    std::vector<ggml_backend_buffer_t> replay_meta_bufs;
+    std::vector<size_t> replay_meta_buf_sizes;
     int replay_n_accepted = 0;
     int32_t replay_cell_idx = -1;
     llama_seq_id replay_seq_id = 0;
@@ -168,8 +217,20 @@ struct dflash_capture_data {
         if (replay_graph_ctx) {
             ggml_free(replay_graph_ctx);
         }
+        for (auto * ctx : replay_meta_ctxs) {
+            ggml_free(ctx);
+        }
+        for (auto * buf : replay_meta_bufs) {
+            ggml_backend_buffer_free(buf);
+        }
         if (replay_buf) {
             ggml_backend_buffer_free(replay_buf);
+        }
+        if (stage_buf) {
+            ggml_backend_buffer_free(stage_buf);
+        }
+        if (stage_ctx) {
+            ggml_free(stage_ctx);
         }
     }
 };
@@ -538,6 +599,11 @@ public:
     int32_t get_n_layer_hiddens() const;
 
     void set_dflash_capture(const int32_t * layer_ids, int32_t n_layers);
+    void allocate_capture_stage_gpu();
+    void set_capture_stage_enabled(bool enabled);
+    // returns tokens staged by the last staged decode (0 = none) and the device
+    // pointer of the layer's staging data (shard 0 under --split-mode tensor)
+    int32_t dflash_capture_stage_get(int32_t layer_idx, const void ** data);
     void set_dflash_sample_temp(float temp);
     void set_dflash_topk(int k);
     void set_dflash_n_slots(int n);
@@ -548,10 +614,13 @@ public:
     void set_tape_recording(bool enable);
     void allocate_tape_gpu(int max_tokens) { allocate_tape_gpu(1, max_tokens); }
     void allocate_tape_gpu(int n_slots, int max_tokens);
+    void tape_replay_meta(ggml_backend_t meta_backend, llama_memory_recurrent * mem_recurrent,
+                          int32_t cell_idx, int n_accepted, llama_seq_id seq_id);
     void set_active_dflash_slot(int slot_idx);
 
     // first GPU/IGPU-typed backend, or nullptr (tensor-split's meta backend is neither)
     ggml_backend_t find_gpu_backend();
+    ggml_backend_t find_meta_backend();
 
     bool tape_replay_available();
 

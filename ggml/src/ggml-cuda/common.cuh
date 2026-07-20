@@ -1246,7 +1246,11 @@ struct ggml_cuda_graph {
 
     bool is_enabled() const {
         static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
-        return !(disable_due_to_gpu_arch || disable_cuda_graphs_due_to_env);
+        // the pre-Ampere disable is inherited upstream policy (regressions measured on
+        // old drivers years ago), not an API limit — cudaGraph works from CUDA 10 on
+        // every arch. GGML_CUDA_FORCE_GRAPHS opts back in for A/B on older cards.
+        static const bool force_cuda_graphs = (getenv("GGML_CUDA_FORCE_GRAPHS") != nullptr);
+        return !(disable_cuda_graphs_due_to_env || (disable_due_to_gpu_arch && !force_cuda_graphs));
     }
 #endif
 };

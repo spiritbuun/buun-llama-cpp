@@ -861,10 +861,13 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_FFN_LATENT_DOWN,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_FFN_LATENT_UP,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     // DFlash drafter
-    {LLM_TENSOR_DFLASH_FC,                  {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL_MAT}},
-    {LLM_TENSOR_DFLASH_HIDDEN_NORM,         {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL}},
-    {LLM_TENSOR_GEMMA4_DFLASH_FC,           {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL_MAT}},
-    {LLM_TENSOR_GEMMA4_DFLASH_HIDDEN_NORM,  {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL}},
+    // LAYER_OUTPUT (like eagle3's FC below), NOT LAYER_INPUT: INPUT lands these in the
+    // CPU token-embedding bucket, and the sched then re-uploads the ~132 MB fc weight
+    // to the GPU on every draft call (~15 ms — it dominated DFlash step time).
+    {LLM_TENSOR_DFLASH_FC,                  {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_DFLASH_HIDDEN_NORM,         {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+    {LLM_TENSOR_GEMMA4_DFLASH_FC,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_GEMMA4_DFLASH_HIDDEN_NORM,  {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
     {LLM_TENSOR_MASKED_EMBD_CENTROIDS,      {LLM_TENSOR_LAYER_INPUT,     GGML_OP_NONE}},
     {LLM_TENSOR_MASKED_EMBD_ORDERING,       {LLM_TENSOR_LAYER_INPUT,     GGML_OP_NONE}},
     // eagle3

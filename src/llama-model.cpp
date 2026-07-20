@@ -361,6 +361,14 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const std::regex pattern_ssm_beta_alpha  ("blk\\.\\d*\\.ssm_ba.weight");
     const std::regex pattern_r_cache         ("cache_r_l\\d*");
     const std::regex pattern_s_cache         ("cache_s_l\\d*");
+    // DFlash GDN rollback tape (llama_context::allocate_tape_gpu): shards must line up
+    // with the GDN input tensors the graph-embedded copies slice from — k plain per-head,
+    // v/gate/beta in qwen35's k-group-interleaved v-head order, qkv in conv channel layout.
+    // static: this callback runs per tensor on every split-state cache rebuild — don't
+    // recompile the NFAs each call
+    static const std::regex pattern_tape_k   ("dflash_tape_k_l\\d+");
+    static const std::regex pattern_tape_vgb ("dflash_tape_(v|g|b)_l\\d+");
+    static const std::regex pattern_tape_qkv ("dflash_tape_qkv_l\\d+");
     const std::regex pattern_ssm_conv1d      ("blk\\.\\d*\\.ssm_conv1d.weight");
     const std::regex pattern_ssm_out_weight  ("blk\\.\\d*\\.ssm_out.weight");
 
@@ -409,8 +417,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             prefix = tensor_name.substr(0, length_prefix + 1);
             il = std::stoull(tensor_name.substr(4, length_prefix));
             rotation = get_il_eff(il) % ud->n_devices;
-        } else if (tensor_name.substr(0, 6) == "cache_") {
-            const size_t layer_index_start = tensor_name.find("_l", 6);
+        } else if (tensor_name.substr(0, 6) == "cache_" || tensor_name.substr(0, 12) == "dflash_tape_") {
+            const size_t layer_index_start = tensor_name.rfind("_l");
             GGML_ASSERT(layer_index_start != std::string::npos);
             il = std::stoull(tensor_name.substr(layer_index_start + 2));
             prefix = "blk." + std::to_string(il) + ".";
@@ -466,6 +474,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ssm_out.weight");
         }
         if (std::regex_match(tensor_name, pattern_r_cache) || std::regex_match(tensor_name, pattern_s_cache)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ssm_out.weight");
+        }
+        if (std::regex_match(tensor_name, pattern_tape_k) || std::regex_match(tensor_name, pattern_tape_vgb)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ssm_out.weight");
+        }
+        if (std::regex_match(tensor_name, pattern_tape_qkv)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ssm_out.weight");
         }
         if (std::regex_match(tensor_name, pattern_ssm_conv1d)) {
@@ -545,6 +559,16 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 if (std::regex_match(tensor_name, pattern_s_cache)) {
                     return {{n_k_heads * head_v_dim * head_v_dim, head_ratio}};
                 }
+                if (std::regex_match(tensor_name, pattern_tape_k)) {
+                    return {{n_k_heads, 1}};
+                }
+                if (std::regex_match(tensor_name, pattern_tape_vgb)) {
+                    return {{n_k_heads, head_ratio}};
+                }
+                if (std::regex_match(tensor_name, pattern_tape_qkv)) {
+                    GGML_ASSERT(tensor->ne[axis] == 2*key_dim + value_dim);
+                    return {{key_dim, 2 + head_ratio}};
+                }
             }
 
             // the FFN is the same for Qwen 3 Next and Qwen 3.5:
@@ -594,6 +618,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
             if (std::regex_match(tensor_name, pattern_s_cache)) {
                 return std::vector<int64_t>(segments.size(), granularity_qkv * head_dim);
+            }
+            if (std::regex_match(tensor_name, pattern_tape_k) || std::regex_match(tensor_name, pattern_tape_vgb)) {
+                return std::vector<int64_t>(segments.size(), granularity_qkv / head_dim);
+            }
+            if (std::regex_match(tensor_name, pattern_tape_qkv)) {
+                return std::vector<int64_t>(segments.size(), granularity_qkv);
             }
         } else {
             // regular attention

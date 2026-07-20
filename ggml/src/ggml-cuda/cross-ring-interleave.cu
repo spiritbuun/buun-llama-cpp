@@ -114,6 +114,21 @@ extern "C" void dflash_cross_ring_gpu_free(void * handle) {
     delete ring;
 }
 
+// Split a [ring_pos, ring_pos + n_tokens) span into at most two contiguous segments
+// (wrap-around) and invoke copy(ring_tok, other_tok, seg_tokens) for each — the one
+// place that owns the ring wrap math for write/write_d2d/read below.
+template <typename F>
+static void ring_span_for_each(int ring_size, int ring_pos, int n_tokens, F && copy) {
+    const int pos   = ((ring_pos % ring_size) + ring_size) % ring_size;
+    const int first = ring_size - pos;
+    if (first >= n_tokens) {
+        copy(pos, 0, n_tokens);
+    } else {
+        copy(pos, 0, first);
+        copy(0, first, n_tokens - first);
+    }
+}
+
 // Upload host data to a specific position in the GPU ring for one layer.
 // Handles wrap-around: if ring_pos + n_tokens > ring_size, splits into two copies.
 extern "C" void dflash_cross_ring_gpu_write(
@@ -145,19 +160,65 @@ extern "C" void dflash_cross_ring_gpu_write(
     float * dst = ring->h_layer_ptrs[layer];
     const size_t stride = (size_t)n_embd * sizeof(float);
 
-    int pos = ring_pos % ring->ring_size;
-    int first = ring->ring_size - pos;
-    if (first >= n_tokens) {
-        // no wrap
-        cudaMemcpyAsync(dst + (size_t)pos * n_embd, host_data,
-                         (size_t)n_tokens * stride, cudaMemcpyHostToDevice, cudaStreamPerThread);
-    } else {
-        // wrap: two copies
-        cudaMemcpyAsync(dst + (size_t)pos * n_embd, host_data,
-                         (size_t)first * stride, cudaMemcpyHostToDevice, cudaStreamPerThread);
-        cudaMemcpyAsync(dst, host_data + (size_t)first * n_embd,
-                         (size_t)(n_tokens - first) * stride, cudaMemcpyHostToDevice, cudaStreamPerThread);
+    ring_span_for_each(ring->ring_size, ring_pos, n_tokens, [&](int ring_tok, int src_tok, int n) {
+        cudaMemcpyAsync(dst + (size_t)ring_tok * n_embd, host_data + (size_t)src_tok * n_embd,
+                        (size_t)n * stride, cudaMemcpyHostToDevice, cudaStreamPerThread);
+    });
+}
+
+extern "C" void dflash_cross_ring_gpu_set_tensor(void * d_dst, const void * d_src, size_t offset, size_t size);
+
+// Device-to-device variant of the ring write: source is a device pointer (e.g. the
+// target's graph-embedded capture staging), possibly on another GPU. Same clamp and
+// wrap-around handling as the host write; peer copies resolved from pointer attributes.
+extern "C" void dflash_cross_ring_gpu_write_d2d(
+        void * handle, int layer, int ring_pos,
+        const void * dev_src, int n_tokens, int n_embd) {
+    if (!handle || !dev_src) return;
+    auto * ring = (dflash_cross_ring_gpu *)handle;
+
+    if (layer < 0 || layer >= ring->n_layers) return;
+    if (n_tokens <= 0) return;
+
+    const float * src = (const float *)dev_src;
+    if (n_tokens > ring->ring_size) {
+        const int skip = n_tokens - ring->ring_size;
+        src      += (size_t)skip * n_embd;
+        ring_pos += skip;
+        n_tokens  = ring->ring_size;
     }
+
+    (void)cudaSetDevice(ring->device);
+
+    float * dst = ring->h_layer_ptrs[layer];
+    const size_t stride = (size_t)n_embd * sizeof(float);
+
+    ring_span_for_each(ring->ring_size, ring_pos, n_tokens, [&](int ring_tok, int src_tok, int n) {
+        dflash_cross_ring_gpu_set_tensor(dst, src + (size_t)src_tok * n_embd,
+                                         (size_t)ring_tok * stride, (size_t)n * stride);
+    });
+}
+
+// Read a token range out of the ring into host memory (checkpoint persistence when the
+// CPU ring is not being maintained). Handles wrap-around; synchronous.
+extern "C" void dflash_cross_ring_gpu_read(
+        void * handle, int layer, int ring_pos,
+        float * host_dst, int n_tokens, int n_embd) {
+    if (!handle || !host_dst) return;
+    auto * ring = (dflash_cross_ring_gpu *)handle;
+
+    if (layer < 0 || layer >= ring->n_layers) return;
+    if (n_tokens <= 0 || n_tokens > ring->ring_size) return;
+
+    (void)cudaSetDevice(ring->device);
+
+    const float * src = ring->h_layer_ptrs[layer];
+    const size_t stride = (size_t)n_embd * sizeof(float);
+
+    ring_span_for_each(ring->ring_size, ring_pos, n_tokens, [&](int ring_tok, int dst_tok, int n) {
+        cudaMemcpy(host_dst + (size_t)dst_tok * n_embd, src + (size_t)ring_tok * n_embd,
+                   (size_t)n * stride, cudaMemcpyDeviceToHost);
+    });
 }
 
 // Launch interleave kernel. Returns device pointer to interleaved staging buffer.

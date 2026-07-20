@@ -1957,6 +1957,15 @@ private:
             llama_dflash_allocate_slots(ctx_tgt, dflash_slots_cap);
         }
 
+        // Under --split-mode tensor the load-time capability probe was predictive; now
+        // that capture setup exists the tape allocation (with its shard-consistency
+        // check) has run, so re-probe for the authoritative answer.
+        if (dflash_tape_ok && !llama_dflash_tape_replay_available(ctx_tgt)) {
+            dflash_tape_ok = false;
+            SRV_INF("%s", "DFlash rollback: GPU tape rejected after allocation (shard "
+                    "mismatch) — partial accepts re-decode the accepted tokens\n");
+        }
+
         // DFlash + hybrid target: expand the recurrent state to its full backup-cell count
         // NOW instead of at the first draft — the expand costs ~100 ms of buffer realloc +
         // CUDA-graph re-capture, which otherwise lands on the first request's latency.

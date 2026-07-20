@@ -105,6 +105,31 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override;
 
+    // set_input() rewrites every buffer (hidden window, positions, masks) from the live
+    // cross state on each call, so the graph is reusable whenever the baked shapes match.
+    // Without this override the base class refuses reuse and the drafter rebuilds its
+    // graph (and re-captures CUDA graphs) on every draft call.
+    bool can_reuse(const llm_graph_params & params) override {
+        if (cross != params.cross || n_block != (int64_t) params.ubatch.n_tokens) {
+            return false;
+        }
+        // ctx_len is baked into every tensor here but derived from live cross state at
+        // build time — recompute the builder's formula and refuse reuse across a window
+        // change instead of trusting the set-cross path to have invalidated the graph.
+        const int n_slots = std::clamp(params.cparams.dflash_n_slots, 1, (int) LLAMA_DFLASH_MAX_SLOTS);
+        int64_t want_ctx;
+        if (n_slots == 1) {
+            want_ctx = (cross && cross->n_enc > 0) ? cross->n_enc : (int64_t) LLAMA_DFLASH_PER_SLOT_CTX;
+            const int64_t max_ctx = dflash_max_cross_ctx();
+            if (max_ctx > 0 && want_ctx > max_ctx) {
+                want_ctx = max_ctx;
+            }
+        } else {
+            want_ctx = (int64_t) n_slots * LLAMA_DFLASH_PER_SLOT_CTX;
+        }
+        return want_ctx == ctx_len;
+    }
+
     ggml_tensor * target_hidden     = nullptr; // [n_target_features, ctx_len]
     ggml_tensor * pos_ctx           = nullptr; // [ctx_len]
     ggml_tensor * kq_mask           = nullptr; // [ctx_len + n_block, n_block, 1, 1]

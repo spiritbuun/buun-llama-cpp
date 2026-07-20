@@ -88,11 +88,8 @@ extern "C" {
     // Backend (meta)
     //
 
-    GGML_API bool ggml_backend_is_meta       (ggml_backend_t backend);
-    // ggml_backend_buffer_is_meta / ggml_backend_buft_is_meta moved to ggml-backend.h (public)
-
-    GGML_API size_t         ggml_backend_meta_n_backends    (ggml_backend_t meta_backend);
-    GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
+    // ggml_backend_is_meta / ggml_backend_meta_n_backends / ggml_backend_meta_simple_backend
+    // and ggml_backend_buffer_is_meta / ggml_backend_buft_is_meta moved to ggml-backend.h (public)
 
     // temporary workaround to statically allocate tensors from a context in a deduplicated way:
     GGML_API struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft);

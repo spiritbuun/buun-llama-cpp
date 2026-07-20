@@ -415,6 +415,11 @@ extern "C" {
     GGML_API ggml_backend_buffer_t      ggml_backend_meta_buffer_simple_buffer(ggml_backend_buffer_t meta_buf, size_t index);
     // per-device shard of a tensor placed in a meta buffer (NULL if the tensor is unknown to the buffer)
     GGML_API struct ggml_tensor *       ggml_backend_meta_buffer_simple_tensor(const struct ggml_tensor * tensor, size_t index);
+    // per-device backend instances owned by a meta backend (they share its streams/ordering,
+    // for consumers that schedule auxiliary per-device graphs, e.g. DFlash tape replay)
+    GGML_API bool                       ggml_backend_is_meta               (ggml_backend_t backend);
+    GGML_API size_t                     ggml_backend_meta_n_backends       (ggml_backend_t meta_backend);
+    GGML_API ggml_backend_t             ggml_backend_meta_simple_backend   (ggml_backend_t meta_backend, size_t index);
 
     // Like ggml_backend_alloc_ctx_tensors_from_buft on a meta buffer type, but the CALLER allocates each
     // device's memory: for every simple device index the callback receives the ggml context holding that

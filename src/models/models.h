@@ -8,6 +8,20 @@
 #include <cmath>
 
 //
+// shared graph helpers
+//
+
+// DFlash GDN rollback tape: graph-embedded per-seq copies of one recurrent layer's
+// k/v/gate/beta (and qkv when staged, single-seq) into the GPU tape tensors.
+// Shared by the qwen35 and qwen35moe recurrent-layer builders — the slice/cont/cpy
+// layout here must match what llama_context::tape_replay* reads back.
+// Defined in qwen35.cpp.
+void build_dflash_tape_copies(ggml_context * ctx0, ggml_cgraph * gf, const llama_cparams & cparams,
+        int il, int64_t n_seqs, int64_t n_seq_tokens,
+        ggml_tensor * k_conv, ggml_tensor * v_conv, ggml_tensor * gate,
+        ggml_tensor * beta_presigmoid, ggml_tensor * qkv_mixed);
+
+//
 // base classes
 //
 

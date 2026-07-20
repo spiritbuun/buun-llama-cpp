@@ -765,6 +765,17 @@ llama_kv_cache::llama_kv_cache(
             if (il_share >= 0) {
                 const auto & layer_share = other->layers[other->map_layer_ids[il_share]];
 
+                // A tensor-split target's cache is head-sharded across devices in the meta
+                // buffer — this drafter's scheduler has no meta backend, so adopting the tensor
+                // would hard-abort later at sched reserve ("pre-allocated tensor (cache_k_lN)
+                // in a buffer (Meta())"). Refuse here with an actionable message instead.
+                if (layer_share.k->buffer != nullptr && ggml_backend_buffer_is_meta(layer_share.k->buffer)) {
+                    throw std::runtime_error(
+                        "shared-KV drafter cannot read a tensor-split target: the target's KV cache is "
+                        "head-sharded across devices under --split-mode tensor — run the target with "
+                        "--split-mode layer, or drop the drafter (native in-model MTP heads still work)");
+                }
+
                 LLAMA_LOG_WARN("%s: layer %3d: sharing with layer %d. k = %p, v = %p\n", __func__, il, il_share,
                         layer_share.k->data, layer_share.v->data);
 
