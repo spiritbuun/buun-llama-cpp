@@ -152,6 +152,14 @@ struct llama_memory_i {
         return 0.0;
     }
 
+    // #88: per-token bytes of the fattn f16 dequant scratch at the settled (deep-fill) tier
+    // state, summed over KV-hosting devices — a context-linear consumer that lives OUTSIDE the
+    // KV budget (it draws from the fit margin). The fit charges it in the total-VRAM wall
+    // constraint only. 0 = no turbo/VBR-capable cache.
+    virtual double memory_vbr_scratch_bytes_per_token(ggml_type /*entry_k*/, ggml_type /*entry_v*/, double /*floor_bpv*/) {
+        return 0.0;
+    }
+
     //
     // ops
     //

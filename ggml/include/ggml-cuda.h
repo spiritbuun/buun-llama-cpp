@@ -67,6 +67,9 @@ GGML_BACKEND_API int  ggml_backend_cuda_get_device_count(void);
 GGML_BACKEND_API void ggml_backend_cuda_get_device_description(int device, char * description, size_t description_size);
 GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * total);
 
+// #88: boundary-time reserve of the fattn f16 dequant scratch (ggml-vbr.h vtable slot)
+GGML_BACKEND_API bool ggml_backend_cuda_kv_dequant_scratch_reserve(int device, size_t k_bytes, size_t v_bytes);
+
 GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
 GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 

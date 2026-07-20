@@ -70,6 +70,10 @@ public:
         return mem_attn->memory_vbr_floor_bits_per_token(entry_k, entry_v, floor_bpv);
     }
 
+    double memory_vbr_scratch_bytes_per_token(ggml_type entry_k, ggml_type entry_v, double floor_bpv) override {
+        return mem_attn->memory_vbr_scratch_bytes_per_token(entry_k, entry_v, floor_bpv);
+    }
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;

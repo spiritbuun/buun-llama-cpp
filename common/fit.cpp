@@ -40,6 +40,10 @@ struct common_vbr_fit_costs {
     ggml_type entry_v = GGML_TYPE_COUNT;
     double    bits_pt_floor = 0.0;       // out: per-token KV bits at the achievable clamped mix
     double    bits_pt_price = 0.0;       // out: per-token KV bits at cparams' (price) types
+    // #88: per-token bytes of the fattn f16 dequant scratch at the settled deep-fill state — a
+    // context-linear consumer OUTSIDE the KV budget (it draws from the fit margin). Charged in
+    // the total-VRAM wall constraint only, never in the budget-capacity solves.
+    double    scratch_bytes_pt = 0.0;    // out
 };
 
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
@@ -183,6 +187,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     if (vbr_costs != nullptr) {
         vbr_costs->bits_pt_floor = llama_vbr_floor_bits_per_token(ctx, vbr_costs->entry_k, vbr_costs->entry_v, cparams->vbr_min_bits);
         vbr_costs->bits_pt_price = llama_vbr_floor_bits_per_token(ctx, cparams->type_k, cparams->type_v, 1e30);
+        vbr_costs->scratch_bytes_pt = llama_vbr_scratch_bytes_per_token(ctx, vbr_costs->entry_k, vbr_costs->entry_v, cparams->vbr_min_bits);
     }
 
     llama_free(ctx);
@@ -353,6 +358,23 @@ static void common_params_fit_impl(
     // armed snapshot: kv_size bakes at construction, so a co-tenant present at startup must not
     // permanently shrink the context ceiling the runtime budget can later grow back into.
     // Returns 0 when no cap is needed (the full trained context is servable at the floor).
+    //
+    // #88: the fattn f16 dequant scratch grows linearly with the attended width at depth
+    // (turbo/degraded tiers materialize K/V to f16). It lives OUTSIDE the KV budget — it is
+    // paid from the fit MARGIN — so it is charged against the margin, not on top of it:
+    // vbr_scratch_excess is the scratch demand beyond the summed margins, and only that excess
+    // tightens the wall. Charging margin + scratch would double-count (on a typical 24GB
+    // single-model box S(n_ctx_train) ~= the 1 GiB margin and the advert is unchanged —
+    // matching measured full-context fills); the budget solves must not carry it at all.
+    // Single home for the scratch-vs-margin comparison — the cap subtracts it, the warn in
+    // vbr_dynamic_arm_budget fires when it is > 0 for the requested context.
+    auto vbr_scratch_excess = [&](uint64_t n_tokens) -> int64_t {
+        double margin_total = 0.0;
+        for (size_t id = 0; id < nd; id++) {
+            margin_total += (double) margins[id];
+        }
+        return (int64_t) std::max(0.0, vbr_costs.scratch_bytes_pt * (double) n_tokens - margin_total);
+    };
     auto vbr_growth_reachable_ctx_cap = [&](const dmds_t & dmds_full) -> uint32_t {
         if (nd == 0 || hp_nct == 0) {
             return 0;
@@ -366,6 +388,7 @@ static void common_params_fit_impl(
             ctx_kv    += (int64_t) dmd.mb.context - (int64_t) dmd.mb.context_fixed;
         }
         ctx_kv = (int64_t) ((double) ctx_kv * vbr_kv_scale); // floor-mix cost, not price-tier
+        budget_gr -= vbr_scratch_excess(hp_nct);
         if (ctx_kv <= 0 || budget_gr <= 0) {
             return 0;
         }
@@ -447,6 +470,19 @@ static void common_params_fit_impl(
                     "at the %.4g bits/value floor (~%.0f MiB) — the deepest fills will hit the floor "
                     "clamp early\n", __func__, budget / MiB,
                     floor_bpv, (double) ctx_priced * vbr_kv_scale / (double) MiB);
+        }
+        // #88: explicit -c bypasses every advert estimator, so the only startup honesty signal
+        // for an overcommitted context is this warn: the f16 dequant scratch is paid from the
+        // fit margin, and when the full-context scratch outgrows it (shared vbr_scratch_excess,
+        // same margin basis as the growth-reachable cap) the deepest fills can stop short of -c
+        // — recoverably (per-request context-exceeded), not with an abort.
+        if (cparams->n_ctx != 0) {
+            const int64_t excess = vbr_scratch_excess(cparams->n_ctx);
+            if (excess > 0) {
+                LOG_WRN("%s: VBR dynamic: the f16 dequant scratch outgrows the fit margin by "
+                        "~%" PRId64 " MiB at -c %u — the deepest fills may stop short of the full "
+                        "context (recoverably)\n", __func__, excess / MiB, cparams->n_ctx);
+            }
         }
     };
 

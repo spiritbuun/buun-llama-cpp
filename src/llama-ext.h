@@ -102,6 +102,13 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
 LLAMA_API double llama_vbr_floor_bits_per_token(struct llama_context * ctx,
         enum ggml_type entry_k, enum ggml_type entry_v, double floor_bpv);
 
+// #88: per-token bytes of the fattn f16 dequant scratch at the settled (deep-fill) tier state
+// (see llama-memory.h memory_vbr_scratch_bytes_per_token). The fit charges this in its
+// total-VRAM wall constraint only — it must NOT enter the KV budget solves (the scratch draws
+// from the fit margin, not the budget). Works on no_alloc (fit dry-load) contexts.
+LLAMA_API double llama_vbr_scratch_bytes_per_token(struct llama_context * ctx,
+        enum ggml_type entry_k, enum ggml_type entry_v, double floor_bpv);
+
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits

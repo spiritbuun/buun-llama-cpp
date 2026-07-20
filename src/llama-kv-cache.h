@@ -182,6 +182,7 @@ public:
     void   kv_bpv_accum(double & bits, double & vals) const;
 
     double memory_vbr_floor_bits_per_token(ggml_type entry_k, ggml_type entry_v, double floor_bpv) override;
+    double memory_vbr_scratch_bytes_per_token(ggml_type entry_k, ggml_type entry_v, double floor_bpv) override;
 
     // shared floor-walk core (runtime clamp + fit capacity math), see impl comment
     struct vbr_floor_sim_result {
@@ -326,6 +327,11 @@ private:
         int      device      = -1;                // backend device ordinal backing the pool
         size_t   gran        = 0;                 // page granularity
         size_t   mapped_base = 0;                 // bytes mapped up front (rotation matrices)
+        // #88 scratch-reserve memo: widest f16 row per dequant-active side, valid while no tier
+        // flips (keyed on vbr_tier_epoch_; ~0 forces the first compute)
+        uint64_t scratch_rows_epoch = ~0ull;
+        size_t   scratch_k_row      = 0;
+        size_t   scratch_v_row      = 0;
         // per-device transcode side stream (lazy) + S5 overlap state: transcodes run async on
         // backend's stream; the next decode graph GPU-waits via the armed per-device fence
         // (be->fence_arm). Tail pages a transcode may still READ (rA extent >
@@ -383,6 +389,7 @@ private:
     bool     vbr_promote_next(uint32_t wm_next);      // occupancy dropped: re-promote one container
     void     vbr_floor_clamp_order();
     void     vbr_flush_deferred_unmaps();
+    bool     vbr_scratch_reserve(uint32_t wm_cells);  // #88: boundary-time f16 dequant scratch grow
     char *   vbr_stash_ensure(vbr_pool & p);          // lazy per-pool sink-stash buffer; returns base
     void     vbr_load_degrade_order();                // baked table, VBR_DEGRADE_ORDER=<file>, or generic fallback
     void     vbr_synth_generic_order();               // cross-model curves for unsupported archs (VBR_FORCE_GENERIC=1 to force)

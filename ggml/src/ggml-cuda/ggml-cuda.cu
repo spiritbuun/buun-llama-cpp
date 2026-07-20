@@ -3706,9 +3706,14 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     if (graph->graph == nullptr) {
-        if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA) {
-            if (!graph->disable_due_to_gpu_arch) {
-                GGML_LOG_DEBUG("%s: disabling CUDA graphs due to GPU architecture\n", __func__);
+        if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_AMPERE) {
+            // is_enabled() honors GGML_CUDA_FORCE_GRAPHS over this flag — don't log "disabling"
+            // when the override is active (it fires per graph key and reads as the flag not
+            // working; P100 A/B nearly misfiled over exactly that).
+            static const bool force_cuda_graphs = (getenv("GGML_CUDA_FORCE_GRAPHS") != nullptr);
+            if (!graph->disable_due_to_gpu_arch && !force_cuda_graphs) {
+                GGML_LOG_DEBUG("%s: disabling CUDA graphs due to GPU architecture "
+                               "(set GGML_CUDA_FORCE_GRAPHS=1 to override)\n", __func__);
             }
             graph->disable_due_to_gpu_arch = true;
         }
@@ -4911,6 +4916,7 @@ const ggml_vbr_backend_iface * ggml_backend_cuda_vbr_iface(void) {
         /* .kv_transcode      = */ ggml_backend_cuda_kv_transcode,
         /* .kv_stash_capture  = */ ggml_backend_cuda_kv_stash_capture,
         /* .fence_arm         = */ ggml_backend_cuda_vbr_fence_arm,
+        /* .kv_dequant_scratch_reserve = */ ggml_backend_cuda_kv_dequant_scratch_reserve,
     };
     return &iface;
 }
