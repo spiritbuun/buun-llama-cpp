@@ -586,13 +586,7 @@ static __device__ __forceinline__ void flash_attn_ext_turbo4_load_tile(
                 cn_h[c] = __float2half(d_turbo_centroids_4bit_fattn[c] * norm);
             }
 
-// RDNA4's full unroll of this 64-iteration loader exhausts VGPRs and spills heavily.
-// Sixteen is the measured runtime optimum; it reduces or removes spills depending on shape.
-#if defined(RDNA4)
-#pragma unroll 16
-#else
-#pragma unroll
-#endif
+TURBO_FA_LOAD_PRAGMA
             for (int b = 0; b < 64; ++b) {
                 const uint8_t byte = blk->qs[b];
                 tile_KV[row * stride_tile + blk_idx * 64 + b] = __halves2half2(cn_h[byte & 0xF], cn_h[byte >> 4]);
@@ -634,7 +628,7 @@ static __device__ __forceinline__ void flash_attn_ext_turbo8_load_tile(
             // = q*s - norm, with s = norm/127.5. Skip the 256-entry constant-mem lookup
             // and dequant with a single FMA (matches Q8's tile-load cost).
             const float s = norm * (1.0f / 127.5f);
-#pragma unroll
+TURBO_FA_LOAD_PRAGMA
             for (int b = 0; b < 64; ++b) {
                 const uint8_t q0 = blk->qs[2*b];
                 const uint8_t q1 = blk->qs[2*b + 1];
@@ -688,7 +682,7 @@ static __device__ __forceinline__ void flash_attn_ext_turbo_load_tile(
 #pragma unroll
                 for (int c = 0; c < 8; c++)
                     cn_h[c] = __float2half(d_turbo_centroids_3bit_fattn[c] * norm);
-#pragma unroll
+TURBO_FA_LOAD_PRAGMA
                 for (int b = 0; b < QK_TURBO3/2; ++b) {
                     const int j0 = b * 2;
                     const int j1 = j0 + 1;
@@ -718,7 +712,7 @@ static __device__ __forceinline__ void flash_attn_ext_turbo_load_tile(
 #pragma unroll
                 for (int c = 0; c < 4; c++)
                     cn_h[c] = __float2half(d_turbo_centroids_2bit_fattn[c] * norm);
-#pragma unroll
+TURBO_FA_LOAD_PRAGMA
                 for (int b = 0; b < QK_TURBO2/2; ++b) {
                     const int j0 = b * 2;
                     const int j1 = j0 + 1;
@@ -735,7 +729,7 @@ static __device__ __forceinline__ void flash_attn_ext_turbo_load_tile(
             for (int blk_idx = 0; blk_idx < blocks_per_row; ++blk_idx) {
                 const block_turbo3_tcq * blk = (const block_turbo3_tcq *)(row_ptr) + blk_idx;
                 const float norm = __half2float(blk->norm) * alpha;
-#pragma unroll
+TURBO_FA_LOAD_PRAGMA
                 for (int b = 0; b < QK_TURBO3_TCQ/2; ++b) {
                     const int t0 = b * 2;
                     const int t1 = t0 + 1;
@@ -761,7 +755,7 @@ static __device__ __forceinline__ void flash_attn_ext_turbo_load_tile(
             for (int blk_idx = 0; blk_idx < blocks_per_row; ++blk_idx) {
                 const block_turbo1_tcq * blk = (const block_turbo1_tcq *)(row_ptr) + blk_idx;
                 const float norm = __half2float(blk->norm) * alpha;
-#pragma unroll
+TURBO_FA_LOAD_PRAGMA
                 for (int b = 0; b < QK_TURBO1_TCQ/2; ++b) {
                     const int t0 = b * 2;
                     const int t1 = t0 + 1;
@@ -781,7 +775,7 @@ static __device__ __forceinline__ void flash_attn_ext_turbo_load_tile(
             for (int blk_idx = 0; blk_idx < blocks_per_row; ++blk_idx) {
                 const block_turbo2_tcq * blk = (const block_turbo2_tcq *)(row_ptr) + blk_idx;
                 const float norm = __half2float(blk->norm) * alpha;
-#pragma unroll
+TURBO_FA_LOAD_PRAGMA
                 for (int b = 0; b < QK_TURBO2_TCQ/2; ++b) {
                     const int t0 = b * 2;
                     const int t1 = t0 + 1;
