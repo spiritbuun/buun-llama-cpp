@@ -443,6 +443,53 @@ class DeepseekV2Model(TextModel):
                 raise ValueError(f"Unprocessed experts: {experts}")
 
 
+@ModelBase.register("InstellaMoEForCausalLM")
+class InstellaMoEModel(DeepseekV2Model):
+    """AMD Instella-MoE.
+
+    Weight layout is DeepSeek-V3 (MLA + noaux_tc MoE + shared experts), so the whole
+    DeepseekV2Model conversion is reused. Two architectural additions:
+
+      * gated attention -- an extra per-layer `self_attn.gate_proj`;
+        `attn_output *= sigmoid(gate_proj(x))` before `o_proj`. The tensor is already
+        mapped to ATTN_GATE (shared with afmoe), and its presence is the signal, so no
+        metadata key is needed.
+      * FarSkip-Collective connectivity -- MoE layers emit two residual streams
+        (full, and routed-expert-free); farskip-active layers feed attention the
+        routed-free stream and the MLP the PRE-attention residual (a parallel block).
+        This adds no tensors, so it must be recorded as metadata.
+    """
+
+    model_arch = gguf.MODEL_ARCH.INSTELLA_MOE
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+
+        hparams = self.hparams
+        n_layer = hparams["num_hidden_layers"]
+
+        enabled = bool(hparams.get("farskip", False))
+        self.gguf_writer.add_farskip_enabled(enabled)
+        if enabled:
+            start = int(hparams.get("farskip_start_idx", 0))
+            # upstream default is 1e4 (a float) and is min()-ed against n_layer-1 at
+            # runtime; clamp here so the reader never sees an out-of-range index
+            end = int(min(float(hparams.get("farskip_end_idx", 1e4)), n_layer - 1))
+            self.gguf_writer.add_farskip_start_idx(start)
+            self.gguf_writer.add_farskip_end_idx(end)
+            self.gguf_writer.add_farskip_attn_only(bool(hparams.get("attn_only_farskip", False)))
+            self.gguf_writer.add_farskip_mlp_only(bool(hparams.get("mlp_only_farskip", False)))
+
+        # gated_attention is inferred from ATTN_GATE presence; fail loudly if the config
+        # claims gating but the checkpoint has no gate tensors (or vice versa) -- that
+        # mismatch would silently produce a wrong model.
+        if not hparams.get("gated_attention", False):
+            logger.warning(
+                "InstellaMoE: config has gated_attention=False; the graph gates only when "
+                "attn_gate tensors are present -- verify this is intended"
+            )
+
+
 @ModelBase.register("DeepseekV32ForCausalLM")
 class DeepseekV32Model(DeepseekV2Model):
     model_arch = gguf.MODEL_ARCH.DEEPSEEK32

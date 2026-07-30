@@ -925,6 +925,21 @@ class GGUFWriter:
     def add_q_lora_rank(self, length: int) -> None:
         self.add_uint32(Keys.Attention.Q_LORA_RANK.format(arch=self.arch), length)
 
+    def add_farskip_enabled(self, value: bool) -> None:
+        self.add_bool(Keys.FarSkip.ENABLED.format(arch=self.arch), value)
+
+    def add_farskip_start_idx(self, value: int) -> None:
+        self.add_uint32(Keys.FarSkip.START_IDX.format(arch=self.arch), value)
+
+    def add_farskip_end_idx(self, value: int) -> None:
+        self.add_uint32(Keys.FarSkip.END_IDX.format(arch=self.arch), value)
+
+    def add_farskip_attn_only(self, value: bool) -> None:
+        self.add_bool(Keys.FarSkip.ATTN_ONLY.format(arch=self.arch), value)
+
+    def add_farskip_mlp_only(self, value: bool) -> None:
+        self.add_bool(Keys.FarSkip.MLP_ONLY.format(arch=self.arch), value)
+
     def add_kv_lora_rank(self, length: int) -> None:
         self.add_uint32(Keys.Attention.KV_LORA_RANK.format(arch=self.arch), length)
 

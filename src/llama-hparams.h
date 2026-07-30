@@ -86,6 +86,18 @@ struct llama_hparams {
     uint32_t n_layer_dense_lead = 0;
     uint32_t n_lora_q           = 0;
     uint32_t n_lora_kv          = 0;
+
+    // FarSkip-Collective connectivity (AMD Instella-MoE). Purely topological --
+    // it adds no tensors, so it can only travel as metadata.
+    bool     farskip_enabled    = false;
+    uint32_t farskip_start_idx  = 0;
+    uint32_t farskip_end_idx    = 0;   // inclusive
+    bool     farskip_attn_only  = false;
+    bool     farskip_mlp_only   = false;
+
+    bool farskip_at(uint32_t il) const {
+        return farskip_enabled && il >= farskip_start_idx && il <= farskip_end_idx;
+    }
     uint32_t n_ff_exp           = 0;
     uint32_t n_ff_shexp         = 0;
     uint32_t n_ff_chexp         = 0;
