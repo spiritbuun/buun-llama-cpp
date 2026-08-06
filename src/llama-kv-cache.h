@@ -263,6 +263,8 @@ public:
     ggml_tensor * get_k_storage(int32_t il) const;
     llama_turbo_meansub_ref get_turbo_meansub_ref(int32_t il) const;
 
+    const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
+
     //
     // graph_build API
     //

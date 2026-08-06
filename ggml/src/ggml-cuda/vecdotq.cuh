@@ -110,7 +110,8 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
 #define VDR_Q1_0_Q8_1_MMQ  4  // Q1_0 has 128 bits (4 ints) per block
 
 #define VDR_Q2_0_Q8_1_MMVQ 1  // Process one 32-element chunk at a time for parallelism
-#define VDR_Q2_0_Q8_1_MMQ  4  // Q2_0 has 256 bits (8 ints) per block, 4 32-element chunks
+#define VDR_Q2_0_Q8_1_MMQ  2  // Q2_0 group 64: 128 bits (4 ints) per block, 2 32-element chunks
+#define VDR_Q2_0_G128_Q8_1_MMQ  4  // Q2_0_G128 has 256 bits (8 ints) per block, 4 32-element chunks
 
 #define VDR_Q4_0_Q8_1_MMVQ 2
 #define VDR_Q4_0_Q8_1_MMQ  4
@@ -725,46 +726,42 @@ static __device__ __forceinline__ float vec_dot_q1_0_q8_1(
     return d1 * d8 * sumi;
 }
 
-// Q2_0 (group-64) MMVQ vec-dot. Processes one 32-element chunk (iqs in [0, QK2_0/32)).
-// Codes {0,1,2,(3)} are dp4a'd raw; symbol = code-1, so the -sum(act) correction is
-// applied once via ds.y (deferred-correction pattern).
 static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
     const block_q2_0 * bq2_0 = (const block_q2_0 *) vbq + kbx;
 
-    const float d2 = bq2_0->d;
+    // Q2_0 (group 64): 64 elements with ONE scale, 2 bits per element (4 elements per byte)
+    // Q8_1: 32 elements per block with individual scales
+    // iqs selects which of the 2 chunks of 32 elements to process (0-1)
+
+    const float     d2 = bq2_0->d;
+    const int16_t * qs = (const int16_t *) bq2_0->qs + iqs * 4;
+
+    // Process only the chunk specified by iqs
     const block_q8_1 * bq8_1_chunk = bq8_1 + iqs;
-
-    const int offset = iqs * 8;
-    const int v0 = bq2_0->qs[offset + 0] | (bq2_0->qs[offset + 1] << 8) |
-                   (bq2_0->qs[offset + 2] << 16) | (bq2_0->qs[offset + 3] << 24);
-    const int v1 = bq2_0->qs[offset + 4] | (bq2_0->qs[offset + 5] << 8) |
-                   (bq2_0->qs[offset + 6] << 16) | (bq2_0->qs[offset + 7] << 24);
-
-    int vi_bytes[8];
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const int codes = (v0 >> (j * 8)) & 0xFF;
-        vi_bytes[j] = ((codes >> 0) & 0x3) | (((codes >> 2) & 0x3) << 8) |
-                      (((codes >> 4) & 0x3) << 16) | (((codes >> 6) & 0x3) << 24);
-    }
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const int codes = (v1 >> (j * 8)) & 0xFF;
-        vi_bytes[4 + j] = ((codes >> 0) & 0x3) | (((codes >> 2) & 0x3) << 8) |
-                          (((codes >> 4) & 0x3) << 16) | (((codes >> 6) & 0x3) << 24);
-    }
 
     int sumi = 0;
 #pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        const int u = get_int_b4(bq8_1_chunk->qs, j);
-        sumi = ggml_cuda_dp4a(vi_bytes[j], u, sumi);
+    for (int j = 0; j < 4; ++j) {
+        const int q  = qs[j];
+        const int u  = get_int_b4(bq8_1_chunk->qs, j*2+0);
+        const int v  = get_int_b4(bq8_1_chunk->qs, j*2+1);
+
+        // unpack even and odd crumbs into byte values
+        const int qe = __byte_perm(0x020100FF, 0x020100FF, q >> 0);
+        const int qo = __byte_perm(0x020100FF, 0x020100FF, q >> 2);
+        // unshuffle values
+        const int qx = __byte_perm(qe, qo, 0x5140);
+        const int qy = __byte_perm(qe, qo, 0x7362);
+
+        sumi = ggml_cuda_dp4a(u, qx, sumi);
+        sumi = ggml_cuda_dp4a(v, qy, sumi);
     }
 
-    const float2 ds8f = __half22float2(bq8_1_chunk->ds);
-    return d2 * (sumi * ds8f.x - ds8f.y);
+    // Apply Q2_0's single scale and this chunk's Q8_1 scale
+    const float d8 = __low2float(bq8_1_chunk->ds);
+    return d2 * d8 * sumi;
 }
 
 // Q2_0_G128 (group-128) MMVQ vec-dot. Identical math; wider block struct (32-byte qs).

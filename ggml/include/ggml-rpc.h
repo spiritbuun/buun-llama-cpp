@@ -6,10 +6,10 @@
 extern "C" {
 #endif
 
-#define RPC_PROTO_MAJOR_VERSION    4
+#define RPC_PROTO_MAJOR_VERSION    5
 #define RPC_PROTO_MINOR_VERSION    0
 // 4: fork op enum (tree ops + TURBO_WHT) diverges from stock upstream wire ordering —
-//    stock patch version is 3; the fork must advertise a different patch version so a
+//    stock proto is 5.0.0 (patch 0); the fork must advertise a different patch version so a
 //    fork client can't false-match a stock rpc-server; fork-to-fork RPC only.
 #define RPC_PROTO_PATCH_VERSION    4
 

@@ -4,8 +4,8 @@ project("ggml" C CXX ASM)
 
 ### GGML Version
 set(GGML_VERSION_MAJOR 0)
-set(GGML_VERSION_MINOR 17)
-set(GGML_VERSION_PATCH 0)
+set(GGML_VERSION_MINOR 18)
+set(GGML_VERSION_PATCH 1)
 set(GGML_VERSION_BASE "${GGML_VERSION_MAJOR}.${GGML_VERSION_MINOR}.${GGML_VERSION_PATCH}")
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/")
@@ -220,7 +220,6 @@ option(GGML_HIP_RCCL                        "ggml: use ROCm Collective Comm. Lib
 # Upstream defaults this ON (VMM off) for broad HW safety; flip OFF here so AMD gets VMM without
 # the -DGGML_HIP_NO_VMM=OFF flag. Set it ON again for any card where HIP VMM misbehaves.
 option(GGML_HIP_NO_VMM                      "ggml: do not try to use HIP VMM"                 OFF)
-option(GGML_HIP_ROCWMMA_FATTN               "ggml: enable rocWMMA for FlashAttention"         OFF)
 option(GGML_HIP_MMQ_MFMA                    "ggml: enable MFMA MMA for CDNA in MMQ"           ON)
 option(GGML_HIP_EXPORT_METRICS              "ggml: enable kernel perf metrics output"         OFF)
 option(GGML_MUSA_GRAPHS                     "ggml: use MUSA graph, experimental, unstable"    OFF)
