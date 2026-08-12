@@ -2621,6 +2621,10 @@ bool llama_model_kv_cache_types_coupled(const llama_model * model) {
     return model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4;
 }
 
+bool llama_model_kv_cache_vbr_static_cap(const llama_model * model) {
+    return model->hparams.is_mla();
+}
+
 int32_t llama_model_n_swa(const llama_model * model) {
     // dsv4 kv-cache has SWA but it cannot be used as a rollback because of
     // other compression ratios, so we return 0 here

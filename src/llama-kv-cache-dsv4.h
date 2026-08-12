@@ -3,6 +3,7 @@
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 
+#include <array>
 #include <map>
 #include <memory>
 #include <unordered_map>
@@ -82,7 +83,9 @@ private:
 // DSV4 uses a normal raw/SWA token cache plus compressed K-only block caches.
 // The compressed caches are storage only; DSV4-specific visibility and block
 // planning are handled by llama_kv_cache_dsv4_context / llm_graph_input_dsv4.
-// FIXME: currently the cache only supports non-unified mode even if unified flag is passed
+// Dynamic VBR uses unified storage for one user sequence (including recurrent
+// speculation backup planes); static DSV4 retains the established split layout.
+// Multiple independent user sequences still require split compressed rows.
 // FIXME: we currently conflate token_pos and buffer contents. See https://github.com/ggml-org/llama.cpp/pull/25521#discussion_r3558173819
 
 class llama_kv_cache_dsv4 : public llama_memory_i {
@@ -123,9 +126,27 @@ public:
     // Compressed caches support only state-dependent suffix removals, not arbitrary ranges.
     bool can_seq_rm_partial() const override { return false; }
 
-    // VBR params are threaded to all four children (footprint-weighted split in the ctor),
-    // so each child's controller gets its breathe tick
-    void breathe() override { kv_raw->breathe(); kv_csa->breathe(); kv_hca->breathe(); kv_lid->breathe(); }
+    double kv_bpv() const override;
+    llama_memory_vbr_state_data memory_vbr_state(llama_seq_id seq_id, uint32_t n_tokens_extra) const override;
+    bool vbr_operation_armed() const override;
+    bool vbr_retier_freeze_begin(const char * owner, vbr_operation_id operation_id) override;
+    void vbr_retier_freeze_end(const char * owner, vbr_operation_id operation_id) override;
+    void vbr_commit_submitted() override;
+    void vbr_decode_ops_finish(bool ok) override;
+    void vbr_adopt_operation(vbr_operation_id operation_id) override;
+    void vbr_release_adopted() override;
+    llama_memory_vbr_preflight_data vbr_retier_preflight(uint32_t n_tokens_extra) const override;
+    double memory_vbr_floor_bits_per_token(ggml_type entry_k, ggml_type entry_v, double floor_bpv) override;
+    double memory_vbr_scratch_bytes_per_token(ggml_type entry_k, ggml_type entry_v, double floor_bpv) override;
+    void vbr_cotenancy_accum(uint64_t & decrement, uint32_t & grants,
+                             uint64_t & offer, uint64_t & pending) const override;
+    bool vbr_ledger_tree_active() const override;
+    void vbr_hard_seal_guard_set(vbr_hard_seal_guard guard) override;
+    bool vbr_hard_seal_blocked_take(bool decode_failed) override;
+    void vbr_hard_seal_evidence_take(std::vector<vbr_hard_seal_subject> & out) override;
+    void vbr_shared_scratch_detach() override;
+
+    void breathe() override;
 
     void clear(bool data) override;
 
@@ -158,6 +179,7 @@ public:
     uint32_t get_n_rs_seq() const;
     const std::vector<uint32_t> & get_rs_idx() const;
     void reset_rs_idx_for_ubatches(const std::vector<llama_ubatch> & ubatches);
+    uint64_t get_vbr_epoch() const;
 
 private:
     llama_hparams hparams_raw;
@@ -167,6 +189,7 @@ private:
 
     const uint32_t n_seq_max;
     const uint32_t n_rs_seq;
+    const uint32_t kv_size;
 
     std::vector<uint32_t> rs_idx;
 
@@ -178,7 +201,33 @@ private:
     std::unique_ptr<llama_dsv4_comp_state> hca_state;
     std::unique_ptr<llama_dsv4_comp_state> lid_state;
 
+    struct vbr_freeze_children {
+        vbr_operation_id operation_id = {};
+        bool raw = false;
+        bool csa = false;
+        bool hca = false;
+    };
+    static constexpr size_t VBR_RETIER_FREEZE_MAX_DEPTH = 64;
+    std::array<vbr_freeze_children, VBR_RETIER_FREEZE_MAX_DEPTH> vbr_freeze_stack_ = {};
+    uint32_t vbr_freeze_depth_ = 0;
+    uint32_t vbr_pending_csa_wm_ = 0;
+    uint32_t vbr_pending_hca_wm_ = 0;
+    bool vbr_group_enabled_ = false;
+
+    struct vbr_group_budget_state {
+        uint64_t bytes_needed = 0;
+        uint64_t bytes_available = 0;
+        int64_t max_deficit = 0;
+    };
+
     void clear_compressed(llama_seq_id seq_id, bool data);
+    double vbr_floor_group(ggml_type entry_k, double floor_bpv, bool pooled_only,
+                           bool install_runtime_limit);
+    vbr_group_budget_state vbr_group_budget(
+            uint32_t raw_wm, uint32_t csa_wm, uint32_t hca_wm, bool live) const;
+    double vbr_group_projected_bpv(
+            uint32_t raw_wm, uint32_t csa_wm, uint32_t hca_wm) const;
+    bool vbr_prepare_group(uint32_t raw_wm);
 };
 
 // DSV4 raw attention only uses the SWA half of kv_raw. The base half is kept
@@ -204,6 +253,7 @@ public:
 
     bool next() override;
     bool apply() override;
+    uint64_t get_vbr_epoch() const override;
 
     llama_memory_status get_status() const override;
     const llama_ubatch & get_ubatch() const override;
@@ -354,6 +404,7 @@ public:
 
     bool next()  override;
     bool apply() override;
+    uint64_t get_vbr_epoch() const override;
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
@@ -379,6 +430,7 @@ public:
     const comp_plan & get_lid_plan(const llama_ubatch & ubatch) const;
 
 private:
+    llama_kv_cache_dsv4 * kv = nullptr;
     size_t i_next = 0;
 
     std::vector<llama_ubatch> ubatches;

@@ -32,9 +32,19 @@ struct llama_context;
 class vbr_unit_build;
 class vbr_pinned_chunk_ring;
 class vbr_kv_import_session;
+class llama_kv_cache_dsv4;
 struct vbr_validated_child_plan;
 struct vbr_target_unit_snapshot;
 class vbr_import_receipt_group;
+
+enum vbr_tier : uint8_t {
+    VBR_TIER_T8,
+    VBR_TIER_T4,
+    VBR_TIER_T3_TCQ,
+    VBR_TIER_T2_TCQ,
+    VBR_TIER_T1_TCQ,
+    VBR_TIER_COUNT,
+};
 struct vbr_capture_stream_stats;
 enum class vbr_explicit_generation_failure : uint8_t;
 enum class vbr_explicit_size_failure : uint8_t;
@@ -241,6 +251,15 @@ public:
     void vbr_attach_ledger_tree(llama_kv_cache * root, llama_kv_cache * peer, double device_share);
     void vbr_finalize_ledger_tree();
     void vbr_finalize_failed_child(uint32_t n_tokens, bool root_ran);
+
+    // A composite cache whose physical streams must retier together can own the
+    // policy boundary while retaining the ordinary per-stream VMM/transcode
+    // implementation. The callback runs after slot admission but before any
+    // graph is built; returning false makes the batch fail recoverably.
+    using vbr_group_prepare_cb = std::function<bool(uint32_t)>;
+    void vbr_group_prepare_set(vbr_group_prepare_cb cb) {
+        vbr_group_prepare_cb_ = std::move(cb);
+    }
 
     // A share-linked drafter consumes f16 dequant scratch on its own compute backend while
     // reading this cache's tensors. The owner-side donation planner needs the terminal
@@ -520,6 +539,11 @@ private:
         ggml_type type0    = GGML_TYPE_COUNT;   // ENTRY tier (immutable; full-clear reset target)
         size_t    stash_off   = 0;              // offset into the f16 sink-stash buffer
         uint32_t  stash_valid = 0;              // rows captured (0 = not yet)
+        // Some composite planners issue a shape-padding write to a deliberately invisible
+        // cache row outside the attended prefix. Dynamic VMM must keep the CURRENT-tier page
+        // containing that row resident even when wm_cells does not reach it. UINT32_MAX means
+        // the ordinary prefix-only contract.
+        uint32_t  vmm_required_write_row = UINT32_MAX;
         // promote transcodes with live rows since the last full reset: each one re-encodes the
         // aged rows from their degraded recon, so error compounds per hop — cap bounds the damage
         uint8_t   promote_hops = 0;
@@ -629,6 +653,8 @@ private:
     vbr_shared_scratch_registration vbr_shared_scratch_register(
             const vbr_shared_scratch_binding & binding);
     void vbr_vmm_ensure_mapped(); // grow physical backing to the current cell watermark
+    size_t vbr_vmm_required_page(const vbr_pool & pool, const vbr_extent & extent) const;
+    void vbr_vmm_unmap_preserving_required(vbr_pool & pool, size_t off, size_t len);
     bool vbr_vmm_try_map(uint32_t wm); // same, recoverable: false on physical exhaustion
 
     // S3/S4: decode-time degrade controller (VMM mode only). The price order and its cursor stay
@@ -1202,6 +1228,7 @@ private:
     void vbr_ownership_update_all_seqs(uint32_t stream, uint32_t cell, llama_pos pos,
                                        bool add, llama_seq_id exclude_seq = -1);
     void     vbr_shrink_watermark();                  // occupancy dropped: release phantom tail pages
+    void     vbr_shrink_watermark_to(uint32_t wm_now);// composite-owned equivalent
     void     vbr_invalidate_dirty_stash();            // one dirty-stash settlement implementation
     bool     vbr_promote_next(uint32_t wm_next);      // occupancy dropped: re-promote one container
     void     vbr_floor_clamp_order();
@@ -1243,7 +1270,10 @@ private:
     bool vbr_unit_movable(ggml_type t, bool is_v) const;
     uint32_t vbr_watermark_cells(uint32_t extra_tokens) const; // shared by prepare() + ensure_mapped
     enum class vbr_degrade_result { applied, exhausted, reserve_failed, hard_lease_blocked };
-    vbr_degrade_result vbr_degrade_next(uint32_t wm_next);
+    // Composite owners pass hard_seal_prechecked only after checking the canonical logical
+    // range for the whole coupled transaction. Its physical children must not reinterpret that
+    // lease against compressed/scaled address ranges while landing the already-authorized step.
+    vbr_degrade_result vbr_degrade_next(uint32_t wm_next, bool hard_seal_prechecked = false);
                                                       // wm_next = projected watermark incl. the
                                                       // incoming batch (bounds live pages/scrub)
 
@@ -1301,6 +1331,7 @@ private:
     // Dynamic VBR shared KV pools (M2 bookkeeping; M3 transcode/relocate) — one per KV buffer
     // (per device under -sm layer; exactly one on a single GPU)
     std::vector<vbr_pool> vbr_pools_;
+    vbr_group_prepare_cb vbr_group_prepare_cb_;
     // Scratch bindings for shared-KV aliases. Deliberately separate from vbr_pools_: a
     // controller-less drafter must not appear to own VMM, budget, ledger, or degrade state.
     std::vector<vbr_shared_scratch_binding> vbr_shared_scratch_bindings_;
@@ -1316,6 +1347,7 @@ private:
     void vbr_transcode_anchor_test();
 
     friend struct llama_kv_cache_vbr_epoch_test;
+    friend class llama_kv_cache_dsv4;
 
     // TurboQuant rotation matrices (128x128, row-major stored)
     ggml_tensor * turbo_rotation = nullptr;      // R (forward rotation)

@@ -18,6 +18,26 @@
 static constexpr uint32_t DSV4_CSA_RATIO = 4;
 static constexpr uint32_t DSV4_HCA_RATIO = 128;
 
+static ggml_type dsv4_vbr_tier_type(uint8_t tier) {
+    switch (tier) {
+        case VBR_TIER_T8:     return GGML_TYPE_TURBO8_0;
+        case VBR_TIER_T4:     return GGML_TYPE_TURBO4_0;
+        case VBR_TIER_T3_TCQ: return GGML_TYPE_TURBO3_TCQ;
+        case VBR_TIER_T2_TCQ: return GGML_TYPE_TURBO2_TCQ;
+        case VBR_TIER_T1_TCQ: return GGML_TYPE_TURBO1_TCQ;
+        default:              GGML_ABORT("invalid DSV4 VBR tier %d", (int) tier);
+    }
+}
+
+static double dsv4_vbr_floor_bpv(double requested) {
+    if (const char * env = getenv("VBR_MIN_BITS")) {
+        requested = atof(env);
+    }
+    return requested > 0.0 ? requested :
+        8.0 * ggml_type_size(GGML_TYPE_TURBO1_TCQ) /
+            ggml_blck_size(GGML_TYPE_TURBO1_TCQ);
+}
+
 static constexpr uint32_t DSV4_STATE_MAGIC         = 0x34565344; // DSV4
 static constexpr uint32_t DSV4_STATE_VERSION       = 1;
 static constexpr uint32_t DSV4_STATE_MODE_FULL     = 0;
@@ -1177,6 +1197,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     hparams_lid(model.hparams),
     n_seq_max(n_seq_max),
     n_rs_seq(n_rs_seq),
+    kv_size(kv_size),
     rs_idx(n_seq_max, 0) {
 
     const layer_filter_cb filter_raw = [&](int32_t il) {
@@ -1187,24 +1208,42 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
         return true;
     };
 
-    GGML_UNUSED(unified);
+    // Speculative server contexts reserve one backup sequence per user slot;
+    // DSV4 performs their bounded rollback through n_rs_seq snapshot planes,
+    // so those backups do not require independent KV streams. Distinct user
+    // slots do: compressed rows are addressed by (position / ratio), and two
+    // unrelated sequences at the same position cannot share that row. Dynamic
+    // VBR currently requires one unified VMM plane, so reject the unsupported
+    // multi-slot geometry before slot 1 can overwrite or clear slot 0.
+    const uint32_t n_user_seq = n_rs_seq > 0 && n_seq_max % 2 == 0
+            ? n_seq_max / 2
+            : n_seq_max;
+    if (vbr.dynamic && !hparams_raw.no_alloc && n_user_seq > 1) {
+        throw std::runtime_error(format(
+                "DSV4 dynamic VBR currently supports one user sequence (-np 1); "
+                "this context requests %u user sequences", n_user_seq));
+    }
 
-    // Keep DSV4 KV/state streams per sequence even when public KV mode is unified.
-    const bool unified_raw = false;
+    // Dynamic VBR's VMM representation is one unified tensor plane. Recurrent
+    // speculation does not need a second KV plane: its short rollback history
+    // lives in llama_dsv4_comp_state's n_rs_seq snapshot planes. Keep the
+    // established per-sequence layout for static DSV4 caches, but honor the
+    // public unified contract when arming dynamic VBR.
+    const bool unified_raw = unified && vbr.dynamic;
 
     hparams_raw.n_layer_nextn = 0;
     hparams_csa.n_layer_nextn = 0;
     hparams_hca.n_layer_nextn = 0;
     hparams_lid.n_layer_nextn = 0;
 
-    // Turbo/VBR policy (2026-08-10). Reader map: raw/csa/hca are read ONLY through fused
+    // Turbo/VBR policy. Reader map: raw/csa/hca are read ONLY through fused
     // attention (deepseek4.cpp concats them into k_all for build_attn_mha; ggml_concat handles
     // same-type quantized tensors block-aligned), and the compressor reads only the untyped
     // comp-state streams — so STATIC turbo tiers are legal on raw/csa/hca. The lightning-indexer
     // cache (lid) is read by mul_mat (or the fused_lid op, which has no turbo decode yet) and its
-    // rows are indexer-head-sized — pin it at F16. The DYNAMIC ladder stays q8_0-capped: per-child
-    // controllers degrade independently, and the concat requires raw/csa/hca to agree per layer —
-    // cross-child tier ganging is the remaining work for full VBR on this arch.
+    // rows are indexer-head-sized — pin it at F16. Dynamic VBR gives raw/csa/hca separate VMM
+    // pools but one parent-owned policy boundary: a layer's raw and compressed tensors always
+    // transcode together before the concat graph is built.
     llama_memory_vbr_params vbr_raw = vbr;
     vbr_raw.trace_label = "raw";
     const bool turbo_req = ggml_is_turbo_kv_type(type_k) || ggml_is_turbo_kv_type(type_v);
@@ -1218,22 +1257,60 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
                 "lid pinned at f16 (indexer reads via mul_mat/fused_lid)\n",
                 __func__, ggml_type_name(type_k));
     } else if (vbr.dynamic) {
-        type_k    = GGML_TYPE_Q8_0;
-        type_v    = GGML_TYPE_Q8_0;
-        type_comp = GGML_TYPE_Q8_0;
-        type_lid  = GGML_TYPE_Q8_0;
-        vbr_raw = {};
-        vbr_raw.compute_backend_for_buft = vbr.compute_backend_for_buft;
-        LLAMA_LOG_INFO("%s: DSV4 KV runs static q8_0 under dynamic VBR (per-child tier ganging "
-                "for the concat'd raw/csa/hca caches is not built yet; use an explicit static "
-                "-ctk/-ctv turbo type for lower-bit KV on this arch)\n",
-                __func__);
+        type_lid = GGML_TYPE_F16;
+        LLAMA_LOG_INFO("%s: DSV4 dynamic VBR: raw/csa/hca use one ganged per-layer ladder; "
+                "lid pinned at f16\n", __func__);
     }
 
     // children need the backend-binding callback even without dynamic VBR: static turbo
     // K/V types resolve their decode backend through it (refused at init otherwise)
     llama_memory_vbr_params vbr_child = {};
     vbr_child.compute_backend_for_buft = vbr.compute_backend_for_buft;
+
+    llama_memory_vbr_params vbr_csa = vbr.dynamic ? vbr : vbr_child;
+    llama_memory_vbr_params vbr_hca = vbr.dynamic ? vbr : vbr_child;
+    vbr_csa.trace_label = "csa";
+    vbr_hca.trace_label = "hca";
+    if (vbr.dynamic || vbr.budget_bytes > 0) {
+        uint64_t n_raw_l = 0;
+        uint64_t n_csa_l = 0;
+        uint64_t n_hca_l = 0;
+        for (uint32_t il = 0; il < model.hparams.n_layer_all; ++il) {
+            if (filter && !filter(il)) {
+                continue;
+            }
+            ++n_raw_l;
+            if (model.hparams.dsv4_compress_ratios[il] == DSV4_CSA_RATIO) {
+                ++n_csa_l;
+            } else if (model.hparams.dsv4_compress_ratios[il] == DSV4_HCA_RATIO) {
+                ++n_hca_l;
+            }
+        }
+        const uint64_t raw_cells = swa_full ? kv_size :
+            GGML_PAD(std::min(kv_size, model.hparams.n_swa + n_ubatch), 256u);
+        const uint64_t csa_cells = GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u);
+        const uint64_t hca_cells = GGML_PAD(dsv4_comp_size(kv_size, DSV4_HCA_RATIO), 256u);
+        const double w_raw = (double) n_raw_l * raw_cells;
+        const double w_csa = (double) n_csa_l * csa_cells;
+        const double w_hca = (double) n_hca_l * hca_cells;
+        const double w_all = w_raw + w_csa + w_hca;
+        if (w_all > 0.0) {
+            const double raw_frac = w_raw / w_all;
+            const double csa_frac = w_csa / w_all;
+            vbr_raw.device_share = vbr.device_share * raw_frac;
+            vbr_csa.device_share = vbr.device_share * csa_frac;
+            vbr_hca.device_share = vbr.device_share - vbr_raw.device_share - vbr_csa.device_share;
+            if (vbr.budget_bytes > 0) {
+                vbr_raw.budget_bytes = (uint64_t) ((double) vbr.budget_bytes * raw_frac);
+                vbr_csa.budget_bytes = (uint64_t) ((double) vbr.budget_bytes * csa_frac);
+                vbr_hca.budget_bytes = vbr.budget_bytes - vbr_raw.budget_bytes - vbr_csa.budget_bytes;
+                LLAMA_LOG_INFO("%s: DSV4 VBR budget split: %.2f MiB raw / %.2f MiB CSA / "
+                        "%.2f MiB HCA (by entry-tier allocated rows)\n", __func__,
+                        vbr_raw.budget_bytes/1048576.0, vbr_csa.budget_bytes/1048576.0,
+                        vbr_hca.budget_bytes/1048576.0);
+            }
+        }
+    }
 
     LLAMA_LOG_INFO("%s: creating DSV4 raw KV cache\n", __func__);
 
@@ -1271,7 +1348,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
         return model.hparams.dsv4_compress_ratios[il] == DSV4_HCA_RATIO;
     };
 
-    const bool unified_compressed = false;
+    const bool unified_compressed = unified && vbr.dynamic;
 
     LLAMA_LOG_INFO("%s: creating DSV4 CSA compressed KV cache, size = %u cells\n",
             __func__, dsv4_comp_size(kv_size, DSV4_CSA_RATIO));
@@ -1279,7 +1356,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     kv_csa = std::make_unique<llama_kv_cache>(
             model, hparams_csa, type_comp, type_comp,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u), n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr, vbr_child);
+            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr, vbr_csa);
 
     LLAMA_LOG_INFO("%s: creating DSV4 HCA compressed KV cache, size = %u cells\n",
             __func__, dsv4_comp_size(kv_size, DSV4_HCA_RATIO));
@@ -1287,7 +1364,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     kv_hca = std::make_unique<llama_kv_cache>(
             model, hparams_hca, type_comp, type_comp,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_HCA_RATIO), 256u), n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_hca, nullptr, nullptr, vbr_child);
+            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_hca, nullptr, nullptr, vbr_hca);
 
     LLAMA_LOG_INFO("%s: creating DSV4 lightning-indexer KV cache, size = %u cells\n",
             __func__, dsv4_comp_size(kv_size, DSV4_CSA_RATIO));
@@ -1296,6 +1373,114 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
             model, hparams_lid, type_lid, type_lid,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u), n_seq_max, n_pad,
             0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr, vbr_child);
+
+    if (vbr.dynamic && !model.hparams.no_alloc) {
+        llama_kv_cache * leader = kv_raw->get_swa();
+        if (!leader->vbr_controller_active()) {
+            throw std::runtime_error("DSV4 dynamic VBR could not arm the raw-cache controller");
+        }
+
+        // The generic order is normalized over the KV-bearing layers of one cache. CSA and HCA
+        // each contain only a subset, so independently synthesizing their orders would rank the
+        // same model layer differently. Install the raw cache's full-model order in both; their
+        // absent-layer entries become no-ops and the next applicable step names exactly the
+        // compressed partner of the raw step.
+        const auto install_order = [&](llama_kv_cache * child) {
+            if (!child->vbr_controller_active()) {
+                return;
+            }
+            child->vbr_degrade_order_ = leader->vbr_degrade_order_;
+            child->vbr_degrade_cursor_ = 0;
+            child->t8_band_end_ = leader->t8_band_end_;
+            child->vbr_floor_typed_ = leader->vbr_floor_typed_;
+        };
+        install_order(kv_csa.get());
+        install_order(kv_hca.get());
+
+        // CSA pads its compressor graph to the reserve-time block count by writing one
+        // deliberately invisible row at the end of each cache tensor. Prefix-only VMM mapping
+        // does not otherwise back that address when no complete 4-token block exists yet.
+        // Record the semantic write requirement; the generic mapper follows its current-tier
+        // byte address and protects only that one page from tail reclamation.
+        for (auto & pool : kv_csa->vbr_pools_) {
+            for (auto & extent : pool.k) {
+                if (extent.t != nullptr) {
+                    GGML_ASSERT(extent.t->ne[2] == 1); // dynamic VMM requires unified KV
+                    extent.vmm_required_write_row = (uint32_t) extent.t->ne[1] - 1;
+                }
+            }
+        }
+        vbr_floor_group(GGML_TYPE_COUNT, vbr.min_bits, /*pooled_only=*/true,
+                /*install_runtime_limit=*/true);
+        const std::array<llama_kv_cache *, 3> group = { leader, kv_csa.get(), kv_hca.get() };
+        if (vbr.budget_bytes > 0 && vbr.budget_explicit) {
+            size_t floor_total = 0;
+            size_t extra_weight_total = 0;
+            for (const llama_kv_cache * child : group) {
+                floor_total += child->vbr_floor_cost_bytes_;
+                for (const auto & pool : child->vbr_pools_) {
+                    if (pool.vmm != nullptr) {
+                        extra_weight_total += pool.size > pool.budget_base
+                            ? pool.size - pool.budget_base : 0;
+                    }
+                }
+            }
+            if (vbr.budget_bytes < floor_total) {
+                throw std::runtime_error(format(
+                        "DSV4 VBR budget %.2f MiB is below the page-exact %.2f MiB floor layout",
+                        vbr.budget_bytes/1048576.0, floor_total/1048576.0));
+            }
+            size_t extra_left = (size_t) vbr.budget_bytes - floor_total;
+            size_t weight_left = extra_weight_total;
+            for (llama_kv_cache * child : group) {
+                size_t child_budget = 0;
+                for (auto & pool : child->vbr_pools_) {
+                    if (pool.vmm == nullptr) {
+                        continue;
+                    }
+                    const size_t weight = pool.size > pool.budget_base
+                        ? pool.size - pool.budget_base : 0;
+                    const size_t add = weight_left == 0 ? extra_left :
+                        (size_t) ((long double) extra_left * weight / weight_left);
+                    pool.budget = pool.budget_base + add;
+                    pool.budget_eff_stamp = ~0ull;
+                    child_budget += pool.budget;
+                    extra_left -= add;
+                    weight_left -= weight;
+                }
+                child->vbr_budget_bytes_ = child_budget;
+            }
+        } else {
+            for (llama_kv_cache * child : group) {
+                size_t child_budget = 0;
+                for (auto & pool : child->vbr_pools_) {
+                    if (pool.vmm != nullptr) {
+                        pool.budget = std::max(pool.budget, pool.budget_base);
+                        pool.budget_eff_stamp = ~0ull;
+                        child_budget += pool.budget;
+                    }
+                }
+                child->vbr_budget_bytes_ = std::max(child_budget, child->vbr_floor_cost_bytes_);
+            }
+        }
+
+        // The current ledger tree represents at most two ordinary caches. Publishing three
+        // independent markers from one DSV4 memory would double-count the same logical donor,
+        // so grouped DSV4 starts with process-external co-tenancy disabled. The local aggregate
+        // budget and all recoverable map/reserve behavior remain active.
+        for (llama_kv_cache * child : { kv_raw->get_base(), leader, kv_csa.get(), kv_hca.get() }) {
+            child->vbr_ledger_owner_ = false;
+            child->vbr_ledger_root_ = nullptr;
+            child->vbr_ledger_sibling_ = nullptr;
+        }
+        LLAMA_LOG_WARN("%s: DSV4 grouped VBR does not yet publish co-tenancy offers; "
+                "runtime tiering and explicit/auto local budgets remain active\n", __func__);
+
+        leader->vbr_group_prepare_set([this](uint32_t raw_wm) {
+            return vbr_prepare_group(raw_wm);
+        });
+        vbr_group_enabled_ = true;
+    }
 
     LLAMA_LOG_INFO("%s: creating DSV4 CSA compressor state\n", __func__);
 
@@ -1322,6 +1507,524 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     clear_compressed(-1, true);
 }
 
+double llama_kv_cache_dsv4::vbr_floor_group(
+        ggml_type entry_k, double floor_bpv, bool pooled_only,
+        bool install_runtime_limit) {
+    llama_kv_cache * raw = kv_raw->get_swa();
+
+    if (raw->vbr_degrade_order_.empty()) {
+        raw->vbr_load_degrade_order();
+    }
+    // Every child must walk the full-model ordinal space. Missing layers are intentional
+    // no-ops; this is what gives one ordinal the same model-layer meaning in all three caches.
+    for (llama_kv_cache * child : { kv_csa.get(), kv_hca.get() }) {
+        child->vbr_degrade_order_ = raw->vbr_degrade_order_;
+        child->t8_band_end_ = raw->t8_band_end_;
+    }
+
+    struct sim_child {
+        llama_kv_cache * cache;
+        double rate;
+        std::vector<ggml_type> types;
+        double bits = 0.0;
+        int64_t vals = 0;
+    };
+    sim_child sr { raw,          1.0,                 {} };
+    sim_child sc { kv_csa.get(), 1.0/DSV4_CSA_RATIO, {} };
+    sim_child sh { kv_hca.get(), 1.0/DSV4_HCA_RATIO, {} };
+    std::array<sim_child *, 3> sims = { &sr, &sc, &sh };
+
+    double sum_bits = 0.0;
+    double sum_vals = 0.0;
+    for (sim_child * s : sims) {
+        s->cache->vbr_sim_seed(s->types, pooled_only, entry_k, entry_k,
+                &s->bits, &s->vals, nullptr);
+        sum_bits += s->rate * s->bits;
+        sum_vals += s->rate * s->vals;
+    }
+
+    const double floor_eff = dsv4_vbr_floor_bpv(floor_bpv);
+    size_t limit = raw->vbr_degrade_order_.size();
+    for (size_t i = 0; i < raw->vbr_degrade_order_.size(); ++i) {
+        const auto & order = raw->vbr_degrade_order_[i];
+        if (order.is_v) {
+            continue; // DSV4 stores one K==V tensor per component.
+        }
+
+        const uint32_t ratio = hparams_raw.dsv4_compress_ratios[order.il];
+        sim_child * follower = ratio == DSV4_CSA_RATIO ? &sc :
+                               ratio == DSV4_HCA_RATIO ? &sh : nullptr;
+        size_t raw_slot = 0, follower_slot = 0;
+        const ggml_tensor * raw_tensor = nullptr;
+        const ggml_tensor * follower_tensor = nullptr;
+        ggml_type raw_next = GGML_TYPE_COUNT;
+        ggml_type follower_next = GGML_TYPE_COUNT;
+        const bool raw_moves = raw->vbr_sim_step(
+                sr.types, i, raw_slot, raw_tensor, raw_next);
+        const bool follower_moves = follower != nullptr && follower->cache->vbr_sim_step(
+                follower->types, i, follower_slot, follower_tensor, follower_next);
+        if (!raw_moves && !follower_moves) {
+            continue;
+        }
+        // Compressed layers have exactly one partner; ratio-0 layers attend raw KV directly.
+        GGML_ASSERT(raw_moves && (follower == nullptr || follower_moves));
+
+        const double raw_delta =
+            - 8.0 * ggml_row_size(sr.types[raw_slot], raw_tensor->ne[0])
+            + 8.0 * ggml_row_size(raw_next, raw_tensor->ne[0]);
+        const double follower_delta = follower != nullptr ?
+            - 8.0 * ggml_row_size(follower->types[follower_slot], follower_tensor->ne[0])
+            + 8.0 * ggml_row_size(follower_next, follower_tensor->ne[0]) : 0.0;
+        const double next_bits = sum_bits + raw_delta +
+            (follower != nullptr ? follower->rate * follower_delta : 0.0);
+        if (sum_vals > 0.0 && next_bits / sum_vals < floor_eff - 1e-9) {
+            limit = i;
+            break;
+        }
+        sr.types[raw_slot] = raw_next;
+        if (follower != nullptr) {
+            follower->types[follower_slot] = follower_next;
+            follower->bits += follower_delta;
+        }
+        sr.bits += raw_delta;
+        sum_bits = next_bits;
+    }
+
+    if (install_runtime_limit) {
+        const auto install = [&](sim_child & s) {
+            s.cache->vbr_degrade_limit_ = limit;
+            s.cache->vbr_floor_cost_bytes_ = 0;
+            for (auto & pool : s.cache->vbr_pools_) {
+                size_t pool_floor = pool.mapped_base;
+                for (size_t ikv = 0; ikv < s.cache->layers.size(); ++ikv) {
+                    auto & extent = pool.k[ikv];
+                    if (extent.t == nullptr) {
+                        continue;
+                    }
+                    const ggml_type type = s.types[ikv*2];
+                    if (type != GGML_TYPE_COUNT) {
+                        const size_t need = ggml_row_size(type, extent.t->ne[0]) *
+                            (size_t) extent.t->ne[1];
+                        pool_floor += GGML_PAD(need, pool.gran);
+                    }
+                }
+                pool.budget_base = pool_floor;
+                pool.budget_eff_stamp = ~0ull;
+                s.cache->vbr_floor_cost_bytes_ += pool_floor;
+            }
+        };
+        install(sr);
+        install(sc);
+        install(sh);
+        LLAMA_LOG_INFO("%s: DSV4 aggregate VBR floor %.4g bits/value clamps the ganged order at %zu/%zu steps\n",
+                __func__, floor_eff, limit, raw->vbr_degrade_order_.size());
+    }
+    if (kv_size == 0) {
+        return 0.0;
+    }
+    // Fit scales the bytes of the actually allocated, padded dry tensors. Preserve that exact
+    // geometry here; the 1/ratio weights above are only the quality-floor definition.
+    return sr.bits * (double) raw->get_size() / kv_size +
+           sc.bits * (double) kv_csa->get_size() / kv_size +
+           sh.bits * (double) kv_hca->get_size() / kv_size;
+}
+
+llama_kv_cache_dsv4::vbr_group_budget_state llama_kv_cache_dsv4::vbr_group_budget(
+        uint32_t raw_wm, uint32_t csa_wm, uint32_t hca_wm, bool live) const {
+    struct device_total {
+        const ggml_vbr_backend_iface * be = nullptr;
+        size_t projected = 0;
+        size_t configured = 0;
+        size_t mapped = 0;
+        size_t growth_headroom = 0;
+        bool explicit_budget = false;
+        bool freeze = false;
+    };
+    struct child_state {
+        const llama_kv_cache * cache;
+        uint32_t wm;
+    };
+    const std::array<child_state, 3> children = {{
+        { kv_raw->get_swa(), raw_wm },
+        { kv_csa.get(), csa_wm },
+        { kv_hca.get(), hca_wm },
+    }};
+
+    std::map<int, device_total> totals;
+    for (const auto & child : children) {
+        if (!child.cache->vbr_controller_active()) {
+            continue;
+        }
+        for (const auto & pool : child.cache->vbr_pools_) {
+            if (pool.vmm == nullptr) {
+                continue;
+            }
+            auto & total = totals[pool.device];
+            GGML_ASSERT(total.be == nullptr || total.be == pool.be);
+            total.be = pool.be;
+            total.projected += child.cache->vbr_vmm_projected_bytes(pool, child.wm);
+            total.configured += pool.budget;
+            total.mapped += pool.be->vmm_pool_mapped(pool.vmm);
+            total.growth_headroom = std::max(
+                    total.growth_headroom, child.cache->vbr_growth_headroom_);
+            total.explicit_budget |= child.cache->vbr_budget_explicit_;
+            total.freeze |= child.cache->vbr_freeze_;
+        }
+    }
+    vbr_group_budget_state result;
+    result.max_deficit = INT64_MIN;
+    for (const auto & [device, total] : totals) {
+        size_t effective = total.configured;
+        if (live && !total.freeze) {
+            size_t free_b = 0;
+            size_t total_b = 0;
+            total.be->get_device_memory(device, &free_b, &total_b);
+            GGML_UNUSED(total_b);
+            const size_t ledger_headroom = llama_vram_headroom_bytes();
+            const size_t grow_room = effective > total.mapped
+                ? effective - total.mapped : 0;
+            const size_t headroom = total.explicit_budget
+                ? std::max(std::min(total.growth_headroom, grow_room), ledger_headroom)
+                : ledger_headroom;
+            const size_t cap = total.mapped + (free_b > headroom ? free_b - headroom : 0);
+            effective = std::min(effective, cap);
+        }
+        effective = std::max(effective, total.mapped);
+        result.bytes_needed += total.projected;
+        result.bytes_available += effective;
+        const int64_t deficit = total.projected > effective
+            ? (int64_t) std::min(total.projected - effective,
+                    (size_t) std::numeric_limits<int64_t>::max())
+            : - (int64_t) std::min(effective - total.projected,
+                    (size_t) std::numeric_limits<int64_t>::max());
+        result.max_deficit = std::max(result.max_deficit, deficit);
+    }
+    if (result.max_deficit == INT64_MIN) {
+        result.max_deficit = 0;
+    }
+    return result;
+}
+
+double llama_kv_cache_dsv4::vbr_group_projected_bpv(
+        uint32_t raw_wm, uint32_t csa_wm, uint32_t hca_wm) const {
+    struct sim_child {
+        const llama_kv_cache * cache;
+        uint32_t wm;
+        std::vector<ggml_type> types;
+        double bits = 0.0;
+        double vals = 0.0;
+    };
+    sim_child sr { kv_raw->get_swa(), raw_wm, {} };
+    sim_child sc { kv_csa.get(), csa_wm, {} };
+    sim_child sh { kv_hca.get(), hca_wm, {} };
+    std::array<sim_child *, 3> children = { &sr, &sc, &sh };
+
+    std::map<int, int64_t> projected;
+    std::map<int, int64_t> configured;
+    const auto extent_bytes = [](const llama_kv_cache::vbr_pool & pool,
+                                 const llama_kv_cache::vbr_extent & extent,
+                                 ggml_type type, uint32_t wm) {
+        const size_t slot = GGML_PAD(
+                ggml_row_size(GGML_TYPE_F16, extent.t->ne[0]) *
+                    (size_t) extent.t->ne[1] * extent.t->ne[2],
+                pool.gran);
+        const size_t need = ggml_row_size(type, extent.t->ne[0]) * (size_t) wm;
+        size_t bytes = std::min(slot, (size_t) GGML_PAD(need, pool.gran));
+        if (extent.vmm_required_write_row != UINT32_MAX) {
+            const size_t rel = ggml_row_size(type, extent.t->ne[0]) *
+                extent.vmm_required_write_row;
+            const size_t page = (rel / pool.gran) * pool.gran;
+            if (page >= bytes) {
+                bytes += pool.gran;
+            }
+        }
+        return bytes;
+    };
+
+    for (sim_child * child : children) {
+        double bits = 0.0;
+        int64_t vals = 0;
+        child->cache->vbr_sim_seed(child->types, /*pooled_only=*/true,
+                GGML_TYPE_COUNT, GGML_TYPE_COUNT, &bits, &vals, nullptr);
+        child->bits = bits * child->cache->get_size();
+        child->vals = (double) vals * child->cache->get_size();
+        for (const auto & pool : child->cache->vbr_pools_) {
+            if (pool.vmm == nullptr) {
+                continue;
+            }
+            configured[pool.device] += (int64_t) pool.budget;
+            projected[pool.device] += (int64_t) pool.mapped_base;
+            for (size_t ikv = 0; ikv < child->cache->layers.size(); ++ikv) {
+                for (int side = 0; side < 2; ++side) {
+                    const auto & extent = side ? pool.v[ikv] : pool.k[ikv];
+                    if (extent.t != nullptr) {
+                        projected[pool.device] += (int64_t) extent_bytes(
+                                pool, extent, child->types[ikv*2 + side], child->wm);
+                    }
+                }
+            }
+        }
+    }
+
+    const auto fits = [&]() {
+        for (const auto & [device, bytes] : projected) {
+            if (bytes > configured[device]) {
+                return false;
+            }
+        }
+        return true;
+    };
+    const auto apply_step = [&](sim_child & child, size_t i) {
+        size_t slot = 0;
+        const ggml_tensor * tensor = nullptr;
+        ggml_type next = GGML_TYPE_COUNT;
+        if (!child.cache->vbr_sim_step(child.types, i, slot, tensor, next)) {
+            return false;
+        }
+        const size_t ikv = slot/2;
+        const bool is_v = (slot & 1) != 0;
+        const ggml_type prev = child.types[slot];
+        for (const auto & pool : child.cache->vbr_pools_) {
+            if (pool.vmm == nullptr) {
+                continue;
+            }
+            const auto & extent = is_v ? pool.v[ikv] : pool.k[ikv];
+            if (extent.t == nullptr) {
+                continue;
+            }
+            projected[pool.device] +=
+                (int64_t) extent_bytes(pool, extent, next, child.wm) -
+                (int64_t) extent_bytes(pool, extent, prev, child.wm);
+        }
+        child.bits += 8.0 * ((double) ggml_row_size(next, tensor->ne[0]) -
+                (double) ggml_row_size(prev, tensor->ne[0])) * child.cache->get_size();
+        child.types[slot] = next;
+        return true;
+    };
+
+    const size_t end = std::min(sr.cache->vbr_degrade_order_.size(),
+            sr.cache->vbr_degrade_limit_);
+    for (size_t i = sr.cache->vbr_degrade_cursor_; i < end && !fits(); ++i) {
+        const auto & order = sr.cache->vbr_degrade_order_[i];
+        if (order.is_v) {
+            continue;
+        }
+        const uint32_t ratio = hparams_raw.dsv4_compress_ratios[order.il];
+        sim_child * follower = ratio == DSV4_CSA_RATIO ? &sc :
+                               ratio == DSV4_HCA_RATIO ? &sh : nullptr;
+        const bool raw_moves = apply_step(sr, i);
+        const bool follower_moves = follower != nullptr && apply_step(*follower, i);
+        GGML_ASSERT(!raw_moves || follower == nullptr || follower_moves);
+    }
+
+    double bits = 0.0;
+    double vals = 0.0;
+    for (const sim_child * child : children) {
+        bits += child->bits;
+        vals += child->vals;
+    }
+    // Keep the public BPV metric scoped to the raw/compressed attention cache.
+    // LID is immutable auxiliary indexer state: fit prices its bytes separately,
+    // but static and live codec telemetry should still report the selected tier.
+    return vals > 0.0 ? bits/vals : -1.0;
+}
+
+bool llama_kv_cache_dsv4::vbr_prepare_group(uint32_t raw_wm) {
+    llama_kv_cache * raw = kv_raw->get_swa();
+    const uint32_t csa_wm = std::min(vbr_pending_csa_wm_, kv_csa->get_size());
+    const uint32_t hca_wm = std::min(vbr_pending_hca_wm_, kv_hca->get_size());
+
+    struct child_boundary {
+        llama_kv_cache * cache;
+        uint32_t wm;
+    };
+    const std::array<child_boundary, 3> children = {{
+        { raw, raw_wm }, { kv_csa.get(), csa_wm }, { kv_hca.get(), hca_wm },
+    }};
+
+    for (const auto & child : children) {
+        if (!child.cache->vbr_controller_active()) {
+            continue;
+        }
+        child.cache->vbr_runtime_was_over_ = false;
+        child.cache->vbr_reserve_failed_ = false;
+        child.cache->vbr_hard_seal_blocked_ = false;
+        child.cache->vbr_hard_seal_evidence_.clear();
+        child.cache->vbr_flush_deferred_unmaps();
+        child.cache->vbr_invalidate_dirty_stash();
+        child.cache->vbr_last_prepare_ns_ = llama_vram_ledger_now_ns();
+        if (!child.cache->vbr_budget_explicit_ && child.cache->vbr_boundary_count_ % 8 == 0) {
+            child.cache->vbr_rederive_budget();
+        }
+    }
+
+    uint32_t used_raw = 0;
+    for (const auto & cells : raw->v_cells) {
+        used_raw += cells.get_used();
+    }
+    if (raw->vbr_degrade_cursor_ > 0 && used_raw == 0 &&
+            !raw->vbr_f5_preserve_empty_tiers_) {
+        for (const auto & child : children) {
+            if (child.cache->vbr_controller_active() && child.cache->vbr_degrade_cursor_ > 0) {
+                child.cache->vbr_full_reset();
+            }
+        }
+    }
+    for (const auto & child : children) {
+        if (child.cache->vbr_controller_active()) {
+            child.cache->vbr_shrink_watermark_to(child.wm);
+        }
+    }
+
+    const auto over_budget = [&]() {
+        return vbr_group_budget(raw_wm, csa_wm, hca_wm, /*live=*/true).max_deficit > 0;
+    };
+
+    const auto reserve_unit_stashes = [&](llama_kv_cache * cache, int32_t il) {
+        if (cache->vbr_stash_rows_ == 0) {
+            return true;
+        }
+        const auto found = cache->map_layer_ids.find(il);
+        GGML_ASSERT(found != cache->map_layer_ids.end());
+        for (const auto & [pool, extent] : cache->vbr_units_of(found->second, false)) {
+            if (pool->wm_cells == 0) {
+                continue;
+            }
+            const bool capture = extent->stash_valid == 0 &&
+                ggml_is_turbo_kv_type(extent->t->type) &&
+                extent->t->type != GGML_TYPE_TURBO8_0;
+            const uint32_t rows = capture
+                ? std::min(cache->vbr_stash_rows_, pool->wm_cells)
+                : extent->stash_valid;
+            if (rows > 0) {
+                const std::vector<llama_kv_cache::vbr_stash_request> request = {{ extent, rows }};
+                if (!cache->vbr_stash_reserve(*pool, request)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
+
+    const auto next_raw_step = [&]() -> std::pair<size_t, int32_t> {
+        const size_t end = std::min(raw->vbr_degrade_order_.size(), raw->vbr_degrade_limit_);
+        for (size_t i = raw->vbr_degrade_cursor_; i < end; ++i) {
+            const auto & step = raw->vbr_degrade_order_[i];
+            const auto found = raw->map_layer_ids.find(step.il);
+            if (found == raw->map_layer_ids.end()) {
+                continue;
+            }
+            const size_t ikv = found->second;
+            ggml_tensor * tensor = step.is_v ? raw->layers[ikv].v : raw->layers[ikv].k;
+            if (tensor == nullptr || raw->vbr_units_of(ikv, step.is_v != 0).empty() ||
+                    !raw->vbr_unit_movable(tensor->type, step.is_v != 0)) {
+                continue;
+            }
+            const ggml_type next = dsv4_vbr_tier_type(step.tier);
+            if (tensor->type != next &&
+                    ggml_row_size(next, tensor->ne[0]) < ggml_row_size(tensor->type, tensor->ne[0])) {
+                return { i, step.il };
+            }
+        }
+        return { end, -1 };
+    };
+
+    const bool frozen = raw->vbr_retier_freeze_depth_ > 0 ||
+        kv_csa->vbr_retier_freeze_depth_ > 0 || kv_hca->vbr_retier_freeze_depth_ > 0;
+    if (!frozen) {
+        vbr_hard_seal_consult_session seal_session;
+        while (over_budget()) {
+            const auto [order_ordinal, il] = next_raw_step();
+            if (il < 0) {
+                break;
+            }
+            const uint32_t ratio = hparams_raw.dsv4_compress_ratios[il];
+            llama_kv_cache * follower = ratio == DSV4_CSA_RATIO ? kv_csa.get() :
+                                        ratio == DSV4_HCA_RATIO ? kv_hca.get() : nullptr;
+            const uint32_t follower_wm = follower == kv_csa.get() ? csa_wm :
+                                         follower == kv_hca.get() ? hca_wm : 0;
+
+            // One raw logical range owns both physical halves of the pair. Consult that range
+            // once against the canonical full-model ordinal: f16->t8 remains restorable and is
+            // allowed under a lease, while the first t4-or-lower step reports typed evidence to
+            // the server so it can retire the conflicting checkpoint and retry.
+            if (raw->vbr_hard_seal_step_blocked(order_ordinal, seal_session)) {
+                raw->vbr_hard_seal_blocked_ = true;
+                raw->vbr_hard_seal_evidence_record(order_ordinal);
+                LLAMA_LOG_WARN("%s: DSV4 ganged retier reached a hard-lease-protected step\n",
+                        __func__);
+                return false;
+            }
+            if (!reserve_unit_stashes(raw, il) ||
+                    (follower != nullptr && !reserve_unit_stashes(follower, il))) {
+                LLAMA_LOG_ERROR("%s: DSV4 ganged sink-stash reserve failed before tier mutation\n",
+                        __func__);
+                return false;
+            }
+
+            const auto follower_result = follower != nullptr ? follower->vbr_degrade_next(follower_wm, true) :
+                llama_kv_cache::vbr_degrade_result::applied;
+            const auto raw_result = raw->vbr_degrade_next(raw_wm, true);
+            if (follower_result != llama_kv_cache::vbr_degrade_result::applied ||
+                    raw_result != llama_kv_cache::vbr_degrade_result::applied) {
+                GGML_ABORT("DSV4 ganged VBR invariant failed for layer %d", il);
+            }
+        }
+    }
+
+    for (const auto & child : children) {
+        if (!child.cache->vbr_controller_active()) {
+            continue;
+        }
+        child.cache->vbr_arm_wave_fences();
+        if (!child.cache->vbr_vmm_try_map(child.wm)) {
+            LLAMA_LOG_ERROR("%s: DSV4 VBR physical map to %u cells failed recoverably\n",
+                    __func__, child.wm);
+            return false;
+        }
+    }
+
+    // Attention sees concat(raw, compressed) as one coupled K==V tensor. Reserve both backend
+    // scratch sides for that combined attended width; reserving each child independently would
+    // cover only max(raw, compressed) and leave the second half to grow inside the graph.
+    const size_t attended_cells = (size_t) raw_wm + std::max(csa_wm, hca_wm);
+    for (auto & pool : raw->vbr_pools_) {
+        if (pool.be == nullptr || pool.device < 0) {
+            continue;
+        }
+        size_t row = 0;
+        for (const auto & extent : pool.k) {
+            if (extent.t != nullptr && ggml_is_turbo_kv_type(extent.t->type)) {
+                row = std::max(row, ggml_row_size(GGML_TYPE_F16, extent.t->ne[0]));
+            }
+        }
+        const size_t bytes = row * attended_cells;
+        if (bytes != 0 && !pool.be->kv_dequant_scratch_reserve(
+                pool.compute_backend, bytes, bytes)) {
+            for (const auto & child : children) {
+                child.cache->vbr_flush_deferred_unmaps();
+            }
+            if (!pool.be->kv_dequant_scratch_reserve(pool.compute_backend, bytes, bytes)) {
+                LLAMA_LOG_ERROR("%s: DSV4 coupled f16 dequant scratch reserve failed recoverably\n",
+                        __func__);
+                return false;
+            }
+        }
+        pool.scratch_k_reserved = std::max(pool.scratch_k_reserved, bytes);
+        pool.scratch_v_reserved = std::max(pool.scratch_v_reserved, bytes);
+    }
+
+    for (const auto & child : children) {
+        if (!child.cache->vbr_controller_active()) {
+            continue;
+        }
+        child.cache->vbr_boundary_count_++;
+        child.cache->vbr_last_wm_ = child.wm;
+        child.cache->vbr_trace_emit("prepare_group", child.wm, used_raw);
+    }
+    return true;
+}
+
 llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
             llama_batch_allocr & balloc,
             uint32_t n_ubatch,
@@ -1334,6 +2037,25 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
 
     const auto make_context = [&](std::vector<llama_ubatch> ubatches) -> llama_memory_context_ptr {
         auto ubatches_raw = dsv4_build_raw_write_ubatches(ubatches);
+
+        if (vbr_group_enabled_) {
+            const auto csa_plans = dsv4_build_comp_plans(
+                    ubatches, DSV4_CSA_RATIO, true,
+                    csa_state->get_state_size(), kv_csa->get_size(), csa_state->get_n_stream(),
+                    n_rs_seq, rs_idx);
+            const auto hca_plans = dsv4_build_comp_plans(
+                    ubatches, DSV4_HCA_RATIO, false,
+                    hca_state->get_state_size(), kv_hca->get_size(), hca_state->get_n_stream(),
+                    n_rs_seq, rs_idx);
+            vbr_pending_csa_wm_ = 0;
+            vbr_pending_hca_wm_ = 0;
+            for (const auto & plan : csa_plans) {
+                vbr_pending_csa_wm_ = std::max<uint32_t>(vbr_pending_csa_wm_, (uint32_t) plan.n_kv);
+            }
+            for (const auto & plan : hca_plans) {
+                vbr_pending_hca_wm_ = std::max<uint32_t>(vbr_pending_hca_wm_, (uint32_t) plan.n_kv);
+            }
+        }
 
         auto sinfos_raw_base_write = kv_raw->get_base()->prepare(ubatches_raw);
         if (sinfos_raw_base_write.empty()) {
@@ -1434,6 +2156,265 @@ bool llama_kv_cache_dsv4::get_can_shift() const {
     // Compressed row metadata uses block-derived positions. Keep shifting
     // disabled until DSV4 compressed-cache shift semantics are wired.
     return false;
+}
+
+void llama_kv_cache_dsv4::breathe() {
+    if (!vbr_group_enabled_) {
+        kv_raw->breathe();
+        kv_csa->breathe();
+        kv_hca->breathe();
+        kv_lid->breathe();
+        return;
+    }
+    // Ordinary child ticks may retier independently. Reuse the parent boundary so an idle-time
+    // auto-budget refresh cannot leave either half of a concat at a different row stride.
+    (void) vbr_prepare_group(kv_raw->get_swa()->vbr_watermark_cells(0));
+}
+
+double llama_kv_cache_dsv4::kv_bpv() const {
+    double bits = 0.0;
+    double vals = 0.0;
+    kv_raw->get_base()->kv_bpv_accum(bits, vals);
+    kv_raw->get_swa ()->kv_bpv_accum(bits, vals);
+    kv_csa->kv_bpv_accum(bits, vals);
+    kv_hca->kv_bpv_accum(bits, vals);
+    return vals > 0.0 ? bits / vals : -1.0;
+}
+
+llama_memory_vbr_state_data llama_kv_cache_dsv4::memory_vbr_state(
+        llama_seq_id seq_id, uint32_t n_tokens_extra) const {
+    const auto r = kv_raw->memory_vbr_state(seq_id, n_tokens_extra);
+    const auto c = kv_csa->memory_vbr_state(seq_id,
+            (n_tokens_extra + DSV4_CSA_RATIO - 1)/DSV4_CSA_RATIO);
+    const auto h = kv_hca->memory_vbr_state(seq_id,
+            (n_tokens_extra + DSV4_HCA_RATIO - 1)/DSV4_HCA_RATIO);
+    llama_memory_vbr_state_data out = r;
+    const uint32_t raw_wm = kv_raw->get_swa()->vbr_watermark_cells(n_tokens_extra);
+    const uint32_t csa_wm = std::max(vbr_pending_csa_wm_,
+            kv_csa->vbr_watermark_cells((n_tokens_extra + DSV4_CSA_RATIO - 1)/DSV4_CSA_RATIO));
+    const uint32_t hca_wm = std::max(vbr_pending_hca_wm_,
+            kv_hca->vbr_watermark_cells((n_tokens_extra + DSV4_HCA_RATIO - 1)/DSV4_HCA_RATIO));
+    const auto budget_raw = vbr_group_budget(raw_wm, csa_wm, hca_wm, /*live=*/false);
+    const auto budget_live = vbr_group_budget(raw_wm, csa_wm, hca_wm, /*live=*/true);
+    out.deficit_raw = budget_raw.max_deficit;
+    out.deficit_clamped = budget_live.max_deficit;
+    out.bpv_if_degraded = budget_raw.max_deficit > 0
+        ? vbr_group_projected_bpv(raw_wm, csa_wm, hca_wm)
+        : kv_bpv();
+    out.cursor = r.cursor;
+    out.representation_epoch_swa ^= c.representation_epoch +
+        0x9e3779b97f4a7c15ULL + (h.representation_epoch << 6) + (h.representation_epoch >> 2);
+    out.retier_freeze_depth = std::max({ r.retier_freeze_depth, c.retier_freeze_depth, h.retier_freeze_depth });
+    out.retier_env_freeze = std::max({ r.retier_env_freeze, c.retier_env_freeze, h.retier_env_freeze });
+    out.retier_freeze_enters = std::max({ r.retier_freeze_enters, c.retier_freeze_enters, h.retier_freeze_enters });
+    out.retier_freeze_exits = std::max({ r.retier_freeze_exits, c.retier_freeze_exits, h.retier_freeze_exits });
+    out.retier_deferred_decisions = r.retier_deferred_decisions +
+        c.retier_deferred_decisions + h.retier_deferred_decisions;
+    out.retier_reconciles = std::max({ r.retier_reconciles, c.retier_reconciles, h.retier_reconciles });
+    return out;
+}
+
+bool llama_kv_cache_dsv4::vbr_operation_armed() const {
+    return vbr_group_enabled_ && kv_raw->vbr_operation_armed();
+}
+
+bool llama_kv_cache_dsv4::vbr_retier_freeze_begin(
+        const char * owner, vbr_operation_id operation_id) {
+    if (!vbr_operation_armed() || vbr_freeze_depth_ >= VBR_RETIER_FREEZE_MAX_DEPTH) {
+        return false;
+    }
+    vbr_freeze_children frame = { operation_id };
+    frame.raw = kv_raw->vbr_retier_freeze_begin(owner, operation_id);
+    if (!frame.raw) {
+        return false;
+    }
+    frame.csa = !kv_csa->vbr_operation_armed() || kv_csa->vbr_retier_freeze_begin(owner, operation_id);
+    if (!frame.csa) {
+        kv_raw->vbr_retier_freeze_end(owner, operation_id);
+        return false;
+    }
+    frame.hca = !kv_hca->vbr_operation_armed() || kv_hca->vbr_retier_freeze_begin(owner, operation_id);
+    if (!frame.hca) {
+        if (kv_csa->vbr_operation_armed()) kv_csa->vbr_retier_freeze_end(owner, operation_id);
+        kv_raw->vbr_retier_freeze_end(owner, operation_id);
+        return false;
+    }
+    vbr_freeze_stack_[vbr_freeze_depth_++] = frame;
+    return true;
+}
+
+void llama_kv_cache_dsv4::vbr_retier_freeze_end(
+        const char * owner, vbr_operation_id operation_id) {
+    GGML_ASSERT(vbr_freeze_depth_ > 0);
+    const auto frame = vbr_freeze_stack_[vbr_freeze_depth_ - 1];
+    GGML_ASSERT(frame.operation_id == operation_id);
+    if (frame.raw) kv_raw->vbr_retier_freeze_end(owner, operation_id);
+    if (frame.csa && kv_csa->vbr_operation_armed()) kv_csa->vbr_retier_freeze_end(owner, operation_id);
+    if (frame.hca && kv_hca->vbr_operation_armed()) kv_hca->vbr_retier_freeze_end(owner, operation_id);
+    vbr_freeze_stack_[--vbr_freeze_depth_] = {};
+}
+
+void llama_kv_cache_dsv4::vbr_commit_submitted() {
+    kv_raw->vbr_commit_submitted(); kv_csa->vbr_commit_submitted(); kv_hca->vbr_commit_submitted();
+}
+
+void llama_kv_cache_dsv4::vbr_decode_ops_finish(bool ok) {
+    kv_raw->vbr_decode_ops_finish(ok); kv_csa->vbr_decode_ops_finish(ok); kv_hca->vbr_decode_ops_finish(ok);
+}
+
+void llama_kv_cache_dsv4::vbr_adopt_operation(vbr_operation_id operation_id) {
+    kv_raw->vbr_adopt_operation(operation_id); kv_csa->vbr_adopt_operation(operation_id); kv_hca->vbr_adopt_operation(operation_id);
+}
+
+void llama_kv_cache_dsv4::vbr_release_adopted() {
+    kv_raw->vbr_release_adopted(); kv_csa->vbr_release_adopted(); kv_hca->vbr_release_adopted();
+}
+
+llama_memory_vbr_preflight_data llama_kv_cache_dsv4::vbr_retier_preflight(
+        uint32_t n_tokens_extra) const {
+    llama_memory_vbr_preflight_data out = {};
+    out.fits = true;
+    if (!vbr_group_enabled_) {
+        return out;
+    }
+
+    llama_kv_cache * raw = kv_raw->get_swa();
+    const uint32_t raw_wm = raw->vbr_watermark_cells(n_tokens_extra);
+    const uint32_t csa_wm = std::max(vbr_pending_csa_wm_,
+            kv_csa->vbr_watermark_cells((n_tokens_extra + DSV4_CSA_RATIO - 1)/DSV4_CSA_RATIO));
+    const uint32_t hca_wm = std::max(vbr_pending_hca_wm_,
+            kv_hca->vbr_watermark_cells((n_tokens_extra + DSV4_HCA_RATIO - 1)/DSV4_HCA_RATIO));
+    const auto budget = vbr_group_budget(raw_wm, csa_wm, hca_wm, /*live=*/true);
+    out.active = true;
+    out.watermark_cells = std::max({ raw_wm, csa_wm, hca_wm });
+    out.bytes_needed = budget.bytes_needed;
+    out.bytes_available = budget.bytes_available;
+    out.max_deficit = budget.max_deficit;
+    out.fits = budget.max_deficit <= 0;
+
+    struct device_growth {
+        const ggml_vbr_backend_iface * be = nullptr;
+        size_t kv = 0;
+        size_t scratch_need = 0;
+        size_t scratch_have = 0;
+    };
+    std::map<int, device_growth> growth;
+    struct child_state { const llama_kv_cache * cache; uint32_t wm; };
+    const std::array<child_state, 3> children = {{
+        { raw, raw_wm }, { kv_csa.get(), csa_wm }, { kv_hca.get(), hca_wm },
+    }};
+    for (const auto & child : children) {
+        for (const auto & pool : child.cache->vbr_pools_) {
+            if (pool.vmm == nullptr) {
+                continue;
+            }
+            out.pools++;
+            auto & g = growth[pool.device];
+            GGML_ASSERT(g.be == nullptr || g.be == pool.be);
+            g.be = pool.be;
+            const size_t needed = child.cache->vbr_vmm_projected_bytes(pool, child.wm);
+            const size_t mapped = pool.be->vmm_pool_mapped(pool.vmm);
+            g.kv += needed > mapped ? needed - mapped : 0;
+        }
+    }
+
+    const size_t attended_cells = (size_t) raw_wm + std::max(csa_wm, hca_wm);
+    for (const auto & pool : raw->vbr_pools_) {
+        if (pool.be == nullptr || pool.device < 0) {
+            continue;
+        }
+        size_t row = 0;
+        for (const auto & extent : pool.k) {
+            if (extent.t != nullptr && ggml_is_turbo_kv_type(extent.t->type)) {
+                row = std::max(row, ggml_row_size(GGML_TYPE_F16, extent.t->ne[0]));
+            }
+        }
+        auto & g = growth[pool.device];
+        g.scratch_need = row * attended_cells;
+        g.scratch_have = std::max(pool.scratch_k_reserved, pool.scratch_v_reserved);
+    }
+    for (const auto & [device, g] : growth) {
+        size_t free_b = 0;
+        size_t total_b = 0;
+        g.be->get_device_memory(device, &free_b, &total_b);
+        GGML_UNUSED(total_b);
+        const size_t scratch_delta = g.scratch_need > g.scratch_have
+            ? g.scratch_need - g.scratch_have : 0;
+        const size_t physical_need = g.kv + 2*scratch_delta;
+        const int64_t deficit = physical_need > free_b
+            ? (int64_t) std::min(physical_need - free_b,
+                    (size_t) std::numeric_limits<int64_t>::max()) : 0;
+        out.physical_growth_needed += physical_need;
+        out.physical_growth_available += free_b;
+        out.max_deficit = std::max(out.max_deficit, deficit);
+        out.fits = out.fits && deficit == 0;
+    }
+    return out;
+}
+
+double llama_kv_cache_dsv4::memory_vbr_floor_bits_per_token(
+        ggml_type entry_k, ggml_type entry_v, double floor_bpv) {
+    (void) entry_v; // DSV4 stores one K==V tensor.
+    if (kv_size == 0) return 0.0;
+    double bits = vbr_floor_group(entry_k, floor_bpv,
+            /*pooled_only=*/false, /*install_runtime_limit=*/false);
+    // LID is fixed F16 but is part of the measured KV bytes which fit scales by the returned
+    // floor/price ratio. Keep its immutable cost in both numerator and denominator.
+    for (const auto & layer : kv_lid->layers) {
+        if (layer.k) bits += 8.0 * ggml_row_size(layer.k->type, layer.k->ne[0]) *
+            (double) kv_lid->get_size() / kv_size;
+    }
+    return bits;
+}
+
+double llama_kv_cache_dsv4::memory_vbr_scratch_bytes_per_token(
+        ggml_type entry_k, ggml_type entry_v, double floor_bpv) {
+    const double raw_row = kv_raw->get_swa()->memory_vbr_scratch_bytes_per_token(
+            entry_k, entry_v, floor_bpv);
+    if (raw_row == 0.0 || kv_size == 0) return 0.0;
+    const double width = (double) (kv_raw->get_swa()->get_size() +
+            std::max(kv_csa->get_size(), kv_hca->get_size())) / kv_size;
+    return 2.0 * raw_row * width; // coupled K==V materializes both backend scratch sides
+}
+
+void llama_kv_cache_dsv4::vbr_cotenancy_accum(
+        uint64_t &, uint32_t &, uint64_t &, uint64_t &) const {
+    // Grouped DSV4 is deliberately not published until the ledger supports >2 children.
+}
+
+bool llama_kv_cache_dsv4::vbr_ledger_tree_active() const { return false; }
+
+void llama_kv_cache_dsv4::vbr_hard_seal_guard_set(vbr_hard_seal_guard guard) {
+    kv_raw->vbr_hard_seal_guard_set(guard);
+    kv_csa->vbr_hard_seal_guard_set(guard);
+    kv_hca->vbr_hard_seal_guard_set(std::move(guard));
+}
+
+bool llama_kv_cache_dsv4::vbr_hard_seal_blocked_take(bool decode_failed) {
+    return kv_raw->vbr_hard_seal_blocked_take(decode_failed) |
+           kv_csa->vbr_hard_seal_blocked_take(decode_failed) |
+           kv_hca->vbr_hard_seal_blocked_take(decode_failed);
+}
+
+void llama_kv_cache_dsv4::vbr_hard_seal_evidence_take(
+        std::vector<vbr_hard_seal_subject> & out) {
+    kv_raw->vbr_hard_seal_evidence_take(out);
+    kv_csa->vbr_hard_seal_evidence_take(out);
+    kv_hca->vbr_hard_seal_evidence_take(out);
+}
+
+void llama_kv_cache_dsv4::vbr_shared_scratch_detach() {
+    kv_raw->vbr_shared_scratch_detach();
+    kv_csa->vbr_shared_scratch_detach();
+    kv_hca->vbr_shared_scratch_detach();
+    kv_lid->vbr_shared_scratch_detach();
+}
+
+uint64_t llama_kv_cache_dsv4::get_vbr_epoch() const {
+    return kv_raw->get_base()->vbr_representation_epoch() +
+           kv_raw->get_swa()->vbr_representation_epoch() +
+           kv_csa->vbr_representation_epoch() +
+           kv_hca->vbr_representation_epoch();
 }
 
 void llama_kv_cache_dsv4::clear(bool data) {
@@ -1721,6 +2702,14 @@ void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
         GGML_ASSERT((uint32_t) seq_id < n_seq_max);
 
         const auto clear_seq = [seq_id, data](llama_kv_cache * kv) {
+            // Dynamic VMM is admitted only for one unified stream. Its tensor VA contains
+            // intentionally unmapped pages, so the ordinary per-stream tensor memset below is
+            // invalid; llama_kv_cache::clear instead zeroes only resident VMM pages.
+            if (data && kv->vbr_vmm_active()) {
+                GGML_ASSERT(kv->get_n_stream() == 1 && seq_id == 0);
+                kv->clear(true);
+                return;
+            }
             kv->seq_rm(seq_id, -1, -1);
 
             if (data) {
@@ -1836,6 +2825,10 @@ bool llama_kv_cache_dsv4_raw_context::apply() {
     }
 
     return res;
+}
+
+uint64_t llama_kv_cache_dsv4_raw_context::get_vbr_epoch() const {
+    return kv_swa != nullptr ? kv_swa->vbr_representation_epoch() : 0;
 }
 
 llama_memory_status llama_kv_cache_dsv4_raw_context::get_status() const {
@@ -1985,6 +2978,7 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(llama_memory_status sta
 
 llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
         llama_kv_cache_dsv4 * kv) :
+    kv(kv),
     ctx_raw(std::make_unique<llama_kv_cache_dsv4_raw_context>(kv->get_raw())),
     ctx_csa_mem(kv->get_csa()->init_full()),
     ctx_hca_mem(kv->get_hca()->init_full()),
@@ -2008,6 +3002,7 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
         stream_copy_info sc_info_csa,
         stream_copy_info sc_info_hca,
         stream_copy_info sc_info_lid) :
+    kv(kv),
     ctx_raw(std::make_unique<llama_kv_cache_dsv4_raw_context>(kv->get_raw(), lctx, optimize)),
     ctx_csa_mem(kv->get_csa()->init_update(lctx, optimize)),
     ctx_hca_mem(kv->get_hca()->init_update(lctx, optimize)),
@@ -2033,6 +3028,7 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
         slot_info_vec_t sinfos_raw_swa_read,
         std::vector<llama_ubatch> ubatches,
         std::vector<llama_ubatch> ubatches_raw) :
+    kv(kv),
     ubatches(std::move(ubatches)),
     plans_csa(dsv4_build_comp_plans(this->ubatches, DSV4_CSA_RATIO, true,
                 kv->get_csa_state()->get_state_size(), kv->get_csa()->get_size(), kv->get_csa_state()->get_n_stream(),
@@ -2109,6 +3105,10 @@ bool llama_kv_cache_dsv4_context::apply() {
     }
 
     return res;
+}
+
+uint64_t llama_kv_cache_dsv4_context::get_vbr_epoch() const {
+    return kv != nullptr ? kv->get_vbr_epoch() : 0;
 }
 
 llama_memory_status llama_kv_cache_dsv4_context::get_status() const {

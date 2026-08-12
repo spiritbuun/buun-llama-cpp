@@ -618,10 +618,12 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_head       (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
 
-    // true when the model requires matching K and V cache types: MLA-family latent KV,
-    // where V is a view of the K latent so the declared types must agree and any
-    // per-side cache tiering is inherently coupled
+    // true when the model requires matching K and V cache types: MLA-family models expose V as
+    // a view of the K latent, while DeepSeek V4 concatenates same-type raw/compressed storage into
+    // one attended tensor. Both representations require coupled per-side cache tiering.
     LLAMA_API bool llama_model_kv_cache_types_coupled(const struct llama_model * model);
+    // true when dynamic VBR is represented by one fixed cache type rather than a runtime ladder
+    LLAMA_API bool llama_model_kv_cache_vbr_static_cap(const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);
 
     // Get the model's RoPE frequency scaling factor

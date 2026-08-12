@@ -32,15 +32,6 @@
 #include <string>
 #include <vector>
 
-// Dynamic VBR (S3): degrade tier ladder + the measured price order (generated table).
-enum vbr_tier : uint8_t {
-    VBR_TIER_T8,
-    VBR_TIER_T4,
-    VBR_TIER_T3_TCQ,
-    VBR_TIER_T2_TCQ,
-    VBR_TIER_T1_TCQ,
-    VBR_TIER_COUNT,
-};
 bool llama_kv_cache::vbr_hard_seal_classify(
         vbr_hard_seal_classification & out) const noexcept {
     return vbr_classify_hard_seal(
@@ -2768,6 +2759,16 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
         n_tokens += ub.n_tokens;
     }
     vbr_runtime_wm_ = vbr_watermark_cells(n_tokens);
+    if (vbr_group_prepare_cb_) {
+        // The enclosing composite prices/maps all coupled streams and performs
+        // their tier flips as one pre-graph operation. Running this cache's
+        // ordinary controller as well would permit one stream to get a tier
+        // ahead of its concat partners.
+        if (!vbr_group_prepare_cb_(vbr_runtime_wm_)) {
+            return {};
+        }
+        return sinfos;
+    }
     if (vbr_vmm_active() && vbr_budget_bytes_ > 0) {
         // sink-stash staleness: if any sink cell was freed since capture, every stash may hold
         // another request's rows — drop them all (they recapture at the next first degrade)
@@ -4150,32 +4151,50 @@ bool llama_kv_cache::vbr_scratch_reserve(size_t flat_cells) {
 // (maps are idempotent, a later retry re-walks them for free).
 bool llama_kv_cache::vbr_vmm_try_map(uint32_t wm) {
     for (auto & pool : vbr_pools_) {
-        if (pool.vmm == nullptr || wm <= pool.wm_cells) {
+        if (pool.vmm == nullptr) {
             continue;
         }
-        // Map only the DELTA [wm_cells, wm): rows below the old watermark stay mapped through degrades
-        // (the tail unmap keeps [0, keep)), so re-walking their chunks every growth is pure waste.
+        if (wm > pool.wm_cells) {
+            // Map only the DELTA [wm_cells, wm): rows below the old watermark stay mapped through
+            // degrades, so re-walking their chunks every growth is pure waste.
+            for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+                for (int side = 0; side < 2; ++side) {
+                    const vbr_extent  & e = side ? pool.v[ikv] : pool.k[ikv];
+                    const ggml_tensor * t = e.t; // pool-local instance (shard under -sm tensor)
+                    if (t == nullptr) {
+                        continue;
+                    }
+                    const size_t row_b = ggml_row_size(t->type, t->ne[0]); // n_stream == 1 (VMM gate)
+                    const size_t start = row_b * pool.wm_cells;
+                    const size_t need  = row_b * wm;
+                    if (!pool.be->vmm_pool_map(pool.vmm, e.byte_off + start, need - start)) {
+                        // Physical exhaustion here is usually the FIRST big degrade wave's transient:
+                        // the wave's old-tier tail pages are still mapped (their unmap is deferred to
+                        // the next decode boundary) while this growth maps the new watermark. Reclaim
+                        // them now and retry once before giving up — the flush synchronizes the side
+                        // stream, so nothing can still read those pages.
+                        LLAMA_LOG_WARN("%s: physical map of %zu bytes failed at offset %zu (watermark %u) — "
+                                "flushing deferred unmaps and retrying\n",
+                                __func__, need - start, e.byte_off + start, wm);
+                        vbr_flush_deferred_unmaps();
+                        if (!pool.be->vmm_pool_map(pool.vmm, e.byte_off + start, need - start)) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+
+        // A composite cache may write a shape-padding row beyond its visible prefix. Its address
+        // follows the live tensor stride, so re-evaluate after every tier flip even when the
+        // watermark did not grow. Mapping is idempotent when the required page overlaps the prefix.
         for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
             for (int side = 0; side < 2; ++side) {
-                const vbr_extent  & e = side ? pool.v[ikv] : pool.k[ikv];
-                const ggml_tensor * t = e.t; // pool-local instance (shard under -sm tensor)
-                if (t == nullptr) {
-                    continue;
-                }
-                const size_t row_b = ggml_row_size(t->type, t->ne[0]); // n_stream == 1 (gated at construction)
-                const size_t start = row_b * pool.wm_cells;
-                const size_t need  = row_b * wm;
-                if (!pool.be->vmm_pool_map(pool.vmm, e.byte_off + start, need - start)) {
-                    // Physical exhaustion here is usually the FIRST big degrade wave's transient:
-                    // the wave's old-tier tail pages are still mapped (their unmap is deferred to
-                    // the next decode boundary) while this growth maps the new watermark. Reclaim
-                    // them now and retry once before giving up — the flush synchronizes the side
-                    // stream, so nothing can still read those pages.
-                    LLAMA_LOG_WARN("%s: physical map of %zu bytes failed at offset %zu (watermark %u) — "
-                            "flushing deferred unmaps and retrying\n",
-                            __func__, need - start, e.byte_off + start, wm);
+                const vbr_extent & e = side ? pool.v[ikv] : pool.k[ikv];
+                const size_t page = vbr_vmm_required_page(pool, e);
+                if (page != SIZE_MAX && !pool.be->vmm_pool_map(pool.vmm, page, pool.gran)) {
                     vbr_flush_deferred_unmaps();
-                    if (!pool.be->vmm_pool_map(pool.vmm, e.byte_off + start, need - start)) {
+                    if (!pool.be->vmm_pool_map(pool.vmm, page, pool.gran)) {
                         return false;
                     }
                 }
@@ -4184,6 +4203,50 @@ bool llama_kv_cache::vbr_vmm_try_map(uint32_t wm) {
         pool.wm_cells = wm;
     }
     return true;
+}
+
+size_t llama_kv_cache::vbr_vmm_required_page(
+        const vbr_pool & pool, const vbr_extent & extent) const {
+    if (extent.t == nullptr || extent.vmm_required_write_row == UINT32_MAX || pool.gran == 0) {
+        return SIZE_MAX;
+    }
+    const size_t n_rows = (size_t) extent.t->ne[1] * extent.t->ne[2];
+    GGML_ASSERT(extent.vmm_required_write_row < n_rows);
+    const size_t row = ggml_row_size(extent.t->type, extent.t->ne[0]);
+    GGML_ASSERT(row == 0 || extent.vmm_required_write_row <= SIZE_MAX / row);
+    const size_t rel = row * extent.vmm_required_write_row;
+    GGML_ASSERT(rel < vbr_slot_span(extent.t, pool.gran));
+    return extent.byte_off + (rel / pool.gran) * pool.gran;
+}
+
+void llama_kv_cache::vbr_vmm_unmap_preserving_required(
+        vbr_pool & pool, size_t off, size_t len) {
+    if (len == 0 || pool.gran == 0) {
+        return;
+    }
+    const size_t c0 = GGML_PAD(off, pool.gran);
+    const size_t c1 = ((off + len) / pool.gran) * pool.gran;
+    size_t cur = c0;
+    while (cur < c1) {
+        size_t next_required = SIZE_MAX;
+        for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+            for (int side = 0; side < 2; ++side) {
+                const vbr_extent & e = side ? pool.v[ikv] : pool.k[ikv];
+                const size_t page = vbr_vmm_required_page(pool, e);
+                if (page >= cur && page < c1) {
+                    next_required = std::min(next_required, page);
+                }
+            }
+        }
+        const size_t end = next_required == SIZE_MAX ? c1 : next_required;
+        if (end > cur) {
+            pool.be->vmm_pool_unmap(pool.vmm, cur, end - cur);
+        }
+        if (next_required == SIZE_MAX) {
+            break;
+        }
+        cur = next_required + pool.gran;
+    }
 }
 
 void llama_kv_cache::vbr_vmm_ensure_mapped() {
@@ -4211,7 +4274,12 @@ size_t llama_kv_cache::vbr_vmm_projected_bytes(const vbr_pool & p, uint32_t wm_c
                 continue;
             }
             const size_t need = (size_t) ggml_row_size(t->type, t->ne[0]) * wm_cells;
-            total += std::min(vbr_slot_span(t, p.gran), (size_t) GGML_PAD(need, p.gran));
+            const size_t prefix = std::min(vbr_slot_span(t, p.gran), (size_t) GGML_PAD(need, p.gran));
+            total += prefix;
+            const size_t required = vbr_vmm_required_page(p, e);
+            if (required != SIZE_MAX && required >= e.byte_off + prefix) {
+                total += p.gran;
+            }
         }
     }
     return total;
@@ -4365,7 +4433,7 @@ size_t llama_kv_cache::vbr_flush_deferred_unmaps() {
             continue;
         }
         for (const auto & [off, len] : p.unmap_deferred) {
-            p.be->vmm_pool_unmap(p.vmm, off, len);
+            vbr_vmm_unmap_preserving_required(p, off, len);
         }
         flushed += p.unmap_deferred.size();
         p.unmap_deferred.clear();
@@ -6865,6 +6933,10 @@ void llama_kv_cache::vbr_full_reset() {
 // 25% hysteresis so growth/trim jitter cannot thrash map/unmap.
 void llama_kv_cache::vbr_shrink_watermark() {
     const uint32_t wm_now = vbr_watermark_cells(0);
+    vbr_shrink_watermark_to(wm_now);
+}
+
+void llama_kv_cache::vbr_shrink_watermark_to(uint32_t wm_now) {
     for (auto & pool : vbr_pools_) {
         if (pool.vmm == nullptr || wm_now + wm_now / 4 >= pool.wm_cells) {
             continue;
@@ -6883,7 +6955,7 @@ void llama_kv_cache::vbr_shrink_watermark() {
                 }
                 const size_t keep = ggml_row_size(t->type, t->ne[0]) * (size_t) wm_now;
                 const size_t slot = vbr_slot_span(t, pool.gran);
-                pool.be->vmm_pool_unmap(pool.vmm, e.byte_off + keep, slot - keep);
+                vbr_vmm_unmap_preserving_required(pool, e.byte_off + keep, slot - keep);
             }
         }
         LLAMA_LOG_INFO("%s: VBR watermark shrink (device %d): %u -> %u cells (%.2f MiB mapped)\n",
@@ -7067,7 +7139,8 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
     return false;
 }
 
-llama_kv_cache::vbr_degrade_result llama_kv_cache::vbr_degrade_next(uint32_t wm_next) {
+llama_kv_cache::vbr_degrade_result llama_kv_cache::vbr_degrade_next(
+        uint32_t wm_next, bool hard_seal_prechecked) {
     vbr_mutation_op mutation_op(this, vbr_operation_kind::controller_retier,
             vbr_operation_class::controller, -1, -1, -1);
     const vbr_mutation_op::success_on_return mutation_ok(mutation_op);
@@ -7079,9 +7152,9 @@ llama_kv_cache::vbr_degrade_result llama_kv_cache::vbr_degrade_next(uint32_t wm_
     const size_t cursor_entry = vbr_degrade_cursor_;
     bool saw_hard_lease_block = false;
     vbr_hard_seal_consult_session seal_session;
-    GGML_ASSERT(!vbr_hard_seal_guard_ ||
+    GGML_ASSERT(hard_seal_prechecked || !vbr_hard_seal_guard_ ||
         vbr_hard_seal_attempted_.size() == vbr_degrade_order_.size());
-    bool attempted_ready = !vbr_hard_seal_deferred_.empty();
+    bool attempted_ready = !hard_seal_prechecked && !vbr_hard_seal_deferred_.empty();
     if (attempted_ready) {
         std::fill(vbr_hard_seal_attempted_.begin(),
                   vbr_hard_seal_attempted_.end(), 0);
@@ -7089,11 +7162,19 @@ llama_kv_cache::vbr_degrade_result llama_kv_cache::vbr_degrade_next(uint32_t wm_
     while (true) {
         size_t order_ordinal = 0;
         bool from_deferred = false;
-        if (!vbr_hard_seal_next_order_step(
-                vbr_degrade_cursor_,
-                std::min(vbr_degrade_order_.size(), vbr_degrade_limit_),
-                vbr_hard_seal_deferred_, vbr_hard_seal_attempted_,
-                order_ordinal, from_deferred)) {
+        const size_t limit = std::min(vbr_degrade_order_.size(), vbr_degrade_limit_);
+        bool have_step;
+        if (hard_seal_prechecked) {
+            have_step = vbr_degrade_cursor_ < limit;
+            if (have_step) {
+                order_ordinal = vbr_degrade_cursor_++;
+            }
+        } else {
+            have_step = vbr_hard_seal_next_order_step(
+                vbr_degrade_cursor_, limit, vbr_hard_seal_deferred_,
+                vbr_hard_seal_attempted_, order_ordinal, from_deferred);
+        }
+        if (!have_step) {
             break;
         }
         const auto & st = vbr_degrade_order_[order_ordinal];
@@ -7136,7 +7217,7 @@ llama_kv_cache::vbr_degrade_result llama_kv_cache::vbr_degrade_next(uint32_t wm_
             }
         }
 
-        if (vbr_hard_seal_guard_) {
+        if (!hard_seal_prechecked && vbr_hard_seal_guard_) {
             if (vbr_hard_seal_step_blocked(order_ordinal, seal_session)) {
                 saw_hard_lease_block = true;
                 vbr_hard_seal_evidence_record(order_ordinal);
@@ -9144,7 +9225,8 @@ void llama_kv_cache::vbr_tx_apply(vbr_shed_tx & tx, vbr_operation_id operation_i
         if (endpoint.touched && endpoint.live) {
             endpoint.pool->unmap_deferred.push_back({ off, len });
         } else {
-            endpoint.pool->be->vmm_pool_unmap(endpoint.pool->vmm, off, len);
+            tx.children[key.child_idx].cache->vbr_vmm_unmap_preserving_required(
+                    *endpoint.pool, off, len);
         }
     }
 
