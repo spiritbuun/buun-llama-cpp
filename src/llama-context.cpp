@@ -874,12 +874,48 @@ static bool llama_model_has_cacheable_moe_weights(
     return false;
 }
 
+uint32_t llama_context::effective_reserve_n_seqs(const llama_memory_context_i * mctx) const {
+    const uint32_t capacity = mctx
+        ? mctx->get_max_graph_seqs()
+        : std::numeric_limits<uint32_t>::max();
+    const uint32_t n_seqs = std::min(cparams.n_seq_max, capacity);
+
+    if (n_seqs == 0) {
+        LLAMA_LOG_ERROR("%s: memory context has zero graph-sequence capacity\n", __func__);
+        return 0;
+    }
+    if (n_seqs > (uint32_t) LLAMA_MAX_SEQ) {
+        LLAMA_LOG_ERROR("%s: synthetic graph reserve requires %u sequences, exceeding LLAMA_MAX_SEQ=%u\n",
+                __func__, n_seqs, (uint32_t) LLAMA_MAX_SEQ);
+        return 0;
+    }
+    if (n_seqs < cparams.n_seq_max) {
+        LLAMA_LOG_DEBUG("%s: reducing synthetic reserve sequences from %u to %u for current memory capacity\n",
+                __func__, cparams.n_seq_max, n_seqs);
+    }
+
+    return n_seqs;
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
     }
 
-    sched_need_reserve = false;
+    // Capacity discovery is a side-effect-free preflight. A refusal or exception
+    // leaves the current scheduler, graph results, buffers, and retry latch intact.
+    llama_memory_context_ptr mctx;
+    if (memory) {
+        mctx = memory->init_full();
+        if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
+            throw std::runtime_error("failed to initialize full memory context for graph reserve");
+        }
+    }
+
+    const uint32_t n_seqs = effective_reserve_n_seqs(mctx.get());
+    if (n_seqs == 0) {
+        throw std::runtime_error("memory context is unavailable for graph reserve");
+    }
 
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
@@ -887,7 +923,6 @@ void llama_context::sched_reserve() {
 
     const int64_t t_start_us = ggml_time_us();
 
-    const uint32_t n_seqs = cparams.n_seq_max;
     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
@@ -918,15 +953,6 @@ void llama_context::sched_reserve() {
             sched.get(), moe_cache_mode,
             cparams.moe_cache_budget_mib,
             cparams.moe_cache_expert_parallel);
-
-    llama_memory_context_ptr mctx;
-    if (memory) {
-        LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
-        mctx = memory->init_full();
-        if (!mctx) {
-            throw std::runtime_error("failed to initialize memory module");
-        }
-    }
 
     // avoid reserving graphs with zero outputs - assume one output per sequence
     const int n_outputs = n_seqs;
@@ -1054,6 +1080,7 @@ void llama_context::sched_reserve() {
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
     dflash_cross_reserved_bucket = cross.n_enc;
+    sched_need_reserve = false;
 }
 
 void llama_context::synchronize() {
@@ -1189,11 +1216,19 @@ bool llama_context::memory_update(bool optimize) {
     // if the memory module did any computation, we have to reserve a new worst-case graph
     {
         const auto mctx = memory->init_full();
-        if (!mctx) {
+        if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
             throw std::runtime_error("failed to initialize memory context");
         }
 
-        const uint32_t n_seqs = cparams.n_seq_max;
+        const uint32_t n_seqs = effective_reserve_n_seqs(mctx.get());
+        if (n_seqs == 0) {
+            LLAMA_LOG_ERROR("%s: cannot reserve graph after memory update at zero sequence capacity\n", __func__);
+            // A later recurrent expansion can make the synthetic shape available
+            // again. Preserve an explicit retry owner instead of relying on an
+            // unrelated topology setter to request another scheduler reserve.
+            sched_need_reserve = true;
+            return true;
+        }
         const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
         const bool     reserve_all_outputs = cparams.logits_all || cparams.embeddings || cparams.pooling_type != LLAMA_POOLING_TYPE_NONE || cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
@@ -1202,6 +1237,10 @@ bool llama_context::memory_update(bool optimize) {
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs, mctx.get());
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to reserve graph after the memory update\n", __func__);
+            // graph_reserve() resets the scheduler before attempting the physical
+            // reserve. Retain an explicit retry owner if allocation fails so the next
+            // decode cannot silently continue with an under-reserved scheduler.
+            sched_need_reserve = true;
         }
     }
 
@@ -5278,11 +5317,47 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
 
 ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
-    LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
-    GGML_ASSERT(n_outputs >= 1);
+    auto reject_shape = [&](const char * reason) -> ggml_cgraph * {
+        LLAMA_LOG_ERROR("%s: invalid graph reserve shape: %s (n_tokens = %u, n_seqs = %u, n_outputs = %u)\n",
+                __func__, reason, n_tokens, n_seqs, n_outputs);
+        return nullptr;
+    };
 
-    if (n_tokens % n_seqs != 0) {
-        n_tokens = ((n_tokens + (n_seqs - 1)) / n_seqs) * n_seqs; // round to next multiple of n_seqs
+    if (n_tokens == 0) {
+        return reject_shape("n_tokens must be positive");
+    }
+    if (n_seqs == 0) {
+        return reject_shape("n_seqs must be positive");
+    }
+    if (n_outputs == 0) {
+        return reject_shape("n_outputs must be positive");
+    }
+    if (n_seqs > cparams.n_seq_max) {
+        return reject_shape("n_seqs exceeds the configured context maximum");
+    }
+    if (n_seqs > (uint32_t) LLAMA_MAX_SEQ) {
+        return reject_shape("n_seqs exceeds LLAMA_MAX_SEQ");
+    }
+    if (mctx && mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
+        return reject_shape("memory context is not valid for graph construction");
+    }
+    if (mctx && n_seqs > mctx->get_max_graph_seqs()) {
+        return reject_shape("n_seqs exceeds current memory-context capacity");
+    }
+
+    const uint64_t rounded_n_tokens =
+        ((uint64_t) n_tokens + n_seqs - 1)/n_seqs*n_seqs;
+    if (rounded_n_tokens > std::numeric_limits<uint32_t>::max()) {
+        return reject_shape("rounding n_tokens to n_seqs would overflow");
+    }
+    if (n_outputs > rounded_n_tokens) {
+        return reject_shape("n_outputs exceeds the rounded token count");
+    }
+
+    LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
+
+    if (rounded_n_tokens != n_tokens) {
+        n_tokens = (uint32_t) rounded_n_tokens;
         LLAMA_LOG_DEBUG("%s: making n_tokens a multiple of n_seqs - n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs);
     }
 
@@ -7617,10 +7692,18 @@ struct ggml_cgraph * llama_graph_reserve(
         uint32_t n_tokens,
         uint32_t n_seqs,
         uint32_t n_outputs) {
+    if (!ctx) {
+        LLAMA_LOG_ERROR("%s: context is null\n", __func__);
+        return nullptr;
+    }
     auto memory = ctx->get_memory();
     llama_memory_context_ptr mctx;
     if (memory) {
         mctx = memory->init_full();
+        if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
+            LLAMA_LOG_ERROR("%s: failed to initialize full memory context\n", __func__);
+            return nullptr;
+        }
     }
     return ctx->graph_reserve(n_tokens, n_seqs, n_outputs, mctx.get());
 }

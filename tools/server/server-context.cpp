@@ -10,6 +10,7 @@
 #include "server-vbr-artifact-store.h"
 #include "server-task.h"
 #include "server-queue.h"
+#include "server-recurrent-expansion.h"
 #include "server-schema.h"
 #include "server-stream.h"
 
@@ -2320,8 +2321,9 @@ private:
     // rejecting draft tokens, because the recurrent state cannot be rolled back
     bool needs_reeval = false;
     int  n_parallel_user = 0;
-    int  n_seq_max_full = 0;      // target n_seq_max after expansion (2*n_parallel_user)
-    bool recurrent_expanded = true; // false = backup cells deferred, expand before first draft
+    int  n_seq_max_full = 0; // target n_seq_max after expansion (2*n_parallel_user)
+
+    server_recurrent_expansion_lifecycle recurrent_expansion;
 
     int32_t n_ctx; // total context for all clients / slots
 
@@ -4110,7 +4112,26 @@ private:
     }
 
     void recurrent_shrink_for_prefill(const char * reason) {
-        if (!recurrent_expanded || !needs_reeval || n_seq_max_full <= n_parallel_user) {
+        if (!needs_reeval || n_seq_max_full <= n_parallel_user) {
+            return;
+        }
+
+        // An allocation failure suppresses retries for the rest of the active request.
+        // Rearm exactly once at the next quiescent request/prefill boundary.
+        if (recurrent_expansion.retry_deferred) {
+            for (const server_slot & slot : slots) {
+                if (slot.is_processing() || slot.has_draft_backup) {
+                    SRV_DBG("not rearming recurrent expansion (%s): slot %d processing=%d has_backup=%d\n",
+                            reason, slot.id, slot.is_processing(), slot.has_draft_backup);
+                    return;
+                }
+            }
+            if (recurrent_expansion.rearm_if_idle(true)) {
+                SRV_INF("rearmed recurrent expansion retry at idle prefill boundary (%s)\n", reason);
+            }
+        }
+
+        if (recurrent_expansion.state != server_recurrent_expansion_state::expanded) {
             return;
         }
 
@@ -4137,7 +4158,7 @@ private:
         }
 
         if (llama_memory_recurrent_shrink(mem, n_parallel_user)) {
-            recurrent_expanded = false;
+            recurrent_expansion.state = server_recurrent_expansion_state::contracted;
             SRV_INF("shrunk recurrent state to %d cells for prefill (%s, removed %d backup cells)\n",
                     n_parallel_user, reason, n_seq_max_full - n_parallel_user);
         } else {
@@ -4338,7 +4359,7 @@ private:
         }
 
         n_parallel_user = params_base.n_parallel;
-        recurrent_expanded = true;
+        recurrent_expansion.state = server_recurrent_expansion_state::expanded;
         // optionally reserve VRAM for the draft / MTP context before fitting the target model
         if (params_base.fit_params) {
             // Native MTP is context-sized by the target fit, so its reservation is solved after
@@ -4713,7 +4734,7 @@ private:
             params_base.speculative.has_model_free_type()) {
             params_base.n_parallel = n_parallel_user * 2;
             n_seq_max_full = params_base.n_parallel;
-            recurrent_expanded = false;
+            recurrent_expansion.state = server_recurrent_expansion_state::contracted;
 
             // The backup sequences double n_seq_max. Without unified KV each sequence gets its
             // own n_ctx / n_seq_max stream, so the doubling silently HALVES every slot's usable
@@ -5490,11 +5511,16 @@ private:
         if (needs_reeval && can_spec &&
             params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
             ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
-            n_seq_max_full > n_parallel_user && !recurrent_expanded) {
+            n_seq_max_full > n_parallel_user &&
+            recurrent_expansion.state == server_recurrent_expansion_state::contracted) {
             auto * mem = llama_get_memory(ctx_tgt);
-            if (llama_memory_recurrent_expand(mem, n_seq_max_full)) {
-                recurrent_expanded = true;
+            const bool expanded = llama_memory_recurrent_expand(mem, n_seq_max_full);
+            recurrent_expansion.complete_expand(expanded);
+            if (expanded) {
                 SRV_INF("pre-expanded recurrent state to %d cells for speculative backup\n", n_seq_max_full);
+            } else {
+                SRV_ERR("failed to pre-expand recurrent state to %d cells; deferring speculation until the next request\n",
+                        n_seq_max_full);
             }
         }
 
@@ -6278,15 +6304,13 @@ private:
         // Shrink recurrent state to free backup cells during prefill.
         // Must happen after init-time decodes (common_speculative_is_compat, warmup)
         // so the scheduler's CUDA graph state isn't stale.
-        if (!recurrent_expanded && needs_reeval) {
-            if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH && n_parallel_user <= 2) {
-                recurrent_expanded = true;
-            } else {
-                auto * mem = llama_get_memory(ctx_tgt);
-                if (llama_memory_recurrent_shrink(mem, n_parallel_user)) {
-                    SRV_INF("shrunk recurrent state to %d cells for prefill (deferred %d backup cells)\n",
-                            n_parallel_user, n_seq_max_full - n_parallel_user);
-                }
+        if (recurrent_expansion.state == server_recurrent_expansion_state::contracted &&
+            needs_reeval &&
+            params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH) {
+            auto * mem = llama_get_memory(ctx_tgt);
+            if (llama_memory_recurrent_shrink(mem, n_parallel_user)) {
+                SRV_INF("shrunk recurrent state to %d cells for prefill (deferred %d backup cells)\n",
+                        n_parallel_user, n_seq_max_full - n_parallel_user);
             }
         }
 
@@ -10152,10 +10176,16 @@ private:
 
         std::vector<llama_tokens> batched_drafts(slots.size());
         std::vector<bool> batched_draft_decode_succeeded(slots.size(), false);
+        const auto recurrent_speculation_deferred = [&]() {
+            return needs_reeval &&
+                ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
+                recurrent_expansion.retry_deferred;
+        };
         if (ctx_dft_shared) {
             int n_drafting = 0;
             for (const auto & slot : slots) {
-                if (slot.state == SLOT_STATE_GENERATING && slot.can_speculate() && slot.get_n_draft_max() > 0) {
+                if (!recurrent_speculation_deferred() &&
+                    slot.state == SLOT_STATE_GENERATING && slot.can_speculate() && slot.get_n_draft_max() > 0) {
                     n_drafting++;
                 }
             }
@@ -10167,7 +10197,8 @@ private:
                 std::vector<int>                  batch_slot_ids;
 
                 for (auto & slot : slots) {
-                    if (slot.state == SLOT_STATE_GENERATING && slot.can_speculate() && slot.get_n_draft_max() > 0) {
+                    if (!recurrent_speculation_deferred() &&
+                        slot.state == SLOT_STATE_GENERATING && slot.can_speculate() && slot.get_n_draft_max() > 0) {
                         batch_specs.push_back(slot.get_spec());
                         batch_id_lasts.push_back(slot.sampled);
                         batch_slot_ids.push_back(slot.id);
@@ -10206,7 +10237,7 @@ private:
                 return;
             }
 
-            const int n_draft_max = slot.get_n_draft_max();
+            const int n_draft_max = recurrent_speculation_deferred() ? 0 : slot.get_n_draft_max();
             if (n_draft_max > 0) {
                 const int64_t t_draft_slot_start = ggml_time_us();
 
@@ -10289,7 +10320,11 @@ private:
                     slot.spec_draft.clear();
                     slot.spec_i_batch.clear();
                 } else {
-                    slot.n_draft_total += draft.size();
+                    enum class draft_batch_path {
+                        speculative,
+                        non_spec_fallback,
+                    };
+                    draft_batch_path batch_path = draft_batch_path::speculative;
 
                     // keep the spec checkpoint's position bookkeeping current (upstream #24536 family);
                     // the fork accept loop rolls back via backup seqs / seq_rm, so only the cheap
@@ -10310,43 +10345,65 @@ private:
                             llama_set_tree_parent_ids(ctx_tgt, linear_parents.data(), n_batch_tokens);
                         }
 
-                        // RS contexts handle rollback internally via seq_rm snapshots
-                        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
-                            if (!recurrent_expanded) {
+                        // RS contexts handle rollback internally via seq_rm snapshots. Keep them
+                        // contracted: only non-RS contexts may allocate backup sequence cells.
+                        auto expansion_action = recurrent_expansion.action(
+                            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS);
+                        if (expansion_action != server_recurrent_speculation_action::rs_plane) {
+                            slot.has_draft_backup = false;
+                            slot.seq_id_backup = -1;
+
+                            if (expansion_action == server_recurrent_speculation_action::try_expand) {
                                 auto * mem = llama_get_memory(ctx_tgt);
-                                if (llama_memory_recurrent_expand(mem, n_seq_max_full)) {
+                                const bool expanded = llama_memory_recurrent_expand(mem, n_seq_max_full);
+                                expansion_action = recurrent_expansion.complete_expand(expanded);
+                                if (expanded) {
                                     SRV_INF("expanded recurrent state to %d cells for speculative backup\n", n_seq_max_full);
                                 } else {
-                                    SRV_ERR("failed to expand recurrent state to %d cells\n", n_seq_max_full);
+                                    SRV_ERR("failed to expand recurrent state to %d cells; using non-speculative decode until the next request\n",
+                                            n_seq_max_full);
                                 }
-                                recurrent_expanded = true;
                             }
-                            const llama_seq_id seq_backup = slot.id + n_parallel_user;
-                            auto * mem = llama_get_memory(ctx_tgt);
-                            server_cache_transient_seq_rm_impl(
-                                mem, seq_backup, -1, -1);
-                            // Arm the rollback backup only if the copy actually succeeded [I13/N4].
-                            // A recurrent-pool exhaustion previously left the backup empty while
-                            // has_draft_backup stayed true, so a later partial accept "restored" the
-                            // empty backup over the live state. On failure, fall back to the
-                            // plane-based bounded rollback (has_draft_backup == false path).
-                            if (llama_memory_try_seq_cp(mem, slot.id, seq_backup, -1, -1)) {
-                                slot.has_draft_backup = true;
-                                slot.seq_id_backup = seq_backup;
-                            } else {
-                                SLT_WRN(slot, "%s\n", "speculative backup copy failed (recurrent pool full); using plane-based rollback");
-                                slot.has_draft_backup = false;
-                                slot.seq_id_backup = -1;
+                            if (expansion_action == server_recurrent_speculation_action::non_speculative) {
+                                batch_path = draft_batch_path::non_spec_fallback;
+                            }
+
+                            if (expansion_action == server_recurrent_speculation_action::backup_ready) {
+                                const llama_seq_id seq_backup = slot.id + n_parallel_user;
+                                auto * mem = llama_get_memory(ctx_tgt);
+                                const bool backup_cleared = server_cache_transient_seq_rm_impl(
+                                    mem, seq_backup, -1, -1);
+                                // Arm rollback only after both cleanup and copy succeed. Non-RS
+                                // recurrent targets have no plane-based rollback substitute.
+                                if (backup_cleared &&
+                                    llama_memory_try_seq_cp(mem, slot.id, seq_backup, -1, -1)) {
+                                    slot.has_draft_backup = true;
+                                    slot.seq_id_backup = seq_backup;
+                                } else {
+                                    recurrent_expansion.defer();
+                                    batch_path = draft_batch_path::non_spec_fallback;
+                                    SLT_WRN(slot, "%s\n", "speculative backup preparation failed; using non-speculative decode");
+                                }
                             }
                         }
                     }
 
-                    for (size_t i = 0; i < draft.size(); i++) {
-                        slot.spec_i_batch.push_back(batch.size());
-                        batch.add(slot.id, draft[i], slot.prompt.tokens.pos_next(), true);
-                        slot.prompt.tokens.push_back(draft[i]);
+                    if (batch_path == draft_batch_path::non_spec_fallback) {
+                        if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                            llama_clear_tree_parent_ids(ctx_tgt);
+                        }
+                        slot.i_batch = slot.spec_i_batch[0];
+                        slot.spec_draft.clear();
+                        slot.spec_i_batch.clear();
+                    } else {
+                        slot.n_draft_total += draft.size();
+                        for (size_t i = 0; i < draft.size(); i++) {
+                            slot.spec_i_batch.push_back(batch.size());
+                            batch.add(slot.id, draft[i], slot.prompt.tokens.pos_next(), true);
+                            slot.prompt.tokens.push_back(draft[i]);
+                        }
+                        slot.spec_draft = std::move(draft);
                     }
-                    slot.spec_draft = std::move(draft);
                 }
                 t_draft_total += ggml_time_us() - t_draft_slot_start;
                 n_slots_drafted++;
@@ -12701,9 +12758,13 @@ private:
                     } else {
                         const int n_past_before = slot.n_tokens_before_draft;
 
-                        server_cache_transient_seq_rm_impl(
-                            mem, slot.id, n_past_before, -1);
-                        if (!llama_memory_try_seq_cp(mem, seq_backup, slot.id, -1, -1)) {
+                        // Non-RS recurrent state cannot trim a rejected suffix in place.
+                        // Free the known destination first so restoring a known-good
+                        // backup does not require a third cell in a full live+backup pool.
+                        const bool live_removed = server_cache_transient_seq_rm_impl(
+                            mem, slot.id, -1, -1);
+                        if (!live_removed ||
+                            !llama_memory_try_seq_cp(mem, seq_backup, slot.id, -1, -1)) {
                             // could not restore the backup into the slot (recurrent pool exhausted):
                             // the slot is left at n_past_before with the accepted tokens unresolved.
                             // Reset it coherently rather than continue on inconsistent state [I13].
@@ -12714,6 +12775,7 @@ private:
                                 server_cache_destruction_reason::restore_failure);
                             slot.has_draft_backup = false;
                             slot.seq_id_backup = -1;
+                            continue;
                         } else {
                             server_cache_transient_seq_rm_impl(
                                 mem, seq_backup, -1, -1);
@@ -12737,6 +12799,9 @@ private:
                                     slot.release();
                                     slot.mandatory_recovery_reset(
                                         server_cache_destruction_reason::restore_failure);
+                                    slot.has_draft_backup = false;
+                                    slot.seq_id_backup = -1;
+                                    continue;
                                 }
                             }
                         }
@@ -12745,10 +12810,19 @@ private:
 
                 slot.has_draft_backup = false;
                 slot.seq_id_backup = -1;
-            } else {
-                server_cache_transient_seq_rm_impl(
-                    llama_get_memory(ctx_tgt), slot.id,
-                    slot.prompt.tokens.pos_next(), -1);
+            } else if (!server_cache_transient_seq_rm_impl(
+                           llama_get_memory(ctx_tgt), slot.id,
+                           slot.prompt.tokens.pos_next(), -1)) {
+                // RS contexts own their rollback snapshot internally, so this is the
+                // only target-state rollback operation on the no-backup path. Refusal
+                // cannot be ignored: accepted-token bookkeeping would otherwise advance
+                // over an untrimmed rejected suffix.
+                SLT_ERR(slot, "%s\n", "failed to roll back rejected speculative suffix; resetting slot");
+                send_error(slot, "Compute error rolling back speculative tokens");
+                slot.release();
+                slot.mandatory_recovery_reset(
+                    server_cache_destruction_reason::restore_failure);
+                continue;
             }
 
             common_speculative_rollback_dft(slot.get_spec(), slot.id, slot.prompt.n_tokens(), (uint16_t)(ids.size() - 1));

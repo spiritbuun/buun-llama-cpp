@@ -642,10 +642,15 @@ llama_kv_cache * llama_kv_cache_iswa::get_swa() const {
 llama_kv_cache_iswa_context::llama_kv_cache_iswa_context(llama_memory_status status) : status(status) {}
 
 llama_kv_cache_iswa_context::llama_kv_cache_iswa_context(
-        llama_kv_cache_iswa * kv) :
+        llama_kv_cache_iswa * kv) : llama_kv_cache_iswa_context(kv, std::numeric_limits<uint32_t>::max()) {
+}
+
+llama_kv_cache_iswa_context::llama_kv_cache_iswa_context(
+        llama_kv_cache_iswa * kv,
+        uint32_t              max_graph_seqs_limit) :
     kv(kv),
-    ctx_base(kv->get_base()->init_full()),
-    ctx_swa (kv->get_swa ()->init_full()),
+    ctx_base(new llama_kv_cache_context(kv->get_base(), max_graph_seqs_limit)),
+    ctx_swa (new llama_kv_cache_context(kv->get_swa (), max_graph_seqs_limit)),
     status(llama_memory_status_combine(ctx_base->get_status(), ctx_swa->get_status())) {
 }
 
@@ -740,6 +745,13 @@ bool llama_kv_cache_iswa_context::apply() {
 
 llama_memory_status llama_kv_cache_iswa_context::get_status() const {
     return status;
+}
+
+uint32_t llama_kv_cache_iswa_context::get_max_graph_seqs() const {
+    if (!ctx_base || !ctx_swa) {
+        return 0;
+    }
+    return std::min(ctx_base->get_max_graph_seqs(), ctx_swa->get_max_graph_seqs());
 }
 
 const llama_ubatch & llama_kv_cache_iswa_context::get_ubatch() const {

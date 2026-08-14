@@ -199,6 +199,27 @@ int main(int argc, char ** argv) {
 
     std::set<test_object> tests;
 
+    // Public reserve must reject malformed shapes before mutating the scheduler.
+    // The valid reserve immediately afterward is the side-effect-free refusal proof.
+    const struct {
+        uint32_t n_tokens;
+        uint32_t n_seqs;
+        uint32_t n_outputs;
+    } invalid_shapes[] = {
+        { 0,        n_seqs, 1 },
+        { n_tokens, 0,      1 },
+        { n_tokens, n_seqs, 0 },
+        { n_tokens, n_seqs, n_tokens + 1 },
+        { n_tokens, n_seqs == UINT32_MAX ? n_seqs : n_seqs + 1, 1 },
+    };
+    for (const auto & shape : invalid_shapes) {
+        if (llama_graph_reserve(ctx, shape.n_tokens, shape.n_seqs, shape.n_outputs) != nullptr) {
+            LOG_ERR("accepted invalid reserve shape: n_tokens=%u n_seqs=%u n_outputs=%u\n",
+                    shape.n_tokens, shape.n_seqs, shape.n_outputs);
+            return 1;
+        }
+    }
+
     auto * gf_pp = llama_graph_reserve(ctx, n_tokens, n_seqs, n_tokens);
     if (!gf_pp) {
         LOG_ERR("failed to reserve prompt processing graph\n");

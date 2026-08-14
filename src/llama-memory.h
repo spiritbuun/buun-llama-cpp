@@ -8,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <functional>
+#include <limits>
 
 struct llama_ubatch;
 
@@ -99,6 +100,13 @@ struct llama_memory_context_i {
 
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
+
+    // Maximum number of sequences a graph built against this context can represent
+    // at the current physical allocation. Most memory types do not impose a tighter
+    // bound than the owning llama_context's configured sequence maximum.
+    virtual uint32_t get_max_graph_seqs() const {
+        return std::numeric_limits<uint32_t>::max();
+    }
 
     // TurboQuant: get rotation tensors for pre-rotate-queries optimization
     // Returns null for non-turbo memory types. Override in KV cache contexts.

@@ -204,6 +204,10 @@ public:
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
+    uint32_t get_max_graph_seqs() const override {
+        return status == LLAMA_MEMORY_STATUS_SUCCESS && mem != nullptr ? get_n_rs() : 0;
+    }
+
     //
     // llama_memory_recurrent_context specific API
     //

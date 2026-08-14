@@ -4,12 +4,15 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-recurrent.h"
+#include "llama-ext.h"
 #include "llama.h"
 
 #include <algorithm>
 #include <clocale>
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -149,8 +152,31 @@ static bool abort_decode(void *) {
     return true;
 }
 
+static void set_resize_test_fault(bool enabled) {
+#ifdef _WIN32
+    _putenv_s("LLAMA_RECURRENT_RESIZE_TEST_FAIL", enabled ? "before_publish" : "");
+#else
+    if (enabled) {
+        setenv("LLAMA_RECURRENT_RESIZE_TEST_FAIL", "before_publish", 1);
+    } else {
+        unsetenv("LLAMA_RECURRENT_RESIZE_TEST_FAIL");
+    }
+#endif
+}
+
+static bool get_recurrent_epoch(llama_memory_recurrent * recurrent, uint64_t & epoch) {
+    auto memory_context = recurrent->init_full();
+    auto * recurrent_context = dynamic_cast<llama_memory_recurrent_context *>(memory_context.get());
+    if (recurrent_context == nullptr) {
+        return false;
+    }
+    epoch = recurrent_context->get_tensor_binding_epoch();
+    return true;
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
+    set_resize_test_fault(false);
 
     common_params params;
     params.sampling.seed = 1234;
@@ -177,6 +203,10 @@ int main(int argc, char ** argv) {
     GGML_ASSERT(params.cache_type_k == GGML_TYPE_F16);
     GGML_ASSERT(params.cache_type_v == GGML_TYPE_F16);
     GGML_ASSERT(!params.vbr_enabled());
+
+    // The production MTP/VBR server uses unified KV. Its single physical stream
+    // must remain distinct from the logical multi-sequence graph capacity.
+    params.kv_unified = true;
 
     ggml_backend_load_all();
 
@@ -205,6 +235,28 @@ int main(int argc, char ** argv) {
     if (!ctx_src || !ctx_test || !ctx_ref || !ctx_parallel) {
         fprintf(stderr, "%s : failed to init contexts\n", __func__);
         return 1;
+    }
+
+    // A unified attention cache owns one physical stream while remaining logically
+    // capable of the configured sequence count. Composite lowering may narrow that
+    // logical cap without changing the physical stream layout.
+    llama_memory_t parallel_mem = llama_get_memory(ctx_parallel.get());
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(parallel_mem)) {
+        llama_kv_cache_context unrestricted(hybrid->get_mem_attn());
+        llama_kv_cache_context limited(hybrid->get_mem_attn(), 2);
+        if (unrestricted.get_max_graph_seqs() != std::numeric_limits<uint32_t>::max() ||
+            limited.get_max_graph_seqs() != 2) {
+            fprintf(stderr, "%s : unified attention logical capacity was confused with its physical stream\n", __func__);
+            return 1;
+        }
+    } else if (auto * hybrid = dynamic_cast<llama_memory_hybrid_iswa *>(parallel_mem)) {
+        llama_kv_cache_iswa_context unrestricted(hybrid->get_mem_attn());
+        llama_kv_cache_iswa_context limited(hybrid->get_mem_attn(), 2);
+        if (unrestricted.get_max_graph_seqs() != std::numeric_limits<uint32_t>::max() ||
+            limited.get_max_graph_seqs() != 2) {
+            fprintf(stderr, "%s : unified iSWA attention logical capacity was confused with its physical stream\n", __func__);
+            return 1;
+        }
     }
 
     auto * recurrent = get_recurrent(ctx_test.get());
@@ -418,6 +470,13 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "%s : exhausted recurrent seq_cp succeeded or mutated destination\n", __func__);
         return 1;
     }
+    if (!recurrent_parallel->seq_rm(0, -1, -1) ||
+        !recurrent_parallel->try_seq_cp(1, 0, -1, -1) ||
+        recurrent_parallel->cells[0].tail < 0 ||
+        recurrent_parallel->used != exhausted_used) {
+        fprintf(stderr, "%s : full-pool backup restore did not reuse the freed live cell\n", __func__);
+        return 1;
+    }
 
     // The hybrid fallback cannot roll back the attention copy, so detected failure
     // invalidates both children. The destination is empty and therefore never selectable
@@ -445,6 +504,160 @@ int main(int argc, char ** argv) {
         !check_depth(ctx_parallel.get(), 0, 0, "narrow seq 0") ||
         !check_depth(ctx_parallel.get(), 1, 3, "untouched seq 1")) {
         fprintf(stderr, "%s : per-sequence equal-split assignment failed\n", __func__);
+        return 1;
+    }
+
+    // A live logical sequence may occupy a high physical cell. Shrinking must
+    // refuse atomically instead of truncating that recurrent state while leaving
+    // the attention half reusable.
+    llama_memory_clear(mem_parallel, true);
+    llama_memory_clear(llama_get_memory(ctx_ref.get()), true);
+    if (!llama_memory_recurrent_expand(mem_parallel, 3) ||
+        !decode_range(ctx_parallel.get(), tokens, 0, 1, 1) ||
+        !decode_range(ctx_parallel.get(), tokens, 0, 1, 2) ||
+        !decode_range(ctx_parallel.get(), tokens, 0, 1, 0) ||
+        !decode_range(ctx_ref.get(), tokens, 0, 1, 0) ||
+        !llama_memory_seq_rm(mem_parallel, 1, -1, -1) ||
+        !llama_memory_seq_rm(mem_parallel, 2, -1, -1)) {
+        fprintf(stderr, "%s : high-cell shrink setup failed\n", __func__);
+        return 1;
+    }
+    recurrent_parallel = get_recurrent(ctx_parallel.get());
+    const int32_t high_tail = recurrent_parallel->cells[0].tail;
+    const auto high_state_before = save_seq(ctx_parallel.get(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    const auto high_r_before = recurrent_parallel->r_l;
+    const auto high_s_before = recurrent_parallel->s_l;
+    uint64_t high_epoch_before = 0;
+    uint64_t high_epoch_after = 0;
+    if (high_tail < 1 || high_state_before.empty() ||
+        !get_recurrent_epoch(recurrent_parallel, high_epoch_before) ||
+        llama_memory_recurrent_shrink(mem_parallel, 1) ||
+        recurrent_parallel->size != 3 ||
+        recurrent_parallel->cells[0].tail != high_tail ||
+        recurrent_parallel->r_l != high_r_before ||
+        recurrent_parallel->s_l != high_s_before ||
+        save_seq(ctx_parallel.get(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != high_state_before ||
+        !get_recurrent_epoch(recurrent_parallel, high_epoch_after) ||
+        high_epoch_after != high_epoch_before ||
+        !decode_range(ctx_parallel.get(), tokens, 1, 1, 0) ||
+        !decode_range(ctx_ref.get(), tokens, 1, 1, 0) ||
+        !logits_equal(copy_logits(ctx_parallel.get(), n_vocab), copy_logits(ctx_ref.get(), n_vocab),
+                "post-refused-high-cell-shrink continuation")) {
+        fprintf(stderr, "%s : high-cell shrink was not failure-atomic\n", __func__);
+        return 1;
+    }
+
+    // A resize failure after all replacement tensors and metadata have been staged must
+    // leave the live cache completely untouched and usable. A following successful resize
+    // must publish one new binding epoch and preserve the active recurrent row.
+    llama_memory_clear(mem_parallel, true);
+    llama_memory_clear(llama_get_memory(ctx_ref.get()), true);
+    const uint32_t pre_zero_shrink_size = recurrent_parallel->size;
+    if (llama_memory_recurrent_shrink(mem_parallel, 0) ||
+        recurrent_parallel->size != pre_zero_shrink_size ||
+        !llama_memory_recurrent_shrink(mem_parallel, 1) ||
+        !decode_range(ctx_parallel.get(), tokens, 0, 4) ||
+        !decode_range(ctx_ref.get(), tokens, 0, 4)) {
+        fprintf(stderr, "%s : resize failure-atomic setup failed\n", __func__);
+        return 1;
+    }
+
+    recurrent_parallel = get_recurrent(ctx_parallel.get());
+    const auto contracted_mctx = mem_parallel->init_full();
+    if (!contracted_mctx || contracted_mctx->get_max_graph_seqs() != 1 ||
+        llama_graph_reserve(ctx_parallel.get(), 2, 2, 2) != nullptr ||
+        llama_graph_reserve(ctx_parallel.get(), 1, 1, 1) == nullptr) {
+        fprintf(stderr, "%s : contracted recurrent graph capacity was not enforced\n", __func__);
+        return 1;
+    }
+
+    // Force the production sched_reserve() owner through a real topology setter while
+    // recurrent storage is contracted. It must reserve the one-sequence graph rather
+    // than rebuilding the old configured two-sequence shape.
+    llama_set_causal_attn(ctx_parallel.get(), false);
+    llama_set_causal_attn(ctx_parallel.get(), true);
+    llama_set_causal_attn(ctx_ref.get(), false);
+    llama_set_causal_attn(ctx_ref.get(), true);
+    if (!decode_range(ctx_parallel.get(), tokens, 4, 1) ||
+        !decode_range(ctx_ref.get(), tokens, 4, 1) ||
+        !logits_equal(copy_logits(ctx_parallel.get(), n_vocab), copy_logits(ctx_ref.get(), n_vocab),
+                "contracted scheduler reserve continuation")) {
+        fprintf(stderr, "%s : contracted production scheduler reserve failed\n", __func__);
+        return 1;
+    }
+
+    const auto resize_state_before = save_seq(ctx_parallel.get(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    const auto resize_r_before = recurrent_parallel->r_l;
+    const auto resize_s_before = recurrent_parallel->s_l;
+    const auto resize_rs_idx_before = recurrent_parallel->rs_idx;
+    const auto resize_depth_before = recurrent_parallel->rollback_valid_depth;
+    const uint32_t resize_size_before = recurrent_parallel->size;
+    const uint32_t resize_head_before = recurrent_parallel->head;
+    const uint32_t resize_used_before = recurrent_parallel->used;
+    const uint32_t resize_n_before = recurrent_parallel->n;
+    const int32_t resize_rs_z_before = recurrent_parallel->rs_z;
+    uint64_t resize_epoch_before = 0;
+    if (resize_state_before.empty() || !get_recurrent_epoch(recurrent_parallel, resize_epoch_before)) {
+        fprintf(stderr, "%s : failed to snapshot recurrent resize state\n", __func__);
+        return 1;
+    }
+
+    set_resize_test_fault(true);
+    const bool injected_resize_succeeded = llama_memory_recurrent_expand(mem_parallel, 2);
+    set_resize_test_fault(false);
+
+    uint64_t resize_epoch_after_failure = 0;
+    if (injected_resize_succeeded ||
+        recurrent_parallel->size != resize_size_before ||
+        recurrent_parallel->head != resize_head_before ||
+        recurrent_parallel->used != resize_used_before ||
+        recurrent_parallel->n != resize_n_before ||
+        recurrent_parallel->rs_z != resize_rs_z_before ||
+        recurrent_parallel->r_l != resize_r_before ||
+        recurrent_parallel->s_l != resize_s_before ||
+        recurrent_parallel->rs_idx != resize_rs_idx_before ||
+        recurrent_parallel->rollback_valid_depth != resize_depth_before ||
+        save_seq(ctx_parallel.get(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != resize_state_before ||
+        !get_recurrent_epoch(recurrent_parallel, resize_epoch_after_failure) ||
+        resize_epoch_after_failure != resize_epoch_before) {
+        fprintf(stderr, "%s : failed recurrent resize mutated live state or bindings\n", __func__);
+        return 1;
+    }
+
+    if (!decode_range(ctx_parallel.get(), tokens, 5, 1) ||
+        !decode_range(ctx_ref.get(), tokens, 5, 1) ||
+        !logits_equal(copy_logits(ctx_parallel.get(), n_vocab), copy_logits(ctx_ref.get(), n_vocab),
+                "post-failed-resize continuation")) {
+        fprintf(stderr, "%s : failed recurrent resize broke continuation\n", __func__);
+        return 1;
+    }
+
+    if (!llama_memory_recurrent_expand(mem_parallel, 2)) {
+        fprintf(stderr, "%s : recurrent resize did not recover after injected failure\n", __func__);
+        return 1;
+    }
+    const auto expanded_mctx = mem_parallel->init_full();
+    if (!expanded_mctx || expanded_mctx->get_max_graph_seqs() != 2 ||
+        llama_graph_reserve(ctx_parallel.get(), 2, 2, 2) == nullptr) {
+        fprintf(stderr, "%s : unified hybrid graph capacity did not follow recurrent expansion\n", __func__);
+        return 1;
+    }
+    uint64_t resize_epoch_after_success = 0;
+    const uint64_t expected_resize_epoch = resize_epoch_before == UINT64_MAX ? 1 : resize_epoch_before + 1;
+    bool tensors_rebound = false;
+    for (size_t i = 0; i < resize_r_before.size(); ++i) {
+        tensors_rebound = tensors_rebound ||
+            (resize_r_before[i] != nullptr && resize_r_before[i] != recurrent_parallel->r_l[i]) ||
+            (resize_s_before[i] != nullptr && resize_s_before[i] != recurrent_parallel->s_l[i]);
+    }
+    if (recurrent_parallel->size != 2 || !tensors_rebound ||
+        !get_recurrent_epoch(recurrent_parallel, resize_epoch_after_success) ||
+        resize_epoch_after_success != expected_resize_epoch ||
+        !decode_range(ctx_parallel.get(), tokens, 6, 1) ||
+        !decode_range(ctx_ref.get(), tokens, 6, 1) ||
+        !logits_equal(copy_logits(ctx_parallel.get(), n_vocab), copy_logits(ctx_ref.get(), n_vocab),
+                "post-successful-resize continuation")) {
+        fprintf(stderr, "%s : successful recurrent resize did not publish one usable binding epoch\n", __func__);
         return 1;
     }
 

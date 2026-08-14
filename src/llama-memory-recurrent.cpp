@@ -10,9 +10,11 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
+#include <new>
 #include <stdexcept>
 
 namespace {
@@ -21,6 +23,14 @@ struct ggml_backend_buft_comparator {
         return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
     }
 };
+
+bool recurrent_resize_test_fail_before_publish() {
+    // TEST-ONLY, undocumented fault seam. Keep it local to this translation unit: the
+    // recurrent cache has no public/internal test-control API, and the exact value is
+    // checked only after a complete off-side resize has been staged.
+    const char * value = std::getenv("LLAMA_RECURRENT_RESIZE_TEST_FAIL");
+    return value != nullptr && std::strcmp(value, "before_publish") == 0;
+}
 } // namespace
 
 namespace {
@@ -1003,164 +1013,263 @@ bool llama_memory_recurrent::resize(uint32_t new_mem_size) {
     if (new_mem_size == size) {
         return true;
     }
+    if (new_mem_size == 0) {
+        LLAMA_LOG_ERROR("%s: recurrent memory requires at least one resident cell\n", __func__);
+        return false;
+    }
 
-    const int32_t n_layer = hparams.n_layer();
-    const uint32_t old_size = size;
-    const uint32_t n_copy = std::min(old_size, new_mem_size);
+    try {
+        const int32_t n_layer = hparams.n_layer();
+        const uint32_t old_size = size;
+        const uint32_t n_copy = std::min(old_size, new_mem_size);
+        const size_t tensor_overhead = ggml_tensor_overhead();
 
-    std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
-
-    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
-        auto it = ctx_map.find(buft);
-        if (it == ctx_map.end()) {
-            ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u * n_layer * ggml_tensor_overhead()),
-                /*.mem_buffer =*/ NULL,
-                /*.no_alloc   =*/ true,
-            };
-            ggml_context * ctx = ggml_init(params);
-            if (!ctx) {
-                return nullptr;
+        if (new_mem_size < old_size) {
+            // A logical sequence can live in any physical cell. Truncating a high
+            // occupied cell (or a retained cell that still references one) would
+            // silently discard recurrent state while the attention half survives.
+            // Refuse atomically; callers may retry after clearing/compacting it.
+            for (uint32_t i = 0; i < old_size; ++i) {
+                const auto & cell = cells[i];
+                if (!cell.seq_id.empty()) {
+                    if (i >= new_mem_size || cell.src >= (int32_t) new_mem_size ||
+                        cell.src0 >= (int32_t) new_mem_size) {
+                        LLAMA_LOG_WARN("%s: cannot shrink recurrent memory while cell %u references truncated storage\n",
+                                __func__, i);
+                        return false;
+                    }
+                    for (llama_seq_id seq_id : cell.seq_id) {
+                        if (seq_id < 0 || (uint32_t) seq_id >= new_mem_size) {
+                            LLAMA_LOG_WARN("%s: cannot shrink recurrent memory while sequence %d remains live\n",
+                                    __func__, seq_id);
+                            return false;
+                        }
+                    }
+                }
             }
-            ctx_map.emplace(buft, ctx);
-            return ctx;
-        }
-        return it->second.get();
-    };
-
-    std::vector<ggml_tensor *> old_r_l = r_l;
-    std::vector<ggml_tensor *> old_s_l = s_l;
-
-    for (int i = 0; i < n_layer; i++) {
-        if (!old_r_l[i] && !old_s_l[i]) {
-            continue;
+            for (uint32_t seq_id = 0; seq_id < new_mem_size; ++seq_id) {
+                if (cells[seq_id].tail >= (int32_t) new_mem_size) {
+                    LLAMA_LOG_WARN("%s: cannot shrink recurrent memory while sequence %u has a high physical tail\n",
+                            __func__, seq_id);
+                    return false;
+                }
+            }
         }
 
-        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(old_r_l[i] ? old_r_l[i]->buffer : old_s_l[i]->buffer);
-        ggml_context * ctx = ctx_for_buft(buft);
-        if (!ctx) {
-            LLAMA_LOG_ERROR("%s: failed to create ggml context for resized rs cache\n", __func__);
+        if (n_layer < 0 ||
+            (tensor_overhead != 0 && size_t(n_layer) > SIZE_MAX / tensor_overhead / 2)) {
+            LLAMA_LOG_ERROR("%s: resized rs context metadata size overflows\n", __func__);
+            return false;
+        }
+        if (new_mem_size > n_seq_max ||
+            new_mem_size > cells.max_size() ||
+            new_mem_size > rs_idx.max_size() ||
+            new_mem_size > rollback_valid_depth.max_size()) {
+            LLAMA_LOG_ERROR("%s: requested rs cache size %u exceeds its capacity %u\n",
+                    __func__, new_mem_size, n_seq_max);
             return false;
         }
 
-        if (old_r_l[i]) {
-            ggml_tensor * r = ggml_new_tensor_2d(ctx, old_r_l[i]->type, hparams.n_embd_r(), new_mem_size * (1 + n_rs_seq));
-            ggml_format_name(r, "cache_r_l%d", i);
-            r_l[i] = r;
-        }
-        if (old_s_l[i]) {
-            ggml_tensor * s = ggml_new_tensor_2d(ctx, old_s_l[i]->type, hparams.n_embd_s(), new_mem_size * (1 + n_rs_seq));
-            ggml_format_name(s, "cache_s_l%d", i);
-            s_l[i] = s;
-        }
-    }
-
-    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> new_ctxs_bufs;
-    for (auto & [buft, ctx] : ctx_map) {
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
-        if (!buf) {
-            LLAMA_LOG_ERROR("%s: failed to allocate resized rs buffer\n", __func__);
-            r_l = old_r_l;
-            s_l = old_s_l;
+        const uint64_t row_groups = uint64_t(n_rs_seq) + 1;
+        if (new_mem_size != 0 && row_groups > UINT64_MAX / new_mem_size) {
+            LLAMA_LOG_ERROR("%s: resized rs row count overflows\n", __func__);
             return false;
         }
-        ggml_backend_buffer_clear(buf, 0);
-        new_ctxs_bufs.emplace_back(std::move(ctx), buf);
-    }
+        const uint64_t new_rows = uint64_t(new_mem_size) * row_groups;
+        if (new_rows > INT64_MAX || new_rows > SIZE_MAX) {
+            LLAMA_LOG_ERROR("%s: resized rs row count exceeds ggml dimensions\n", __func__);
+            return false;
+        }
+        const size_t context_bytes = 2 * size_t(n_layer) * tensor_overhead;
 
-    if (n_copy > 0) {
-        const uint32_t n_copy_rows = n_copy * (1 + n_rs_seq);
-        std::vector<uint8_t> tmp;
+        auto tensor_shape_fits = [&](ggml_type type, uint32_t n_embd) {
+            if (n_embd != 0 && new_rows > uint64_t(INT64_MAX) / n_embd) {
+                return false;
+            }
+            const size_t row_bytes = ggml_row_size(type, n_embd);
+            return row_bytes == 0 || new_rows <= SIZE_MAX / row_bytes;
+        };
+
+        std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
+
+        auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+            auto it = ctx_map.find(buft);
+            if (it == ctx_map.end()) {
+                ggml_init_params params = {
+                    /*.mem_size   =*/ context_bytes,
+                    /*.mem_buffer =*/ NULL,
+                    /*.no_alloc   =*/ true,
+                };
+                ggml_context_ptr ctx(ggml_init(params));
+                if (!ctx) {
+                    return nullptr;
+                }
+                it = ctx_map.emplace(buft, std::move(ctx)).first;
+            }
+            return it->second.get();
+        };
+
+        const std::vector<ggml_tensor *> old_r_l = r_l;
+        const std::vector<ggml_tensor *> old_s_l = s_l;
+        std::vector<ggml_tensor *> new_r_l(r_l.size(), nullptr);
+        std::vector<ggml_tensor *> new_s_l(s_l.size(), nullptr);
+
         for (int i = 0; i < n_layer; i++) {
-            if (old_r_l[i] && r_l[i]) {
-                size_t bytes = ggml_row_size(old_r_l[i]->type, hparams.n_embd_r()) * n_copy_rows;
-                tmp.resize(bytes);
-                ggml_backend_tensor_get(old_r_l[i], tmp.data(), 0, bytes);
-                ggml_backend_tensor_set(r_l[i], tmp.data(), 0, bytes);
+            if (!old_r_l[i] && !old_s_l[i]) {
+                continue;
             }
-            if (old_s_l[i] && s_l[i]) {
-                size_t bytes = ggml_row_size(old_s_l[i]->type, hparams.n_embd_s()) * n_copy_rows;
-                tmp.resize(bytes);
-                ggml_backend_tensor_get(old_s_l[i], tmp.data(), 0, bytes);
-                ggml_backend_tensor_set(s_l[i], tmp.data(), 0, bytes);
+
+            if ((old_r_l[i] && !tensor_shape_fits(old_r_l[i]->type, hparams.n_embd_r())) ||
+                (old_s_l[i] && !tensor_shape_fits(old_s_l[i]->type, hparams.n_embd_s()))) {
+                LLAMA_LOG_ERROR("%s: resized rs tensor shape overflows\n", __func__);
+                return false;
             }
-        }
-    }
 
-    ctxs_bufs = std::move(new_ctxs_bufs);
-    bump_tensor_binding_epoch();
-    cells.resize(new_mem_size);
-    size = new_mem_size;
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(old_r_l[i] ? old_r_l[i]->buffer : old_s_l[i]->buffer);
+            ggml_context * ctx = ctx_for_buft(buft);
+            if (!ctx) {
+                LLAMA_LOG_ERROR("%s: failed to create ggml context for resized rs cache\n", __func__);
+                return false;
+            }
 
-    // Resizing replaces the backing tensors and remaps snapshot-plane row strides.
-    rs_idx.resize(new_mem_size, 0);
-    rollback_valid_depth.resize(new_mem_size, 0);
-    std::fill(rs_idx.begin(), rs_idx.end(), 0);
-    std::fill(rollback_valid_depth.begin(), rollback_valid_depth.end(), 0);
-
-    uint32_t used_new = 0;
-    for (auto & cell : cells) {
-        cell.tail = -1;
-
-        for (auto it = cell.seq_id.begin(); it != cell.seq_id.end();) {
-            if (*it < 0 || (uint32_t) *it >= size) {
-                LLAMA_LOG_WARN("%s: dropping seq_id %d after resize %u -> %u\n",
-                        __func__, *it, old_size, new_mem_size);
-                it = cell.seq_id.erase(it);
-            } else {
-                ++it;
+            if (old_r_l[i]) {
+                ggml_tensor * r = ggml_new_tensor_2d(ctx, old_r_l[i]->type, hparams.n_embd_r(), (int64_t) new_rows);
+                if (!r) {
+                    LLAMA_LOG_ERROR("%s: failed to create resized R tensor\n", __func__);
+                    return false;
+                }
+                ggml_format_name(r, "cache_r_l%d", i);
+                new_r_l[i] = r;
+            }
+            if (old_s_l[i]) {
+                ggml_tensor * s = ggml_new_tensor_2d(ctx, old_s_l[i]->type, hparams.n_embd_s(), (int64_t) new_rows);
+                if (!s) {
+                    LLAMA_LOG_ERROR("%s: failed to create resized S tensor\n", __func__);
+                    return false;
+                }
+                ggml_format_name(s, "cache_s_l%d", i);
+                new_s_l[i] = s;
             }
         }
 
-        if (cell.seq_id.empty()) {
-            cell.pos  = -1;
-            cell.src  = -1;
-            cell.src0 = -1;
-            continue;
+        std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> new_ctxs_bufs;
+        new_ctxs_bufs.reserve(ctx_map.size());
+        for (auto & [buft, ctx] : ctx_map) {
+            ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
+            if (!buf) {
+                LLAMA_LOG_ERROR("%s: failed to allocate resized rs buffer\n", __func__);
+                return false;
+            }
+            ggml_backend_buffer_clear(buf.get(), 0);
+            new_ctxs_bufs.emplace_back(std::move(ctx), std::move(buf));
         }
 
-        if (cell.src >= (int32_t) size) {
-            LLAMA_LOG_WARN("%s: clearing out-of-range src %d after resize %u -> %u\n",
-                    __func__, cell.src, old_size, new_mem_size);
-            cell.src = -1;
-        }
-        if (cell.src0 >= (int32_t) size) {
-            LLAMA_LOG_WARN("%s: clearing out-of-range src0 %d after resize %u -> %u\n",
-                    __func__, cell.src0, old_size, new_mem_size);
-            cell.src0 = -1;
+        if (n_copy > 0) {
+            const size_t n_copy_rows = size_t(uint64_t(n_copy) * row_groups);
+            std::vector<uint8_t> tmp;
+            for (int i = 0; i < n_layer; i++) {
+                if (old_r_l[i] && new_r_l[i]) {
+                    size_t bytes = ggml_row_size(old_r_l[i]->type, hparams.n_embd_r()) * n_copy_rows;
+                    tmp.resize(bytes);
+                    ggml_backend_tensor_get(old_r_l[i], tmp.data(), 0, bytes);
+                    ggml_backend_tensor_set(new_r_l[i], tmp.data(), 0, bytes);
+                }
+                if (old_s_l[i] && new_s_l[i]) {
+                    size_t bytes = ggml_row_size(old_s_l[i]->type, hparams.n_embd_s()) * n_copy_rows;
+                    tmp.resize(bytes);
+                    ggml_backend_tensor_get(old_s_l[i], tmp.data(), 0, bytes);
+                    ggml_backend_tensor_set(new_s_l[i], tmp.data(), 0, bytes);
+                }
+            }
         }
 
-        used_new++;
+        std::vector<mem_cell> new_cells = cells;
+        new_cells.resize(new_mem_size);
+        std::vector<uint32_t> new_rs_idx(new_mem_size, 0);
+        std::vector<uint32_t> new_rollback_valid_depth(new_mem_size, 0);
+
+        uint32_t new_used = 0;
+        for (auto & cell : new_cells) {
+            cell.tail = -1;
+
+            for (auto it = cell.seq_id.begin(); it != cell.seq_id.end();) {
+                if (*it < 0 || (uint32_t) *it >= new_mem_size) {
+                    LLAMA_LOG_WARN("%s: dropping seq_id %d after resize %u -> %u\n",
+                            __func__, *it, old_size, new_mem_size);
+                    it = cell.seq_id.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+
+            if (cell.seq_id.empty()) {
+                cell.pos  = -1;
+                cell.src  = -1;
+                cell.src0 = -1;
+                continue;
+            }
+
+            if (cell.src >= (int32_t) new_mem_size) {
+                LLAMA_LOG_WARN("%s: clearing out-of-range src %d after resize %u -> %u\n",
+                        __func__, cell.src, old_size, new_mem_size);
+                cell.src = -1;
+            }
+            if (cell.src0 >= (int32_t) new_mem_size) {
+                LLAMA_LOG_WARN("%s: clearing out-of-range src0 %d after resize %u -> %u\n",
+                        __func__, cell.src0, old_size, new_mem_size);
+                cell.src0 = -1;
+            }
+
+            new_used++;
+        }
+
+        for (uint32_t i = 0; i < new_mem_size; ++i) {
+            for (llama_seq_id seq_id : new_cells[i].seq_id) {
+                new_cells[seq_id].tail = i;
+            }
+        }
+
+        const uint32_t new_head = new_mem_size == 0 ? 0 : std::min(head, new_mem_size - 1);
+        const uint32_t new_n = new_mem_size == 0 ? 0 : std::min(n, new_mem_size);
+        const int32_t new_rs_z = new_mem_size == 0 || rs_z >= (int32_t) new_mem_size ? -1 : rs_z;
+
+        if (recurrent_resize_test_fail_before_publish()) {
+            LLAMA_LOG_ERROR("%s: injected failure before publishing resized rs cache\n", __func__);
+            return false;
+        }
+
+        // All allocation, copying, and metadata normalization succeeded. These swaps are
+        // non-throwing, and the old contexts stay alive in the staged locals until every
+        // live tensor pointer has been rebound.
+        r_l.swap(new_r_l);
+        s_l.swap(new_s_l);
+        ctxs_bufs.swap(new_ctxs_bufs);
+        cells.swap(new_cells);
+        rs_idx.swap(new_rs_idx);
+        rollback_valid_depth.swap(new_rollback_valid_depth);
+        size = new_mem_size;
+        used = new_used;
+        head = new_head;
+        n = new_n;
+        rs_z = new_rs_z;
+        bump_tensor_binding_epoch();
+
+        const size_t memory_size_r = size_r_bytes();
+        const size_t memory_size_s = size_s_bytes();
+        LLAMA_LOG_INFO("%s: resized %u -> %u cells, used=%u, head=%u, n=%u, rs_z=%d, R: %7.2f MiB, S: %7.2f MiB\n", __func__,
+                old_size, new_mem_size,
+                used, head, n, rs_z,
+                (float)memory_size_r / (1024.0f * 1024.0f),
+                (float)memory_size_s / (1024.0f * 1024.0f));
+
+        return true;
+    } catch (const std::length_error &) {
+        LLAMA_LOG_ERROR("%s: host container size is invalid while staging resized rs cache\n", __func__);
+        return false;
+    } catch (const std::bad_alloc &) {
+        LLAMA_LOG_ERROR("%s: host allocation failed while staging resized rs cache\n", __func__);
+        return false;
     }
-
-    for (uint32_t i = 0; i < size; ++i) {
-        for (llama_seq_id seq_id : cells[i].seq_id) {
-            cells[seq_id].tail = i;
-        }
-    }
-
-    used = used_new;
-    if (size == 0) {
-        head = 0;
-        n    = 0;
-        rs_z = -1;
-    } else {
-        head = std::min(head, size - 1);
-        n    = std::min(n, size);
-        if (rs_z >= (int32_t) size) {
-            rs_z = -1;
-        }
-    }
-
-    const size_t memory_size_r = size_r_bytes();
-    const size_t memory_size_s = size_s_bytes();
-    LLAMA_LOG_INFO("%s: resized %u -> %u cells, used=%u, head=%u, n=%u, rs_z=%d, R: %7.2f MiB, S: %7.2f MiB\n", __func__,
-            old_size, new_mem_size,
-            used, head, n, rs_z,
-            (float)memory_size_r / (1024.0f * 1024.0f),
-            (float)memory_size_s / (1024.0f * 1024.0f));
-
-    return true;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {

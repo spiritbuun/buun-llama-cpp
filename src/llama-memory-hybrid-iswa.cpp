@@ -256,8 +256,8 @@ llama_memory_recurrent * llama_memory_hybrid_iswa::get_mem_recr() const {
 llama_memory_hybrid_iswa_context::llama_memory_hybrid_iswa_context(llama_memory_status status) : status(status) {}
 
 llama_memory_hybrid_iswa_context::llama_memory_hybrid_iswa_context(llama_memory_hybrid_iswa * mem) :
-    ctx_attn(mem->get_mem_attn()->init_full()),
     ctx_recr(mem->get_mem_recr()->init_full()),
+    ctx_attn(new llama_kv_cache_iswa_context(mem->get_mem_attn(), ctx_recr->get_max_graph_seqs())),
     status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
 }
 
@@ -265,8 +265,8 @@ llama_memory_hybrid_iswa_context::llama_memory_hybrid_iswa_context(
         llama_memory_hybrid_iswa * mem,
                    llama_context * lctx,
                             bool   optimize) :
-    ctx_attn(mem->get_mem_attn()->init_update(lctx, optimize)),
     ctx_recr(mem->get_mem_recr()->init_update(lctx, optimize)),
+    ctx_attn(mem->get_mem_attn()->init_update(lctx, optimize)),
     status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
 }
 
@@ -277,8 +277,8 @@ llama_memory_hybrid_iswa_context::llama_memory_hybrid_iswa_context(
           std::vector<llama_ubatch>   ubatches) :
     ubatches(std::move(ubatches)),
     // note: here we copy the ubatches. not sure if this is ideal
-    ctx_attn(new llama_kv_cache_iswa_context(mem->get_mem_attn(), std::move(sinfos_base), std::move(sinfos_swa), this->ubatches)),
     ctx_recr(new llama_memory_recurrent_context(mem->get_mem_recr(), this->ubatches)),
+    ctx_attn(new llama_kv_cache_iswa_context(mem->get_mem_attn(), std::move(sinfos_base), std::move(sinfos_swa), this->ubatches)),
     status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
 }
 
@@ -313,6 +313,13 @@ llama_memory_status llama_memory_hybrid_iswa_context::get_status() const {
 const llama_ubatch & llama_memory_hybrid_iswa_context::get_ubatch() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
     return ubatches[i_next];
+}
+
+uint32_t llama_memory_hybrid_iswa_context::get_max_graph_seqs() const {
+    if (!ctx_attn || !ctx_recr) {
+        return 0;
+    }
+    return std::min(ctx_attn->get_max_graph_seqs(), ctx_recr->get_max_graph_seqs());
 }
 
 uint64_t llama_memory_hybrid_iswa_context::get_vbr_epoch() const {

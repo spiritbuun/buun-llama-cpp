@@ -192,6 +192,8 @@ public:
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
+    uint32_t get_max_graph_seqs() const override;
+
     // tier epoch of the attention child (the recurrent child has no VBR)
     uint64_t get_vbr_epoch() const override;
 
@@ -212,8 +214,8 @@ private:
 
     std::vector<llama_ubatch> ubatches;
 
-    const llama_memory_context_ptr ctx_attn;
     const llama_memory_context_ptr ctx_recr;
+    const llama_memory_context_ptr ctx_attn;
 
     const llama_memory_status status;
 };

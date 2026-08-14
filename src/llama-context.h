@@ -464,6 +464,10 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
+    // Choose a synthetic reserve shape that both the configured context and the
+    // current physical memory context can represent. Returns zero when unavailable.
+    uint32_t effective_reserve_n_seqs(const llama_memory_context_i * mctx) const;
+
     llm_graph_params graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,

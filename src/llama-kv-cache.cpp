@@ -11120,13 +11120,32 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
 // llama_kv_cache_context
 //
 
-llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : status(status) {}
+llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) :
+    status(status), max_graph_seqs(status == LLAMA_MEMORY_STATUS_SUCCESS ?
+            std::numeric_limits<uint32_t>::max() : 0) {
+}
 
 llama_kv_cache_context::llama_kv_cache_context(
-        llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
+        llama_kv_cache * kv) : llama_kv_cache_context(kv, std::numeric_limits<uint32_t>::max()) {
+}
+
+llama_kv_cache_context::llama_kv_cache_context(
+        llama_kv_cache * kv,
+        uint32_t         max_graph_seqs_limit) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
     n_kv = kv->get_size();
 
-    const uint32_t n_stream = kv->get_n_stream();
+    const uint32_t n_stream_physical = kv->get_n_stream();
+    if (max_graph_seqs_limit == 0 || n_stream_physical == 0) {
+        status = LLAMA_MEMORY_STATUS_FAILED_PREPARE;
+        max_graph_seqs = 0;
+        return;
+    }
+    // Unified KV has one physical stream but may represent every configured logical
+    // sequence. Keep physical graph layout separate from the composite's logical cap.
+    const uint32_t n_stream = n_stream_physical == 1
+        ? 1
+        : std::min(n_stream_physical, max_graph_seqs_limit);
+    max_graph_seqs = max_graph_seqs_limit;
 
     // create a dummy slot info - the actual data is irrelevant. we just need to build the graph
     sinfos.resize(1);
@@ -11188,6 +11207,10 @@ bool llama_kv_cache_context::apply() {
 
 llama_memory_status llama_kv_cache_context::get_status() const {
     return status;
+}
+
+uint32_t llama_kv_cache_context::get_max_graph_seqs() const {
+    return max_graph_seqs;
 }
 
 const llama_ubatch & llama_kv_cache_context::get_ubatch() const {

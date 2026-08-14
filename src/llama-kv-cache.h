@@ -18,6 +18,7 @@
 #include <map>
 #include <memory>
 #include <exception>
+#include <limits>
 #include <optional>
 #include <set>
 #include <tuple>
@@ -1378,6 +1379,12 @@ public:
     llama_kv_cache_context(
             llama_kv_cache * kv);
 
+    // used by composite memories whose other child currently exposes fewer
+    // logical graph sequences than the attention cache was configured with
+    llama_kv_cache_context(
+            llama_kv_cache * kv,
+            uint32_t         max_graph_seqs_limit);
+
     // used to create an update context
     llama_kv_cache_context(
             llama_kv_cache * kv,
@@ -1402,6 +1409,7 @@ public:
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
+    uint32_t get_max_graph_seqs() const override;
 
     // VBR tier-flip epoch of the underlying cache (0 when VBR is off — the counter never moves)
     uint64_t get_vbr_epoch() const override;
@@ -1459,6 +1467,8 @@ public:
 
 private:
     llama_memory_status status;
+
+    uint32_t max_graph_seqs = std::numeric_limits<uint32_t>::max();
 
     llama_kv_cache * kv;
     llama_context * lctx;

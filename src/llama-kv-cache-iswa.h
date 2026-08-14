@@ -190,6 +190,10 @@ public:
     llama_kv_cache_iswa_context(
             llama_kv_cache_iswa * kv);
 
+    llama_kv_cache_iswa_context(
+            llama_kv_cache_iswa * kv,
+            uint32_t              max_graph_seqs_limit);
+
     // used to create an update context
     llama_kv_cache_iswa_context(
             llama_kv_cache_iswa * kv,
@@ -214,6 +218,7 @@ public:
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
+    uint32_t get_max_graph_seqs() const override;
 
     // sum of both caches' tier epochs — a flip in either fences graph reuse
     uint64_t get_vbr_epoch() const override;
