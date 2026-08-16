@@ -960,7 +960,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // GPU draft sampling: top-K ids + log-probs computed in-graph (t_logits_argmax tail),
     // skipping the full-vocab logits D2H + CPU top-k scan per draft position
     bool    gpu_sample = false;
-    int32_t gpu_topk   = 10; // matches the CPU sampler chain's top_k
+    int32_t gpu_topk   = 10; // ordinary DFlash needs K probabilities for p_min
 
     // fused encoder+injection: inject decode takes raw target features and applies the
     // encoder (fc + enc-norm) in-graph — no llama_encode round-trip per prefill chunk
@@ -1028,6 +1028,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const llama_model * model_dft = llama_get_model(ctx_dft);
         const llama_model * model_tgt = llama_get_model(ctx_tgt);
+
+        // DSpark consumes only rank zero and uses its learned confidence head for
+        // p_min, so the other nine candidates carry no policy information.
+        const bool dspark_k1 = is_dspark && env_on("GGML_DSPARK_ARGMAX_K1");
+        if (dspark_k1) {
+            gpu_topk = 1;
+        }
 
         target_layer_ids   = llama_model_target_layer_ids  (model_dft);
         target_layer_ids_n = llama_model_target_layer_ids_n(model_dft);
