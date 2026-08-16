@@ -1,5 +1,6 @@
 #include "common.h"
 #include "log.h"
+#include "mtp-vocab-trim.h"
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "gguf.h"
@@ -14,11 +15,14 @@
 #include "../src/llama-model-saver.h"
 
 #include <cinttypes>
+#include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
 #include <memory>
+#include <filesystem>
+#include <fstream>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -496,6 +500,106 @@ static void test_qwen35_mtp_d2t_contract(const size_t seed) {
         GGML_ASSERT(candidates->src[0]->src[0] != nullptr);
         GGML_ASSERT(candidates->src[0]->src[0]->type == GGML_TYPE_I32);
         GGML_ASSERT(ggml_nelements(candidates->src[0]->src[0]) == 32);
+    }
+
+    // Native/shared-weight MTP attaches only the compact output head and d2t map
+    // to the already-loaded target model. It must not require a second model or
+    // replace the target's full-vocabulary output tensor.
+    {
+        gguf_context_ptr source_gguf = get_gguf_ctx(LLM_ARCH_QWEN35, false);
+        llama_model_saver source_meta(LLM_ARCH_QWEN35, source_gguf.get());
+        source_meta.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, uint32_t(1));
+        llama_model_params source_params = llama_model_default_params();
+        source_params.load_mtp = true;
+        ggml_backend_dev_t cpu_devices[] = { nullptr };
+        source_params.devices = cpu_devices;
+        size_t tmp_seed = seed;
+        llama_model_ptr model(llama_model_init_from_user(
+                source_gguf.get(), set_tensor_data, &tmp_seed, source_params));
+        GGML_ASSERT(model != nullptr && model->output != nullptr && model->d2t == nullptr);
+        ggml_tensor * full_output = model->output;
+
+        const auto nonce = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+        const std::filesystem::path head_source =
+                "test-qwen35-native-mtp-source-" + std::to_string(nonce) + ".gguf";
+        const std::filesystem::path artifact =
+                "test-qwen35-native-mtp-head-" + std::to_string(nonce) + ".gguf";
+        const std::filesystem::path tampered =
+                "test-qwen35-native-mtp-tampered-" + std::to_string(nonce) + ".gguf";
+        struct artifact_cleanup {
+            std::vector<std::filesystem::path> paths;
+            ~artifact_cleanup() {
+                std::error_code ec;
+                for (const auto & path : paths) {
+                    std::filesystem::remove(path, ec);
+                }
+            }
+        } cleanup { { head_source, artifact, tampered } };
+
+        gguf_context_ptr head_source_gguf(gguf_init_empty());
+        llama_model_saver saver(LLM_ARCH_QWEN35, head_source_gguf.get());
+        ggml_init_params tensor_params = {
+            /*.mem_size   =*/ 256*1024,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ false,
+        };
+        ggml_context_ptr tensor_ctx(ggml_init(tensor_params));
+        ggml_tensor * source_output = ggml_new_tensor_2d(
+                tensor_ctx.get(), full_output->type, full_output->ne[0], full_output->ne[1]);
+        ggml_set_name(source_output, "output.weight");
+        memset(source_output->data, 0, ggml_nbytes(source_output));
+        saver.add_tensor(source_output);
+        saver.save(head_source.string());
+
+        std::vector<int64_t> draft_to_target(32);
+        for (int64_t i = 0; i < 32; ++i) {
+            draft_to_target[i] = i;
+        }
+        std::string trim_error;
+        GGML_ASSERT(common_mtp_vocab_trim_head_for_test(
+                head_source.string(), artifact.string(), draft_to_target, trim_error));
+
+        // Attachment must verify the helper's embedded semantic-payload digest,
+        // not merely trust the artifact's tensor names and shapes.
+        GGML_ASSERT(std::filesystem::copy_file(artifact, tampered));
+        gguf_init_params artifact_params = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+        gguf_context_ptr tampered_gguf(gguf_init_from_file(tampered.string().c_str(), artifact_params));
+        GGML_ASSERT(tampered_gguf != nullptr);
+        const int64_t tampered_output = gguf_find_tensor(tampered_gguf.get(), "output.weight");
+        GGML_ASSERT(tampered_output >= 0);
+        const uint64_t tampered_offset = gguf_get_data_offset(tampered_gguf.get()) +
+                gguf_get_tensor_offset(tampered_gguf.get(), tampered_output);
+        std::fstream tampered_stream(tampered, std::ios::binary | std::ios::in | std::ios::out);
+        uint8_t byte = 0;
+        tampered_stream.seekg(static_cast<std::streamoff>(tampered_offset));
+        tampered_stream.read(reinterpret_cast<char *>(&byte), sizeof(byte));
+        byte ^= 1;
+        tampered_stream.seekp(static_cast<std::streamoff>(tampered_offset));
+        tampered_stream.write(reinterpret_cast<const char *>(&byte), sizeof(byte));
+        tampered_stream.flush();
+        GGML_ASSERT(tampered_stream.good());
+        GGML_ASSERT(!llama_model_attach_mtp_vocab(model.get(), tampered.string().c_str()));
+
+        GGML_ASSERT(llama_model_attach_mtp_vocab(model.get(), artifact.string().c_str()));
+        GGML_ASSERT(model->output == full_output);
+        GGML_ASSERT(model->mtp_output != nullptr && model->mtp_output->ne[1] == 32);
+        GGML_ASSERT(model->d2t != nullptr && model->d2t->ne[0] == 32);
+        GGML_ASSERT(!llama_model_attach_mtp_vocab(model.get(), artifact.string().c_str()));
+
+        llama_context_params ctx_params = llama_context_default_params();
+        ctx_params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        ctx_params.n_ctx = 8;
+        ctx_params.n_batch = 8;
+        ctx_params.n_ubatch = 8;
+        ctx_params.n_seq_max = 1;
+        ctx_params.n_outputs_max = 1;
+        ctx_params.n_threads = 1;
+        ctx_params.n_threads_batch = 1;
+        llama_context_ptr ctx(llama_init_from_model(model.get(), ctx_params));
+        GGML_ASSERT(ctx != nullptr);
+        ggml_cgraph * gf = llama_graph_reserve(ctx.get(), 1, 1, 1);
+        GGML_ASSERT(gf != nullptr);
+        GGML_ASSERT(ggml_graph_get_tensor(gf, "result_output_d2t") != nullptr);
     }
 
     printf("Qwen3.5 MTP d2t loader/graph contract test PASSED\n");

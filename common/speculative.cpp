@@ -4286,7 +4286,7 @@ common_speculative_init_result::common_speculative_init_result(
                                     COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
     GGML_ASSERT(has_draft || spec_mtp);
 
-    auto mparams = common_model_params_to_llama(params);
+    auto mparams = common_model_params_to_llama(params, common_model_role::speculative_child);
     auto cparams = common_context_params_to_llama(params);
 
     if (spec_mtp) {

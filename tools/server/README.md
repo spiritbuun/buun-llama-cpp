@@ -268,7 +268,7 @@ is forced when `-np > 1`.
 | `--spec-draft-n-cpu-moe, --spec-draft-ncmoe, -ncmoed, --n-cpu-moe-draft N` | keep the Mixture of Experts (MoE) weights of the first N layers in the CPU for the draft model<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE) |
 | `--spec-draft-n-max N` | number of tokens to draft for speculative decoding (default: 3)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MAX) |
 | `--spec-draft-n-min N` | minimum number of draft tokens to use for speculative decoding (default: 0)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MIN) |
-| `--spec-mtp-vocab-size N` | Qwen-27B MTP public balanced vocabulary; 0 disables, 32768 enables (default: 0)<br/>(env: LLAMA_ARG_SPEC_MTP_VOCAB_SIZE) |
+| `--spec-draft-vocab PACK` | Qwen-27B 32K draft vocabulary pack: eng, code, cn, jp, or kr (disabled when omitted; currently requires `--spec-type draft-mtp`)<br/>(env: LLAMA_ARG_SPEC_DRAFT_VOCAB) |
 | `--spec-draft-p-split, --draft-p-split P` | speculative decoding split probability (default: 0.10)<br/>(env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT) |
 | `--spec-draft-p-min, --draft-p-min P` | minimum speculative decoding probability (greedy) (default: 0.00)<br/>(env: LLAMA_ARG_SPEC_DRAFT_P_MIN) |
 | `--spec-draft-backend-sampling, --no-spec-draft-backend-sampling` | offload draft sampling to the backend (default: enabled)<br/>(env: LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING) |

@@ -72,7 +72,8 @@ common_params_fit_status common_fit_params(
            common_moe_cache_params * moe_cache,
                              size_t * margins,               // margins of memory to leave per device in bytes
                            uint32_t   n_ctx_min,             // minimum context size to set when trying to reduce memory use
-                     ggml_log_level   log_level);            // minimum log level to print during fitting, lower levels go to debug log
+                     ggml_log_level   log_level,             // minimum log level to print during fitting, lower levels go to debug log
+                             size_t   output_resident_reserve_bytes = 0); // exact extra bytes resident with the model output tensor
 
 // print estimated memory to stdout
 void common_fit_print(

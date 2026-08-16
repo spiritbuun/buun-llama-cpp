@@ -181,7 +181,6 @@ llama_option_depr(WARNING     LLAMA_CURL)
 
 include("cmake/license.cmake")
 license_add_file("llama.cpp" "LICENSE")
-license_add_file("memra-bench public balanced MTP vocabulary" "licenses/LICENSE-memra-bench")
 
 #
 # 3rd-party

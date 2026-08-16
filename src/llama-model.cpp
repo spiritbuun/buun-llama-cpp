@@ -8,6 +8,7 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
+#include "llama-sha256.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -26,12 +27,15 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
 #include <functional>
+#include <fstream>
+#include <limits>
 #include <map>
 #include <numeric>
 #include <regex>
@@ -2923,6 +2927,221 @@ void llama_model_share_tensors(llama_model * dst, const llama_model * src) {
             out_cp  != nullptr ? "output" : "",
             ggml_backend_buft_name(buft),
             ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0);
+}
+
+static size_t llama_mtp_artifact_read_at(void * userdata, void * output, uint64_t offset, size_t size) {
+    auto & input = *static_cast<std::ifstream *>(userdata);
+    if (offset > static_cast<uint64_t>(std::numeric_limits<std::streamoff>::max())) {
+        return 0;
+    }
+    input.clear();
+    input.seekg(static_cast<std::streamoff>(offset));
+    if (!input) {
+        return 0;
+    }
+    input.read(static_cast<char *>(output), static_cast<std::streamsize>(size));
+    return static_cast<size_t>(input.gcount());
+}
+
+static std::string llama_mtp_artifact_hex(const std::array<uint8_t, 32> & digest) {
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(64);
+    for (uint8_t byte : digest) {
+        result.push_back(hex[byte >> 4]);
+        result.push_back(hex[byte & 0x0f]);
+    }
+    return result;
+}
+
+static bool llama_mtp_artifact_digest_staged(
+        const gguf_context * artifact,
+        int64_t output_id,
+        const std::vector<uint8_t> & output_data,
+        int64_t d2t_id,
+        const std::vector<int32_t> & d2t_data,
+        std::string & digest) {
+    static constexpr const char * domain = "buun.mtp_vocab_trim.semantic_payload/v1";
+    llama_sha256_writer writer;
+    writer.string(domain, std::strlen(domain));
+    const int64_t n_tensors = gguf_get_n_tensors(artifact);
+    writer.u64(static_cast<uint64_t>(n_tensors));
+    for (int64_t i = 0; i < n_tensors; ++i) {
+        const char * name = gguf_get_tensor_name(artifact, i);
+        writer.string(name, std::strlen(name));
+        writer.u32(static_cast<uint32_t>(gguf_get_tensor_type(artifact, i)));
+        const int64_t * ne = gguf_get_tensor_ne(artifact, i);
+        for (size_t dim = 0; dim < 4; ++dim) {
+            writer.u64(static_cast<uint64_t>(ne[dim]));
+        }
+        const uint64_t tensor_size = gguf_get_tensor_size(artifact, i);
+        writer.u64(tensor_size);
+        if (i == output_id && tensor_size == output_data.size()) {
+            writer.bytes(output_data.data(), output_data.size());
+        } else if (i == d2t_id && tensor_size == d2t_data.size() * sizeof(d2t_data[0])) {
+            writer.bytes(d2t_data.data(), d2t_data.size() * sizeof(d2t_data[0]));
+        } else {
+            return false;
+        }
+    }
+    digest = llama_mtp_artifact_hex(writer.finish());
+    return true;
+}
+
+bool llama_model_attach_mtp_vocab(llama_model * model, const char * artifact_path) {
+    if (model == nullptr || artifact_path == nullptr || artifact_path[0] == '\0' ||
+        model->hparams.n_layer_nextn == 0 || model->output == nullptr ||
+        model->output->buffer == nullptr || model->d2t != nullptr || model->mtp_output != nullptr) {
+        return false;
+    }
+
+    // Scaled output formats need a correspondingly compacted scale tensor. The
+    // first Qwen-27B packs support ordinary row-quantized heads only.
+    if (model->output_s != nullptr || ggml_backend_buffer_is_meta(model->output->buffer)) {
+        LLAMA_LOG_WARN("%s: compact native-MTP heads do not support scaled or tensor-split output weights\n",
+                __func__);
+        return false;
+    }
+
+    // Keep metadata validation, digest verification, and upload on one opened
+    // file object. Replacing the cache pathname cannot splice metadata from one
+    // artifact together with payload from another.
+    std::ifstream input(artifact_path, std::ios::binary);
+    if (!input) {
+        return false;
+    }
+    input.seekg(0, std::ios::end);
+    const std::streamoff artifact_size = input.tellg();
+    if (artifact_size <= 0) {
+        return false;
+    }
+    input.seekg(0, std::ios::beg);
+
+    gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+    std::unique_ptr<gguf_context, decltype(&gguf_free)> artifact(
+            gguf_init_from_callback(llama_mtp_artifact_read_at, &input, 1024 * 1024,
+                                    static_cast<uint64_t>(artifact_size), gp), gguf_free);
+    if (!artifact) {
+        LLAMA_LOG_WARN("%s: failed to read compact native-MTP artifact '%s'\n", __func__, artifact_path);
+        return false;
+    }
+
+    const int64_t output_id = gguf_find_tensor(artifact.get(), "output.weight");
+    const int64_t d2t_id    = gguf_find_tensor(artifact.get(), "d2t");
+    if (gguf_get_n_tensors(artifact.get()) != 2 || output_id < 0 || d2t_id < 0) {
+        LLAMA_LOG_WARN("%s: compact native-MTP artifact must contain exactly output.weight and d2t\n", __func__);
+        return false;
+    }
+
+    const int64_t * output_ne = gguf_get_tensor_ne(artifact.get(), output_id);
+    const int64_t * d2t_ne    = gguf_get_tensor_ne(artifact.get(), d2t_id);
+    const int64_t n_draft_vocab = d2t_ne[0];
+    if (gguf_get_tensor_type(artifact.get(), output_id) != model->output->type ||
+        gguf_get_tensor_type(artifact.get(), d2t_id) != GGML_TYPE_I32 ||
+        n_draft_vocab <= 0 || n_draft_vocab > static_cast<int64_t>(model->vocab.n_tokens()) ||
+        output_ne[0] != model->output->ne[0] || output_ne[1] != n_draft_vocab ||
+        output_ne[2] != 1 || output_ne[3] != 1 ||
+        d2t_ne[0] != n_draft_vocab || d2t_ne[1] != 1 || d2t_ne[2] != 1 || d2t_ne[3] != 1) {
+        LLAMA_LOG_WARN("%s: compact native-MTP artifact shape/type does not match the target output\n", __func__);
+        return false;
+    }
+
+    static constexpr const char * payload_key = "buun.mtp_vocab_trim.payload_sha256";
+    const int64_t payload_id = gguf_find_key(artifact.get(), payload_key);
+    if (payload_id < 0 || gguf_get_kv_type(artifact.get(), payload_id) != GGUF_TYPE_STRING) {
+        LLAMA_LOG_WARN("%s: compact native-MTP artifact payload digest is missing\n", __func__);
+        return false;
+    }
+
+    const uint64_t data_offset = gguf_get_data_offset(artifact.get());
+    auto read_tensor = [&](int64_t id, void * data, size_t size) {
+        input.clear();
+        input.seekg(static_cast<std::streamoff>(data_offset + gguf_get_tensor_offset(artifact.get(), id)));
+        input.read(static_cast<char *>(data), static_cast<std::streamsize>(size));
+        return input.good();
+    };
+
+    std::vector<int32_t> map(static_cast<size_t>(n_draft_vocab));
+    if (!read_tensor(d2t_id, map.data(), map.size() * sizeof(map[0]))) {
+        return false;
+    }
+    int32_t previous = -1;
+    for (int32_t token : map) {
+        if (token <= previous || token < 0 || token >= static_cast<int32_t>(model->vocab.n_tokens())) {
+            LLAMA_LOG_WARN("%s: compact native-MTP d2t map is not a sorted target-vocabulary subset\n", __func__);
+            return false;
+        }
+        previous = token;
+    }
+
+    // Stage the compact head once. Some CPU/repacking buffer types only support
+    // a full offset-zero tensor_set; the previous chunked upload could assert.
+    // Hash these exact staged bytes before allocation/publication, so attachment
+    // verifies and uploads the artifact payload in one file pass.
+    std::vector<uint8_t> compact_data;
+    try {
+        compact_data.resize(static_cast<size_t>(gguf_get_tensor_size(artifact.get(), output_id)));
+    } catch (const std::bad_alloc &) {
+        LLAMA_LOG_WARN("%s: insufficient host memory to stage compact native-MTP head\n", __func__);
+        return false;
+    }
+    if (!read_tensor(output_id, compact_data.data(), compact_data.size())) {
+        LLAMA_LOG_WARN("%s: compact native-MTP head payload is truncated\n", __func__);
+        return false;
+    }
+    std::string actual_payload_digest;
+    if (!llama_mtp_artifact_digest_staged(
+                artifact.get(), output_id, compact_data, d2t_id, map, actual_payload_digest) ||
+        actual_payload_digest != gguf_get_val_str(artifact.get(), payload_id)) {
+        LLAMA_LOG_WARN("%s: compact native-MTP artifact payload digest is invalid\n", __func__);
+        return false;
+    }
+
+    ggml_init_params ip = {
+        /*.mem_size   =*/ 2 * ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx { ggml_init(ip) };
+    if (!ctx) {
+        return false;
+    }
+    ggml_tensor * compact = ggml_new_tensor_2d(
+            ctx.get(), model->output->type, model->output->ne[0], n_draft_vocab);
+    ggml_set_name(compact, "mtp_output.weight");
+    ggml_tensor * d2t = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, n_draft_vocab);
+    ggml_set_name(d2t, "d2t");
+
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(model->output->buffer);
+    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
+    if (!buffer) {
+        LLAMA_LOG_WARN("%s: failed to allocate %.2f MiB compact native-MTP head on %s\n",
+                __func__, ggml_nbytes(compact) / 1024.0 / 1024.0, ggml_backend_buft_name(buft));
+        return false;
+    }
+
+    if (compact_data.size() != ggml_nbytes(compact)) {
+        LLAMA_LOG_WARN("%s: compact native-MTP head payload size does not match its tensor shape\n", __func__);
+        return false;
+    }
+    ggml_backend_tensor_set(compact, compact_data.data(), 0, compact_data.size());
+    ggml_backend_tensor_set(d2t, map.data(), 0, map.size() * sizeof(map[0]));
+
+    // Adopt ownership before publishing either pointer. If the owner table cannot
+    // grow, the moved temporary tears the allocation down and the live model remains
+    // untouched on its full output head.
+    try {
+        model->adopt_buffer(std::move(ctx), std::move(buffer));
+    } catch (const std::exception & error) {
+        LLAMA_LOG_WARN("%s: failed to retain compact native-MTP head: %s\n", __func__, error.what());
+        return false;
+    }
+    model->mtp_output = compact;
+    model->d2t        = d2t;
+    LLAMA_LOG_INFO("%s: attached %lld-token native-MTP head from '%s' (%.2f MiB on %s)\n",
+            __func__, (long long) n_draft_vocab, artifact_path, ggml_nbytes(compact) / 1024.0 / 1024.0,
+            ggml_backend_buft_name(buft));
+    return true;
 }
 
 int32_t llama_model_dflash_block_size(const llama_model * model) {

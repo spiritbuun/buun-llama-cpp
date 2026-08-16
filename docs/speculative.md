@@ -55,30 +55,34 @@ For the full and up-to-date list of supported models, see #18039.
 ### Native MTP (`draft-mtp`)
 
 Qwen3.5, Qwen3.6, and Qwen3.8 27B models can use their native next-token-prediction
-layer as an external MTP sidecar. For a standalone Qwen-27B MTP GGUF with a full
-output head, `llama-server` automatically creates a smaller derived sidecar in the
-llama.cpp cache directory. The original GGUF is never modified. Subsequent starts
-reuse the derivative.
+layer directly from a combined GGUF or from an external MTP sidecar. When vocabulary
+trimming is enabled, `llama-server` caches a compact head in the llama.cpp cache
+directory. A combined model keeps sharing its existing token embedding and MTP block;
+only the compact head/map are attached. A supplied sidecar is repacked as a smaller
+child model. The original GGUF is never modified, and subsequent starts reuse the
+artifact; users of a combined model do not manage a sidecar.
 
-The derivative scores a frequency-ranked 32,768-token subset in the draft model and
-maps those logits back to the full target vocabulary with `d2t`. The map is the
-MIT-licensed [public balanced map](https://huggingface.co/Avifenesh/memra-bench/blob/main/mtp-Qwen3.6-27B-Q4_K_M-frspec-balanced32768.gguf)
-from Avifenesh/memra-bench, built from a reproducible 50/50 code-prose corpus for
-the Qwen3.6/3.8 tokenizer family. The target
-model still verifies every proposed token over its complete vocabulary, so speculative
-decoding remains lossless; an omitted draft token can reduce acceptance but cannot
-change accepted target output.
+The compact path scores a frequency-ranked 32,768-token subset in the draft model and
+maps those logits back to the full target vocabulary with `d2t`. Five separately
+measured packs are available: `eng`, `code`, `cn`, `jp`, and `kr`.
+They are intentionally not blended: a user normally spends the whole draft budget on
+one language domain. The target model still verifies every proposed token over its
+complete vocabulary, so speculative decoding remains lossless; an omitted draft token
+can reduce acceptance but cannot change accepted target output.
 
 ```bash
-llama-server -m Qwen3.8-27B.gguf -md mtp-Qwen3.8-27B.gguf \
-    --spec-type draft-mtp --spec-mtp-vocab-size 32768
+llama-server -m Qwen3.8-27B.gguf \
+    --spec-type draft-mtp --spec-draft-vocab eng
 ```
 
-`--spec-mtp-vocab-size` defaults to the measured 32768 map. `0` disables automatic
-repacking. Smaller prefixes are intentionally not exposed: on Qwen3.8-27B with a
-Q4_K_M MTP head, 16K and 8K lost more draft acceptance than their smaller heads saved.
-Unsupported architectures, model sizes, split files, and already-trimmed sidecars
-fall back to their original behavior.
+Draft vocabulary trimming is off when `--spec-draft-vocab` is omitted. It currently requires
+`--spec-type draft-mtp`; the generic flag is reserved for the same DFlash/DSpark facility later.
+Select one of the five packs to enable automatic
+compact-head attachment/repacking. The vocabulary size is fixed at the measured 32K sweet spot:
+smaller heads lost more draft acceptance than they saved. Unsupported architectures,
+model sizes, split files, tensor-split native output heads, and already-trimmed
+sidecars fall back to their original behavior. `-md` remains supported for users who
+already have a standalone MTP GGUF.
 
 ### DFlash (`draft-dflash`)
 
@@ -256,10 +260,11 @@ If a draft model is combined with a draftless decoding the draftless decoding ha
 --spec-draft-n-min                      N
                                         minimum number of draft tokens to use for speculative decoding (default: 0)
                                         (env: LLAMA_ARG_SPEC_DRAFT_N_MIN)
---spec-mtp-vocab-size                   N
-                                        Qwen-27B MTP public balanced vocabulary; 0 disables, 32768 enables
-                                        (default: 32768)
-                                        (env: LLAMA_ARG_SPEC_MTP_VOCAB_SIZE)
+--spec-draft-vocab                      PACK
+                                        Qwen-27B 32K draft vocabulary pack: eng, code, cn, jp, or kr
+                                        (disabled when omitted; currently
+                                        requires --spec-type draft-mtp)
+                                        (env: LLAMA_ARG_SPEC_DRAFT_VOCAB)
 --spec-draft-p-split, --draft-p-split   P
                                         speculative decoding split probability (default: 0.10)
                                         (env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT)

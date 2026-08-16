@@ -335,9 +335,14 @@ struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
 
-    // Qwen-27B MTP-only sidecars: 32768 enables the experimental public
-    // balanced FR-Spec map; 0 keeps the full vocabulary (default).
-    uint32_t mtp_vocab_size = 0;
+    // Fixed 32K Qwen-27B frequency pack. Omission keeps the full vocabulary;
+    // a language name enables automatic extraction/repacking.
+    std::string draft_vocab_pack;
+
+    // Internal cached compact-head artifact for native/shared-weight MTP. The
+    // server resolves this from draft_vocab_pack; it is not a user-facing path.
+    std::string draft_vocab_artifact_path;
+    size_t      draft_vocab_resident_bytes = 0;
 
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
@@ -1133,7 +1138,13 @@ using common_init_result_ptr = std::unique_ptr<common_init_result>;
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only = false);
 
-struct llama_model_params     common_model_params_to_llama  (      common_params & params);
+enum class common_model_role {
+    target,
+    speculative_child,
+};
+
+struct llama_model_params     common_model_params_to_llama  (
+          common_params & params, common_model_role role = common_model_role::target);
 struct llama_context_params   common_context_params_to_llama(const common_params & params);
 struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const common_cpu_params & params);
 

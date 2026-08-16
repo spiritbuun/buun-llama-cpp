@@ -67,7 +67,8 @@ int main(int argc, char ** argv) {
 
         params_dft.tensor_buft_overrides = params.speculative.draft.tensor_buft_overrides;
 
-        auto mparams_dft = common_model_params_to_llama(params_dft);
+        auto mparams_dft = common_model_params_to_llama(
+                params_dft, common_model_role::speculative_child);
 
         model_dft.reset(llama_model_load_from_file(params_dft.model.path.c_str(), mparams_dft));
         if (model_dft == nullptr) {

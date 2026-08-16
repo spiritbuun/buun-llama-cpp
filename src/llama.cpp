@@ -12,6 +12,7 @@
 #include "llama-vram-demand.h"
 
 #include "ggml.h"
+#include "ggml-alloc.h"
 #include "ggml-cpp.h"
 #include "ggml-backend.h"
 #include "gguf.h"
@@ -86,6 +87,51 @@ size_t llama_max_devices(void) {
 
 size_t llama_max_tensor_buft_overrides() {
     return 4096;
+}
+
+bool llama_model_get_output_reserve_info(
+        const struct llama_model * model,
+        size_t semantic_payload_bytes,
+        ggml_backend_buffer_type_t * buft,
+        size_t * allocation_bytes) {
+    if (buft == nullptr || allocation_bytes == nullptr) {
+        return false;
+    }
+    *buft = nullptr;
+    *allocation_bytes = 0;
+    if (model == nullptr || model->output == nullptr || model->output->buffer == nullptr ||
+        semantic_payload_bytes == 0 || model->output->ne[0] <= 0) {
+        return false;
+    }
+
+    const size_t head_row_bytes = ggml_row_size(model->output->type, model->output->ne[0]);
+    if (head_row_bytes > SIZE_MAX - sizeof(int32_t)) {
+        return false;
+    }
+    const size_t bytes_per_row = head_row_bytes + sizeof(int32_t);
+    if (semantic_payload_bytes % bytes_per_row != 0) {
+        return false;
+    }
+    const size_t n_vocab = semantic_payload_bytes / bytes_per_row;
+    if (n_vocab == 0 || n_vocab > static_cast<size_t>(INT64_MAX)) {
+        return false;
+    }
+
+    ggml_init_params params = {
+        /* .mem_size   = */ 2 * ggml_tensor_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context_ptr ctx { ggml_init(params) };
+    if (!ctx) {
+        return false;
+    }
+    ggml_new_tensor_2d(ctx.get(), model->output->type, model->output->ne[0], static_cast<int64_t>(n_vocab));
+    ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, static_cast<int64_t>(n_vocab));
+
+    *buft = ggml_backend_buffer_get_type(model->output->buffer);
+    *allocation_bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), *buft);
+    return *allocation_bytes > 0;
 }
 
 bool llama_supports_mmap(void) {

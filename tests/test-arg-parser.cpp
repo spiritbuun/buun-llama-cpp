@@ -203,19 +203,58 @@ static void test(void) {
 
     {
         common_params default_params;
-        assert(default_params.speculative.draft.mtp_vocab_size == 0);
+        assert(default_params.speculative.draft.draft_vocab_pack.empty());
     }
 
-    argv = {"binary_name", "--spec-mtp-vocab-size", "32768"};
-    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
-    assert(params.speculative.draft.mtp_vocab_size == 32768);
+    for (const char * pack : { "eng", "code", "cn", "jp", "kr" }) {
+        common_params pack_params;
+        argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-vocab", pack};
+        assert(true == common_params_parse(
+                argv.size(), list_str_to_char(argv).data(), pack_params, LLAMA_EXAMPLE_SERVER));
+        assert(pack_params.speculative.draft.draft_vocab_pack == pack);
+    }
 
-    argv = {"binary_name", "--spec-mtp-vocab-size", "0"};
-    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
-    assert(params.speculative.draft.mtp_vocab_size == 0);
+    for (const std::vector<std::string> & invalid : {
+            std::vector<std::string>{"binary_name", "--spec-type", "draft-mtp", "--spec-draft-vocab", "balanced"},
+            std::vector<std::string>{"binary_name", "--spec-type", "draft-mtp", "--spec-draft-vocab", "off"},
+            std::vector<std::string>{"binary_name", "--spec-type", "draft-mtp", "--spec-draft-vocab", "english"},
+            std::vector<std::string>{"binary_name", "--spec-type", "draft-mtp", "--spec-draft-vocab", "japanese"},
+            std::vector<std::string>{"binary_name", "--spec-draft-vocab", "eng"},
+            std::vector<std::string>{"binary_name", "--spec-type", "draft-dflash", "--spec-draft-vocab", "eng"},
+        }) {
+        common_params invalid_params;
+        argv = invalid;
+        assert(false == common_params_parse(
+                argv.size(), list_str_to_char(argv).data(), invalid_params, LLAMA_EXAMPLE_SERVER));
+    }
 
-    argv = {"binary_name", "--spec-mtp-vocab-size", "16384"};
-    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    // Embedded MTP tensors belong to the target only for native MTP. A separate
+    // derivative owns its own MTP tensors, while unrelated drafters never enable
+    // MTP loading for either role.
+    common_params native_mtp;
+    native_mtp.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+    assert(common_model_params_to_llama(native_mtp, common_model_role::target).load_mtp);
+
+    common_params external_mtp = native_mtp;
+    external_mtp.speculative.draft.mparams.path = "mtp-child.gguf";
+    external_mtp.n_gpu_layers = 17;
+    external_mtp.main_gpu = 2;
+    external_mtp.no_host = true;
+    const auto external_target = common_model_params_to_llama(
+            external_mtp, common_model_role::target);
+    const auto external_child = common_model_params_to_llama(
+            external_mtp, common_model_role::speculative_child);
+    assert(!external_target.load_mtp);
+    assert(external_child.load_mtp);
+    assert(external_target.n_gpu_layers == external_child.n_gpu_layers);
+    assert(external_target.main_gpu == external_child.main_gpu);
+    assert(external_target.no_host == external_child.no_host);
+
+    common_params dflash;
+    dflash.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
+    dflash.speculative.draft.mparams.path = "dflash-child.gguf";
+    assert(!common_model_params_to_llama(
+            dflash, common_model_role::speculative_child).load_mtp);
 
     argv = {"binary_name", "-lm", "none"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));

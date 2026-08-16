@@ -90,7 +90,11 @@ add_library(${TARGET}
     llguidance.cpp
     log.cpp
     log.h
-    mtp-vocab-qwen27b-balanced.inc
+    mtp-vocab-qwen27b-chinese.inc
+    mtp-vocab-qwen27b-code.inc
+    mtp-vocab-qwen27b-english.inc
+    mtp-vocab-qwen27b-japanese.inc
+    mtp-vocab-qwen27b-korean.inc
     mtp-vocab-trim.cpp
     mtp-vocab-trim.h
     ngram-cache.cpp

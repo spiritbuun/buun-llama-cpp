@@ -309,7 +309,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         common_vbr_fit_costs * vbr_costs = nullptr,
         bool plan_hint = false,
         std::vector<llama_moe_tensor_info> * moe_tensors = nullptr,
-        llama_context * ctx_parent = nullptr) {
+        llama_context * ctx_parent = nullptr,
+        size_t output_resident_reserve_bytes = 0) {
     common_fit_logger_guard logger_guard(log_level);
 
     llama_model_params mparams_copy = *mparams;
@@ -358,6 +359,46 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
                 break;
             }
         }
+    }
+
+    // Some runtime-only model attachments are not present in the no-alloc dry
+    // model, but are resident beside its output tensor. Charge that payload to the
+    // actual selected buffer owner (including tensor overrides) on every fit probe.
+    // Host buffers land in the trailing host bucket; an unmatched accelerator
+    // output is an accounting error rather than implicit host memory.
+    if (output_resident_reserve_bytes > 0) {
+        ggml_backend_buffer_type_t output_buft = nullptr;
+        size_t output_allocation_bytes = 0;
+        if (!llama_model_get_output_reserve_info(
+                    model.get(), output_resident_reserve_bytes,
+                    &output_buft, &output_allocation_bytes)) {
+            throw std::runtime_error("cannot resolve output allocation for output-resident fit reserve");
+        }
+
+        size_t output_bucket = nd; // host bucket for CPU/host output buffers
+        const ggml_backend_dev_t output_dev = ggml_backend_buft_get_device(output_buft);
+        const bool cpu_output = output_dev != nullptr &&
+                ggml_backend_dev_type(output_dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        if (!ggml_backend_buft_is_host(output_buft) && !cpu_output) {
+            if (output_dev == nullptr) {
+                throw std::runtime_error(std::string("output-resident fit reserve buffer has no device: ") +
+                        ggml_backend_buft_name(output_buft));
+            }
+            for (size_t i = 0; i < nd; ++i) {
+                if (llama_model_get_device(model.get(), i) == output_dev) {
+                    output_bucket = i;
+                    break;
+                }
+            }
+            if (output_bucket == nd) {
+                throw std::runtime_error(std::string("output-resident fit reserve owner is not a model device: ") +
+                        ggml_backend_dev_name(output_dev));
+            }
+        }
+        if (ret[output_bucket].mb.model > SIZE_MAX - output_allocation_bytes) {
+            throw std::runtime_error("output-resident fit reserve overflowed model memory");
+        }
+        ret[output_bucket].mb.model += output_allocation_bytes;
     }
 
     {
@@ -526,7 +567,11 @@ common_device_memory_data_vec common_get_device_memory_data_with_parent(
 
     std::vector<llama_device_memory_data> impl = common_get_device_memory_data_impl(
             path_model, mparams, cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert,
-            log_level, nullptr, ctx_parent.get());
+            log_level,
+            /*vbr_costs=*/nullptr,
+            /*plan_hint=*/false,
+            /*moe_tensors=*/nullptr,
+            ctx_parent.get());
 
     common_device_memory_data_vec ret(impl.size());
     for (size_t i = 0; i < impl.size(); i++) {
@@ -543,7 +588,7 @@ static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
         common_moe_cache_params * moe_cache, size_t * margins_s, uint32_t n_ctx_min, enum ggml_log_level log_level,
-        ggml_type type_k_entry, ggml_type type_v_entry) {
+        ggml_type type_k_entry, ggml_type type_v_entry, size_t output_resident_reserve_bytes) {
     // SPLIT_MODE_TENSOR runs through the single-device paths below: the model exposes exactly one
     // meta device whose memory report is the balanced-equivalent aggregate of the real GPUs (see
     // common_get_device_memory_data_impl) and whose margin is the sum of the per-device targets.
@@ -569,7 +614,8 @@ static void common_params_fit_impl(
     vbr_costs.entry_k = type_k_entry;
     vbr_costs.entry_v = type_v_entry;
     const dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level,
-            cparams->vbr_dynamic ? &vbr_costs : nullptr, /*plan_hint=*/true, &moe_tensors);
+            cparams->vbr_dynamic ? &vbr_costs : nullptr, /*plan_hint=*/true, &moe_tensors,
+            /*ctx_parent=*/nullptr, output_resident_reserve_bytes);
     const size_t nd = devs.size(); // number of devices
 
     // dynamic VBR: measured dry-load KV bytes are PRICE-tier-priced (largest tier <= the floor)
@@ -842,7 +888,9 @@ static void common_params_fit_impl(
         }
 
         cparams->n_ctx = n_ctx_probe;
-        const dmds_t dmds_probe = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+        const dmds_t dmds_probe = common_get_device_memory_data_impl(
+                path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level,
+                nullptr, false, nullptr, nullptr, output_resident_reserve_bytes);
         cparams->n_ctx = 0;
 
         const int64_t ctx_probe = (int64_t) ((double) sum_context_kv_bytes(dmds_probe) * vbr_kv_scale);
@@ -877,7 +925,9 @@ static void common_params_fit_impl(
         }
 
         cparams->n_ctx = n_ctx_probe;
-        const dmds_t dmds_probe = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+        const dmds_t dmds_probe = common_get_device_memory_data_impl(
+                path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level,
+                nullptr, false, nullptr, nullptr, output_resident_reserve_bytes);
         cparams->n_ctx = 0;
 
         uint64_t n_ctx_est = std::numeric_limits<uint64_t>::max();
@@ -1069,7 +1119,9 @@ static void common_params_fit_impl(
 
                     int64_t sum_projected_used_min_ctx = 0;
                     cparams->n_ctx = n_ctx_min;
-                    const dmds_t dmds_min_ctx = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+                    const dmds_t dmds_min_ctx = common_get_device_memory_data_impl(
+                            path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level,
+                            nullptr, false, nullptr, nullptr, output_resident_reserve_bytes);
                     if (nd == 0) {
                         sum_projected_used_min_ctx = dmds_min_ctx.back().mb.total();
                     } else {
@@ -1256,7 +1308,8 @@ static void common_params_fit_impl(
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, mparams_copy);
 
         const dmds_t dmd_nl = common_get_device_memory_data_impl(
-            path_model, &mparams_copy, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+            path_model, &mparams_copy, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level,
+            nullptr, false, nullptr, nullptr, output_resident_reserve_bytes);
 
         LOG_TRC("%s: memory for test allocation by device:\n", func_name);
         for (size_t id = 0; id < nd; id++) {
@@ -1309,7 +1362,8 @@ static void common_params_fit_impl(
         uint32_t candidate_nex = 0;
         candidate_memory = common_get_device_memory_data_impl(
                 path_model, &candidate, cparams, candidate_devs,
-                candidate_ngl, candidate_nct, candidate_nex, log_level);
+                candidate_ngl, candidate_nct, candidate_nex, log_level,
+                nullptr, false, nullptr, nullptr, output_resident_reserve_bytes);
         if (candidate_devs != devs || candidate_memory.size() != nd + 1) {
             return false;
         }
@@ -1336,7 +1390,8 @@ static void common_params_fit_impl(
 
         LOG_TRC("%s: getting device memory data with all MoE tensors moved to system memory:\n", __func__);
         const dmds_t dmds_cpu_moe = common_get_device_memory_data_impl(
-            path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+            path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level,
+            nullptr, false, nullptr, nullptr, output_resident_reserve_bytes);
 
         for (size_t id = 0; id < nd; id++) {
             global_surplus_cpu_moe += dmds_cpu_moe[id].free;
@@ -1715,7 +1770,8 @@ static void common_params_fit_impl(
                     uint32_t c_ngl = 0, c_nct = 0, c_nex = 0;
                     dmds_t candidate_memory = common_get_device_memory_data_impl(
                             path_model, &candidate, cparams, candidate_devs,
-                            c_ngl, c_nct, c_nex, log_level);
+                            c_ngl, c_nct, c_nex, log_level,
+                            nullptr, false, nullptr, nullptr, output_resident_reserve_bytes);
 
                     bool candidate_valid = (candidate_devs == devs && candidate_memory.size() == nd + 1);
                     if (candidate_valid) {
@@ -1853,7 +1909,8 @@ enum common_params_fit_status common_fit_params(
         common_moe_cache_params * moe_cache,
         size_t * margins,
         uint32_t n_ctx_min,
-        ggml_log_level log_level) {
+        ggml_log_level log_level,
+        size_t output_resident_reserve_bytes) {
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
 
@@ -1899,7 +1956,7 @@ enum common_params_fit_status common_fit_params(
 
     try {
         common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, moe_cache, margins, n_ctx_min, log_level,
-                type_k_entry, type_v_entry);
+                type_k_entry, type_v_entry, output_resident_reserve_bytes);
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());

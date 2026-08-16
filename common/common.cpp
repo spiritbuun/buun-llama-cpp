@@ -1297,7 +1297,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             &params.moe_cache,
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
-            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR,
+            params.speculative.draft.draft_vocab_resident_bytes);
         if (fit_status == COMMON_PARAMS_FIT_STATUS_ERROR) {
             throw std::runtime_error(
                 "failed to fit parameters to device memory (hard error); retry with -fit off");
@@ -1346,6 +1347,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 
     pimpl->model.reset(model);
+
+    if (!params.speculative.draft.draft_vocab_artifact_path.empty() &&
+        !llama_model_attach_mtp_vocab(model, params.speculative.draft.draft_vocab_artifact_path.c_str())) {
+        COM_WRN("%s", "failed to attach the requested native-MTP vocabulary pack; using the full output head\n");
+    }
 
     if (model_only) {
         return;
@@ -1730,7 +1736,7 @@ void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adap
     llama_set_adapters_lora(ctx, loras.data(), loras.size(), scales.data());
 }
 
-struct llama_model_params common_model_params_to_llama(common_params & params) {
+struct llama_model_params common_model_params_to_llama(common_params & params, common_model_role role) {
     auto mparams = llama_model_default_params();
 
     if (!params.devices.empty()) {
@@ -1763,7 +1769,13 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback           = params.load_progress_callback;
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
-    mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    const bool spec_mtp = std::find(
+            params.speculative.types.begin(), params.speculative.types.end(),
+            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    // A target exposes embedded MTP tensors only for native MTP. An external MTP
+    // child always owns and loads those tensors from its own GGUF.
+    mparams.load_mtp = spec_mtp &&
+            (role == common_model_role::speculative_child || !params.speculative.has_dft());
 
     return mparams;
 }

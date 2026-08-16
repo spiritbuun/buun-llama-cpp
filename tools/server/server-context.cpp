@@ -4234,31 +4234,53 @@ private:
         params_base = params_load;
         params_base.n_outputs_max = server_n_outputs_max(params_base);
 
-        // Qwen-27B external MTP sidecars can derive and reuse a frequency-prior
-        // vocabulary-trimmed copy. This runs before fit/placement so the first
-        // launch also accounts the smaller LM head. The source GGUF is immutable;
-        // unsupported inputs and conversion failures retain the original path.
-        if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) &&
-            params_base.speculative.has_dft()) {
-            if (params_base.speculative.draft.mtp_vocab_size > 0) {
-                SRV_INF("[spec] checking Qwen MTP vocabulary-trim cache (requested vocab=%u)\n",
-                        params_base.speculative.draft.mtp_vocab_size);
-            }
+        // Qwen-27B MTP can derive and reuse a frequency-prior compact head. A
+        // standalone sidecar is repacked as a smaller child; a combined GGUF emits
+        // only a compact-head artifact which is attached to the native model, so its
+        // token embedding and NextN block remain shared. This runs before fit so the
+        // first launch can reserve the attached head. The source is never modified.
+        const bool draft_vocab_requested =
+                params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) &&
+                !params_base.speculative.draft.draft_vocab_pack.empty();
+        const bool native_vocab_tensor_split =
+                draft_vocab_requested && !params_base.speculative.has_dft() &&
+                params_base.split_mode == LLAMA_SPLIT_MODE_TENSOR;
+        if (draft_vocab_requested && !native_vocab_tensor_split) {
+            SRV_INF("[spec] checking Qwen MTP vocabulary-trim cache (pack=%s, vocab=32768)\n",
+                    params_base.speculative.draft.draft_vocab_pack.c_str());
+            const bool        external_mtp = params_base.speculative.has_dft();
+            const std::string source_path  = external_mtp
+                                           ? params_base.speculative.draft.mparams.path
+                                           : params_base.model.path;
             auto trim = common_mtp_vocab_trim_prepare(
-                    params_base.speculative.draft.mparams.path,
-                    params_base.speculative.draft.mtp_vocab_size);
+                    source_path,
+                    params_base.speculative.draft.draft_vocab_pack);
             if (trim.status == common_mtp_vocab_trim_status::created) {
-                SRV_INF("[spec] created Qwen MTP vocabulary-trim derivative '%s' (%s)\n",
+                SRV_INF("[spec] created Qwen MTP vocabulary-trim artifact '%s' (%s)\n",
                         trim.path.c_str(), trim.detail.c_str());
-                params_base.speculative.draft.mparams.path = std::move(trim.path);
             } else if (trim.status == common_mtp_vocab_trim_status::cached) {
-                SRV_INF("[spec] using cached Qwen MTP vocabulary-trim derivative '%s' (%s)\n",
+                SRV_INF("[spec] using cached Qwen MTP vocabulary-trim artifact '%s' (%s)\n",
                         trim.path.c_str(), trim.detail.c_str());
-                params_base.speculative.draft.mparams.path = std::move(trim.path);
             } else if (trim.status == common_mtp_vocab_trim_status::failed) {
-                SRV_WRN("[spec] Qwen MTP vocabulary trim unavailable: %s; using original sidecar\n",
-                        trim.detail.c_str());
+                SRV_WRN("[spec] Qwen MTP vocabulary trim unavailable: %s; using original %s\n",
+                        trim.detail.c_str(), external_mtp ? "sidecar" : "embedded MTP layer");
+            } else {
+                SRV_WRN("[spec] Qwen MTP vocabulary pack '%s' is not applicable: %s; using original %s\n",
+                        params_base.speculative.draft.draft_vocab_pack.c_str(), trim.detail.c_str(),
+                        external_mtp ? "sidecar" : "embedded MTP layer");
             }
+            if (trim.status == common_mtp_vocab_trim_status::created ||
+                trim.status == common_mtp_vocab_trim_status::cached) {
+                if (trim.native_head) {
+                    params_base.speculative.draft.draft_vocab_artifact_path = std::move(trim.path);
+                    params_base.speculative.draft.draft_vocab_resident_bytes = trim.resident_bytes;
+                } else {
+                    params_base.speculative.draft.mparams.path = std::move(trim.path);
+                }
+            }
+        } else if (native_vocab_tensor_split) {
+            SRV_WRN("%s", "[spec] --spec-draft-vocab does not support tensor-split native output heads; "
+                          "using the full MTP vocabulary without changing fit margins\n");
         }
 
         const bool has_mmproj = !params_base.mmproj.path.empty();
@@ -4272,6 +4294,13 @@ private:
         auto make_params_dft = [&]() -> server_resolved_draft_params {
             common_params params_dft = common_base_params_to_speculative(params_base);
             const bool cpu_dspark_backbone = server_has_cpu_dspark_backbone(params_base);
+            // Tensor split is a target-only topology. Normalize the draft once
+            // here so fit measurement and the eventual child load see identical
+            // devices/buckets instead of measuring a meta device and loading a
+            // layer-split model later.
+            if (params_dft.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+                params_dft.split_mode = LLAMA_SPLIT_MODE_LAYER;
+            }
             if (shared_draft_devices.prepared) {
                 params_dft.devices = shared_draft_devices.devices;
                 params_dft.main_gpu = 0;
@@ -4391,15 +4420,14 @@ private:
         // optionally reserve VRAM for the draft / MTP context before fitting the target model
         if (params_base.fit_params) {
             // Native MTP is context-sized by the target fit, so its reservation is solved after
-            // the speculative n_parallel expansion below.  A separate draft model has no such
-            // dependency and keeps the one-pass measurement here.
+            // the speculative n_parallel expansion below.  Every entry here has a separate
+            // draft path, including external MTP sidecars, and must be measured from that child
+            // GGUF rather than charging a second copy of the target model.
             if (has_draft) {
-                // MTP draft context lives on the target model, only context+compute are new
-                bool measure_model_bytes = has_draft;
-
                 common_params params_dft = std::move(make_params_dft().params);
 
-                auto mparams_dft = common_model_params_to_llama(params_dft);
+                auto mparams_dft = common_model_params_to_llama(
+                        params_dft, common_model_role::speculative_child);
                 auto cparams_dft = common_context_params_to_llama(params_dft);
                 if (spec_mtp) {
                     cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
@@ -4413,7 +4441,7 @@ private:
                 try {
                     auto mparams_tgt = common_model_params_to_llama(params_base);
                     auto cparams_tgt = common_context_params_to_llama(params_base);
-                    const char * path_dft = spec_mtp ? params_base.model.path.c_str() : params_dft.model.path.c_str();
+                    const char * path_dft = params_dft.model.path.c_str();
                     auto measure_spec_memory = [&](const llama_model_params & mparams_measure,
                                                    const llama_model_params & mparams_parent,
                                                    std::vector<ggml_backend_dev_t> & measured_devs,
@@ -4447,7 +4475,7 @@ private:
                         return data;
                     };
 
-                    const llama_model_params & mparams_measure = spec_mtp ? mparams_tgt : mparams_dft;
+                    const llama_model_params & mparams_measure = mparams_dft;
                     auto dmd = measure_spec_memory(
                         mparams_measure, mparams_tgt, devs, hp_ngl, hp_nct, hp_nex);
 
@@ -4456,8 +4484,7 @@ private:
                                                 const std::vector<ggml_backend_dev_t> & devices) {
                         GGML_ASSERT(data.size() >= devices.size());
                         for (size_t i = 0; i < devices.size(); i++) {
-                            const size_t bytes = (measure_model_bytes ? data[i].model : 0) +
-                                                 data[i].context + data[i].compute;
+                            const size_t bytes = data[i].model + data[i].context + data[i].compute;
                             auto found = std::find_if(reservations.begin(), reservations.end(), [&](const auto & entry) {
                                 return entry.first == devices[i];
                             });
@@ -4470,7 +4497,12 @@ private:
                     };
                     add_reservations(dmd, devs);
 
-                    if ((shared_draft_devices.prepared || spec_mtp) && mparams_tgt.split_mode != LLAMA_SPLIT_MODE_NONE &&
+                    // Shared-weight DFlash/DSpark children can move target-owned tensors onto
+                    // the target's main device, so also measure that placement. An external
+                    // MTP sidecar owns its embedding and output tensors and has no such second
+                    // placement; measuring it again would merely duplicate the layer-split
+                    // result (and used to substitute the target GGUF by mistake).
+                    if (shared_draft_devices.prepared && mparams_tgt.split_mode != LLAMA_SPLIT_MODE_NONE &&
                         mparams_tgt.main_gpu >= 0) {
                         try {
                             llama_model_params mparams_tgt_main = mparams_tgt;
@@ -4482,13 +4514,12 @@ private:
                                 mparams_tgt_main.tensor_buft_overrides = mtp_overrides;
                                 mparams_tgt_main.use_extra_bufts = false;
                             }
-                            const llama_model_params & mparams_measure_main = spec_mtp ? mparams_tgt_main : mparams_dft;
                             std::vector<ggml_backend_dev_t> devs_main;
                             uint32_t hp_ngl_main = 0;
                             uint32_t hp_nct_main = 0;
                             uint32_t hp_nex_main = 0;
                             const auto dmd_main = measure_spec_memory(
-                                mparams_measure_main, mparams_tgt_main,
+                                mparams_dft, mparams_tgt_main,
                                 devs_main, hp_ngl_main, hp_nct_main, hp_nex_main);
                             add_reservations(dmd_main, devs_main);
                         } catch (const std::exception & e) {
@@ -4620,7 +4651,8 @@ private:
                         &params_base.moe_cache,
                         margins_work.data(),
                         params_base.fit_params_min_ctx,
-                        params_base.verbosity >= 4 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+                        params_base.verbosity >= 4 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR,
+                        params_base.speculative.draft.draft_vocab_resident_bytes);
                 if (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS || cparams_fit.n_ctx == 0) {
                     return false;
                 }
@@ -4829,13 +4861,18 @@ private:
                         &params_trial.moe_cache,
                         margins_work.data(),
                         params_trial.fit_params_min_ctx,
-                        params_trial.verbosity >= 4 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
-                if (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS || cparams_trial.n_ctx == 0) {
+                        params_trial.verbosity >= 4 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR,
+                        params_trial.speculative.draft.draft_vocab_resident_bytes);
+                if (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
                     return false;
                 }
 
                 common_params params_mtp = params_base;
                 params_mtp.n_parallel = n_parallel_user;
+                // A successful VBR fit deliberately leaves n_ctx == 0 when the full
+                // trained context is reachable at the requested floor.  Preserve that
+                // default for the MTP dry context; its metadata probe below reports the
+                // concrete trained limit used by both contexts.
                 params_mtp.n_ctx = cparams_trial.n_ctx;
                 params_mtp.cache_type_k = params_base.speculative.draft.cache_type_k;
                 params_mtp.cache_type_v = params_base.speculative.draft.cache_type_v;
@@ -4852,6 +4889,9 @@ private:
                 const auto dmd_mtp = common_get_device_memory_data(
                         params_mtp.model.path.c_str(), &mparams_trial, &cparams_mtp,
                         devs_mtp, hp_ngl_mtp, hp_nct_mtp, hp_nex_mtp, GGML_LOG_LEVEL_ERROR);
+                if (hp_nct_mtp == 0) {
+                    return false;
+                }
 
                 margins_needed = margins_base;
                 total_mtp = 0;
@@ -4865,7 +4905,7 @@ private:
                         }
                     }
                 }
-                n_ctx_fit = cparams_trial.n_ctx;
+                n_ctx_fit = cparams_trial.n_ctx != 0 ? cparams_trial.n_ctx : hp_nct_mtp;
                 return true;
             };
 
@@ -5013,16 +5053,8 @@ private:
             params_dft.n_ctx        = params_spec.n_ctx == 0 ? llama_n_ctx_seq(ctx_tgt) : params_spec.n_ctx;
             params_dft.n_batch      = params_dft.n_ctx;
 
-            // SPLIT_MODE_TENSOR is target-only: drafter archs have no meta split rules, and the
-            // hidden-state feed runs through host buffers anyway — run the drafter as a normal
-            // (layer-split or pinned) model; pin with --spec-draft-device to keep it on one GPU
-            if (params_dft.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
-                params_dft.split_mode = LLAMA_SPLIT_MODE_LAYER;
-                SRV_INF("%s", "tensor-split target: draft model falls back to layer split "
-                        "(use --spec-draft-device to pin it to one GPU)\n");
-            }
-
-            auto mparams_dft = common_model_params_to_llama(params_dft);
+            auto mparams_dft = common_model_params_to_llama(
+                    params_dft, common_model_role::speculative_child);
 
             // progress callback
             mparams_dft.progress_callback           = load_progress_callback;

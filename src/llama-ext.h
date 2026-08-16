@@ -19,6 +19,11 @@ LLAMA_API bool llama_memory_try_seq_cp_transient(
         llama_memory_t mem, llama_seq_id seq_id_src, llama_seq_id seq_id_dst,
         llama_pos p0, llama_pos p1);
 
+// Attach a cached compact output head and draft-to-target map to a native MTP
+// model while retaining its shared token embedding and NextN weights.
+LLAMA_API bool llama_model_attach_mtp_vocab(
+        struct llama_model * model, const char * artifact_path);
+
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         struct llama_context * ctx,
@@ -117,6 +122,16 @@ LLAMA_API size_t llama_model_get_moe_tensor_info(
         size_t capacity);
 
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
+
+// Internal fit staging: resolve the actual selected output.weight buffer type
+// after tensor overrides and the exact backend allocation for a compact output
+// payload (head bytes plus one I32 d2t element per row). This is not part of the
+// stable public llama.h API.
+LLAMA_API bool llama_model_get_output_reserve_info(
+        const struct llama_model * model,
+        size_t semantic_payload_bytes,
+        ggml_backend_buffer_type_t * buft,
+        size_t * allocation_bytes);
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
