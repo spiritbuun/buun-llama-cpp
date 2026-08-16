@@ -206,7 +206,7 @@ static void test(void) {
         assert(default_params.speculative.draft.draft_vocab_pack.empty());
     }
 
-    for (const char * pack : { "eng", "code", "cn", "jp", "kr" }) {
+    for (const char * pack : { "mix", "eng", "code", "cn", "jp", "kr" }) {
         common_params pack_params;
         argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-vocab", pack};
         assert(true == common_params_parse(

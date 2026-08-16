@@ -55,6 +55,7 @@ constexpr const char * META_PAYLOAD_SHA256   = "buun.mtp_vocab_trim.payload_sha2
 #include "mtp-vocab-qwen27b-english.inc"
 #include "mtp-vocab-qwen27b-japanese.inc"
 #include "mtp-vocab-qwen27b-korean.inc"
+#include "mtp-vocab-qwen27b-mix.inc"
 
 constexpr size_t bit_count(uint64_t value) {
     size_t count = 0;
@@ -79,10 +80,12 @@ static_assert(qwen27b_map_size(QWEN27B_CODE_VOCAB)     == QWEN_DRAFT_VOCAB_SIZE)
 static_assert(qwen27b_map_size(QWEN27B_CHINESE_VOCAB)  == QWEN_DRAFT_VOCAB_SIZE);
 static_assert(qwen27b_map_size(QWEN27B_JAPANESE_VOCAB) == QWEN_DRAFT_VOCAB_SIZE);
 static_assert(qwen27b_map_size(QWEN27B_KOREAN_VOCAB)   == QWEN_DRAFT_VOCAB_SIZE);
+static_assert(qwen27b_map_size(QWEN27B_MIX_VOCAB)      == QWEN_DRAFT_VOCAB_SIZE);
 
 using qwen27b_vocab = std::array<uint64_t, QWEN_TOKENIZER_SIZE / 64>;
 
 const qwen27b_vocab * qwen27b_vocab_for_pack(const std::string & pack) {
+    if (pack == "mix")      return &QWEN27B_MIX_VOCAB;
     if (pack == "eng")      return &QWEN27B_ENGLISH_VOCAB;
     if (pack == "code")     return &QWEN27B_CODE_VOCAB;
     if (pack == "cn")       return &QWEN27B_CHINESE_VOCAB;

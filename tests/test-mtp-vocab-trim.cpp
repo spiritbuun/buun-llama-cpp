@@ -132,7 +132,7 @@ int main() {
     const auto unsupported_pack = common_mtp_vocab_trim_prepare("missing.gguf", "balanced");
     assert(unsupported_pack.status == common_mtp_vocab_trim_status::failed);
     assert(unsupported_pack.detail == "unknown Qwen-27B MTP vocabulary pack");
-    for (const char * pack : { "eng", "code", "cn", "jp", "kr" }) {
+    for (const char * pack : { "mix", "eng", "code", "cn", "jp", "kr" }) {
         const auto recognized_pack = common_mtp_vocab_trim_prepare("missing.gguf", pack);
         assert(recognized_pack.status == common_mtp_vocab_trim_status::failed);
         assert(recognized_pack.detail == "could not open or identify the MTP source");

@@ -95,6 +95,7 @@ add_library(${TARGET}
     mtp-vocab-qwen27b-english.inc
     mtp-vocab-qwen27b-japanese.inc
     mtp-vocab-qwen27b-korean.inc
+    mtp-vocab-qwen27b-mix.inc
     mtp-vocab-trim.cpp
     mtp-vocab-trim.h
     ngram-cache.cpp

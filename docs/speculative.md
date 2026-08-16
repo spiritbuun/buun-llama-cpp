@@ -63,21 +63,21 @@ child model. The original GGUF is never modified, and subsequent starts reuse th
 artifact; users of a combined model do not manage a sidecar.
 
 The compact path scores a frequency-ranked 32,768-token subset in the draft model and
-maps those logits back to the full target vocabulary with `d2t`. Five separately
-measured packs are available: `eng`, `code`, `cn`, `jp`, and `kr`.
-They are intentionally not blended: a user normally spends the whole draft budget on
-one language domain. The target model still verifies every proposed token over its
+maps those logits back to the full target vocabulary with `d2t`. Six separately
+measured packs are available: `mix`, `eng`, `code`, `cn`, `jp`, and `kr`.
+`mix` is the general-purpose 50/50 English+code profile. The other packs spend the
+whole draft budget on one language or code domain. The target model still verifies every proposed token over its
 complete vocabulary, so speculative decoding remains lossless; an omitted draft token
 can reduce acceptance but cannot change accepted target output.
 
 ```bash
 llama-server -m Qwen3.8-27B.gguf \
-    --spec-type draft-mtp --spec-draft-vocab eng
+    --spec-type draft-mtp --spec-draft-vocab mix
 ```
 
 Draft vocabulary trimming is off when `--spec-draft-vocab` is omitted. It currently requires
 `--spec-type draft-mtp`; the generic flag is reserved for the same DFlash/DSpark facility later.
-Select one of the five packs to enable automatic
+Select one of the six packs to enable automatic
 compact-head attachment/repacking. The vocabulary size is fixed at the measured 32K sweet spot:
 smaller heads lost more draft acceptance than they saved. Unsupported architectures,
 model sizes, split files, tensor-split native output heads, and already-trimmed
@@ -261,7 +261,7 @@ If a draft model is combined with a draftless decoding the draftless decoding ha
                                         minimum number of draft tokens to use for speculative decoding (default: 0)
                                         (env: LLAMA_ARG_SPEC_DRAFT_N_MIN)
 --spec-draft-vocab                      PACK
-                                        Qwen-27B 32K draft vocabulary pack: eng, code, cn, jp, or kr
+                                        Qwen-27B 32K draft vocabulary pack: mix, eng, code, cn, jp, or kr
                                         (disabled when omitted; currently
                                         requires --spec-type draft-mtp)
                                         (env: LLAMA_ARG_SPEC_DRAFT_VOCAB)

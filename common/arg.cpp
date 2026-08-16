@@ -5004,15 +5004,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
     add_opt(common_arg(
         {"--spec-draft-vocab"}, "PACK",
-        "Qwen-27B 32K draft vocabulary pack: eng, code, cn, jp, or kr "
+        "Qwen-27B 32K draft vocabulary pack: mix, eng, code, cn, jp, or kr "
         "(disabled when omitted; currently requires --spec-type draft-mtp)",
         [](common_params & params, const std::string & value) {
-            static const std::array<const char *, 5> packs = {
-                "eng", "code", "cn", "jp", "kr",
+            static const std::array<const char *, 6> packs = {
+                "mix", "eng", "code", "cn", "jp", "kr",
             };
             if (std::find(packs.begin(), packs.end(), value) == packs.end()) {
                 throw std::invalid_argument(
-                    "--spec-draft-vocab must be eng, code, cn, jp, or kr");
+                    "--spec-draft-vocab must be mix, eng, code, cn, jp, or kr");
             }
             params.speculative.draft.draft_vocab_pack = value;
         }
