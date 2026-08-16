@@ -613,10 +613,16 @@ struct llama_model {
     struct ggml_tensor * d2t        = nullptr;  // draft to target vocabulary mapping
 
     // dspark
+    struct ggml_tensor * dspark_output_compact    = nullptr;
+    struct ggml_tensor * dspark_markov_w1_compact = nullptr;
+    struct ggml_tensor * dspark_markov_w2_compact = nullptr;
+    struct ggml_tensor * dspark_t2d               = nullptr;
     struct ggml_tensor * dspark_markov_w1   = nullptr;
     struct ggml_tensor * dspark_markov_w2   = nullptr;
     struct ggml_tensor * dspark_conf_proj   = nullptr;
     struct ggml_tensor * dspark_conf_proj_b = nullptr;
+    std::vector<int32_t>  draft_to_target_vocab;
+    std::vector<int32_t>  target_to_draft_vocab;
 
     // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
     std::vector<int32_t> target_layer_ids;

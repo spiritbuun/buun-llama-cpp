@@ -5237,6 +5237,14 @@ private:
                 llama_model_share_tensors(model_dft.get(), llama_get_model(ctx_tgt));
             }
 
+            if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)) {
+                if (const char * map_path = std::getenv("GGML_DSPARK_VOCAB_MAP")) {
+                    if (!llama_model_attach_dspark_vocab(model_dft.get(), map_path)) {
+                        SRV_WRN("[spec] failed to attach DSpark vocabulary map '%s'; using full vocabulary\n", map_path);
+                    }
+                }
+            }
+
             // Upstream block-diffusion DFlash / DSpark: create the drafter context here
             // (it shares tok_embd/output with the target through cparams_dft.ctx_other)
             // and wire the draft params so the shared speculative init below picks the

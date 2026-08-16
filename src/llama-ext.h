@@ -24,6 +24,19 @@ LLAMA_API bool llama_memory_try_seq_cp_transient(
 LLAMA_API bool llama_model_attach_mtp_vocab(
         struct llama_model * model, const char * artifact_path);
 
+// Experimental load-time DSpark vocabulary pack. The map file is a packed
+// little-endian I32 draft-to-target token list. The target output and both
+// Markov tables are gathered into compact tensors without modifying either
+// source GGUF.
+LLAMA_API bool llama_model_attach_dspark_vocab(
+        struct llama_model * model, const char * map_path);
+
+LLAMA_API llama_token llama_model_draft_token_to_target(
+        const struct llama_model * model, llama_token token);
+
+LLAMA_API llama_token llama_model_target_token_to_draft(
+        const struct llama_model * model, llama_token token);
+
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         struct llama_context * ctx,

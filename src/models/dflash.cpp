@@ -27,6 +27,26 @@ static void build_dflash_draft_argmax(llm_graph_context & g) {
     ggml_build_forward_expand(g.gf, t);
 }
 
+static void build_dflash_restore_dense_vocab(llm_graph_context & g, const llama_model & model) {
+    if (model.d2t == nullptr || model.dspark_output_compact == nullptr ||
+        g.cparams.dflash_argmax || g.res->t_logits == nullptr) {
+        return;
+    }
+
+    ggml_tensor * cur = g.res->t_logits;
+    const int64_t n_draft_vocab = cur->ne[0];
+    const int64_t n_outputs     = cur->ne[1];
+    const int64_t n_vocab_full  = static_cast<int64_t>(model.vocab.n_tokens());
+    GGML_ASSERT(model.d2t->ne[0] == n_draft_vocab);
+    ggml_tensor * logits = ggml_fill(g.ctx0,
+            ggml_new_tensor_3d(g.ctx0, GGML_TYPE_F32, 1, n_vocab_full, n_outputs), -INFINITY);
+    cur = ggml_set_rows(g.ctx0, logits,
+            ggml_reshape_3d(g.ctx0, cur,       1,             n_draft_vocab, n_outputs),
+            ggml_reshape_3d(g.ctx0, model.d2t, n_draft_vocab, 1,             1));
+    g.res->t_logits = ggml_reshape_2d(g.ctx0, cur, n_vocab_full, n_outputs);
+    ggml_build_forward_expand(g.gf, g.res->t_logits);
+}
+
 void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -309,7 +329,10 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     auto         & res  = g.res;
 
     ggml_tensor * w1 = model.dspark_markov_w1;
-    ggml_tensor * w2 = model.dspark_markov_w2;
+    ggml_tensor * w1_compact = model.dspark_markov_w1_compact;
+    ggml_tensor * w2 = model.dspark_markov_w2_compact
+            ? model.dspark_markov_w2_compact
+            : model.dspark_markov_w2;
     GGML_ASSERT(w1 && w2 && model.dspark_conf_proj && "DSpark markov/confidence weights not loaded");
 
     ggml_tensor * base = res->t_logits; // [n_vocab, n_tokens]
@@ -338,6 +361,11 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
 
     ggml_tensor * prev = ggml_view_2d(ctx0, tokens, 1, n_blocks, token_stride, 0);
     prev = ggml_cont_1d(ctx0, prev, n_blocks);
+    if (model.dspark_t2d) {
+        GGML_ASSERT(w1_compact);
+        prev = ggml_get_rows(ctx0, model.dspark_t2d, prev);
+        prev = ggml_cont_1d(ctx0, prev, n_blocks);
+    }
 
     // confidence head input: predicts per-position acceptance
     ggml_tensor * conf_inp = res->t_embd; // [n_embd, n_tok]
@@ -348,7 +376,7 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
     // TODO: the in-graph chain is greedy (argmax); sampling params affect only the final
     //       token pick, not the Markov conditioning path
     for (int64_t i = 0; i < block_drafts; ++i) {
-        ggml_tensor * w1_prev = ggml_get_rows(ctx0, w1, prev);   // [R, n_blocks]
+        ggml_tensor * w1_prev = ggml_get_rows(ctx0, w1_compact ? w1_compact : w1, prev); // [R, n_blocks]
         ggml_tensor * bias    = ggml_mul_mat(ctx0, w2, w1_prev); // [n_vocab, n_blocks]
 
         // position i of every block: strided view [n_vocab, n_blocks]
@@ -594,7 +622,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     // lm_head from the target model — see the tok_embd note above (share_tensors
     // provides a drafter-schedulable model.output; the fallback is not device-safe)
-    auto * output = model.output;
+    auto * output = model.dspark_output_compact ? model.dspark_output_compact : model.output;
     if (output == nullptr) {
         GGML_ASSERT(cparams.ctx_other != nullptr);
         const auto * model_other = llama_get_model(cparams.ctx_other);
@@ -617,6 +645,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         build_dspark_markov_head(*this, model, tok);
     }
 
+    build_dflash_restore_dense_vocab(*this, model);
     build_dflash_draft_argmax(*this);
 }
 
@@ -799,7 +828,7 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
 
     // lm_head from the target model — see the tok_embd note above (share_tensors
     // provides a drafter-schedulable model.output; the fallback is not device-safe)
-    auto * output = model.output;
+    auto * output = model.dspark_output_compact ? model.dspark_output_compact : model.output;
     if (output == nullptr) {
         GGML_ASSERT(cparams.ctx_other != nullptr);
         const auto * model_other = llama_get_model(cparams.ctx_other);
@@ -821,5 +850,6 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
         build_dspark_markov_head(*this, model, tok);
     }
 
+    build_dflash_restore_dense_vocab(*this, model);
     build_dflash_draft_argmax(*this);
 }

@@ -1566,6 +1566,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
 
+        // A compact DSpark Markov table has no row for an anchor outside its
+        // vocabulary. Skip this cycle; the target token remains authoritative,
+        // and drafting can resume when the next committed token is represented.
+        if (is_dspark) {
+            const auto * model_dft = llama_get_model(ctx_dft);
+            for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+                if (dparams[s].drafting &&
+                    llama_model_target_token_to_draft(model_dft, dparams[s].id_last) == LLAMA_TOKEN_NULL) {
+                    dparams[s].drafting = false;
+                }
+            }
+        }
+
         // phase C: fuse the deferred injection into this decode when the batch has the
         // single-drafting-seq shape (the server drives this path per slot). Other
         // shapes flush their stashes standalone and keep the two-decode path.
@@ -1764,7 +1777,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
 
                     if (g_ids) {
-                        const llama_token id = (llama_token) g_ids[(size_t) row * g_K];
+                        const llama_token id = llama_model_draft_token_to_target(
+                                llama_get_model(ctx_dft), (llama_token) g_ids[(size_t) row * g_K]);
+                        if (id == LLAMA_TOKEN_NULL) {
+                            break;
+                        }
                         LOG_DBG(" - seq_id %d, draft pos %3d: %6d (lp %8.3f) '%s'\n",
                                 seq_id, i, id, g_lps[(size_t) row * g_K],
                                 common_token_to_piece(ctx_dft, id).c_str());
@@ -1793,7 +1810,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
                     if (g_ids) {
                         const int32_t row = beg + i - out_off; // argmax rows are output rows
-                        const llama_token id = (llama_token) g_ids[(size_t) row * g_K];
+                        const llama_token id = llama_model_draft_token_to_target(
+                                llama_get_model(ctx_dft), (llama_token) g_ids[(size_t) row * g_K]);
+                        if (id == LLAMA_TOKEN_NULL) {
+                            break;
+                        }
                         if (params.p_min > 0.0f && gpu_top_p(row) < params.p_min) {
                             break;
                         }

@@ -3144,6 +3144,166 @@ bool llama_model_attach_mtp_vocab(llama_model * model, const char * artifact_pat
     return true;
 }
 
+bool llama_model_attach_dspark_vocab(llama_model * model, const char * map_path) {
+    if (model == nullptr || map_path == nullptr || map_path[0] == '\0' ||
+        model->arch != LLM_ARCH_DFLASH || model->output == nullptr ||
+        model->dspark_markov_w1 == nullptr || model->dspark_markov_w2 == nullptr ||
+        model->dspark_output_compact != nullptr || model->d2t != nullptr) {
+        return false;
+    }
+
+    const int64_t n_vocab = static_cast<int64_t>(model->vocab.n_tokens());
+    auto * output = model->output;
+    auto * w1     = model->dspark_markov_w1;
+    auto * w2     = model->dspark_markov_w2;
+    if (output->buffer == nullptr || w1->buffer == nullptr || w2->buffer == nullptr ||
+        output->ne[1] != n_vocab || w1->ne[1] != n_vocab || w2->ne[1] != n_vocab ||
+        output->ne[2] != 1 || w1->ne[2] != 1 || w2->ne[2] != 1 ||
+        output->ne[3] != 1 || w1->ne[3] != 1 || w2->ne[3] != 1 ||
+        ggml_backend_buffer_is_meta(output->buffer)) {
+        LLAMA_LOG_WARN("%s: DSpark compact vocabulary requires ordinary 2D output/Markov tensors\n", __func__);
+        return false;
+    }
+
+    std::ifstream input(map_path, std::ios::binary | std::ios::ate);
+    if (!input) {
+        LLAMA_LOG_WARN("%s: failed to open DSpark vocabulary map '%s'\n", __func__, map_path);
+        return false;
+    }
+    const std::streamoff map_bytes = input.tellg();
+    if (map_bytes <= 0 || map_bytes % static_cast<std::streamoff>(sizeof(int32_t)) != 0) {
+        LLAMA_LOG_WARN("%s: malformed DSpark vocabulary map '%s'\n", __func__, map_path);
+        return false;
+    }
+    const size_t n_draft_vocab = static_cast<size_t>(map_bytes) / sizeof(int32_t);
+    if (n_draft_vocab >= static_cast<size_t>(n_vocab)) {
+        LLAMA_LOG_WARN("%s: DSpark vocabulary map is not smaller than the target vocabulary\n", __func__);
+        return false;
+    }
+    std::vector<int32_t> map(n_draft_vocab);
+    input.seekg(0);
+    input.read(reinterpret_cast<char *>(map.data()), map_bytes);
+    if (!input) {
+        return false;
+    }
+    std::vector<uint8_t> seen(static_cast<size_t>(n_vocab), 0);
+    for (int32_t token : map) {
+        if (token < 0 || token >= n_vocab || seen[static_cast<size_t>(token)]++) {
+            LLAMA_LOG_WARN("%s: DSpark vocabulary map contains an invalid or duplicate token\n", __func__);
+            return false;
+        }
+    }
+
+    auto gather_rows = [&](const ggml_tensor * source, std::vector<uint8_t> & compact) {
+        const size_t row_size = ggml_row_size(source->type, source->ne[0]);
+        if (source->nb[1] != row_size || ggml_nbytes(source) != row_size * static_cast<size_t>(n_vocab)) {
+            return false;
+        }
+        std::vector<uint8_t> full(ggml_nbytes(source));
+        ggml_backend_tensor_get(source, full.data(), 0, full.size());
+        compact.resize(row_size * n_draft_vocab);
+        for (size_t i = 0; i < n_draft_vocab; ++i) {
+            std::memcpy(compact.data() + i * row_size,
+                        full.data() + static_cast<size_t>(map[i]) * row_size,
+                        row_size);
+        }
+        return true;
+    };
+
+    std::vector<uint8_t> output_data;
+    std::vector<uint8_t> w1_data;
+    std::vector<uint8_t> w2_data;
+    try {
+        if (!gather_rows(output, output_data) || !gather_rows(w1, w1_data) || !gather_rows(w2, w2_data)) {
+            LLAMA_LOG_WARN("%s: DSpark vocabulary source tensors are not row-contiguous\n", __func__);
+            return false;
+        }
+    } catch (const std::bad_alloc &) {
+        LLAMA_LOG_WARN("%s: insufficient host memory to build the DSpark vocabulary pack\n", __func__);
+        return false;
+    }
+
+    ggml_init_params ip = {
+        /*.mem_size   =*/ 5 * ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx { ggml_init(ip) };
+    if (!ctx) {
+        return false;
+    }
+    ggml_tensor * output_compact = ggml_new_tensor_2d(ctx.get(), output->type, output->ne[0], n_draft_vocab);
+    ggml_tensor * w1_compact     = ggml_new_tensor_2d(ctx.get(), w1->type,     w1->ne[0],     n_draft_vocab);
+    ggml_tensor * w2_compact     = ggml_new_tensor_2d(ctx.get(), w2->type,     w2->ne[0],     n_draft_vocab);
+    ggml_tensor * d2t            = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, n_draft_vocab);
+    ggml_tensor * t2d            = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 1, n_vocab);
+    ggml_set_name(output_compact, "dspark.output_compact");
+    ggml_set_name(w1_compact,     "dspark.markov_w1_compact");
+    ggml_set_name(w2_compact,     "dspark.markov_w2_compact");
+    ggml_set_name(d2t,            "d2t");
+    ggml_set_name(t2d,            "dspark.t2d");
+
+    const auto buft = ggml_backend_buffer_get_type(output->buffer);
+    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
+    if (!buffer) {
+        LLAMA_LOG_WARN("%s: failed to allocate compact DSpark vocabulary tensors on %s\n",
+                __func__, ggml_backend_buft_name(buft));
+        return false;
+    }
+    ggml_backend_tensor_set(output_compact, output_data.data(), 0, output_data.size());
+    ggml_backend_tensor_set(w1_compact,     w1_data.data(),     0, w1_data.size());
+    ggml_backend_tensor_set(w2_compact,     w2_data.data(),     0, w2_data.size());
+    ggml_backend_tensor_set(d2t,            map.data(),         0, map.size() * sizeof(map[0]));
+    std::vector<int32_t> inverse(static_cast<size_t>(n_vocab), LLAMA_TOKEN_NULL);
+    for (size_t draft = 0; draft < map.size(); ++draft) {
+        inverse[static_cast<size_t>(map[draft])] = static_cast<int32_t>(draft);
+    }
+    std::vector<int32_t> inverse_device = inverse;
+    std::replace(inverse_device.begin(), inverse_device.end(), LLAMA_TOKEN_NULL, 0);
+    ggml_backend_tensor_set(t2d, inverse_device.data(), 0, inverse_device.size() * sizeof(inverse_device[0]));
+
+    try {
+        model->adopt_buffer(std::move(ctx), std::move(buffer));
+    } catch (const std::exception & error) {
+        LLAMA_LOG_WARN("%s: failed to retain compact DSpark vocabulary tensors: %s\n", __func__, error.what());
+        return false;
+    }
+    model->dspark_output_compact    = output_compact;
+    model->dspark_markov_w1_compact = w1_compact;
+    model->dspark_markov_w2_compact = w2_compact;
+    model->dspark_t2d               = t2d;
+    model->d2t                      = d2t;
+    model->draft_to_target_vocab    = std::move(map);
+    model->target_to_draft_vocab    = std::move(inverse);
+    LLAMA_LOG_INFO("%s: attached %zu-token DSpark vocabulary pack from '%s' (%.2f MiB on %s)\n",
+            __func__, n_draft_vocab, map_path,
+            (ggml_nbytes(output_compact) + ggml_nbytes(w1_compact) + ggml_nbytes(w2_compact) +
+                    ggml_nbytes(d2t) + ggml_nbytes(t2d)) /
+                    1024.0 / 1024.0,
+            ggml_backend_buft_name(buft));
+    return true;
+}
+
+llama_token llama_model_draft_token_to_target(const llama_model * model, llama_token token) {
+    if (model == nullptr || model->draft_to_target_vocab.empty()) {
+        return token;
+    }
+    if (token < 0 || static_cast<size_t>(token) >= model->draft_to_target_vocab.size()) {
+        return LLAMA_TOKEN_NULL;
+    }
+    return model->draft_to_target_vocab[static_cast<size_t>(token)];
+}
+
+llama_token llama_model_target_token_to_draft(const llama_model * model, llama_token token) {
+    if (model == nullptr || model->target_to_draft_vocab.empty()) {
+        return token;
+    }
+    if (token < 0 || static_cast<size_t>(token) >= model->target_to_draft_vocab.size()) {
+        return LLAMA_TOKEN_NULL;
+    }
+    return model->target_to_draft_vocab[static_cast<size_t>(token)];
+}
+
 int32_t llama_model_dflash_block_size(const llama_model * model) {
     return (int32_t) model->hparams.dflash_block_size;
 }
