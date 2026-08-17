@@ -6,18 +6,6 @@
 
 #include <cstdint>
 
-// RDNA4 (gfx1201, wave32, VGPR-limited): ROCm-LLVM fully unrolls the register-heavy turbo dequant
-// load/dot inner loops and spills to scratch, tanking throughput (same pathology upstream fixed for
-// MMQ in PR #25940). Serialize those loops on HIP only. NVIDIA keeps full unroll (the tuned 3090
-// optimum — _Pragma("unroll") is byte-identical to the previous "#pragma unroll", so sm_* is
-// untouched). A/B: this branch serializes; baseline = master (full unroll). For a bounded sweep,
-// change the "1" below to 4 or 8 and rebuild. See weekly-runs/rdna4_turbo_mma_unroll_audit.md.
-#if defined(__HIP_PLATFORM_AMD__) || defined(GGML_USE_HIP)
-#  define TURBO_FA_LOAD_PRAGMA _Pragma("unroll 1")
-#else
-#  define TURBO_FA_LOAD_PRAGMA _Pragma("unroll")
-#endif
-
 static __constant__ float d_turbo_centroids_2bit_fattn[4] = {
     -0.133462f, -0.039994f, 0.039994f, 0.133462f
 };
