@@ -552,6 +552,49 @@ static inline uint8_t ggml_fp32_to_ue4m3(float x) {
     return (uint8_t) ((ue4m3_exp << 3) | ue4m3_man);
 }
 
+// Signed E4M3FN as used by CUDA/PyTorch float8_e4m3fn. Unlike the unsigned
+// NVFP4 scale encoding above, exponent 15 is finite except for mantissa 7.
+static inline float ggml_e4m3_to_fp32(uint8_t x) {
+    const int sign = x >> 7;
+    const int exp  = (x >> 3) & 0x0f;
+    const int man  = x & 0x07;
+
+    if (exp == 0x0f && man == 0x07) {
+        return NAN;
+    }
+
+    const float value = exp == 0
+        ? ldexpf((float) man, -9)
+        : ldexpf(1.0f + (float) man / 8.0f, exp - 7);
+    return sign ? -value : value;
+}
+
+static inline uint8_t ggml_fp32_to_e4m3(float x) {
+    if (isnan(x)) {
+        return signbit(x) ? 0xff : 0x7f;
+    }
+
+    const uint8_t sign = signbit(x) ? 0x80 : 0x00;
+    const float ax = fabsf(x);
+    if (isinf(ax)) {
+        return sign | 0x7e;
+    }
+    uint8_t best = 0;
+    float best_err = ax;
+
+    // Reference conversion. Model loading preserves source bytes and does not
+    // call this deliberately simple, deterministic path.
+    for (uint8_t code = 1; code < 0x7f; ++code) {
+        const float candidate = ggml_e4m3_to_fp32(code);
+        const float err = fabsf(candidate - ax);
+        if (err < best_err || (err == best_err && (code & 1) == 0)) {
+            best = code;
+            best_err = err;
+        }
+    }
+    return sign | best;
+}
+
 /**
  * Converts brain16 to float32.
  *

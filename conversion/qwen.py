@@ -547,6 +547,40 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
 
         return weight, scale
 
+    def _transform_fp8_channel_weight(self, name: str, weight: Tensor, scale: Tensor) -> tuple[Tensor, Tensor]:
+        if "linear_attn." not in name:
+            return weight, scale
+
+        num_k_heads = self.hparams["linear_num_key_heads"]
+        num_v_heads = self.hparams["linear_num_value_heads"]
+        if num_k_heads == num_v_heads:
+            return weight, scale
+
+        head_k_dim = self.hparams["linear_key_head_dim"]
+        head_v_dim = self.hparams["linear_value_head_dim"]
+        num_v_per_k = num_v_heads // num_k_heads
+
+        def reorder_rows(tensor: Tensor, head_dim: int) -> Tensor:
+            return self._reorder_v_heads(tensor, 0, num_k_heads, num_v_per_k, head_dim)
+
+        if name.endswith(".linear_attn.in_proj_qkv.weight"):
+            q_dim = head_k_dim * num_k_heads
+            k_dim = head_k_dim * num_k_heads
+            q, k, v = torch.split(weight, [q_dim, k_dim, weight.shape[0] - q_dim - k_dim], dim=0)
+            qs, ks, vs = torch.split(scale, [q_dim, k_dim, scale.shape[0] - q_dim - k_dim], dim=0)
+            weight = torch.cat([q, k, reorder_rows(v, head_v_dim)], dim=0)
+            scale = torch.cat([qs, ks, reorder_rows(vs, head_v_dim)], dim=0)
+        elif name.endswith(".linear_attn.in_proj_z.weight"):
+            weight = reorder_rows(weight, head_v_dim)
+            scale = reorder_rows(scale, head_v_dim)
+        elif name.endswith((".linear_attn.in_proj_a.weight", ".linear_attn.in_proj_b.weight")):
+            weight = reorder_rows(weight, 1)
+            scale = reorder_rows(scale, 1)
+        elif name.endswith(".linear_attn.out_proj.weight"):
+            weight = self._reorder_v_heads(weight, 1, num_k_heads, num_v_per_k, head_v_dim)
+
+        return weight.contiguous(), scale.contiguous()
+
     def _repack_nvfp4(self, name: str, weight: Tensor, scale: Tensor, scale2: Tensor, input_scale: Tensor):
         weight, scale = self._transform_nvfp4_weight(name, weight, scale)
         super()._repack_nvfp4(name, weight, scale, scale2, input_scale)

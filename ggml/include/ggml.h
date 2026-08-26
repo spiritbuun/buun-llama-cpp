@@ -443,7 +443,8 @@ extern "C" {
         GGML_TYPE_TURBO1_CQ = 51, // RESERVED (codec removed 2026-07-05)
         GGML_TYPE_TURBO1_TCQ = 52, // turbo1 Trellis-Coded: FWHT + k=1/L=8 trellis, separate K/V 256-state codebooks (1.25 bpw)
         GGML_TYPE_Q2_0_G128 = 53, // 2-bit ternary weight quant, group-128 (PrismML Bonsai; on-disk type-42 remapped here at load)
-        GGML_TYPE_COUNT   = 54,
+        GGML_TYPE_F8_E4M3 = 54, // raw signed E4M3FN weights; external per-channel scale is a separate tensor
+        GGML_TYPE_COUNT   = 55,
     };
 
     // precision

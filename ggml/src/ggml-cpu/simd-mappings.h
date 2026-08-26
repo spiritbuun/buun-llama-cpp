@@ -124,6 +124,10 @@ extern float ggml_table_f32_e8m0_half[1 << 8];
 // defined in ggml-cpu.c, initialized in ggml_cpu_init()
 extern float ggml_table_f32_ue4m3[1 << 8];
 
+// precomputed f32 table for signed E4M3FN (1 KB)
+// defined in ggml-cpu.c, initialized in ggml_cpu_init()
+extern float ggml_table_f32_e4m3[1 << 8];
+
 // Use lookup table for E8M0 on x86 (faster than bit manipulation)
 #if defined(__AVX__) || defined(__AVX2__) || defined(__AVX512F__)
 #define GGML_CPU_E8M0_TO_FP32_HALF(x) ggml_table_f32_e8m0_half[(uint8_t)(x)]
@@ -137,6 +141,8 @@ extern float ggml_table_f32_ue4m3[1 << 8];
 #else
 #define GGML_CPU_UE4M3_TO_FP32(x) ggml_ue4m3_to_fp32(x)
 #endif
+
+#define GGML_CPU_E4M3_TO_FP32(x) ggml_table_f32_e4m3[(uint8_t)(x)]
 
 // On ARM NEON, it's quicker to directly convert x -> x instead of calling into ggml_lookup_fp16_to_fp32,
 // so we define GGML_CPU_FP16_TO_FP32 and GGML_CPU_FP32_TO_FP16 elsewhere for NEON.

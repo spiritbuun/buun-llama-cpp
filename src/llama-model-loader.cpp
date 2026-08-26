@@ -819,7 +819,18 @@ llama_model_loader::llama_model_loader(
     }
 
     n_kv      = gguf_get_n_kv(metadata);
-    n_tensors = weights_map.size();
+    n_tensors = files.empty() ? gguf_get_n_tensors(metadata) : weights_map.size();
+    if (files.empty()) {
+        for (int64_t i = 0; i < n_tensors; ++i) {
+            const int64_t * ne = gguf_get_tensor_ne(metadata, i);
+            size_t elements = 1;
+            for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+                elements *= static_cast<size_t>(ne[dim]);
+            }
+            n_elements += elements;
+            n_bytes += gguf_get_tensor_size(metadata, i);
+        }
+    }
 
     fver = (enum llama_fver) gguf_get_version(metadata);
 
@@ -1238,9 +1249,6 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             int max_n_tensors = n_tensors;
             max_n_tensors += 1;                   // duplicated output tensor
             max_n_tensors += hparams.n_layer()*2; // duplicated rope freq tensors
-            if (files.empty()) {
-                max_n_tensors += hparams.n_layer()*256; // this should be well above what any model actually uses
-            }
             const size_t ctx_size = ggml_tensor_overhead()*max_n_tensors;
 
             ggml_init_params params = {
@@ -1289,7 +1297,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             const size_t nbytes = ggml_nbytes(t_meta);
             LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", tn.str().c_str(), nbytes);
 
-            size_data -= nbytes;
+            if (!files.empty()) {
+                size_data -= nbytes;
+            }
             n_created++;
 
             return nullptr;
@@ -1402,15 +1412,48 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
         ggml_type type = GGML_TYPE_F32;
         const int64_t tid = gguf_find_tensor(metadata, tn.str().c_str());
-        if (tid != -1) {
-            type = gguf_get_tensor_type(metadata, tid);
+        if (tid == -1) {
+            if (flags & TENSOR_NOT_REQUIRED) {
+                return nullptr;
+            }
+            throw std::runtime_error(format("missing tensor '%s'", tn.str().c_str()));
         }
+        type = gguf_get_tensor_type(metadata, tid);
 
-        // for tensors that are not required some of the dimensions can be invalid:
+        // Optional tensors can have architecture-dependent dimensions that
+        // make them inapplicable for this model.
         if (flags & TENSOR_NOT_REQUIRED) {
             for (size_t dim = 0; dim < ne.size(); dim++) {
                 if (ne.begin()[dim] <= 0) {
                     return nullptr;
+                }
+            }
+        }
+
+        const int64_t * metadata_ne = gguf_get_tensor_ne(metadata, tid);
+        if (flags & TENSOR_ALLOW_RESHAPE) {
+            int64_t expected_elements = 1;
+            int64_t metadata_elements = 1;
+            for (size_t dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+                const int64_t expected = dim < ne.size() ? ne.begin()[dim] : 1;
+                if (expected <= 0 || metadata_ne[dim] <= 0 ||
+                    expected > INT64_MAX / expected_elements || metadata_ne[dim] > INT64_MAX / metadata_elements) {
+                    throw std::runtime_error(format("invalid dimensions for tensor '%s'", tn.str().c_str()));
+                }
+                expected_elements *= expected;
+                metadata_elements *= metadata_ne[dim];
+            }
+            if (expected_elements != metadata_elements) {
+                throw std::runtime_error(format("tensor '%s' has %" PRId64 " elements, expected %" PRId64,
+                                                tn.str().c_str(), metadata_elements, expected_elements));
+            }
+        } else {
+            for (size_t dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+                const int64_t expected = dim < ne.size() ? ne.begin()[dim] : 1;
+                if (metadata_ne[dim] != expected) {
+                    throw std::runtime_error(format(
+                        "tensor '%s' has wrong shape; dimension %zu is %" PRId64 ", expected %" PRId64,
+                        tn.str().c_str(), dim, metadata_ne[dim], expected));
                 }
             }
         }
@@ -1433,10 +1476,21 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         ggml_set_name(&t_meta, tn.str().c_str());
 
         ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
-        GGML_ASSERT(buft != nullptr);
+        if (buft == nullptr) {
+            return nullptr;
+        }
         ggml_context * ctx = ctx_for_buft(buft);
+        if (flags & TENSOR_DUPLICATED) {
+            if (ggml_tensor * existing = ggml_get_tensor(ctx, tn.str().c_str())) {
+                return existing;
+            }
+        }
         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
         ggml_set_name(ret, tn.str().c_str());
+        if (!(flags & TENSOR_DUPLICATED)) {
+            n_created++;
+        }
+        size_data += ggml_nbytes(ret);
         return ret;
     }
 
@@ -1594,7 +1648,16 @@ bool llama_model_loader::load_all_data(
         void * progress_callback_user_data) {
     if (files.empty()) {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (progress_callback &&
+                !progress_callback(size_data == 0 ? 0.0f : (float) size_done / size_data,
+                                   progress_callback_user_data)) {
+                return false;
+            }
             set_tensor_data(t, set_tensor_data_ud);
+            size_done += ggml_nbytes(t);
+        }
+        if (size_done >= size_data) {
+            return progress_callback == nullptr || progress_callback(1.0f, progress_callback_user_data);
         }
         return true;
     }

@@ -9,6 +9,7 @@
 #include "llama-model-loader.h"
 #include "llama-model-saver.h"
 #include "llama-model.h"
+#include "llama-safetensors.h"
 #include "llama-vram-demand.h"
 
 #include "ggml.h"
@@ -24,6 +25,8 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
+#include <memory>
 #include <stdexcept>
 #include <vector>
 
@@ -456,6 +459,21 @@ struct llama_model * llama_load_model_from_file(
 struct llama_model * llama_model_load_from_file(
         const char * path_model,
         struct llama_model_params params) {
+    std::error_code ec;
+    if (path_model != nullptr && std::filesystem::is_directory(path_model, ec)) {
+        try {
+            return llama_model_load_from_safetensors_dir(path_model, params);
+        } catch (const std::exception & error) {
+            LLAMA_LOG_ERROR("%s: failed to load safetensors directory '%s': %s\n",
+                            __func__, path_model, error.what());
+            return nullptr;
+        }
+    }
+    if (ec) {
+        LLAMA_LOG_ERROR("%s: failed to inspect model path '%s': %s\n",
+                        __func__, path_model, ec.message().c_str());
+        return nullptr;
+    }
     std::vector<std::string> splits = {};
     return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, path_model, splits, /*file*/ nullptr, params);
 }

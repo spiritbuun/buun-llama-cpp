@@ -38,6 +38,9 @@ add_library(llama
             llama-model.cpp
             llama-quant.cpp
             llama-sampler.cpp
+            llama-safetensors.cpp
+            llama-safetensors-loader.cpp
+            llama-safetensors-qwen35.cpp
             llama-vocab.cpp
             llama-cache-accounting.cpp
             llama-cache-budget.cpp
@@ -72,7 +75,7 @@ set_target_properties(llama PROPERTIES
     MACHO_CURRENT_VERSION 0 # keep macOS linker from seeing oversized version number
 )
 
-target_include_directories(llama PRIVATE .)
+target_include_directories(llama PRIVATE . ../vendor)
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 

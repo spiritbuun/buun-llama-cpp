@@ -84,7 +84,8 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
 
     if (tensor->type == GGML_TYPE_F32 || tensor->type == GGML_TYPE_I32) {
         ggml_backend_tensor_set(tensor, data.data(), 0, nels * sizeof(float));
-    } else if (ggml_is_quantized(tensor->type) || tensor->type == GGML_TYPE_F16 || tensor->type == GGML_TYPE_BF16) {
+    } else if (ggml_is_quantized(tensor->type) || tensor->type == GGML_TYPE_F16 ||
+               tensor->type == GGML_TYPE_BF16 || tensor->type == GGML_TYPE_F8_E4M3) {
         GGML_ASSERT(nels % ggml_blck_size(tensor->type) == 0);
 
          // dummy importance matrix
@@ -286,7 +287,7 @@ static std::vector<float> tensor_to_float(const ggml_tensor * t) {
                         tv.push_back((float)*(int16_t *) &buf[i]);
                     } else if (t->type == GGML_TYPE_I8) {
                         tv.push_back((float)*(int8_t *) &buf[i]);
-                    } else if (quantized) {
+                    } else if (quantized || t->type == GGML_TYPE_F8_E4M3) {
                         tt->to_float(&buf[i], vq.data(), bs);
                         tv.insert(tv.end(), vq.begin(), vq.end());
                     } else {
@@ -6307,19 +6308,23 @@ struct test_mul_mat_vec_fusion : public test_case {
     const bool with_gate;
     const bool with_lane_scale;
     std::array<int64_t, 2> batch_dims;
+    const bool noncanonical_lane_scale;
 
     test_mul_mat_vec_fusion(ggml_type type, ggml_glu_op op, int64_t m, int64_t n, int64_t k,
                         bool use_id = false, int n_mats = 1, int n_used = 1, bool b = false, bool with_bias = false, bool with_gate = true,
-                        bool with_lane_scale = false, std::array<int64_t, 2> batch_dims = {4, 2})
+                        bool with_lane_scale = false, std::array<int64_t, 2> batch_dims = {4, 2},
+                        bool noncanonical_lane_scale = false)
     : type(type), glu_op(op), m(m), n(n), k(k), use_id(use_id), n_mats(n_mats), n_used(n_used), b(b), with_bias(with_bias),
-        with_gate(with_gate), with_lane_scale(with_lane_scale), batch_dims(batch_dims) {
+        with_gate(with_gate), with_lane_scale(with_lane_scale), batch_dims(batch_dims),
+        noncanonical_lane_scale(noncanonical_lane_scale) {
         if (use_id) {
             GGML_ASSERT(n_used <= n_mats);
         }
     }
 
     std::string vars() override {
-        return VARS_TO_STR13(type, glu_op, m, n, k, use_id, n_mats, n_used, b, with_bias, with_gate, with_lane_scale, batch_dims);
+        return VARS_TO_STR14(type, glu_op, m, n, k, use_id, n_mats, n_used, b, with_bias, with_gate,
+                            with_lane_scale, batch_dims, noncanonical_lane_scale);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -6345,7 +6350,14 @@ struct test_mul_mat_vec_fusion : public test_case {
     }
 
     ggml_tensor * build_lane_scale_dense(ggml_context * ctx, ggml_tensor * out) {
-        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        const bool f8_channel = type == GGML_TYPE_F8_E4M3;
+        if (noncanonical_lane_scale) {
+            GGML_ASSERT(f8_channel && out->ne[0] == out->ne[1]);
+            ggml_tensor * scale = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, 1, out->ne[1]);
+            return ggml_mul(ctx, out, scale);
+        }
+        ggml_tensor * scale = ggml_new_tensor_1d(
+            ctx, f8_channel ? GGML_TYPE_BF16 : GGML_TYPE_F32, f8_channel ? out->ne[0] : 1);
         return ggml_mul(ctx, out, scale);
     }
 
@@ -9093,6 +9105,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
 #endif
 
+    // Channel-scaled F8 uses raw E4M3 storage with BF16 activations in MMVQ,
+    // then BF16/F32 expansion for wider batches.
+    for (int64_t n : { 1, 8, 16, 128 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F8_E4M3, GGML_TYPE_F32, 256, n, 256, {1, 1}, {1, 1}));
+    }
+    for (int64_t k : { 31, 33 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F8_E4M3, GGML_TYPE_F32, 32, 1, k, {1, 1}, {1, 1}));
+    }
+
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
             test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  i, 256, { 1,  1}, {1, 1}));
@@ -9932,6 +9953,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // Dense gate/up graph with a mandatory BF16 scale per F8 output channel.
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(
+        GGML_TYPE_F8_E4M3, GGML_GLU_OP_SWIGLU, 1, 32, 256,
+        false, 1, 1, false, false, true, true, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(
+        GGML_TYPE_F8_E4M3, GGML_GLU_OP_SWIGLU, 1, 32, 255,
+        false, 1, 1, false, false, true, true, {1, 1}));
+    // Same element count as a channel vector, but broadcast across tokens.
+    // The CUDA scale fusion must decline this valid noncanonical layout.
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(
+        GGML_TYPE_F8_E4M3, GGML_GLU_OP_SWIGLU, 32, 32, 256,
+        false, 1, 1, false, false, true, true, {1, 1}, true));
 
     // SM120 shares route preparation and activation quantization across paired
     // gate/up MMQ launches. Use a ragged batch above the MMVQ crossover.

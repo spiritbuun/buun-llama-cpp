@@ -529,6 +529,26 @@ void ggml_vec_dot_q8_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
     *s = sumf;
 }
 
+void ggml_vec_dot_f8_e4m3_bf16(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bs);
+    UNUSED(bx);
+    UNUSED(by);
+
+    const uint8_t * GGML_RESTRICT x = vx;
+    const ggml_bf16_t * GGML_RESTRICT y = vy;
+    float sumf = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        sumf += GGML_CPU_E4M3_TO_FP32(x[i]) * GGML_BF16_TO_FP32(y[i]);
+    }
+    *s = sumf;
+}
+
+void quantize_row_f8_e4m3(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_f8_e4m3_ref(x, y, k);
+}
+
 void ggml_vec_dot_tq1_0_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     UNUSED(nrc);

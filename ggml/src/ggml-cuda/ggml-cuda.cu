@@ -1697,7 +1697,15 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
 
 static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     ggml_type compute_type = src0->type;
-    if (ggml_is_quantized(compute_type)) {
+    if (compute_type == GGML_TYPE_F8_E4M3) {
+        // Channel-scaled E4M3 stores large unscaled values and applies its
+        // per-output-channel scale after the matrix product. FP16 accumulation
+        // can overflow before that scale is applied, so retain the FP32-range
+        // exponent of BF16 where available.
+        compute_type = bf16_mma_hardware_available(ggml_cuda_info().devices[ctx.device].cc)
+            ? GGML_TYPE_BF16
+            : GGML_TYPE_F32;
+    } else if (ggml_is_quantized(compute_type)) {
         compute_type = fast_fp16_hardware_available(ggml_cuda_info().devices[ctx.device].cc) ? GGML_TYPE_F16 : GGML_TYPE_F32;
     } else if (compute_type == GGML_TYPE_F16 && !fast_fp16_hardware_available(ggml_cuda_info().devices[ctx.device].cc)) {
         compute_type = GGML_TYPE_F32;
@@ -1715,7 +1723,15 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
         if (env_cpp == "f32" || env_cpp == "fp32") {
             compute_type = GGML_TYPE_F32;
         } else if (env_cpp == "f16" || env_cpp == "fp16") {
-            compute_type = GGML_TYPE_F16;
+            if (src0->type == GGML_TYPE_F8_E4M3) {
+                static std::once_flag warned_f8_fp16;
+                std::call_once(warned_f8_fp16, [&]() {
+                    GGML_LOG_WARN("%s: ignoring FP16 compute override for channel-scaled F8 weights; "
+                                  "the unscaled accumulation can overflow\n", __func__);
+                });
+            } else {
+                compute_type = GGML_TYPE_F16;
+            }
         } else if (env_cpp == "bf16") {
             compute_type = GGML_TYPE_BF16;
         } else if (env_cpp != "auto") {
@@ -1832,6 +1848,12 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     return true;
 }
 
+static bool ggml_cuda_f8_mmvq_layout_supported(const ggml_tensor * weight) {
+    return weight->type != GGML_TYPE_F8_E4M3 ||
+           (weight->ne[0] % QK8_1 == 0 && weight->nb[1] % QK8_1 == 0 &&
+            weight->nb[2] % QK8_1 == 0 && weight->nb[3] % QK8_1 == 0);
+}
+
 static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
@@ -1868,7 +1890,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                    src0->view_src;
 
-    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
+    bool use_mul_mat_vec_q = (ggml_is_quantized(src0->type) || src0->type == GGML_TYPE_F8_E4M3) &&
+                             ggml_cuda_f8_mmvq_layout_supported(src0) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
                              dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
 
     // fusion is not universally faster on Pascal
@@ -1935,7 +1958,8 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     const bool force_mmq = hint == GGML_HINT_FORCE_MMQ &&
             GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE && cc < GGML_CUDA_CC_ADA_LOVELACE;
-    if (!force_mmq && ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
+    if (!force_mmq && ggml_cuda_f8_mmvq_layout_supported(src0) &&
+            ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
     }
@@ -3610,8 +3634,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
 
         const ggml_tensor * scale = scale_lhs_mm ? scale_node->src[1] : scale_node->src[0];
-        if (mm_node->src[0]->type != GGML_TYPE_NVFP4 || scale_node->type != GGML_TYPE_F32 ||
-                scale->type != GGML_TYPE_F32 || !ggml_is_contiguous(scale) || ggml_nelements(scale) != 1 ||
+        const ggml_type weight_type = mm_node->src[0]->type;
+        const bool nvfp4_scale = weight_type == GGML_TYPE_NVFP4 && scale->type == GGML_TYPE_F32 &&
+                                 ggml_nelements(scale) == 1;
+        const bool f8_scale = weight_type == GGML_TYPE_F8_E4M3 && scale->type == GGML_TYPE_BF16 &&
+                              scale->ne[0] == mm_node->src[0]->ne[1] &&
+                              scale->ne[1] == 1 && scale->ne[2] == 1 && scale->ne[3] == 1;
+        if (scale_node->type != GGML_TYPE_F32 || (!nvfp4_scale && !f8_scale) || !ggml_is_contiguous(scale) ||
                 !ggml_are_same_shape(scale_node, mm_node)) {
             return nullptr;
         }
@@ -5127,6 +5156,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_MXFP4:
                     case GGML_TYPE_NVFP4:
+                    case GGML_TYPE_F8_E4M3:
                     case GGML_TYPE_Q2_K:
                     case GGML_TYPE_Q3_K:
                     case GGML_TYPE_Q4_K:
@@ -5380,6 +5410,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_SUB:
         case GGML_OP_MUL:
         case GGML_OP_DIV:
+            if (op->op == GGML_OP_MUL && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_BF16 &&
+                    op->type == GGML_TYPE_F32) {
+                return true;
+            }
             return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
                    (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) &&
                    (op->type         == GGML_TYPE_F32 || op->type         == GGML_TYPE_F16);

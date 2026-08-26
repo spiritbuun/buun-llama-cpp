@@ -151,6 +151,10 @@ endif ()
 llama_build_and_test(test-server-recurrent-expansion.cpp)
 target_include_directories(test-server-recurrent-expansion PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 
+llama_build(test-safetensors-registry.cpp)
+target_include_directories(test-safetensors-registry PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_test(test-safetensors-registry)
+
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build(test-recurrent-state-rollback.cpp)
