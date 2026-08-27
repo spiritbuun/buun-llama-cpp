@@ -2069,8 +2069,13 @@ void launch_fattn(
     }
 
     if (max_blocks_per_sm <= 0 || (diag_requested && diag_first_for_device)) {
+#if defined(GGML_USE_HIP)
+        hipFuncAttributes attr = {};
+        const cudaError_t attr_status = hipFuncGetAttributes(&attr, reinterpret_cast<const void *>(fattn_kernel));
+#else
         cudaFuncAttributes attr = {};
         const cudaError_t attr_status = cudaFuncGetAttributes(&attr, fattn_kernel);
+#endif // defined(GGML_USE_HIP)
         const auto & device = ggml_cuda_info().devices[id];
 
         std::fprintf(stderr,
