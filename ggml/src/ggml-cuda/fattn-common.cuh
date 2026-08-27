@@ -4,6 +4,7 @@
 #include "convert.cuh"
 #include "vecdotq.cuh"
 
+#include <atomic>
 #include <cstdint>
 
 static __constant__ float d_turbo_centroids_2bit_fattn[4] = {
@@ -1913,7 +1914,8 @@ static __global__ void flash_attn_combine_results(
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
-    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE
+    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE,
+    const char * kernel_path = "unknown"
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -2052,6 +2054,68 @@ void launch_fattn(
     const dim3 block_dim(warp_size, nwarps, 1);
     int max_blocks_per_sm = 1; // Max. number of active blocks limited by occupancy.
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, fattn_kernel, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
+
+    // Diagnostic branch for issue #108. GGML_FATTN_DIAGNOSTICS=1 emits the first launch per
+    // device/template; an invalid occupancy result is always emitted before the assertion.
+    // Keep this on stderr so it survives the abort path even when the application log callback
+    // is buffered or interrupted.
+    const char * diag_env = std::getenv("GGML_FATTN_DIAGNOSTICS");
+    const bool diag_requested = diag_env != nullptr && std::atoi(diag_env) != 0;
+    static std::atomic<unsigned long long> diag_devices { 0 };
+    bool diag_first_for_device = true;
+    if (id >= 0 && id < 64) {
+        const unsigned long long bit = 1ULL << id;
+        diag_first_for_device = (diag_devices.fetch_or(bit, std::memory_order_relaxed) & bit) == 0;
+    }
+
+    if (max_blocks_per_sm <= 0 || (diag_requested && diag_first_for_device)) {
+        cudaFuncAttributes attr = {};
+        const cudaError_t attr_status = cudaFuncGetAttributes(&attr, fattn_kernel);
+        const auto & device = ggml_cuda_info().devices[id];
+
+        std::fprintf(stderr,
+            "GGML_FATTN_DIAG version=1 path=%s device=%d physical_device=%d cc=%d rdna2=%d "
+            "warp_size=%d nsm=%d smpb=%zu smpbo=%zu K_type=%s V_type=%s "
+            "DKQ=%lld DV=%d ncols1=%d ncols2=%d Q_cols=%lld K_rows=%lld "
+            "nwarps=%d threads=%u nbatch_fa=%d dynamic_shared=%zu need_f16_K=%d need_f16_V=%d stream_k=%d "
+            "occupancy=%d attr_status=%d attr_error=%s regs=%d static_shared=%zu local=%zu constant=%zu "
+            "attr_max_threads=%d attr_max_dynamic_shared=%d\n",
+            kernel_path,
+            id,
+            device.physical_device,
+            cc,
+            GGML_CUDA_CC_IS_RDNA2(cc) ? 1 : 0,
+            device.warp_size,
+            nsm,
+            device.smpb,
+            device.smpbo,
+            ggml_type_name(K->type),
+            ggml_type_name(V->type),
+            (long long) Q->ne[0],
+            DV,
+            ncols1,
+            ncols2,
+            (long long) Q->ne[1],
+            (long long) K->ne[1],
+            nwarps,
+            block_dim.x * block_dim.y * block_dim.z,
+            nbatch_fa,
+            nbytes_shared,
+            need_f16_K ? 1 : 0,
+            need_f16_V ? 1 : 0,
+            stream_k ? 1 : 0,
+            max_blocks_per_sm,
+            (int) attr_status,
+            cudaGetErrorString(attr_status),
+            attr.numRegs,
+            attr.sharedSizeBytes,
+            attr.localSizeBytes,
+            attr.constSizeBytes,
+            attr.maxThreadsPerBlock,
+            attr.maxDynamicSharedSizeBytes);
+        std::fflush(stderr);
+    }
+
     GGML_ASSERT(max_blocks_per_sm > 0);
     int parallel_blocks = max_blocks_per_sm;
 
