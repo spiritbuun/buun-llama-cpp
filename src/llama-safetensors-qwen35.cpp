@@ -1,5 +1,6 @@
 #include "llama-safetensors-qwen35.h"
 #include "llama-safetensors-names.h"
+#include "llama-safetensors-tensor.h"
 #include "llama.h"
 
 #include <algorithm>
@@ -32,6 +33,12 @@ struct source_spec {
     std::optional<llama_safetensors_quant_binding> quant;
 };
 
+class unsupported_target : public std::runtime_error {
+  public:
+    explicit unsupported_target(const std::string & target_name) :
+        std::runtime_error("unsupported Qwen3.5 target tensor '" + target_name + "'") {}
+};
+
 struct qwen_geometry {
     uint32_t n_layer;
     uint32_t n_mtp;
@@ -61,31 +68,6 @@ const llama_safetensors_tensor & require_tensor(const llama_safetensors_registry
     return *tensor;
 }
 
-size_t dtype_size(llama_safetensors_dtype dtype) {
-    switch (dtype) {
-        case llama_safetensors_dtype::BOOL:
-        case llama_safetensors_dtype::U8:
-        case llama_safetensors_dtype::I8:
-        case llama_safetensors_dtype::F8_E4M3:
-        case llama_safetensors_dtype::F8_E5M2:
-            return 1;
-        case llama_safetensors_dtype::U16:
-        case llama_safetensors_dtype::I16:
-        case llama_safetensors_dtype::F16:
-        case llama_safetensors_dtype::BF16:
-            return 2;
-        case llama_safetensors_dtype::U32:
-        case llama_safetensors_dtype::I32:
-        case llama_safetensors_dtype::F32:
-            return 4;
-        case llama_safetensors_dtype::U64:
-        case llama_safetensors_dtype::I64:
-        case llama_safetensors_dtype::F64:
-            return 8;
-    }
-    throw std::runtime_error("unknown safetensors dtype");
-}
-
 std::string layer_source_prefix(int layer, const qwen_geometry & geometry) {
     if (layer >= 0 && static_cast<uint32_t>(layer) < geometry.n_layer) {
         return "model.language_model.layers." + std::to_string(layer) + ".";
@@ -105,6 +87,9 @@ source_spec quantized_or_plain(
     if (auto binding = quant.bind(module, role)) {
         return { binding->primary, std::move(transforms), std::move(binding) };
     }
+    if (quant.applies(module)) {
+        return { {}, std::move(transforms), std::nullopt };
+    }
     return { plain_name, std::move(transforms), std::nullopt };
 }
 
@@ -119,7 +104,7 @@ source_spec bind_source_name(
     return { std::move(source.source), std::move(transforms), std::nullopt };
 }
 
-source_spec map_target(
+source_spec map_target_unchecked(
         const llama_safetensors_quant_adapters & quant,
         const qwen_geometry & geometry,
         const std::string & target_name) {
@@ -148,7 +133,7 @@ source_spec map_target(
     static const std::regex layer_pattern(R"(^blk\.([0-9]+)\.(.+)$)");
     std::smatch             match;
     if (!std::regex_match(target_name, match, layer_pattern)) {
-        throw std::runtime_error("unsupported Qwen3.5 target tensor '" + target_name + "'");
+        throw unsupported_target(target_name);
     }
     const int         layer  = std::stoi(match[1].str());
     const std::string suffix = match[2].str();
@@ -235,7 +220,43 @@ source_spec map_target(
         }
     }
 
-    throw std::runtime_error("unsupported Qwen3.5 target tensor '" + target_name + "'");
+    throw unsupported_target(target_name);
+}
+
+bool is_row_transform(transform_kind transform) {
+    return transform == transform_kind::QKV_ROWS || transform == transform_kind::V_ROWS ||
+           transform == transform_kind::HEAD_ROWS || transform == transform_kind::CONV_ROWS;
+}
+
+void validate_transform_plan(const source_spec & spec, const std::string & target_name) {
+    if (!spec.quant) {
+        return;
+    }
+
+    const auto materialization = spec.quant->materialization;
+    const bool packed_affine_rows =
+        materialization == llama_safetensors_quant_materialization::AWQ_REPACK ||
+        materialization == llama_safetensors_quant_materialization::GPTQ_REPACK;
+    const bool packed_columns =
+        materialization == llama_safetensors_quant_materialization::NVFP4_REPACK ||
+        materialization == llama_safetensors_quant_materialization::W8A8_REPACK || packed_affine_rows;
+    for (transform_kind transform : spec.transforms) {
+        if ((is_row_transform(transform) && packed_affine_rows) ||
+            (transform == transform_kind::V_COLUMNS && packed_columns)) {
+            throw std::runtime_error(
+                "native safetensors cannot apply the Qwen3.5 recurrent layout transform after repacking '" +
+                target_name + "'");
+        }
+    }
+}
+
+source_spec map_target(
+        const llama_safetensors_quant_adapters & quant,
+        const qwen_geometry & geometry,
+        const std::string & target_name) {
+    source_spec result = map_target_unchecked(quant, geometry, target_name);
+    validate_transform_plan(result, target_name);
+    return result;
 }
 
 ggml_type target_type_for(
@@ -499,7 +520,7 @@ std::vector<uint8_t> apply_layout_transform(
             throw std::runtime_error("unexpected linear-attention output projection rank");
         }
         return permute_columns(
-            source, tensor.shape[0], tensor.shape[1], dtype_size(tensor.dtype),
+            source, tensor.shape[0], tensor.shape[1], llama_safetensors_dtype_size(tensor.dtype),
             v_head_row_permutation(geometry, value_head_dim));
         }
         case transform_kind::NONE:
@@ -579,7 +600,8 @@ qwen_geometry validate_model_contract(const json & root) {
 
 llama_safetensors_qwen35_importer::llama_safetensors_qwen35_importer(
         const std::filesystem::path & model_dir,
-        llama_safetensors_json config) :
+        llama_safetensors_json config,
+        llama_safetensors_io_mode io_mode) :
     model_dir_(model_dir),
     config_(std::move(config)) {
     const qwen_geometry geometry = validate_model_contract(config_);
@@ -592,7 +614,7 @@ llama_safetensors_qwen35_importer::llama_safetensors_qwen35_importer(
     generation_    = llama_safetensors_read_json(model_dir_ / "generation_config.json");
     tokenizer_     = llama_safetensors_read_json(model_dir_ / "tokenizer.json");
     chat_template_ = llama_safetensors_read_optional_text(model_dir_ / "chat_template.jinja");
-    registry_      = llama_safetensors_registry::load(model_dir_);
+    registry_      = llama_safetensors_registry::load(model_dir_, io_mode);
     quant_         = std::make_unique<llama_safetensors_quant_adapters>(config_, registry_);
     if (quant_->summary().fp8_block != 0 &&
         (key_head_dim_ % 128 != 0 || value_head_dim_ % 128 != 0)) {
@@ -616,10 +638,7 @@ gguf_context * llama_safetensors_qwen35_importer::build_metadata() const {
     sink.set_string(
         "general.name",
         model_dir_.filename().empty() ? "Qwen3.5 Safetensors" : model_dir_.filename().string());
-    const llama_safetensors_quant_summary & quant_summary = quant_->summary();
-    sink.set_u32(
-        "general.file_type",
-        quant_summary.nvfp4 != 0 ? LLAMA_FTYPE_MOSTLY_NVFP4 : LLAMA_FTYPE_MOSTLY_F8_E4M3);
+    sink.set_u32("general.file_type", quant_->file_type());
     sink.set_u32("general.quantization_version", 2);
     llama_safetensors_emit_sampling_defaults(sink, generation_);
 
@@ -674,7 +693,7 @@ bool llama_safetensors_qwen35_importer::describe(
         spec = map_target(
             *quant_, { n_layer_, n_mtp_, n_key_heads_, n_value_heads_, key_head_dim_, value_head_dim_ },
             target_name);
-    } catch (const std::runtime_error &) {
+    } catch (const unsupported_target &) {
         return false;
     }
     if (registry_.find(spec.name) == nullptr) {
@@ -705,6 +724,19 @@ void llama_safetensors_qwen35_importer::bind(const std::string & target_name) co
     if (spec.quant) {
         quant_->consume(*spec.quant);
     }
+}
+
+bool llama_safetensors_qwen35_importer::load(
+        const std::string & target_name, ggml_tensor * destination, bool check_tensor) const {
+    const qwen_geometry geometry {
+        n_layer_, n_mtp_, n_key_heads_, n_value_heads_, key_head_dim_, value_head_dim_,
+    };
+    const source_spec spec = map_target(*quant_, geometry, target_name);
+    if (!spec.transforms.empty()) {
+        return false;
+    }
+    return llama_safetensors_load_tensor_direct(
+        registry_, { spec.name, spec.quant }, destination, check_tensor);
 }
 
 void llama_safetensors_qwen35_importer::validate_complete() const {

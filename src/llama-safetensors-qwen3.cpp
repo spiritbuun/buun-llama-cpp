@@ -88,7 +88,8 @@ void validate_model_contract(const llama_safetensors_json & config) {
 }  // namespace
 
 llama_safetensors_qwen3_importer::llama_safetensors_qwen3_importer(const std::filesystem::path & model_dir,
-                                                                   llama_safetensors_json        config) :
+                                                                   llama_safetensors_json        config,
+                                                                   llama_safetensors_io_mode     io_mode) :
     model_dir_(model_dir),
     config_(std::move(config)) {
     validate_model_contract(config_);
@@ -99,7 +100,7 @@ llama_safetensors_qwen3_importer::llama_safetensors_qwen3_importer(const std::fi
     if (tokenizer_config.contains("chat_template") && tokenizer_config.at("chat_template").is_string()) {
         chat_template_ = tokenizer_config.at("chat_template").get<std::string>();
     }
-    registry_ = llama_safetensors_registry::load(model_dir_);
+    registry_ = llama_safetensors_registry::load(model_dir_, io_mode);
     quant_    = std::make_unique<llama_safetensors_quant_adapters>(config_, registry_);
 }
 
@@ -113,8 +114,7 @@ gguf_context * llama_safetensors_qwen3_importer::build_metadata() const {
     sink.set_string("general.type", "model");
     sink.set_string("general.name",
                     model_dir_.filename().empty() ? "Qwen3 Safetensors" : model_dir_.filename().string());
-    const llama_safetensors_quant_summary & summary = quant_->summary();
-    sink.set_u32("general.file_type", summary.nvfp4 != 0 ? LLAMA_FTYPE_MOSTLY_NVFP4 : LLAMA_FTYPE_MOSTLY_F8_E4M3);
+    sink.set_u32("general.file_type", quant_->file_type());
     sink.set_u32("general.quantization_version", 2);
     llama_safetensors_emit_sampling_defaults(sink, generation_);
 
@@ -159,6 +159,12 @@ size_t llama_safetensors_qwen3_importer::tensor_capacity_hint() const {
 
 void llama_safetensors_qwen3_importer::bind(const std::string & target_name) const {
     llama_safetensors_consume_tensor(*quant_, map_target(*quant_, n_layer_, target_name));
+}
+
+bool llama_safetensors_qwen3_importer::load(
+        const std::string & target_name, ggml_tensor * destination, bool check_tensor) const {
+    return llama_safetensors_load_tensor_direct(
+        registry_, map_target(*quant_, n_layer_, target_name), destination, check_tensor);
 }
 
 std::vector<uint8_t> llama_safetensors_qwen3_importer::materialize(const std::string & target_name,

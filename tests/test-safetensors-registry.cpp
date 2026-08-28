@@ -4,6 +4,7 @@
 #include "llama-safetensors-quant.h"
 #include "llama-safetensors-qwen3.h"
 #include "llama-safetensors-qwen35.h"
+#include "llama-safetensors-tensor.h"
 #include "llama-safetensors.h"
 #include "llama.h"
 #include "nlohmann/json.hpp"
@@ -94,10 +95,52 @@ const char * fp8_block_config =
 const char * nvfp4_config =
     R"({"quantization_config":{"quant_method":"compressed-tensors","format":"mixed-precision","config_groups":{"nvfp4":{"format":"nvfp4-pack-quantized","targets":["module"],"input_activations":{"actorder":null,"block_structure":null,"dynamic":"local","group_size":16,"num_bits":4,"scale_dtype":"torch.float8_e4m3fn","strategy":"tensor_group","symmetric":true,"type":"float","zp_dtype":null},"weights":{"actorder":"static","block_structure":null,"dynamic":false,"group_size":16,"num_bits":4,"scale_dtype":"torch.float8_e4m3fn","strategy":"tensor_group","symmetric":true,"type":"float","zp_dtype":null}}}}})";
 
+const char * w8a8_config =
+    R"({"quantization_config":{"quant_method":"compressed-tensors","format":"int-quantized","config_groups":{"int8":{"targets":["module"],"input_activations":{"actorder":null,"block_structure":null,"dynamic":true,"group_size":null,"num_bits":8,"strategy":"token","symmetric":true,"type":"int"},"weights":{"actorder":null,"block_structure":null,"dynamic":false,"group_size":null,"num_bits":8,"strategy":"channel","symmetric":true,"type":"int"}}}}})";
+
+const char * awq_config =
+    R"({"quantization_config":{"bits":4,"group_size":128,"modules_to_not_convert":null,"quant_method":"awq","version":"gemm","zero_point":true}})";
+
+const char * gptq_config =
+    R"({"quantization_config":{"bits":4,"checkpoint_format":"gptq","desc_act":false,"group_size":128,"pack_dtype":"int32","quant_method":"gptq","sym":true}})";
+
+const char * gptq_act_order_config =
+    R"({"quantization_config":{"bits":4,"checkpoint_format":"gptq","desc_act":true,"group_size":128,"pack_dtype":"int32","quant_method":"gptq","sym":true}})";
+
 std::vector<uint8_t> f32_bytes(float value) {
     std::vector<uint8_t> result(sizeof(value));
     std::memcpy(result.data(), &value, sizeof(value));
     return result;
+}
+
+std::vector<uint8_t> i32_bytes(const std::vector<uint32_t> & values) {
+    std::vector<uint8_t> result(values.size() * sizeof(uint32_t));
+    std::memcpy(result.data(), values.data(), result.size());
+    return result;
+}
+
+void store_f16(std::vector<uint8_t> & data, size_t index, float value) {
+    const ggml_fp16_t bits = ggml_fp32_to_fp16(value);
+    std::memcpy(data.data() + index * sizeof(bits), &bits, sizeof(bits));
+}
+
+uint16_t load_u16(const uint8_t * data) {
+    uint16_t result;
+    std::memcpy(&result, data, sizeof(result));
+    return result;
+}
+
+void require_q4_1_block(
+        const uint8_t * block,
+        float scale,
+        uint8_t zero,
+        const std::array<uint8_t, 32> & codes,
+        const char * message) {
+    require(load_u16(block) == ggml_fp32_to_fp16(scale), message);
+    require(load_u16(block + sizeof(ggml_fp16_t)) == ggml_fp32_to_fp16(-scale * zero), message);
+    for (size_t i = 0; i < codes.size() / 2; ++i) {
+        require(block[2 * sizeof(ggml_fp16_t) + i] == (codes[i] | (codes[i + 16] << 4)), message);
+    }
 }
 
 std::string read_text(const std::filesystem::path & path) {
@@ -455,7 +498,8 @@ int main(int argc, char ** argv) {
         const llama_safetensors_quant_summary & summary = adapters.summary();
         std::cout << "shards=" << registry.shards().size() << " tensors=" << registry.tensors().size()
                   << " nvfp4=" << summary.nvfp4 << " fp8_channel=" << summary.fp8_channel
-                  << " fp8_block=" << summary.fp8_block << '\n';
+                  << " fp8_block=" << summary.fp8_block << " w8a8=" << summary.w8a8
+                  << " awq=" << summary.awq << " gptq=" << summary.gptq << '\n';
         return 0;
     }
 
@@ -552,6 +596,46 @@ int main(int argc, char ** argv) {
                 "legacy compressed-tensors ignore rule was not honored");
     }
 
+    // Catch-all producer rules may leave selected modules plain without adding
+    // them to an ignore list. Applicability follows the stored representation,
+    // while an unexpected quant sidecar remains a malformed contract.
+    for (const bool w8a8 : { false, true }) {
+        const std::filesystem::path path = dir.path / (w8a8 ? "w8-plain-exception" : "fp8-plain-exception");
+        const std::string quant_module = "quant";
+        std::vector<tensor_fixture> tensors = {
+            { "module.weight", "BF16", { 2, 32 }, std::vector<uint8_t>(128, 0x2a) },
+        };
+        llama_safetensors_json config = llama_safetensors_json::parse(w8a8 ? w8a8_config : fp8_channel_config);
+        auto & group = config["quantization_config"]["config_groups"].begin().value();
+        group["targets"][0] = "re:.*";
+        if (w8a8) {
+            tensors.push_back({ quant_module + ".weight", "I8", { 2, 32 }, std::vector<uint8_t>(64) });
+            tensors.push_back({ quant_module + ".weight_scale", "BF16", { 2, 1 },
+                                { 0x80, 0x3f, 0x80, 0x3f } });
+        } else {
+            tensors.push_back({ quant_module + ".weight", "F8_E4M3", { 2, 32 }, std::vector<uint8_t>(64) });
+            tensors.push_back({ quant_module + ".weight_scale", "BF16", { 2 },
+                                { 0x80, 0x3f, 0x80, 0x3f } });
+        }
+        write_single_shard_model(path, tensors);
+        write_text(path / "config.json", config.dump());
+        const auto registry = llama_safetensors_registry::load(path);
+        llama_safetensors_quant_adapters adapters(config, registry);
+        require(!adapters.applies("module") &&
+                    !adapters.bind("module", llama_safetensors_quant_role::WEIGHT).has_value() &&
+                    adapters.applies(quant_module),
+                "catch-all quantization did not preserve a plain module exception");
+        const auto binding = llama_safetensors_bind_tensor(
+            adapters, { "module.weight", "module", llama_safetensors_quant_role::WEIGHT });
+        ggml_type type;
+        std::array<int64_t, GGML_MAX_DIMS> ne;
+        require(llama_safetensors_describe_tensor(registry, binding, type, ne) && type == GGML_TYPE_BF16 &&
+                    ne[0] == 32 && ne[1] == 2 &&
+                    llama_safetensors_materialize_tensor(registry, adapters, binding, type, 128) ==
+                        std::vector<uint8_t>(128, 0x2a),
+                "plain catch-all exception did not follow the ordinary BF16 path");
+    }
+
     // The dense runtime supports the 24-, 32-, and 64-layer Qwen3.5 families.
     // The importer must derive recurrent head geometry from config rather than
     // silently assuming the 27B layout.
@@ -610,6 +694,43 @@ int main(int argc, char ** argv) {
         require(channel_importer.materialize("blk.0.ssm_out.scale", GGML_TYPE_BF16, 4) ==
                     std::vector<uint8_t>({ 1, 2, 3, 4 }),
                 "Qwen output channel scale incorrectly followed the weight's column permutation");
+
+        const std::filesystem::path w8_dir = dir.path / "w8-column-transform";
+        write_single_shard_model(w8_dir, {
+            { channel_module + ".weight",       "I8",   { 2, 32 }, std::vector<uint8_t>(64) },
+            { channel_module + ".weight_scale", "BF16", { 2, 1 },  { 0x80, 0x3f, 0x80, 0x3f } },
+        });
+        write_text(w8_dir / "generation_config.json", "{}");
+        write_text(w8_dir / "tokenizer.json", "{}");
+        config["quantization_config"] = llama_safetensors_json::parse(w8a8_config).at("quantization_config");
+        config["quantization_config"]["config_groups"]["int8"]["targets"][0] = channel_module;
+        llama_safetensors_qwen35_importer w8_importer(w8_dir, config);
+        require_rejected(
+            [&] {
+                ggml_type type;
+                std::array<int64_t, GGML_MAX_DIMS> ne;
+                (void) w8_importer.describe("blk.0.ssm_out.weight", type, ne);
+            },
+            "Qwen3.5 accepted a W8A8 column transform after repacking");
+
+        const std::filesystem::path awq_dir = dir.path / "awq-row-transform";
+        const std::string awq_module = "model.language_model.layers.0.linear_attn.in_proj_z";
+        write_single_shard_model(awq_dir, {
+            { awq_module + ".qweight", "I32", { 128, 1 }, std::vector<uint8_t>(128 * sizeof(uint32_t)) },
+            { awq_module + ".qzeros",  "I32", { 1, 1 },   i32_bytes({ 1 })                              },
+            { awq_module + ".scales",  "F16", { 1, 8 },   std::vector<uint8_t>(8 * sizeof(uint16_t), 1) },
+        });
+        write_text(awq_dir / "generation_config.json", "{}");
+        write_text(awq_dir / "tokenizer.json", "{}");
+        config["quantization_config"] = llama_safetensors_json::parse(awq_config).at("quantization_config");
+        llama_safetensors_qwen35_importer awq_importer(awq_dir, config);
+        require_rejected(
+            [&] {
+                ggml_type type;
+                std::array<int64_t, GGML_MAX_DIMS> ne;
+                (void) awq_importer.describe("blk.0.attn_gate.weight", type, ne);
+            },
+            "Qwen3.5 accepted an AWQ row transform after repacking");
     }
 
     // Metadata and tokenizer conversion are shared by architecture importers.
@@ -778,6 +899,284 @@ int main(int argc, char ** argv) {
                          "FP8 block contract accepted the wrong scale grid");
     }
     {
+        const auto path = dir.path / "w8a8";
+        std::vector<uint8_t> weights(128);
+        for (size_t i = 0; i < weights.size(); ++i) {
+            weights[i] = static_cast<uint8_t>(static_cast<int8_t>(static_cast<int>(i % 64) - 32));
+        }
+        write_single_shard_model(path, {
+                                           { "module.weight",       "I8",   { 2, 64 }, weights                    },
+                                           { "module.weight_scale", "BF16", { 2, 1 },  { 0x80, 0x3f, 0x00, 0x40 } },
+        });
+        write_text(path / "config.json", w8a8_config);
+        const auto                       registry = llama_safetensors_registry::load(path);
+        llama_safetensors_quant_adapters adapters(llama_safetensors_read_json(path / "config.json"), registry);
+        const auto                       weight = adapters.bind("module", llama_safetensors_quant_role::WEIGHT);
+        require(weight.has_value() && weight->target_type == GGML_TYPE_Q8_0 &&
+                    weight->materialization == llama_safetensors_quant_materialization::W8A8_REPACK &&
+                    !adapters.bind("module", llama_safetensors_quant_role::WEIGHT_SCALE).has_value() &&
+                    adapters.file_type() == LLAMA_FTYPE_MOSTLY_Q8_0,
+                "W8A8 binding is wrong");
+        const std::vector<uint8_t> repacked = adapters.read(*weight);
+        constexpr size_t block_size = sizeof(ggml_fp16_t) + 32;
+        require(repacked.size() == 4 * block_size, "W8A8 Q8_0 repack has the wrong size");
+        for (size_t row = 0; row < 2; ++row) {
+            const uint16_t expected_scale = ggml_fp32_to_fp16(row == 0 ? 1.0f : 2.0f);
+            for (size_t block = 0; block < 2; ++block) {
+                const uint8_t * actual = repacked.data() + (row * 2 + block) * block_size;
+                require(load_u16(actual) == expected_scale &&
+                            std::equal(weights.begin() + row * 64 + block * 32,
+                                       weights.begin() + row * 64 + (block + 1) * 32,
+                                       actual + sizeof(ggml_fp16_t)),
+                        "W8A8 Q8_0 repack changed a row scale or code block");
+            }
+        }
+        adapters.consume(*weight);
+        adapters.validate_complete();
+    }
+    {
+        const auto path = dir.path / "w8a8-wrong-scale-type";
+        write_single_shard_model(path, {
+                                           { "module.weight",       "I8",  { 2, 32 }, std::vector<uint8_t>(64) },
+                                           { "module.weight_scale", "F16", { 2, 1 },  std::vector<uint8_t>(4)  },
+        });
+        write_text(path / "config.json", w8a8_config);
+        const auto registry = llama_safetensors_registry::load(path);
+        require_rejected([&] { (void) llama_safetensors_quant_adapters(path, registry); },
+                         "W8A8 contract accepted the wrong scale dtype");
+    }
+    {
+        const auto path = dir.path / "w8a8-wrong-weight-type";
+        write_single_shard_model(path, {
+                                           { "module.weight",       "BF16", { 2, 32 }, std::vector<uint8_t>(128) },
+                                           { "module.weight_scale", "BF16", { 2, 1 },  std::vector<uint8_t>(4)   },
+        });
+        write_text(path / "config.json", w8a8_config);
+        const auto registry = llama_safetensors_registry::load(path);
+        require_rejected([&] { (void) llama_safetensors_quant_adapters(path, registry); },
+                         "W8A8 contract accepted a BF16 weight with an INT8 scale sidecar");
+    }
+    {
+        const auto path = dir.path / "w8a8-scale-overflow";
+        write_single_shard_model(path, {
+                                           { "module.weight",       "I8",   { 1, 32 }, std::vector<uint8_t>(32) },
+                                           { "module.weight_scale", "BF16", { 1, 1 },  { 0x80, 0x47 }             },
+        });
+        write_text(path / "config.json", w8a8_config);
+        const auto registry = llama_safetensors_registry::load(path);
+        llama_safetensors_quant_adapters adapters(llama_safetensors_read_json(path / "config.json"), registry);
+        const auto weight = adapters.bind("module", llama_safetensors_quant_role::WEIGHT);
+        require(weight.has_value(), "W8A8 overflow fixture did not bind");
+        require_rejected([&] { (void) adapters.read(*weight); },
+                         "W8A8 accepted a scale that overflows Q8_0");
+    }
+    {
+        const auto path = dir.path / "awq";
+        constexpr size_t cols = 256;
+        constexpr size_t rows = 8;
+        constexpr uint32_t shifts[8] = { 0, 16, 4, 20, 8, 24, 12, 28 };
+        std::vector<uint32_t> qweight(cols);
+        std::vector<uint32_t> qzeros(2);
+        std::vector<uint8_t> scales(2 * rows * sizeof(uint16_t));
+        for (size_t col = 0; col < cols; ++col) {
+            for (size_t row = 0; row < rows; ++row) {
+                qweight[col] |= ((col + 3 * row) % 16) << shifts[row];
+            }
+        }
+        for (size_t group = 0; group < 2; ++group) {
+            for (size_t row = 0; row < rows; ++row) {
+                qzeros[group] |= (1 + (group + row) % 8) << shifts[row];
+                store_f16(scales, group * rows + row, 0.5f + 0.25f * ((group + row) % 8));
+            }
+        }
+        write_single_shard_model(path, {
+            { "module.qweight", "I32", { cols, 1 }, i32_bytes(qweight) },
+            { "module.qzeros",  "I32", { 2, 1 },    i32_bytes(qzeros)  },
+            { "module.scales",  "F16", { 2, rows }, scales             },
+        });
+        write_text(path / "config.json", awq_config);
+        const auto registry = llama_safetensors_registry::load(path);
+        llama_safetensors_quant_adapters adapters(llama_safetensors_read_json(path / "config.json"), registry);
+        const auto weight = adapters.bind("module", llama_safetensors_quant_role::WEIGHT);
+        require(weight.has_value() && weight->target_type == GGML_TYPE_Q4_1 &&
+                    weight->materialization == llama_safetensors_quant_materialization::AWQ_REPACK &&
+                    weight->target_shape == std::vector<int64_t>({ cols, rows }) &&
+                    adapters.file_type() == LLAMA_FTYPE_MOSTLY_Q4_1,
+                "AWQ binding is wrong");
+        const std::vector<uint8_t> repacked = adapters.read(*weight);
+        constexpr size_t block_size = 2 * sizeof(ggml_fp16_t) + 16;
+        require(repacked.size() == rows * (cols / 32) * block_size, "AWQ Q4_1 repack has the wrong size");
+        for (size_t row = 0; row < rows; ++row) {
+            for (size_t block = 0; block < cols / 32; ++block) {
+                const size_t group = block / 4;
+                std::array<uint8_t, 32> codes{};
+                for (size_t col = 0; col < codes.size(); ++col) {
+                    codes[col] = (block * 32 + col + 3 * row) % 16;
+                }
+                require_q4_1_block(
+                    repacked.data() + (row * (cols / 32) + block) * block_size,
+                    0.5f + 0.25f * ((group + row) % 8), 1 + (group + row) % 8, codes,
+                    "AWQ Q4_1 repack changed a row/group code, scale, or zero point");
+            }
+        }
+        adapters.consume(*weight);
+        adapters.validate_complete();
+    }
+    {
+        const auto path = dir.path / "awq-missing-zero";
+        write_single_shard_model(path, {
+            { "module.qweight", "I32", { 128, 1 }, std::vector<uint8_t>(128 * 4) },
+            { "module.scales",  "F16", { 1, 8 },   std::vector<uint8_t>(16)      },
+        });
+        write_text(path / "config.json", awq_config);
+        const auto registry = llama_safetensors_registry::load(path);
+        require_rejected([&] { (void) llama_safetensors_quant_adapters(path, registry); },
+                         "AWQ contract accepted a missing zero-point sidecar");
+    }
+    {
+        const auto path = dir.path / "awq-minimum-overflow";
+        std::vector<uint8_t> scales(8 * sizeof(uint16_t));
+        for (size_t row = 0; row < 8; ++row) {
+            const uint16_t maximum = 0x7bff;
+            std::memcpy(scales.data() + row * sizeof(maximum), &maximum, sizeof(maximum));
+        }
+        write_single_shard_model(path, {
+            { "module.qweight", "I32", { 128, 1 }, std::vector<uint8_t>(128 * sizeof(uint32_t)) },
+            { "module.qzeros",  "I32", { 1, 1 },   i32_bytes({ 15 })                              },
+            { "module.scales",  "F16", { 1, 8 },   scales                                         },
+        });
+        write_text(path / "config.json", awq_config);
+        const auto registry = llama_safetensors_registry::load(path);
+        llama_safetensors_quant_adapters adapters(llama_safetensors_read_json(path / "config.json"), registry);
+        const auto weight = adapters.bind("module", llama_safetensors_quant_role::WEIGHT);
+        require(weight.has_value(), "AWQ overflow fixture did not bind");
+        require_rejected([&] { (void) adapters.read(*weight); },
+                         "AWQ accepted a minimum that overflows Q4_1");
+    }
+    {
+        const auto path = dir.path / "gptq";
+        constexpr size_t cols = 256;
+        constexpr size_t rows = 8;
+        std::vector<uint32_t> qweight((cols / 8) * rows);
+        std::vector<uint32_t> qzeros(2);
+        std::vector<uint8_t> scales(2 * rows * sizeof(uint16_t));
+        for (size_t packed_col = 0; packed_col < cols / 8; ++packed_col) {
+            for (size_t row = 0; row < rows; ++row) {
+                uint32_t word = 0;
+                for (size_t lane = 0; lane < 8; ++lane) {
+                    word |= ((packed_col * 8 + lane + 5 * row) % 16) << (4 * lane);
+                }
+                qweight[packed_col * rows + row] = word;
+            }
+        }
+        for (size_t group = 0; group < 2; ++group) {
+            for (size_t row = 0; row < rows; ++row) {
+                const uint8_t zero = 1 + (2 * group + row) % 8;
+                qzeros[group] |= uint32_t(zero - 1) << (4 * row);
+                store_f16(scales, group * rows + row, 0.5f + 0.25f * ((2 * group + row) % 8));
+            }
+        }
+        std::vector<uint32_t> groups(cols);
+        for (size_t col = 0; col < cols; ++col) {
+            groups[col] = col / 128;
+        }
+        write_single_shard_model(path, {
+            { "module.qweight", "I32", { cols / 8, rows }, i32_bytes(qweight) },
+            { "module.qzeros",  "I32", { 2, 1 },           i32_bytes(qzeros)  },
+            { "module.scales",  "F16", { 2, rows },        scales             },
+            { "module.g_idx",   "I32", { cols },           i32_bytes(groups)  },
+        });
+        write_text(path / "config.json", gptq_config);
+        const auto registry = llama_safetensors_registry::load(path);
+        llama_safetensors_quant_adapters adapters(llama_safetensors_read_json(path / "config.json"), registry);
+        const auto weight = adapters.bind("module", llama_safetensors_quant_role::WEIGHT);
+        require(weight.has_value() && weight->target_type == GGML_TYPE_Q4_1 &&
+                    weight->materialization == llama_safetensors_quant_materialization::GPTQ_REPACK &&
+                    weight->target_shape == std::vector<int64_t>({ cols, rows }) &&
+                    adapters.file_type() == LLAMA_FTYPE_MOSTLY_Q4_1,
+                "GPTQ binding is wrong");
+        const std::vector<uint8_t> repacked = adapters.read(*weight);
+        constexpr size_t block_size = 2 * sizeof(ggml_fp16_t) + 16;
+        require(repacked.size() == rows * (cols / 32) * block_size, "GPTQ Q4_1 repack has the wrong size");
+        for (size_t row = 0; row < rows; ++row) {
+            for (size_t block = 0; block < cols / 32; ++block) {
+                const size_t group = block / 4;
+                std::array<uint8_t, 32> codes{};
+                for (size_t col = 0; col < codes.size(); ++col) {
+                    codes[col] = (block * 32 + col + 5 * row) % 16;
+                }
+                require_q4_1_block(
+                    repacked.data() + (row * (cols / 32) + block) * block_size,
+                    0.5f + 0.25f * ((2 * group + row) % 8), 1 + (2 * group + row) % 8, codes,
+                    "GPTQ Q4_1 repack changed a row/group code, scale, or zero point");
+            }
+        }
+        adapters.consume(*weight);
+        adapters.validate_complete();
+    }
+    {
+        const auto path = dir.path / "gptq-act-order";
+        write_single_shard_model(path, {
+            { "module.qweight", "I32", { 16, 8 }, std::vector<uint8_t>(16 * 8 * 4) },
+        });
+        write_text(path / "config.json", gptq_act_order_config);
+        const auto registry = llama_safetensors_registry::load(path);
+        require_rejected(
+            [&] { (void) llama_safetensors_quant_adapters(llama_safetensors_read_json(path / "config.json"), registry); },
+            "act-order GPTQ was not rejected");
+    }
+    {
+        const auto path = dir.path / "gptq-partial-packed-row";
+        std::vector<uint32_t> groups(128);
+        write_single_shard_model(path, {
+            { "module.qweight", "I32", { 16, 9 },  std::vector<uint8_t>(16 * 9 * sizeof(uint32_t)) },
+            { "module.qzeros",  "I32", { 1, 1 },   std::vector<uint8_t>(sizeof(uint32_t))          },
+            { "module.scales",  "F16", { 1, 9 },   std::vector<uint8_t>(9 * sizeof(uint16_t))      },
+            { "module.g_idx",   "I32", { 128 },    i32_bytes(groups)                               },
+        });
+        write_text(path / "config.json", gptq_config);
+        const auto registry = llama_safetensors_registry::load(path);
+        require_rejected([&] { (void) llama_safetensors_quant_adapters(path, registry); },
+                         "GPTQ accepted output rows not divisible by its eight-row packing");
+    }
+    {
+        const auto path = dir.path / "gptq-minimum-overflow";
+        std::vector<uint8_t> scales(8 * sizeof(uint16_t));
+        for (size_t row = 0; row < 8; ++row) {
+            const uint16_t maximum = 0x7bff;
+            std::memcpy(scales.data() + row * sizeof(maximum), &maximum, sizeof(maximum));
+        }
+        std::vector<uint32_t> groups(128);
+        write_single_shard_model(path, {
+            { "module.qweight", "I32", { 16, 8 }, std::vector<uint8_t>(16 * 8 * sizeof(uint32_t)) },
+            { "module.qzeros",  "I32", { 1, 1 },  i32_bytes({ 14 })                               },
+            { "module.scales",  "F16", { 1, 8 },  scales                                          },
+            { "module.g_idx",   "I32", { 128 },   i32_bytes(groups)                               },
+        });
+        write_text(path / "config.json", gptq_config);
+        const auto registry = llama_safetensors_registry::load(path);
+        llama_safetensors_quant_adapters adapters(llama_safetensors_read_json(path / "config.json"), registry);
+        const auto weight = adapters.bind("module", llama_safetensors_quant_role::WEIGHT);
+        require(weight.has_value(), "GPTQ overflow fixture did not bind");
+        require_rejected([&] { (void) adapters.read(*weight); },
+                         "GPTQ accepted a minimum that overflows Q4_1");
+    }
+    {
+        const auto path = dir.path / "gptq-nonidentity-groups";
+        std::vector<uint32_t> groups(128);
+        groups.back() = 1;
+        write_single_shard_model(path, {
+            { "module.qweight", "I32", { 16, 8 }, std::vector<uint8_t>(16 * 8 * 4) },
+            { "module.qzeros",  "I32", { 1, 1 },  std::vector<uint8_t>(4)          },
+            { "module.scales",  "F16", { 1, 8 },  std::vector<uint8_t>(16)         },
+            { "module.g_idx",   "I32", { 128 },   i32_bytes(groups)                 },
+        });
+        write_text(path / "config.json", gptq_config);
+        const auto registry = llama_safetensors_registry::load(path);
+        require_rejected([&] { (void) llama_safetensors_quant_adapters(path, registry); },
+                         "GPTQ contract accepted a non-identity group map");
+    }
+    {
         const auto path = dir.path / "nvfp4";
         write_single_shard_model(path,
                                  {
@@ -857,6 +1256,55 @@ int main(int argc, char ** argv) {
     require(fp8->dtype == llama_safetensors_dtype::F8_E4M3, "FP8 tensor has the wrong dtype");
     require(fp8->shape == std::vector<uint64_t>({ 2, 2 }), "FP8 tensor has the wrong shape");
     require(registry.find("missing") == nullptr, "missing tensor lookup unexpectedly succeeded");
+
+    {
+        ggml_init_params params {
+            /*.mem_size   =*/ 2 * ggml_tensor_overhead() + 1024,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context * ctx = ggml_init(params);
+        require(ctx != nullptr, "failed to create direct-upload test context");
+        ggml_tensor * destination = ggml_new_tensor_2d(ctx, GGML_TYPE_F8_E4M3, 2, 2);
+        ggml_backend_buffer_t buffer =
+            ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
+        require(buffer != nullptr, "failed to allocate direct-upload test buffer");
+
+        const llama_safetensors_tensor_binding binding { "fp8", std::nullopt };
+        require(llama_safetensors_load_tensor_direct(registry, binding, destination, false),
+                "mapped canonical tensor did not take the direct-upload path");
+        std::array<uint8_t, 4> uploaded{};
+        ggml_backend_tensor_get(destination, uploaded.data(), 0, uploaded.size());
+        require(uploaded == std::array<uint8_t, 4>({ 7, 8, 9, 10 }),
+                "direct upload changed canonical tensor bytes");
+        const auto buffered = llama_safetensors_registry::load(
+            dir.path, llama_safetensors_io_mode::BUFFERED);
+        require(!llama_safetensors_load_tensor_direct(buffered, binding, destination, false),
+                "buffered tensor incorrectly took the mapped direct-upload path");
+
+        llama_safetensors_quant_binding transformed {
+            llama_safetensors_quant_materialization::W8A8_REPACK,
+            "fp8",
+            {},
+            GGML_TYPE_F8_E4M3,
+            { 2, 2 },
+        };
+        require(!llama_safetensors_load_tensor_direct(
+                    registry, { "fp8", transformed }, destination, false),
+                "transformed tensor incorrectly took the direct-upload path");
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+    }
+
+    const auto no_mmap = llama_safetensors_registry::load(dir.path, llama_safetensors_io_mode::BUFFERED);
+    const auto * no_mmap_packed = no_mmap.find("packed");
+    require(no_mmap_packed != nullptr && no_mmap.data(*no_mmap_packed) == nullptr &&
+                no_mmap.read(*no_mmap_packed) == std::vector<uint8_t>({ 5, 6 }),
+            "non-mmap safetensors fallback did not perform an exact bounded read");
+    const auto * no_mmap_a = no_mmap.find("a");
+    require(no_mmap_a != nullptr && no_mmap.data(*no_mmap_a) == nullptr &&
+                no_mmap.read(*no_mmap_a) == std::vector<uint8_t>({ 1, 2, 3, 4 }),
+            "non-mmap canonical tensor did not preserve exact bytes");
 
     write_text(
         dir.path / "config.json",

@@ -278,7 +278,7 @@ Gate: a recorded canonical manifest from `load_arch_tensors()` matches the forme
 - [x] Move FP8-channel contract validation and scale binding out of the Qwen file.
 - [x] Move FP8-block 128x128 validation, inverse-scale handling, and scale transpose out of the Qwen file.
 - [x] Move NVFP4 packed-weight validation, repack, and scale binding out of the Qwen file.
-- [ ] Centralize dtype-to-ggml-type mapping where it is truly format-generic.
+- [x] Centralize dtype size and dtype-to-ggml-type mapping where it is truly format-generic.
 - [x] Add isolated fixtures for missing scales, wrong scale dtype, wrong grid
   shape, zero points, invalid global scalars, dependency consumption, and
   overlapping compressed-tensors rules.
@@ -359,24 +359,113 @@ live comparison is the proof of exact equality.
 
 ### Phase 7 — Loading and memory optimization
 
-- [ ] Replace avoidable full-vector copies with bounded reusable staging buffers.
-- [ ] Stream transforms that are naturally row- or block-local.
-- [ ] Upload directly into the final selected backend buffer when legal.
-- [ ] Preserve one-final-tensor-at-a-time peak-memory bounds for non-streamable transforms.
-- [ ] Investigate zero-copy CPU mappings only for source layouts already identical to canonical ggml layouts.
-- [ ] Measure load time, peak host RAM, peak VRAM, and storage reads.
+- [x] Replace avoidable source-vector copies with read-only shard mappings.
+- [x] Read row- and block-local transforms from mappings into one final target buffer.
+- [x] Upload identical source layouts directly into the final selected backend buffer.
+- [x] Preserve one-final-tensor-at-a-time peak-memory bounds for transformed tensors.
+- [x] Investigate zero-copy CPU mappings for identical canonical layouts.
+- [x] Measure load time, peak host RAM, steady-state model bytes, and storage reads.
 
 Gate: no complete model duplication, no temporary GGUF, and no throughput regression after load.
 
+The registry now keeps each shard mapped for the importer lifetime. Plain BF16,
+F32, and raw F8 tensors use the mapped address in one synchronous full-tensor
+backend upload. NVFP4, W8A8, AWQ, and GPTQ transforms read the mapped source
+directly and allocate only their final canonical tensor image. A full backend
+set is intentional: CPU repack and optional CUDA-private upload transforms
+require offset zero and the complete tensor. True mapped CPU tensor ownership
+would require a source-aware buffer allocator and lifetime handoff before the
+current destination-allocation seam; it was investigated and deferred rather
+than emulated with an unsafe view. `--no-mmap` is honored: the same registry
+falls back to checked, bounded file reads and never exposes a mapped address.
+The registry also preserves `--direct-io` through `llama_file`'s aligned direct
+read path (including its existing platform fallback), while `--mlock` and
+`mmap+mlock` lock final CPU-resident model buffers rather than the temporary
+source mapping.
+
+Measured on one RTX A6000, including model load and a three-repeat PP512/TG128
+run:
+
+| source (pinned revision) | canonical model bytes | peak host RSS | wall time | PP512 | TG128 |
+|---|---:|---:|---:|---:|---:|
+| `nytopop/Qwen3-4B.w8a8@57645321` | 5,417,007,104 | 6,080 MiB | 36.21 s | 8,017 t/s | 121.5 t/s |
+| `Qwen/Qwen3-4B-AWQ@74d4bd2b` | 3,049,519,104 | 3,690 MiB | 34.87 s | 7,864 t/s | 169.7 t/s |
+| `JunHowie/Qwen3-4B-GPTQ-Int4@8153b802` | 3,049,519,104 | 3,693 MiB | 34.05 s | 7,837 t/s | 169.4 t/s |
+
+The measurement command was `llama-bench -m <directory> -ngl 99 -fa on
+-p 512 -n 128 -r 3 -o json`, wrapped by `/usr/bin/time -v` for wall time and
+peak RSS.
+
+Warm-cache storage reads were zero for the retained W8A8 and GPTQ runs (the
+first W8A8 run reported 496 filesystem input blocks). These are not cold-disk
+numbers. A parallel row-repack experiment did not change W8A8 wall time and was
+removed; the recurring startup cost is dominated downstream of the source-copy
+loop. Steady-state graphs contain only canonical ggml tensors and no source
+format dispatch.
+
 ### Phase 8 — Add further quant formats independently
 
-- [ ] Add W8A8 compressed-tensors support.
-- [ ] Add AWQ support with an explicit decision between native execution and load-time repack.
-- [ ] Add non-act-order GPTQ support.
-- [ ] Treat act-order GPTQ as a separate runtime-kernel project unless an exact canonical representation is designed.
-- [ ] Require each adapter to declare CPU, CUDA, HIP, split/offload, and mmap capabilities.
+- [x] Add W8A8 compressed-tensors support.
+- [x] Add AWQ support with an explicit decision between native execution and load-time repack.
+- [x] Add non-act-order GPTQ support.
+- [x] Treat act-order GPTQ as a separate runtime-kernel project unless an exact canonical representation is designed.
+- [x] Record CPU, CUDA, HIP, split/offload, and mmap capabilities for each adapter.
 
 Gate: each new format has contract fixtures, projection correctness, end-to-end KLD, backend capability checks, and independent PP/TG measurements.
+
+The first W8A8 adapter accepts only the measured compressed-tensors contract:
+signed INT8 channel weights, BF16 channel scales, and dynamic symmetric INT8
+token activations. It preserves every INT8 code and folds each BF16 channel
+scale into existing Q8_0 blocks. Against an exactly dequantized BF16 control on
+the canonical 16K WikiText panel it measured median KLD 0.000106, mean 0.000564,
+p99 0.006248, and 99.219% same-top.
+
+AWQ and non-act-order GPTQ are intentionally reference adapters, not the final
+competitive executors. Both unpack their producer-specific INT32 layout and
+fold group-128 affine parameters into Q4_1. This preserves the 4-bit codes and
+works through existing placement and backend machinery, but costs 5.0 bpw and
+uses W4A8 arithmetic. The authoritative AWQ packing permutation is
+`[0,4,1,5,2,6,3,7]`; GPTQ uses ordinary nibble order and its v1 stored-zero
+`+1` convention. GPTQ additionally requires an identity group map. A real
+`desc_act=true` configuration or non-identity `g_idx` fails during adapter
+validation, before model allocation.
+
+Qwen3.5 recurrent projections add row/column layout transforms. The reference
+AWQ/GPTQ repacks cannot apply those transforms after unpacking without also
+moving their group parameters, and W8A8/NVFP4 column transforms need a
+block-aware permutation. Those combinations are rejected during tensor
+description rather than misusing the packed source shape. Production native
+executors must make the coupled transform order explicit before lifting this
+restriction.
+
+One 512-token WikiText control per format measured the representation cost
+against weights dequantized directly from the same source tensors:
+
+| source | median KLD | mean KLD | p99 KLD | same-top |
+|---|---:|---:|---:|---:|
+| AWQ W4A16-g128 -> Q4_1 | 0.000684 | 0.003999 | 0.041151 | 97.647% |
+| GPTQ W4A16-g128 -> Q4_1 | 0.001656 | 0.014044 | 0.218618 | 97.647% |
+
+Those results are not near-zero and must not be described as transparent native
+AWQ/GPTQ execution. Production parity still requires a group-128 W4A16 type
+and executor (or an integrated maintained executor such as Marlin). The value
+of these adapters is a strict loader/reference path and a reusable correctness
+oracle for that kernel work.
+
+| adapter output | CPU | CUDA | HIP | layer/tensor placement and CPU offload | direct source mmap |
+|---|---|---|---|---|---|
+| raw BF16/F32 and channel-scaled F8 | canonical backend support | canonical backend support | canonical backend support | yes | yes |
+| NVFP4 | existing NVFP4 type | existing NVFP4 type | existing NVFP4 type | yes | no (repack) |
+| W8A8 -> Q8_0 | existing Q8_0 type | existing Q8_0 type | existing Q8_0 type | yes | no (repack) |
+| AWQ/GPTQ -> Q4_1 | existing Q4_1 type | existing Q4_1 type | existing Q4_1 type | yes | no (repack) |
+
+The A6000 gates include CUDA execution for all three new adapters and an
+all-CPU GPTQ smoke test (2.0 PP t/s, 1.5 TG t/s). A raw channel-FP8 model also
+completed a CUDA `load_mode=none` smoke (PP16 248.3 t/s, TG8 111.9 t/s), proving
+that disabling mmap takes the bounded-read/materialization path rather than the
+direct mapped upload. HIP and multi-device split inherit established
+Q8_0/Q4_1 kernels and placement semantics, but still need real-machine
+regression runs before release.
 
 ## 6. Test matrix
 
@@ -434,16 +523,20 @@ Questions reviewers must answer:
 7. Is the source/importer lifetime valid until the final upload and all asynchronous copies complete?
 8. Can cancellation or an exception leave partially registered/repacked tensor state behind?
 
-## 8. Recommended immediate order
+## 8. Recommended next order
 
-Phases 1–4 are implemented. Recommended next sequence:
+The architecture bridge, bounded loader, second-model proof, and first format
+adapters have working implementations. Before describing the branch as
+release-ready:
 
-1. freeze the current NVFP4/block-FP8 correctness and performance baselines;
-2. replace Qwen's ordinary projection table with shared naming templates and
-   explicit transform objects;
-3. run the complete regression matrix;
-4. add one straightforward dense architecture as proof of the bridge;
-5. only then expand numerical-format coverage.
+1. run the remaining real-machine HIP and multi-device placement gates;
+2. perform the planned simplification and correctness review over the complete
+   source/importer/adapter diff;
+3. freeze reproducible commands and baselines for the retained NVFP4 and FP8
+   executors;
+4. implement native group-128 W4A16 execution before presenting AWQ or GPTQ as
+   performance-competitive support;
+5. add act-order GPTQ only with an exact activation-gather/runtime contract.
 
 ## 9. Definition of done
 

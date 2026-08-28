@@ -15,6 +15,9 @@ struct llama_safetensors_quant_summary {
     size_t nvfp4       = 0;
     size_t fp8_channel = 0;
     size_t fp8_block   = 0;
+    size_t w8a8        = 0;
+    size_t awq          = 0;
+    size_t gptq         = 0;
 };
 
 enum class llama_safetensors_quant_role {
@@ -26,6 +29,9 @@ enum class llama_safetensors_quant_role {
 enum class llama_safetensors_quant_materialization {
     RAW,
     NVFP4_REPACK,
+    W8A8_REPACK,
+    AWQ_REPACK,
+    GPTQ_REPACK,
     RECIPROCAL_F32,
     FP8_BLOCK_SCALE,
 };
@@ -33,7 +39,7 @@ enum class llama_safetensors_quant_materialization {
 struct llama_safetensors_quant_binding {
     llama_safetensors_quant_materialization materialization;
     std::string                             primary;
-    std::string                             auxiliary;
+    std::vector<std::string>                auxiliaries;
     ggml_type                               target_type;
     std::vector<int64_t>                    target_shape;
 };
@@ -49,7 +55,9 @@ class llama_safetensors_quant_adapters {
 
     std::optional<llama_safetensors_quant_binding> bind(
         const std::string & module, llama_safetensors_quant_role role) const;
+    bool applies(const std::string & module) const;
     const llama_safetensors_quant_summary & summary() const;
+    uint32_t file_type() const;
 
     std::vector<uint8_t> read(const llama_safetensors_quant_binding & binding) const;
     std::vector<uint8_t> finalize(
@@ -67,11 +75,37 @@ class llama_safetensors_quant_adapters {
     mutable std::unordered_set<std::string> consumed_;
 
     const llama_safetensors_quant_group * match(const std::string & module) const;
+    bool format_applies(
+        const std::string & module,
+        const llama_safetensors_quant_group & group) const;
     std::string weight_scale_name(const std::string & module) const;
     std::vector<uint8_t> repack_nvfp4(
         const llama_safetensors_tensor & weight_desc,
-        const std::vector<uint8_t> & weight,
+        const uint8_t * weight,
+        size_t weight_size,
         const llama_safetensors_tensor & scale_desc,
-        const std::vector<uint8_t> & scale) const;
+        const uint8_t * scale,
+        size_t scale_size) const;
+    std::vector<uint8_t> repack_w8a8(
+        const llama_safetensors_tensor & weight_desc,
+        const uint8_t * weight,
+        size_t weight_size,
+        const llama_safetensors_tensor & scale_desc,
+        const uint8_t * scale,
+        size_t scale_size) const;
+    std::vector<uint8_t> repack_awq(
+        const llama_safetensors_tensor & qweight_desc,
+        const uint8_t * qweight,
+        const llama_safetensors_tensor & qzeros_desc,
+        const uint8_t * qzeros,
+        const llama_safetensors_tensor & scales_desc,
+        const uint8_t * scales) const;
+    std::vector<uint8_t> repack_gptq(
+        const llama_safetensors_tensor & qweight_desc,
+        const uint8_t * qweight,
+        const llama_safetensors_tensor & qzeros_desc,
+        const uint8_t * qzeros,
+        const llama_safetensors_tensor & scales_desc,
+        const uint8_t * scales) const;
     void validate();
 };

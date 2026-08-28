@@ -27,6 +27,14 @@ bool llama_safetensors_describe_tensor(const llama_safetensors_registry &       
 void llama_safetensors_consume_tensor(const llama_safetensors_quant_adapters & quant,
                                       const llama_safetensors_tensor_binding & binding);
 
+// Uploads source bytes directly from a mapped shard when the source and
+// canonical runtime layouts are identical. Returns false when materialization
+// or an architecture transform is still required.
+bool llama_safetensors_load_tensor_direct(const llama_safetensors_registry &       registry,
+                                          const llama_safetensors_tensor_binding & binding,
+                                          ggml_tensor *                            destination,
+                                          bool                                     check_tensor);
+
 std::vector<uint8_t> llama_safetensors_materialize_tensor(const llama_safetensors_registry &       registry,
                                                           const llama_safetensors_quant_adapters & quant,
                                                           const llama_safetensors_tensor_binding & binding,

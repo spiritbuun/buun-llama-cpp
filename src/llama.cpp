@@ -472,7 +472,11 @@ llama_model * llama_model_init_from_source(
     GGML_ASSERT(source != nullptr);
     std::string path_model;
     std::vector<std::string> splits;
-    params.load_mode = LLAMA_LOAD_MODE_NONE;
+    if (params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK) {
+        params.load_mode = LLAMA_LOAD_MODE_MLOCK;
+    } else if (params.load_mode != LLAMA_LOAD_MODE_DIRECT_IO) {
+        params.load_mode = LLAMA_LOAD_MODE_NONE;
+    }
     params.use_extra_bufts = false;
     return llama_model_load_from_file_impl(
         metadata, /*set_tensor_data*/ nullptr, /*set_tensor_data_ud*/ nullptr, source,

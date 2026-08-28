@@ -1,5 +1,7 @@
 #include "llama-safetensors-tensor.h"
 
+#include "ggml-backend.h"
+
 #include <algorithm>
 #include <cstring>
 #include <limits>
@@ -64,6 +66,9 @@ llama_safetensors_tensor_binding llama_safetensors_bind_tensor(const llama_safet
         if (auto binding = quant.bind(source.module, *source.quant_role)) {
             return { binding->primary, std::move(binding) };
         }
+        if (quant.applies(source.module)) {
+            return { {}, std::nullopt };
+        }
     }
     return { std::move(source.source), std::nullopt };
 }
@@ -91,6 +96,32 @@ void llama_safetensors_consume_tensor(const llama_safetensors_quant_adapters & q
     if (binding.quant) {
         quant.consume(*binding.quant);
     }
+}
+
+bool llama_safetensors_load_tensor_direct(const llama_safetensors_registry &       registry,
+                                          const llama_safetensors_tensor_binding & binding,
+                                          ggml_tensor *                            destination,
+                                          bool                                     check_tensor) {
+    if (binding.quant && binding.quant->materialization != llama_safetensors_quant_materialization::RAW) {
+        return false;
+    }
+    const llama_safetensors_tensor * source = find_source(registry, binding);
+    if (source == nullptr) {
+        return false;
+    }
+    const ggml_type source_type = binding.quant ? binding.quant->target_type : plain_target_type(*source);
+    if (source_type != destination->type || source->size != ggml_nbytes(destination)) {
+        return false;
+    }
+    const uint8_t * data = registry.data(*source);
+    if (data == nullptr) {
+        return false;
+    }
+    if (check_tensor && !ggml_validate_row_data(destination->type, data, source->size)) {
+        throw std::runtime_error("tensor '" + std::string(destination->name) + "' has invalid data");
+    }
+    ggml_backend_tensor_set(destination, data, 0, source->size);
+    return true;
 }
 
 std::vector<uint8_t> llama_safetensors_materialize_tensor(const llama_safetensors_registry &       registry,

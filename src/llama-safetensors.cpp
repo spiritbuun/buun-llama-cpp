@@ -4,9 +4,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <optional>
 #include <regex>
 #include <set>
@@ -225,6 +227,31 @@ const json & require_json_value(const json & object, const char * key, const std
 
 }  // namespace
 
+size_t llama_safetensors_dtype_size(llama_safetensors_dtype dtype) {
+    switch (dtype) {
+        case llama_safetensors_dtype::BOOL:
+        case llama_safetensors_dtype::U8:
+        case llama_safetensors_dtype::I8:
+        case llama_safetensors_dtype::F8_E4M3:
+        case llama_safetensors_dtype::F8_E5M2:
+            return 1;
+        case llama_safetensors_dtype::U16:
+        case llama_safetensors_dtype::I16:
+        case llama_safetensors_dtype::F16:
+        case llama_safetensors_dtype::BF16:
+            return 2;
+        case llama_safetensors_dtype::U32:
+        case llama_safetensors_dtype::I32:
+        case llama_safetensors_dtype::F32:
+            return 4;
+        case llama_safetensors_dtype::U64:
+        case llama_safetensors_dtype::I64:
+        case llama_safetensors_dtype::F64:
+            return 8;
+    }
+    throw std::runtime_error("unknown safetensors dtype");
+}
+
 llama_safetensors_quant_config::rule llama_safetensors_quant_config::make_rule(const std::string & target,
                                                                                uint32_t            group) {
     rule result;
@@ -292,14 +319,68 @@ llama_safetensors_quant_config llama_safetensors_quant_config::from_json(const l
         return result;
     }
 
+    if (quant_method == "awq") {
+        if (require_json_value(quant, "bits", "quantization_config").get<uint32_t>() != 4 ||
+            require_json_value(quant, "group_size", "quantization_config").get<uint32_t>() != 128 ||
+            require_json_value(quant, "zero_point", "quantization_config").get<bool>() != true ||
+            require_json_value(quant, "version", "quantization_config").get<std::string>() != "gemm") {
+            throw std::runtime_error("unsupported native AWQ quantization contract");
+        }
+
+        llama_safetensors_quant_group group;
+        group.name       = "awq-w4a16-g128";
+        group.format     = llama_safetensors_quant_format::AWQ_G128;
+        group.group_size = 128;
+        result.groups_.push_back(std::move(group));
+        result.rules_.push_back(make_rule("re:.*", 0));
+
+        if (quant.contains("modules_to_not_convert") && !quant.at("modules_to_not_convert").is_null()) {
+            const json & ignored = quant.at("modules_to_not_convert");
+            if (!ignored.is_array()) {
+                throw std::runtime_error("quantization_config.modules_to_not_convert must be null or an array");
+            }
+            for (const auto & target : ignored) {
+                if (!target.is_string()) {
+                    throw std::runtime_error("non-string module in quantization_config.modules_to_not_convert");
+                }
+                result.ignore_.push_back(make_rule(target.get<std::string>(), 0));
+            }
+        }
+        return result;
+    }
+
+    if (quant_method == "gptq") {
+        const bool desc_act = require_json_value(quant, "desc_act", "quantization_config").get<bool>();
+        if (desc_act) {
+            throw std::runtime_error(
+                "native safetensors does not support act-order GPTQ; desc_act must be false");
+        }
+        if (require_json_value(quant, "bits", "quantization_config").get<uint32_t>() != 4 ||
+            require_json_value(quant, "group_size", "quantization_config").get<uint32_t>() != 128 ||
+            require_json_value(quant, "checkpoint_format", "quantization_config").get<std::string>() != "gptq" ||
+            require_json_value(quant, "pack_dtype", "quantization_config").get<std::string>() != "int32") {
+            throw std::runtime_error("unsupported native GPTQ quantization contract");
+        }
+
+        llama_safetensors_quant_group group;
+        group.name       = "gptq-w4a16-g128";
+        group.format     = llama_safetensors_quant_format::GPTQ_G128;
+        group.group_size = 128;
+        result.groups_.push_back(std::move(group));
+        result.rules_.push_back(make_rule("re:.*", 0));
+        return result;
+    }
+
     if (quant_method != "compressed-tensors") {
         throw std::runtime_error("native safetensors does not support quant_method '" + quant_method + "'");
     }
     const std::string container_format =
         require_json_value(quant, "format", "quantization_config").get<std::string>();
-    if (container_format != "mixed-precision" && container_format != "float-quantized") {
+    if (container_format != "mixed-precision" && container_format != "float-quantized" &&
+        container_format != "int-quantized") {
         throw std::runtime_error(
-            "native safetensors requires compressed-tensors format 'mixed-precision' or 'float-quantized'");
+            "native safetensors requires compressed-tensors format 'mixed-precision', 'float-quantized', or "
+            "'int-quantized'");
     }
 
     const json config_groups = require_json_value(quant, "config_groups", "quantization_config");
@@ -393,6 +474,30 @@ llama_safetensors_quant_config llama_safetensors_quant_config::from_json(const l
                 (input.contains("actorder") && !input.at("actorder").is_null())) {
                 throw std::runtime_error("unsupported FP8 input activation contract in group '" + name + "'");
             }
+        } else if (format == "int-quantized") {
+            const uint32_t num_bits =
+                require_json_value(weights, "num_bits", "quantization group '" + name + "'").get<uint32_t>();
+            const std::string strategy =
+                require_json_value(weights, "strategy", "quantization group '" + name + "'").get<std::string>();
+            require_null(weights, "group_size", "quantization group '" + name + "'");
+            require_null(weights, "block_structure", "quantization group '" + name + "'");
+            require_null(weights, "actorder", "quantization group '" + name + "'");
+            if (type != "int" || num_bits != 8 || strategy != "channel" || !symmetric || dynamic) {
+                throw std::runtime_error("unsupported W8A8 weight contract in group '" + name + "'");
+            }
+            group.format = llama_safetensors_quant_format::INT8_CHANNEL;
+
+            const json input = require_json_value(desc, "input_activations", "quantization group '" + name + "'");
+            if (require_json_value(input, "type", "input activations for group '" + name + "'").get<std::string>() != "int" ||
+                require_json_value(input, "num_bits", "input activations for group '" + name + "'").get<uint32_t>() != 8 ||
+                require_json_value(input, "strategy", "input activations for group '" + name + "'").get<std::string>() != "token" ||
+                require_json_value(input, "symmetric", "input activations for group '" + name + "'").get<bool>() != true ||
+                require_json_value(input, "dynamic", "input activations for group '" + name + "'").get<bool>() != true ||
+                (input.contains("group_size") && !input.at("group_size").is_null()) ||
+                (input.contains("block_structure") && !input.at("block_structure").is_null()) ||
+                (input.contains("actorder") && !input.at("actorder").is_null())) {
+                throw std::runtime_error("unsupported W8A8 input activation contract in group '" + name + "'");
+            }
         } else {
             throw std::runtime_error("unsupported compressed-tensors weight type '" + type + "'");
         }
@@ -457,7 +562,8 @@ const llama_safetensors_quant_group * llama_safetensors_quant_config::match(cons
     return nullptr;
 }
 
-llama_safetensors_registry llama_safetensors_registry::load(const std::filesystem::path & model_dir) {
+llama_safetensors_registry llama_safetensors_registry::load(
+        const std::filesystem::path & model_dir, llama_safetensors_io_mode io_mode) {
     llama_safetensors_registry result;
     const auto                 index_path = model_dir / "model.safetensors.index.json";
 
@@ -516,6 +622,18 @@ llama_safetensors_registry llama_safetensors_registry::load(const std::filesyste
         }
     }
 
+    result.files_.reserve(result.shards_.size());
+    for (const llama_safetensors_shard & shard : result.shards_) {
+        result.files_.push_back(std::make_unique<llama_file>(
+            shard.path.string().c_str(), "rb", io_mode == llama_safetensors_io_mode::DIRECT));
+    }
+    if (io_mode == llama_safetensors_io_mode::MMAP && llama_mmap::SUPPORTED) {
+        result.mappings_.reserve(result.shards_.size());
+        for (const auto & file : result.files_) {
+            result.mappings_.push_back(std::make_unique<llama_mmap>(file.get(), 0, false));
+        }
+    }
+
     return result;
 }
 
@@ -524,32 +642,44 @@ const llama_safetensors_tensor * llama_safetensors_registry::find(const std::str
     return it == tensor_index_.end() ? nullptr : &tensors_[it->second];
 }
 
-std::vector<uint8_t> llama_safetensors_registry::read(const llama_safetensors_tensor & tensor) const {
-    if (tensor.shard >= shards_.size()) {
-        throw std::runtime_error("invalid shard index for safetensors tensor '" + tensor.name + "'");
+const uint8_t * llama_safetensors_registry::data(const llama_safetensors_tensor & tensor) const {
+    if (tensor.shard >= shards_.size() || tensor.shard >= mappings_.size()) {
+        return nullptr;
     }
     const llama_safetensors_shard & shard = shards_[tensor.shard];
     if (tensor.offset > shard.file_size || tensor.size > shard.file_size - tensor.offset) {
         throw std::runtime_error("safetensors tensor '" + tensor.name + "' is outside its shard");
     }
+    return static_cast<const uint8_t *>(mappings_[tensor.shard]->addr()) + tensor.offset;
+}
+
+void llama_safetensors_registry::read_into(
+        const llama_safetensors_tensor & tensor,
+        uint64_t offset,
+        void * destination,
+        size_t size) const {
+    if (tensor.shard >= shards_.size() || offset > tensor.size || size > tensor.size - offset) {
+        throw std::runtime_error("invalid read range for safetensors tensor '" + tensor.name + "'");
+    }
+    if (const uint8_t * mapped = data(tensor)) {
+        std::memcpy(destination, mapped + offset, size);
+        return;
+    }
+
+    llama_file & file = *files_.at(tensor.shard);
+    file.seek(tensor.offset + offset, SEEK_SET);
+    file.read_raw(destination, size);
+}
+
+std::vector<uint8_t> llama_safetensors_registry::read(const llama_safetensors_tensor & tensor) const {
+    if (tensor.shard >= shards_.size()) {
+        throw std::runtime_error("invalid shard index for safetensors tensor '" + tensor.name + "'");
+    }
     if (tensor.size > std::numeric_limits<size_t>::max()) {
         throw std::runtime_error("safetensors tensor '" + tensor.name + "' is too large for this host");
     }
-
-    std::ifstream in(shard.path, std::ios::binary);
-    if (!in) {
-        throw std::runtime_error("failed to open safetensors shard '" + shard.path.string() + "'");
-    }
-    in.seekg(static_cast<std::streamoff>(tensor.offset));
-    if (!in) {
-        throw std::runtime_error("failed to seek to safetensors tensor '" + tensor.name + "'");
-    }
-
     std::vector<uint8_t> result(static_cast<size_t>(tensor.size));
-    in.read(reinterpret_cast<char *>(result.data()), static_cast<std::streamsize>(result.size()));
-    if (!in) {
-        throw std::runtime_error("failed to read safetensors tensor '" + tensor.name + "'");
-    }
+    read_into(tensor, 0, result.data(), result.size());
     return result;
 }
 
