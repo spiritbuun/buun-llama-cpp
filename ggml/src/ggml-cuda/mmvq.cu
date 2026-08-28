@@ -6,6 +6,7 @@
 #include "humming-fp8.cuh"
 #include "humming-fp8-block.cuh"
 #include "humming-nvfp4.cuh"
+#include "marlin-q4-a32.cuh"
 #endif
 
 #include <cstdint>
@@ -14,6 +15,133 @@
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
 #if !defined(GGML_USE_HIP)
+static nv_bfloat16 * ggml_cuda_humming_get_input(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * src,
+    size_t count,
+    cudaStream_t stream);
+static bool ggml_cuda_humming_bf16_mlp_enabled();
+static bool ggml_cuda_humming_finish_residual_rms(
+    ggml_backend_cuda_context & ctx,
+    const ggml_cuda_mm_fusion_args_host * fusion,
+    const nv_bfloat16 * output,
+    ggml_tensor * dst,
+    int64_t n,
+    int64_t m,
+    cudaStream_t stream);
+
+bool ggml_cuda_mul_mat_marlin_q4_a32(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * ids,
+        ggml_tensor * dst,
+        const ggml_cuda_mm_fusion_args_host * fusion) {
+    if (!ggml_cuda_marlin_q4_a32_enabled() || src0->type != GGML_TYPE_Q4_A32 ||
+        ids != nullptr ||
+        src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+        dst->ne[2] != 1 || dst->ne[3] != 1 ||
+        !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+
+    const ggml_tensor * gate = fusion != nullptr ? fusion->gate : nullptr;
+    if (fusion != nullptr && (fusion->x_scale != nullptr || fusion->gate_scale != nullptr ||
+            fusion->x_bias != nullptr || fusion->gate_bias != nullptr)) {
+        return false;
+    }
+    if (gate != nullptr && (fusion->glu_op != GGML_GLU_OP_SWIGLU ||
+            gate->type != GGML_TYPE_Q4_A32 || !ggml_are_same_shape(gate, src0) ||
+            !ggml_are_same_stride(gate, src0) || !ggml_is_contiguous(gate))) {
+        return false;
+    }
+
+    const int64_t k = src0->ne[0];
+    const int64_t n = src0->ne[1];
+    const int64_t m = src1->ne[1];
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (src1->ne[0] != k || dst->ne[0] != n || dst->ne[1] != m ||
+        !ggml_cuda_marlin_q4_a32_supports_shape(n, k, m, cc)) {
+        return false;
+    }
+
+    cudaStream_t stream = ctx.stream();
+    auto prepare_weight = [&](const ggml_tensor * weight) {
+        if (ggml_cuda_marlin_q4_a32_is_repacked(weight)) {
+            ggml_cuda_marlin_q4_a32_cache_entry entry;
+            entry.weight_size = size_t(n) * k / 2;
+            entry.scale_size  = size_t(n) * k / QG4_A32 * sizeof(nv_bfloat16);
+            entry.zero_size   = size_t(n) * k / QG4_A32 / 2;
+            entry.weight = weight->data;
+            entry.scale  = static_cast<char *>(weight->data) + entry.weight_size;
+            entry.zero   = static_cast<char *>(entry.scale) + entry.scale_size;
+            return entry;
+        }
+        auto [it, inserted] = ctx.marlin_q4_a32_cache.try_emplace(weight->data);
+        ggml_cuda_marlin_q4_a32_cache_entry & entry = it->second;
+        if (!inserted) {
+            return entry;
+        }
+        entry.weight_size = size_t(n) * k / 2;
+        entry.scale_size  = size_t(n) * k / QG4_A32 * sizeof(nv_bfloat16);
+        entry.zero_size   = size_t(n) * k / QG4_A32 / 2;
+        CUDA_CHECK(cudaMalloc(&entry.weight, entry.weight_size));
+        CUDA_CHECK(cudaMalloc(&entry.scale, entry.scale_size));
+        CUDA_CHECK(cudaMalloc(&entry.zero, entry.zero_size));
+        ggml_cuda_pool_alloc<uint32_t> raw_weight(ctx.pool(), entry.weight_size / sizeof(uint32_t));
+        ggml_cuda_marlin_q4_a32_prepare(
+            weight->data, raw_weight.get(), entry.weight, entry.scale, entry.zero,
+            n, k, ctx.device, ggml_cuda_info().devices[ctx.device].nsm, stream);
+        return entry;
+    };
+    const ggml_cuda_marlin_q4_a32_cache_entry entry = prepare_weight(src0);
+    const ggml_cuda_marlin_q4_a32_cache_entry gate_entry = gate != nullptr ? prepare_weight(gate) :
+        ggml_cuda_marlin_q4_a32_cache_entry{};
+
+    auto & lock_storage = ctx.humming_fp8_locks[ctx.curr_stream_no];
+    const size_t required_locks = ((m + 15) / 16) * ((n + 63) / 64);
+    if (lock_storage.count < required_locks) {
+        if (lock_storage.ptr != nullptr) {
+            lock_storage.retired.push_back(lock_storage.ptr);
+        }
+        CUDA_CHECK(cudaMalloc(&lock_storage.ptr, required_locks * sizeof(int32_t)));
+        CUDA_CHECK(cudaMemsetAsync(lock_storage.ptr, 0, required_locks * sizeof(int32_t), stream));
+        lock_storage.count = required_locks;
+    }
+
+    nv_bfloat16 * input = ggml_cuda_humming_get_input(ctx, src1, size_t(m) * k, stream);
+    ggml_cuda_pool_alloc<nv_bfloat16> output(ctx.pool(), size_t(m) * n);
+    ggml_cuda_pool_alloc<nv_bfloat16> gate_output(ctx.pool());
+    if (gate != nullptr) {
+        gate_output.alloc(size_t(m) * n);
+    }
+    ggml_cuda_marlin_q4_a32_launch(
+        input, entry.weight, entry.scale, entry.zero, output.get(), lock_storage.ptr,
+        n, k, m, ctx.device, ggml_cuda_info().devices[ctx.device].nsm, stream);
+    if (gate != nullptr) {
+        ggml_cuda_marlin_q4_a32_launch(
+            input, gate_entry.weight, gate_entry.scale, gate_entry.zero,
+            gate_output.get(), lock_storage.ptr, n, k, m, ctx.device,
+            ggml_cuda_info().devices[ctx.device].nsm, stream);
+    }
+
+    if (fusion != nullptr && fusion->residual != nullptr &&
+            ggml_cuda_humming_finish_residual_rms(ctx, fusion, output.get(), dst, n, m, stream)) {
+        // The fused epilogue materializes the required F32 graph outputs and
+        // preserves a BF16 normalized activation for following projections.
+    } else if (gate != nullptr && ggml_cuda_humming_bf16_mlp_enabled() && n == 17408) {
+        ggml_cuda_humming_fp8_swiglu_bf16(
+            output.get(), gate_output.get(), static_cast<nv_bfloat16 *>(dst->data), size_t(m) * n, stream);
+        ctx.humming_bf16_activations.insert(dst);
+    } else {
+        ggml_cuda_humming_fp8_output_bf16_to_f32(
+            output.get(), gate != nullptr ? gate_output.get() : nullptr,
+            static_cast<float *>(dst->data), size_t(m) * n, stream);
+    }
+    return true;
+}
+
 static nv_bfloat16 * ggml_cuda_humming_prepare_input(
         ggml_backend_cuda_context & ctx,
         const ggml_tensor * src,

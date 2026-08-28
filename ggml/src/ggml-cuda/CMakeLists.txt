@@ -104,6 +104,10 @@ if (CUDAToolkit_FOUND)
 
     file(GLOB   GGML_SOURCES_CUDA "*.cu")
     list(FILTER GGML_SOURCES_CUDA EXCLUDE REGEX "bsa_.*\\.cu$")
+    if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/marlin-q4-a32.cu")
+        set_source_files_properties(marlin-q4-a32.cu PROPERTIES
+            COMPILE_OPTIONS "--expt-relaxed-constexpr")
+    endif()
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     option(GGML_CUDA_TURBO_FA "Build Turbo flash-attention template instances" ON)

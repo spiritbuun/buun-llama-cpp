@@ -1516,6 +1516,15 @@ struct ggml_cuda_humming_nvfp4_cache_entry {
     size_t scale_size  = 0;
 };
 
+struct ggml_cuda_marlin_q4_a32_cache_entry {
+    void * weight = nullptr;
+    void * scale  = nullptr;
+    void * zero   = nullptr;
+    size_t weight_size = 0;
+    size_t scale_size  = 0;
+    size_t zero_size   = 0;
+};
+
 struct ggml_cuda_humming_fp8_lock_storage {
     int32_t * ptr = nullptr;
     size_t count = 0;
@@ -1573,6 +1582,7 @@ struct ggml_backend_cuda_context {
     // prototype safe across independent llama contexts and CUDA devices.
     std::unordered_map<const void *, ggml_cuda_humming_fp8_cache_entry> humming_fp8_cache;
     std::unordered_map<const void *, ggml_cuda_humming_nvfp4_cache_entry> humming_nvfp4_cache;
+    std::unordered_map<const void *, ggml_cuda_marlin_q4_a32_cache_entry> marlin_q4_a32_cache;
     ggml_cuda_humming_fp8_lock_storage humming_fp8_locks[GGML_CUDA_MAX_STREAMS];
     ggml_cuda_humming_input_storage humming_inputs[GGML_CUDA_MAX_STREAMS];
     std::unordered_set<const ggml_tensor *> humming_bf16_activations;

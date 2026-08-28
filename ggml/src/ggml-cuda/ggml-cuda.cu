@@ -75,6 +75,7 @@
 #include "ggml-cuda/humming-fp8.cuh"
 #include "ggml-cuda/humming-fp8-block.cuh"
 #include "ggml-cuda/humming-nvfp4.cuh"
+#include "ggml-cuda/marlin-q4-a32.cuh"
 #include "ggml.h"
 
 
@@ -777,6 +778,11 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         CUDA_CHECK(cudaFree(item.second.weight));
         CUDA_CHECK(cudaFree(item.second.scale));
     }
+    for (auto & item : marlin_q4_a32_cache) {
+        CUDA_CHECK(cudaFree(item.second.weight));
+        CUDA_CHECK(cudaFree(item.second.scale));
+        CUDA_CHECK(cudaFree(item.second.zero));
+    }
     for (auto & item : humming_prepared_activations) {
         CUDA_CHECK(cudaFree(item.second.ptr));
         for (nv_bfloat16 * ptr : item.second.retired) {
@@ -827,6 +833,7 @@ struct ggml_backend_cuda_buffer_context {
 #if !defined(GGML_USE_HIP)
     std::unordered_set<const void *> humming_fp8_repacked;
     std::unordered_set<const void *> humming_nvfp4_repacked;
+    std::unordered_set<const void *> marlin_q4_a32_repacked;
 #endif
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr, bool owned = true) :
@@ -865,6 +872,14 @@ bool ggml_cuda_humming_nvfp4_is_repacked(const ggml_tensor * tensor) {
     }
     const auto * ctx = static_cast<const ggml_backend_cuda_buffer_context *>(tensor->buffer->context);
     return ctx->humming_nvfp4_repacked.find(tensor->data) != ctx->humming_nvfp4_repacked.end();
+}
+
+bool ggml_cuda_marlin_q4_a32_is_repacked(const ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->buffer == nullptr || !ggml_backend_buffer_is_cuda(tensor->buffer)) {
+        return false;
+    }
+    const auto * ctx = static_cast<const ggml_backend_cuda_buffer_context *>(tensor->buffer->context);
+    return ctx->marlin_q4_a32_repacked.count(tensor->data) != 0;
 }
 
 static ggml_tensor * ggml_cuda_tensor_owner(ggml_tensor * tensor) {
@@ -911,6 +926,18 @@ static void ggml_cuda_canonicalize_repacked(
         CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
         CUDA_CHECK(cudaFree(canonical));
     }
+
+    if (ctx->marlin_q4_a32_repacked.erase(owner->data) != 0) {
+        void * canonical = nullptr;
+        CUDA_CHECK(cudaMalloc(&canonical, size));
+        ggml_cuda_marlin_q4_a32_unrepack(
+            owner->data, canonical, owner->ne[1], owner->ne[0], cudaStreamPerThread);
+        CUDA_CHECK(cudaMemcpyAsync(
+            owner->data, canonical, size, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        CUDA_CHECK(cudaFree(canonical));
+    }
+
 }
 #endif
 
@@ -953,6 +980,7 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     if (tensor == owner && offset == 0 && size == ggml_nbytes(owner)) {
         ctx->humming_fp8_repacked.erase(owner->data);
         ctx->humming_nvfp4_repacked.erase(owner->data);
+        ctx->marlin_q4_a32_repacked.erase(owner->data);
     } else {
         ggml_cuda_canonicalize_repacked(ctx, tensor);
     }
@@ -971,6 +999,7 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     if (full_owner) {
         ctx->humming_fp8_repacked.erase(owner->data);
         ctx->humming_nvfp4_repacked.erase(owner->data);
+        ctx->marlin_q4_a32_repacked.erase(owner->data);
     } else {
         ggml_cuda_canonicalize_repacked(ctx, tensor);
     }
@@ -1004,6 +1033,17 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         ctx->humming_nvfp4_repacked.insert(tensor->data);
         return;
     }
+    if (ggml_cuda_marlin_q4_a32_enabled() && full_tensor && tensor->type == GGML_TYPE_Q4_A32 &&
+        tensor->view_src == nullptr && ggml_is_contiguous(tensor) &&
+        ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+        tensor->ne[2] == 1 && tensor->ne[3] == 1 &&
+        ggml_cuda_marlin_q4_a32_supports_shape(tensor->ne[1], tensor->ne[0], 1, cc)) {
+        ggml_cuda_marlin_q4_a32_repack_upload(
+            data, tensor->data, tensor->ne[1], tensor->ne[0], ctx->device,
+            ggml_cuda_info().devices[ctx->device].nsm, cudaStreamPerThread);
+        ctx->marlin_q4_a32_repacked.insert(tensor->data);
+        return;
+    }
 #endif
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -1017,7 +1057,8 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     const ggml_tensor * owner = ggml_cuda_tensor_owner(tensor);
     if (owner != tensor &&
         (ctx->humming_fp8_repacked.count(owner->data) != 0 ||
-         ctx->humming_nvfp4_repacked.count(owner->data) != 0)) {
+         ctx->humming_nvfp4_repacked.count(owner->data) != 0 ||
+         ctx->marlin_q4_a32_repacked.count(owner->data) != 0)) {
         ggml_cuda_canonicalize_repacked(ctx, const_cast<ggml_tensor *>(tensor));
     }
     if (ctx->humming_fp8_repacked.find(tensor->data) != ctx->humming_fp8_repacked.end()) {
@@ -1035,6 +1076,19 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
         void * canonical_device = nullptr;
         CUDA_CHECK(cudaMalloc(&canonical_device, tensor_size));
         ggml_cuda_humming_nvfp4_unrepack(
+            tensor->data, canonical_device, tensor->ne[1], tensor->ne[0], cudaStreamPerThread);
+        CUDA_CHECK(cudaMemcpyAsync(
+            data, static_cast<const char *>(canonical_device) + offset, size,
+            cudaMemcpyDeviceToHost, cudaStreamPerThread));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        CUDA_CHECK(cudaFree(canonical_device));
+        return;
+    }
+    if (ctx->marlin_q4_a32_repacked.count(tensor->data) != 0) {
+        const size_t tensor_size = ggml_nbytes(tensor);
+        void * canonical_device = nullptr;
+        CUDA_CHECK(cudaMalloc(&canonical_device, tensor_size));
+        ggml_cuda_marlin_q4_a32_unrepack(
             tensor->data, canonical_device, tensor->ne[1], tensor->ne[0], cudaStreamPerThread);
         CUDA_CHECK(cudaMemcpyAsync(
             data, static_cast<const char *>(canonical_device) + offset, size,
@@ -1070,7 +1124,8 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
     const ggml_tensor * owner = ggml_cuda_tensor_owner(tensor);
     if (owner != tensor &&
         (ctx->humming_fp8_repacked.count(owner->data) != 0 ||
-         ctx->humming_nvfp4_repacked.count(owner->data) != 0)) {
+         ctx->humming_nvfp4_repacked.count(owner->data) != 0 ||
+         ctx->marlin_q4_a32_repacked.count(owner->data) != 0)) {
         ggml_cuda_canonicalize_repacked(ctx, const_cast<ggml_tensor *>(tensor));
     }
     if (ctx->humming_fp8_repacked.find(tensor->data) != ctx->humming_fp8_repacked.end()) {
@@ -1096,6 +1151,16 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
         }
         return;
     }
+    if (ctx->marlin_q4_a32_repacked.count(tensor->data) != 0) {
+        const size_t tensor_size = ggml_nbytes(tensor);
+        std::vector<uint8_t> canonical(tensor_size);
+        ggml_backend_cuda_buffer_get_tensor(buffer, tensor, canonical.data(), 0, tensor_size);
+        for (size_t i = 0; i < n_copies; ++i) {
+            memcpy(static_cast<char *>(data) + i * stride_data,
+                   canonical.data() + offset + i * stride_tensor, size);
+        }
+        return;
+    }
 #endif
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
@@ -1111,7 +1176,8 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
         ggml_tensor * dst_owner = ggml_cuda_tensor_owner(dst);
         if (src_owner != src &&
             (src_ctx->humming_fp8_repacked.count(src_owner->data) != 0 ||
-             src_ctx->humming_nvfp4_repacked.count(src_owner->data) != 0)) {
+             src_ctx->humming_nvfp4_repacked.count(src_owner->data) != 0 ||
+             src_ctx->marlin_q4_a32_repacked.count(src_owner->data) != 0)) {
             ggml_cuda_set_device(src_ctx->device);
             ggml_cuda_canonicalize_repacked(src_ctx, const_cast<ggml_tensor *>(src));
         }
@@ -1122,12 +1188,19 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
         const bool src_repacked = src_ctx->humming_fp8_repacked.find(src->data) != src_ctx->humming_fp8_repacked.end();
         const bool src_nvfp4_repacked =
             src_ctx->humming_nvfp4_repacked.find(src->data) != src_ctx->humming_nvfp4_repacked.end();
-        if ((src_repacked || src_nvfp4_repacked) &&
+        const bool src_marlin_q4_repacked = src_ctx->marlin_q4_a32_repacked.count(src->data) != 0;
+        const int dst_cc = ggml_cuda_info().devices[dst_ctx->device].cc;
+        if (src_marlin_q4_repacked &&
+            !ggml_cuda_marlin_q4_a32_supports_shape(dst->ne[1], dst->ne[0], 1, dst_cc)) {
+            return false;
+        }
+        if ((src_repacked || src_nvfp4_repacked || src_marlin_q4_repacked) &&
             (dst_owner != dst || src->type != dst->type || !ggml_are_same_shape(src, dst))) {
             return false;
         }
         dst_ctx->humming_fp8_repacked.erase(dst->data);
         dst_ctx->humming_nvfp4_repacked.erase(dst->data);
+        dst_ctx->marlin_q4_a32_repacked.erase(dst->data);
 #endif
         // compare the backing physical devices: distinct virtual devices may share one physical GPU,
         // in which case a same-device copy (not a peer copy) is required
@@ -1150,6 +1223,9 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
         if (src_nvfp4_repacked) {
             dst_ctx->humming_nvfp4_repacked.insert(dst->data);
         }
+        if (src_marlin_q4_repacked) {
+            dst_ctx->marlin_q4_a32_repacked.insert(dst->data);
+        }
 #endif
         return true;
     }
@@ -1164,6 +1240,7 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
 #if !defined(GGML_USE_HIP)
     ctx->humming_fp8_repacked.clear();
     ctx->humming_nvfp4_repacked.clear();
+    ctx->marlin_q4_a32_repacked.clear();
 #endif
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
@@ -2220,6 +2297,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
+#if !defined(GGML_USE_HIP)
+    if (ggml_cuda_mul_mat_marlin_q4_a32(ctx, src0, src1, nullptr, dst)) {
+        return;
+    }
+#endif
+
     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
@@ -2814,6 +2897,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     if (tensor == owner && offset == 0 && size == ggml_nbytes(owner)) {
         buf_ctx->humming_fp8_repacked.erase(owner->data);
         buf_ctx->humming_nvfp4_repacked.erase(owner->data);
+        buf_ctx->marlin_q4_a32_repacked.erase(owner->data);
     } else {
         ggml_cuda_set_device(buf_ctx->device);
         ggml_cuda_canonicalize_repacked(buf_ctx, tensor);
@@ -2833,12 +2917,14 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
     const ggml_tensor * owner = ggml_cuda_tensor_owner(tensor);
     if (owner != tensor &&
         (buf_ctx->humming_fp8_repacked.count(owner->data) != 0 ||
-         buf_ctx->humming_nvfp4_repacked.count(owner->data) != 0)) {
+         buf_ctx->humming_nvfp4_repacked.count(owner->data) != 0 ||
+         buf_ctx->marlin_q4_a32_repacked.count(owner->data) != 0)) {
         ggml_cuda_set_device(buf_ctx->device);
         ggml_cuda_canonicalize_repacked(buf_ctx, const_cast<ggml_tensor *>(tensor));
     }
     if (buf_ctx->humming_fp8_repacked.find(tensor->data) != buf_ctx->humming_fp8_repacked.end() ||
-        buf_ctx->humming_nvfp4_repacked.find(tensor->data) != buf_ctx->humming_nvfp4_repacked.end()) {
+        buf_ctx->humming_nvfp4_repacked.find(tensor->data) != buf_ctx->humming_nvfp4_repacked.end() ||
+        buf_ctx->marlin_q4_a32_repacked.count(tensor->data) != 0) {
         ggml_backend_cuda_buffer_get_tensor(buf, tensor, data, offset, size);
         return;
     }
@@ -2874,12 +2960,14 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
     const ggml_tensor * owner = ggml_cuda_tensor_owner(tensor);
     if (owner != tensor &&
         (buf_ctx->humming_fp8_repacked.count(owner->data) != 0 ||
-         buf_ctx->humming_nvfp4_repacked.count(owner->data) != 0)) {
+         buf_ctx->humming_nvfp4_repacked.count(owner->data) != 0 ||
+         buf_ctx->marlin_q4_a32_repacked.count(owner->data) != 0)) {
         ggml_cuda_set_device(buf_ctx->device);
         ggml_cuda_canonicalize_repacked(buf_ctx, const_cast<ggml_tensor *>(tensor));
     }
     if (buf_ctx->humming_fp8_repacked.find(tensor->data) != buf_ctx->humming_fp8_repacked.end() ||
-        buf_ctx->humming_nvfp4_repacked.find(tensor->data) != buf_ctx->humming_nvfp4_repacked.end()) {
+        buf_ctx->humming_nvfp4_repacked.find(tensor->data) != buf_ctx->humming_nvfp4_repacked.end() ||
+        buf_ctx->marlin_q4_a32_repacked.count(tensor->data) != 0) {
         ggml_backend_cuda_buffer_get_tensor_2d(buf, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
         return;
     }
@@ -2919,7 +3007,8 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     ggml_tensor * dst_owner = ggml_cuda_tensor_owner(dst);
     if (src_owner != src &&
         (buf_ctx_src->humming_fp8_repacked.count(src_owner->data) != 0 ||
-         buf_ctx_src->humming_nvfp4_repacked.count(src_owner->data) != 0)) {
+         buf_ctx_src->humming_nvfp4_repacked.count(src_owner->data) != 0 ||
+         buf_ctx_src->marlin_q4_a32_repacked.count(src_owner->data) != 0)) {
         ggml_cuda_set_device(buf_ctx_src->device);
         ggml_cuda_canonicalize_repacked(buf_ctx_src, const_cast<ggml_tensor *>(src));
     }
@@ -2929,12 +3018,19 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     }
     const bool src_fp8_repacked = buf_ctx_src->humming_fp8_repacked.count(src->data) != 0;
     const bool src_nvfp4_repacked = buf_ctx_src->humming_nvfp4_repacked.count(src->data) != 0;
-    if ((src_fp8_repacked || src_nvfp4_repacked) &&
+    const bool src_marlin_q4_repacked = buf_ctx_src->marlin_q4_a32_repacked.count(src->data) != 0;
+    const int dst_cc = ggml_cuda_info().devices[buf_ctx_dst->device].cc;
+    if (src_marlin_q4_repacked &&
+        !ggml_cuda_marlin_q4_a32_supports_shape(dst->ne[1], dst->ne[0], 1, dst_cc)) {
+        return false;
+    }
+    if ((src_fp8_repacked || src_nvfp4_repacked || src_marlin_q4_repacked) &&
         (dst_owner != dst || src->type != dst->type || !ggml_are_same_shape(src, dst))) {
         return false;
     }
     buf_ctx_dst->humming_fp8_repacked.erase(dst->data);
     buf_ctx_dst->humming_nvfp4_repacked.erase(dst->data);
+    buf_ctx_dst->marlin_q4_a32_repacked.erase(dst->data);
 #endif
 
     if (backend_src != backend_dst) {
@@ -2973,6 +3069,9 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     }
     if (src_nvfp4_repacked) {
         buf_ctx_dst->humming_nvfp4_repacked.insert(dst->data);
+    }
+    if (src_marlin_q4_repacked) {
+        buf_ctx_dst->marlin_q4_a32_repacked.insert(dst->data);
     }
 #endif
     return true;
@@ -4561,6 +4660,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
+            ggml_cuda_mm_fusion_args_host marlin_fusion{};
+            marlin_fusion.gate   = gate->src[0];
+            marlin_fusion.glu_op = ggml_get_glu_op(glu);
+            if (ggml_cuda_mul_mat_marlin_q4_a32(
+                    *cuda_ctx, src0, src1, ids, glu, &marlin_fusion)) {
+                fused_mul_mat_vec = true;
+                fused_node_count  = 3;
+                break;
+            }
+
             if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate   = gate->src[0];
@@ -4628,7 +4737,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                                            add_node->src[1] == reshaped ? add_node->src[0] : nullptr;
             const ggml_tensor * norm_weight = norm_node->src[0] == rms_node ? norm_node->src[1] :
                                               norm_node->src[1] == rms_node ? norm_node->src[0] : nullptr;
-            if (mm_node->src[2] != nullptr && reshaped->src[0] == mm_node && residual != nullptr &&
+            if ((mm_node->src[2] != nullptr || mm_node->src[0]->type == GGML_TYPE_Q4_A32) &&
+                    reshaped->src[0] == mm_node && residual != nullptr &&
                     norm_weight != nullptr && rms_node->src[0] == add_node &&
                     residual->type == GGML_TYPE_F32 && norm_weight->type == GGML_TYPE_F32 &&
                     ggml_is_contiguous(residual) && ggml_is_contiguous(norm_weight) &&
@@ -4643,7 +4753,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.residual_out = add_node;
                 fusion_data.rms_weight   = norm_weight;
                 memcpy(&fusion_data.rms_eps, rms_node->op_params, sizeof(float));
-                if (ggml_cuda_mul_mat_humming_fp8_block_fused(
+                if (ggml_cuda_mul_mat_marlin_q4_a32(
+                        *cuda_ctx, mm_node->src[0], mm_node->src[1], nullptr,
+                        norm_node, &fusion_data) ||
+                    ggml_cuda_mul_mat_humming_fp8_block_fused(
                         *cuda_ctx, mm_node->src[0], mm_node->src[1], mm_node->src[2],
                         norm_node, &fusion_data)) {
                     return n_ops - 1;
@@ -4670,7 +4783,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                                            add_node->src[1] == mm_node ? add_node->src[0] : nullptr;
             const ggml_tensor * norm_weight = norm_node->src[0] == rms_node ? norm_node->src[1] :
                                               norm_node->src[1] == rms_node ? norm_node->src[0] : nullptr;
-            if (mm_node->src[2] != nullptr && residual != nullptr && norm_weight != nullptr &&
+            if ((mm_node->src[2] != nullptr || mm_node->src[0]->type == GGML_TYPE_Q4_A32) &&
+                    residual != nullptr && norm_weight != nullptr &&
                     rms_node->src[0] == add_node && residual->type == GGML_TYPE_F32 &&
                     norm_weight->type == GGML_TYPE_F32 && ggml_is_contiguous(residual) &&
                     ggml_is_contiguous(norm_weight) && ggml_is_contiguous(add_node) &&
@@ -4684,7 +4798,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.residual_out = add_node;
                 fusion_data.rms_weight   = norm_weight;
                 memcpy(&fusion_data.rms_eps, rms_node->op_params, sizeof(float));
-                if (ggml_cuda_mul_mat_humming_fp8_block_fused(
+                if (ggml_cuda_mul_mat_marlin_q4_a32(
+                        *cuda_ctx, mm_node->src[0], mm_node->src[1], nullptr,
+                        norm_node, &fusion_data) ||
+                    ggml_cuda_mul_mat_humming_fp8_block_fused(
                         *cuda_ctx, mm_node->src[0], mm_node->src[1], mm_node->src[2],
                         norm_node, &fusion_data)) {
                     return n_ops - 1;
