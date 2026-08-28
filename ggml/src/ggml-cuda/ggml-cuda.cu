@@ -1231,16 +1231,55 @@ static void ggml_backend_cuda_comm_init_none(ggml_backend_cuda_comm_context * re
 }
 
 static void ggml_backend_cuda_comm_init_internal(ggml_backend_cuda_comm_context * ret) {
+    const char * diag_env = std::getenv("GGML_ALLREDUCE_DIAGNOSTICS");
+    const bool diagnostics = diag_env != nullptr && std::atoi(diag_env) != 0;
+    if (diagnostics) {
+        const auto & info = ggml_cuda_info();
+        GGML_LOG_INFO("GGML_ALLREDUCE_DIAG version=1 event=internal_init devices=%zu physical_devices=%d\n",
+                      ret->dev_ids.size(), info.physical_device_count);
+        for (size_t i = 0; i < ret->dev_ids.size(); ++i) {
+            const int device = ret->dev_ids[i];
+            const auto & row = info.devices[device];
+            GGML_LOG_INFO("GGML_ALLREDUCE_DIAG version=1 rank=%zu device=%d physical_device=%d cc=%d "
+                          "virtual_index=%d physical_share_count=%d\n",
+                          i, device, row.physical_device, row.cc, row.virtual_index, row.physical_share_count);
+        }
+        for (size_t i = 0; i < ret->dev_ids.size(); ++i) {
+            for (size_t j = 0; j < ret->dev_ids.size(); ++j) {
+                if (i == j) {
+                    continue;
+                }
+                const int src = info.devices[ret->dev_ids[i]].physical_device;
+                const int dst = info.devices[ret->dev_ids[j]].physical_device;
+                int can_access = 0;
+                const cudaError_t status = cudaDeviceCanAccessPeer(&can_access, src, dst);
+                GGML_LOG_INFO("GGML_ALLREDUCE_DIAG version=1 peer_src=%d peer_dst=%d status=%d "
+                              "error=%s can_access=%d\n",
+                              src, dst, (int) status, cudaGetErrorString(status), can_access);
+                if (status != cudaSuccess) {
+                    (void) cudaGetLastError();
+                }
+            }
+        }
+    }
+
     ret->ar_pipeline = ggml_cuda_ar_pipeline_init(ret->dev_ids.data(), ret->dev_ids.size());
     if (ret->ar_pipeline) {
         ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_internal;
+        if (diagnostics) {
+            GGML_LOG_INFO("GGML_ALLREDUCE_DIAG version=1 event=internal_init status=ok selected=internal\n");
+        }
         return;
     }
 
     // Clear sticky CUDA error from the failed init.
     (void) cudaGetLastError();
-    GGML_LOG_WARN("internal AllReduce init failed (n_devices != 2?); "
-                  "falling back to meta-backend butterfly\n");
+    GGML_LOG_WARN("internal AllReduce init failed for %zu device(s); "
+                  "falling back to meta-backend butterfly (set GGML_ALLREDUCE_DIAGNOSTICS=1 for topology details)\n",
+                  ret->dev_ids.size());
+    if (diagnostics) {
+        GGML_LOG_WARN("GGML_ALLREDUCE_DIAG version=1 event=internal_init status=failed selected=butterfly\n");
+    }
     ggml_backend_cuda_comm_init_none(ret);
 }
 

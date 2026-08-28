@@ -2088,6 +2088,37 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
+#ifdef GGML_USE_HIP
+    // Issue #108 diagnostic matrix. These choices are deliberately restricted to the failing
+    // gfx1030 D=256 shape and select only kernel specializations already present in this binary.
+    // An unset environment variable leaves the production dispatcher byte-for-byte unchanged.
+    const auto rdna2_path = ggml_fattn_rdna2_diag_path_get();
+    if (GGML_CUDA_CC_IS_RDNA2(cc) && Q->ne[0] == 256 && V->ne[0] == 256 &&
+        rdna2_path != ggml_fattn_rdna2_diag_path::default_path) {
+        static std::atomic<unsigned long long> emitted { 0 };
+        const unsigned long long bit = device >= 0 && device < 64 ? 1ULL << device : 0;
+        if (bit == 0 || (emitted.fetch_or(bit, std::memory_order_relaxed) & bit) == 0) {
+            std::fprintf(stderr,
+                "GGML_FATTN_RDNA2_DISPATCH version=1 device=%d path=%s Q_cols=%lld K_rows=%lld "
+                "K_type=%s V_type=%s can_vec=%d\n",
+                device, ggml_fattn_rdna2_diag_path_name(rdna2_path),
+                (long long) Q->ne[1], (long long) K->ne[1],
+                ggml_type_name(K->type), ggml_type_name(V->type), can_use_vector_kernel ? 1 : 0);
+            std::fflush(stderr);
+        }
+        if (rdna2_path == ggml_fattn_rdna2_diag_path::vec) {
+            if (can_use_vector_kernel) {
+                return BEST_FATTN_KERNEL_VEC;
+            }
+            std::fprintf(stderr,
+                "GGML_FATTN_RDNA2: vec requested for unsupported shape; using default dispatcher\n");
+            std::fflush(stderr);
+        } else {
+            return BEST_FATTN_KERNEL_TILE;
+        }
+    }
+#endif // GGML_USE_HIP
+
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
         if (can_use_vector_kernel) {

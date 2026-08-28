@@ -437,39 +437,48 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         ggml_cuda_set_device(p->devices[i]);
 
         cudaStream_t stream = nullptr;
-        if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) {
-            GGML_LOG_ERROR("%s: cudaStreamCreateWithFlags failed for device %d\n",
-                           __func__, p->devices[i]);
+        const cudaError_t stream_status = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+        if (stream_status != cudaSuccess) {
+            GGML_LOG_ERROR("%s: cudaStreamCreateWithFlags failed for device %d: %s (%d)\n",
+                           __func__, p->devices[i], cudaGetErrorString(stream_status), (int) stream_status);
             ggml_cuda_ar_pipeline_free(p);
             return nullptr;
         }
         p->streams[i] = stream;
 
         for (int s = 0; s < GGML_CUDA_AR_POOL_SIZE; ++s) {
-            bool ok =
-                cudaEventCreateWithFlags(&p->ev_pool[i][s].app, cudaEventDisableTiming) == cudaSuccess &&
-                cudaEventCreateWithFlags(&p->ev_pool[i][s].h2d, cudaEventDisableTiming) == cudaSuccess &&
-                cudaEventCreateWithFlags(&p->ev_pool[i][s].ker, cudaEventDisableTiming) == cudaSuccess;
+            cudaError_t event_status = cudaEventCreateWithFlags(&p->ev_pool[i][s].app, cudaEventDisableTiming);
+            bool ok = event_status == cudaSuccess;
+            if (ok) event_status = cudaEventCreateWithFlags(&p->ev_pool[i][s].h2d, cudaEventDisableTiming);
+            if (ok) ok = event_status == cudaSuccess;
+            if (ok) event_status = cudaEventCreateWithFlags(&p->ev_pool[i][s].ker, cudaEventDisableTiming);
+            if (ok) ok = event_status == cudaSuccess;
             for (int c = 0; ok && c < GGML_CUDA_AR_COPY_MAX_CHUNKS; ++c) {
-                ok = cudaEventCreateWithFlags(&p->ev_pool[i][s].cpy[c], cudaEventDisableTiming) == cudaSuccess;
+                event_status = cudaEventCreateWithFlags(&p->ev_pool[i][s].cpy[c], cudaEventDisableTiming);
+                ok = event_status == cudaSuccess;
             }
             if (!ok) {
-                GGML_LOG_ERROR("%s: cudaEventCreate failed for device %d slot %d\n",
-                               __func__, p->devices[i], s);
+                GGML_LOG_ERROR("%s: cudaEventCreate failed for device %d slot %d: %s (%d)\n",
+                               __func__, p->devices[i], s,
+                               cudaGetErrorString(event_status), (int) event_status);
                 ggml_cuda_ar_pipeline_free(p);
                 return nullptr;
             }
         }
 
-        if (cudaEventCreateWithFlags(&p->host_large_read_done[i], cudaEventDisableTiming) != cudaSuccess) {
-            GGML_LOG_ERROR("%s: cudaEventCreate for host_large_read_done failed for device %d\n",
-                           __func__, p->devices[i]);
+        const cudaError_t host_done_status =
+            cudaEventCreateWithFlags(&p->host_large_read_done[i], cudaEventDisableTiming);
+        if (host_done_status != cudaSuccess) {
+            GGML_LOG_ERROR("%s: cudaEventCreate for host_large_read_done failed for device %d: %s (%d)\n",
+                           __func__, p->devices[i], cudaGetErrorString(host_done_status), (int) host_done_status);
             ggml_cuda_ar_pipeline_free(p);
             return nullptr;
         }
-        if (cudaEventCreateWithFlags(&p->dev_tmp_kernel_done[i], cudaEventDisableTiming) != cudaSuccess) {
-            GGML_LOG_ERROR("%s: cudaEventCreate for dev_tmp_kernel_done failed for device %d\n",
-                           __func__, p->devices[i]);
+        const cudaError_t tmp_done_status =
+            cudaEventCreateWithFlags(&p->dev_tmp_kernel_done[i], cudaEventDisableTiming);
+        if (tmp_done_status != cudaSuccess) {
+            GGML_LOG_ERROR("%s: cudaEventCreate for dev_tmp_kernel_done failed for device %d: %s (%d)\n",
+                           __func__, p->devices[i], cudaGetErrorString(tmp_done_status), (int) tmp_done_status);
             ggml_cuda_ar_pipeline_free(p);
             return nullptr;
         }
@@ -479,16 +488,19 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     const size_t arrival_bytes =
         (size_t)GGML_CUDA_AR_POOL_SIZE * n_devices *
         GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
-    if (p->arrival.alloc(arrival_bytes) != cudaSuccess) {
-        GGML_LOG_ERROR("%s: alloc for arrival ring failed (%zu bytes)\n",
-                       __func__, arrival_bytes);
+    const cudaError_t arrival_status = p->arrival.alloc(arrival_bytes);
+    if (arrival_status != cudaSuccess) {
+        GGML_LOG_ERROR("%s: alloc for arrival ring failed (%zu bytes): %s (%d)\n",
+                       __func__, arrival_bytes, cudaGetErrorString(arrival_status), (int) arrival_status);
         ggml_cuda_ar_pipeline_free(p);
         return nullptr;
     }
     ggml_cuda_set_device(p->devices[0]);
-    if (cudaMemset(p->arrival.dev, 0, arrival_bytes) != cudaSuccess) {
-        GGML_LOG_ERROR("%s: cudaMemset for arrival ring failed (%zu bytes)\n",
-                       __func__, arrival_bytes);
+    const cudaError_t arrival_memset_status = cudaMemset(p->arrival.dev, 0, arrival_bytes);
+    if (arrival_memset_status != cudaSuccess) {
+        GGML_LOG_ERROR("%s: cudaMemset for arrival ring failed (%zu bytes): %s (%d)\n",
+                       __func__, arrival_bytes,
+                       cudaGetErrorString(arrival_memset_status), (int) arrival_memset_status);
         ggml_cuda_ar_pipeline_free(p);
         return nullptr;
     }
@@ -499,9 +511,11 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     p->buf_bytes = GGML_CUDA_AR_MAX_BYTES;
     const size_t host_buf_total = (size_t) GGML_CUDA_AR_POOL_SIZE * p->buf_bytes;
     for (size_t i = 0; i < n_devices; ++i) {
-        if (p->host_buf[i].alloc(host_buf_total) != cudaSuccess) {
-            GGML_LOG_ERROR("%s: alloc for staging failed (%zu bytes)\n",
-                           __func__, host_buf_total);
+        const cudaError_t status = p->host_buf[i].alloc(host_buf_total);
+        if (status != cudaSuccess) {
+            GGML_LOG_ERROR("%s: alloc for staging failed (%zu bytes) on device %d: %s (%d)\n",
+                           __func__, host_buf_total, p->devices[i],
+                           cudaGetErrorString(status), (int) status);
             ggml_cuda_ar_pipeline_free(p);
             return nullptr;
         }
@@ -513,15 +527,19 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     // cross-stream wait in copy_impl on the prior AR's add_kernel-done event.
     for (size_t i = 0; i < n_devices; ++i) {
         ggml_cuda_set_device(p->devices[i]);
-        if (p->host_large[i].alloc(p->copy_bytes) != cudaSuccess) {
-            GGML_LOG_ERROR("%s: alloc for large staging failed (%zu bytes)\n",
-                           __func__, p->copy_bytes);
+        const cudaError_t host_large_status = p->host_large[i].alloc(p->copy_bytes);
+        if (host_large_status != cudaSuccess) {
+            GGML_LOG_ERROR("%s: alloc for large staging failed (%zu bytes) on device %d: %s (%d)\n",
+                           __func__, p->copy_bytes, p->devices[i],
+                           cudaGetErrorString(host_large_status), (int) host_large_status);
             ggml_cuda_ar_pipeline_free(p);
             return nullptr;
         }
-        if (cudaMalloc(reinterpret_cast<void **>(&p->dev_tmp[i]), p->copy_bytes) != cudaSuccess) {
-            GGML_LOG_ERROR("%s: cudaMalloc for copy scratch failed (%zu bytes) on device %d\n",
-                           __func__, p->copy_bytes, p->devices[i]);
+        const cudaError_t tmp_status = cudaMalloc(reinterpret_cast<void **>(&p->dev_tmp[i]), p->copy_bytes);
+        if (tmp_status != cudaSuccess) {
+            GGML_LOG_ERROR("%s: cudaMalloc for copy scratch failed (%zu bytes) on device %d: %s (%d)\n",
+                           __func__, p->copy_bytes, p->devices[i],
+                           cudaGetErrorString(tmp_status), (int) tmp_status);
             ggml_cuda_ar_pipeline_free(p);
             return nullptr;
         }

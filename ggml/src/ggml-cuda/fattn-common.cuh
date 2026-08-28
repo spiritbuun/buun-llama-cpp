@@ -5,7 +5,58 @@
 #include "vecdotq.cuh"
 
 #include <atomic>
+#include <cstdlib>
 #include <cstdint>
+#include <cstring>
+
+enum class ggml_fattn_rdna2_diag_path : uint8_t {
+    default_path,
+    automatic,
+    tile4,
+    tile8,
+    tile16,
+    tile32,
+    tile32_direct,
+    vec,
+};
+
+static inline ggml_fattn_rdna2_diag_path ggml_fattn_rdna2_diag_path_get() {
+    static const ggml_fattn_rdna2_diag_path result = [] {
+        const char * value = std::getenv("GGML_FATTN_RDNA2_PATH");
+        if (value == nullptr || value[0] == '\0') {
+            return ggml_fattn_rdna2_diag_path::default_path;
+        }
+        if (std::strcmp(value, "default") == 0)       return ggml_fattn_rdna2_diag_path::default_path;
+        if (std::strcmp(value, "auto") == 0)          return ggml_fattn_rdna2_diag_path::automatic;
+        if (std::strcmp(value, "tile4") == 0)         return ggml_fattn_rdna2_diag_path::tile4;
+        if (std::strcmp(value, "tile8") == 0)         return ggml_fattn_rdna2_diag_path::tile8;
+        if (std::strcmp(value, "tile16") == 0)        return ggml_fattn_rdna2_diag_path::tile16;
+        if (std::strcmp(value, "tile32") == 0)        return ggml_fattn_rdna2_diag_path::tile32;
+        if (std::strcmp(value, "tile32-direct") == 0) return ggml_fattn_rdna2_diag_path::tile32_direct;
+        if (std::strcmp(value, "vec") == 0)           return ggml_fattn_rdna2_diag_path::vec;
+
+        std::fprintf(stderr,
+            "GGML_FATTN_RDNA2: unknown GGML_FATTN_RDNA2_PATH=%s; using the default dispatcher\n",
+            value);
+        std::fflush(stderr);
+        return ggml_fattn_rdna2_diag_path::default_path;
+    }();
+    return result;
+}
+
+static inline const char * ggml_fattn_rdna2_diag_path_name(ggml_fattn_rdna2_diag_path path) {
+    switch (path) {
+        case ggml_fattn_rdna2_diag_path::default_path:  return "default";
+        case ggml_fattn_rdna2_diag_path::automatic:     return "auto";
+        case ggml_fattn_rdna2_diag_path::tile4:         return "tile4";
+        case ggml_fattn_rdna2_diag_path::tile8:         return "tile8";
+        case ggml_fattn_rdna2_diag_path::tile16:        return "tile16";
+        case ggml_fattn_rdna2_diag_path::tile32:        return "tile32";
+        case ggml_fattn_rdna2_diag_path::tile32_direct: return "tile32-direct";
+        case ggml_fattn_rdna2_diag_path::vec:           return "vec";
+    }
+    return "unknown";
+}
 
 static __constant__ float d_turbo_centroids_2bit_fattn[4] = {
     -0.133462f, -0.039994f, 0.039994f, 0.133462f
@@ -1915,7 +1966,7 @@ template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE,
-    const char * kernel_path = "unknown"
+    const char * kernel_path = "unknown", const bool allow_zero_occupancy = false
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -2078,14 +2129,55 @@ void launch_fattn(
 #endif // defined(GGML_USE_HIP)
         const auto & device = ggml_cuda_info().devices[id];
 
+        cudaDeviceProp prop = {};
+        const cudaError_t prop_status = cudaGetDeviceProperties(&prop, device.physical_device);
+        int runtime_version = 0;
+        int driver_version = 0;
+#if defined(GGML_USE_HIP)
+        const hipError_t runtime_status = hipRuntimeGetVersion(&runtime_version);
+        const hipError_t driver_status  = hipDriverGetVersion(&driver_version);
+#else
+        const cudaError_t runtime_status = cudaRuntimeGetVersion(&runtime_version);
+        const cudaError_t driver_status  = cudaDriverGetVersion(&driver_version);
+#endif
+        const size_t shared_per_cu = prop_status == cudaSuccess ? prop.sharedMemPerMultiprocessor : 0;
+        const int threads_per_cu = prop_status == cudaSuccess ? prop.maxThreadsPerMultiProcessor : 0;
+        const int regs_per_cu = prop_status == cudaSuccess ? prop.regsPerMultiprocessor : 0;
+        const size_t shared_per_block = attr.sharedSizeBytes + nbytes_shared;
+        const size_t manual_shared_blocks = shared_per_block == 0 || shared_per_cu == 0
+            ? 0 : shared_per_cu / shared_per_block;
+        const int launch_threads = block_dim.x * block_dim.y * block_dim.z;
+        const int manual_thread_blocks = launch_threads == 0 || threads_per_cu == 0
+            ? 0 : threads_per_cu / launch_threads;
+        const uint64_t regs_per_block = uint64_t(attr.numRegs > 0 ? attr.numRegs : 0) * uint64_t(launch_threads);
+        const uint64_t manual_reg_blocks = regs_per_block == 0 || regs_per_cu <= 0
+            ? 0 : uint64_t(regs_per_cu) / regs_per_block;
+
+#if defined(NDEBUG)
+        constexpr int release_build = 1;
+#else
+        constexpr int release_build = 0;
+#endif
+#if defined(__clang_major__)
+        constexpr int compiler_major = __clang_major__;
+        constexpr int compiler_minor = __clang_minor__;
+#else
+        constexpr int compiler_major = 0;
+        constexpr int compiler_minor = 0;
+#endif
+
         std::fprintf(stderr,
-            "GGML_FATTN_DIAG version=1 path=%s device=%d physical_device=%d cc=%d rdna2=%d "
+            "GGML_FATTN_DIAG version=2 path=%s rdna2_path=%s device=%d physical_device=%d cc=%d rdna2=%d "
             "warp_size=%d nsm=%d smpb=%zu smpbo=%zu K_type=%s V_type=%s "
             "DKQ=%lld DV=%d ncols1=%d ncols2=%d Q_cols=%lld K_rows=%lld "
             "nwarps=%d threads=%u nbatch_fa=%d dynamic_shared=%zu need_f16_K=%d need_f16_V=%d stream_k=%d "
             "occupancy=%d attr_status=%d attr_error=%s regs=%d static_shared=%zu local=%zu constant=%zu "
-            "attr_max_threads=%d attr_max_dynamic_shared=%d\n",
+            "attr_max_threads=%d attr_max_dynamic_shared=%d prop_status=%d shared_per_cu=%zu threads_per_cu=%d "
+            "regs_per_cu=%d manual_shared_blocks=%zu manual_thread_blocks=%d manual_reg_blocks=%llu "
+            "runtime_status=%d runtime_version=%d "
+            "driver_status=%d driver_version=%d clang=%d.%d release_build=%d allow_zero_occupancy=%d\n",
             kernel_path,
+            ggml_fattn_rdna2_diag_path_name(ggml_fattn_rdna2_diag_path_get()),
             id,
             device.physical_device,
             cc,
@@ -2117,10 +2209,32 @@ void launch_fattn(
             attr.localSizeBytes,
             attr.constSizeBytes,
             attr.maxThreadsPerBlock,
-            attr.maxDynamicSharedSizeBytes);
+            attr.maxDynamicSharedSizeBytes,
+            (int) prop_status,
+            shared_per_cu,
+            threads_per_cu,
+            regs_per_cu,
+            manual_shared_blocks,
+            manual_thread_blocks,
+            (unsigned long long) manual_reg_blocks,
+            (int) runtime_status,
+            runtime_version,
+            (int) driver_status,
+            driver_version,
+            compiler_major,
+            compiler_minor,
+            release_build,
+            allow_zero_occupancy ? 1 : 0);
         std::fflush(stderr);
     }
 
+    if (max_blocks_per_sm <= 0 && allow_zero_occupancy) {
+        std::fprintf(stderr,
+            "GGML_FATTN_DIAG version=2 action=force_one_block_per_cu path=%s device=%d\n",
+            kernel_path, id);
+        std::fflush(stderr);
+        max_blocks_per_sm = 1;
+    }
     GGML_ASSERT(max_blocks_per_sm > 0);
     int parallel_blocks = max_blocks_per_sm;
 

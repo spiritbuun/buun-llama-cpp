@@ -7230,6 +7230,10 @@ private:
         const bool capture_requested =
             params_base.cache_lifecycle &&
             server_vbr_dynamic_active(params_base);
+        const bool capture_topology_diagnostics = [] {
+            const char * value = std::getenv("GGML_VBR_TOPOLOGY_DIAGNOSTICS");
+            return value != nullptr && std::atoi(value) != 0;
+        }();
         int ngl_eff = 0;
         if (cache_authority) {
             capture_topology_failure = "topology_not_built";
@@ -7298,6 +7302,21 @@ private:
                         model_tgt, resolved_split.data(),
                         resolved_split.size());
                 capture_resolved_split_count = resolved_count;
+                if (capture_topology_diagnostics) {
+                    SRV_INF(
+                        "GGML_VBR_TOPOLOGY_DIAG version=1 event=configured_devices split_mode=%d "
+                        "main_gpu=%d devices=%zu resolved_count=%zu ngl=%d\n",
+                        int(params_base.split_mode), params_base.main_gpu,
+                        gpu_devices.size(), resolved_count, ngl_eff);
+                    for (size_t i = 0; i < gpu_devices.size(); ++i) {
+                        SRV_INF(
+                            "GGML_VBR_TOPOLOGY_DIAG version=1 configured_ordinal=%zu device=%p "
+                            "name=%s description=%s resolved_split=%.9g\n",
+                            i, (void *) gpu_devices[i], ggml_backend_dev_name(gpu_devices[i]),
+                            ggml_backend_dev_description(gpu_devices[i]),
+                            i < resolved_count ? resolved_split[i] : -1.0f);
+                    }
+                }
                 llama_cache_acct_shard_topology topology;
                 const int32_t topology_main_device =
                     params_base.split_mode == LLAMA_SPLIT_MODE_NONE
@@ -7359,7 +7378,28 @@ private:
                     capture_attention_children)) {
                 capture_topology_failure =
                     "runtime_pool_binding_failed";
+                if (capture_topology_diagnostics) {
+                    SRV_INF(
+                        "GGML_VBR_TOPOLOGY_DIAG version=1 event=runtime_pools pools=%zu "
+                        "attention_children=%u live_domains=%zu\n",
+                        capture_runtime_pools.size(), capture_attention_children,
+                        cache_authority->live_device_domains.size());
+                }
                 for (const auto & pool : capture_runtime_pools) {
+                    if (capture_topology_diagnostics) {
+                        const auto backend_device = pool.backend != nullptr
+                            ? ggml_backend_get_device(pool.backend) : nullptr;
+                        SRV_INF(
+                            "GGML_VBR_TOPOLOGY_DIAG version=1 pool_instance=%016" PRIx64 ":%016" PRIx64
+                            " pool_device=%d backend_device=%p backend_device_name=%s backend=%p "
+                            "backend_owner_device=%p owner_device_name=%s\n",
+                            pool.instance_id.hi, pool.instance_id.lo, pool.device,
+                            (void *) pool.backend_device,
+                            pool.backend_device != nullptr ? ggml_backend_dev_name(pool.backend_device) : "null",
+                            (void *) pool.backend,
+                            (void *) backend_device,
+                            backend_device != nullptr ? ggml_backend_dev_name(backend_device) : "null");
+                    }
                     const auto domain = std::find_if(
                         cache_authority->live_device_domains.begin(),
                         cache_authority->live_device_domains.end(),
@@ -7369,6 +7409,12 @@ private:
                         });
                     if (domain ==
                         cache_authority->live_device_domains.end()) {
+                        if (capture_topology_diagnostics) {
+                            SRV_WRN(
+                                "GGML_VBR_TOPOLOGY_DIAG version=1 event=pool_binding status=no_device_match "
+                                "pool_backend_device=%p pool_device=%d\n",
+                                (void *) pool.backend_device, pool.device);
+                        }
                         capture_pool_bindings.clear();
                         capture_lanes.clear();
                         break;
@@ -7407,6 +7453,12 @@ private:
                         domain->domain.device_ordinal.v,
                         lane_index,
                     });
+                    if (capture_topology_diagnostics) {
+                        SRV_INF(
+                            "GGML_VBR_TOPOLOGY_DIAG version=1 event=pool_binding status=ok "
+                            "pool_device=%d device_ordinal=%u lane=%u\n",
+                            pool.device, unsigned(domain->domain.device_ordinal.v), lane_index);
+                    }
                 }
                 capture_manifest_enabled =
                     !capture_pool_bindings.empty() &&
@@ -7416,6 +7468,16 @@ private:
                 if (capture_manifest_enabled) {
                     capture_topology_failure = "none";
                 }
+            }
+            if (capture_topology_diagnostics) {
+                SRV_INF(
+                    "GGML_VBR_TOPOLOGY_DIAG version=1 event=final status=%s manifest_enabled=%d "
+                    "configured_devices=%zu resolved_split=%zu topologies=%zu runtime_pools=%zu "
+                    "bindings=%zu lanes=%zu attention_children=%u\n",
+                    capture_topology_failure, capture_manifest_enabled ? 1 : 0,
+                    gpu_identities.size(), capture_resolved_split_count, capture_topologies.size(),
+                    capture_runtime_pools.size(), capture_pool_bindings.size(), capture_lanes.size(),
+                    capture_attention_children);
             }
 
             // C schema-v2 completeness manifest is owned by configuration, not by either

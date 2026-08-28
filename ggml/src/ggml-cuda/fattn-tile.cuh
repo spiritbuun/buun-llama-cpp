@@ -1151,6 +1151,75 @@ static __global__ void flash_attn_tile(
 }
 
 template <int DKQ, int DV, int ncols2, bool use_logit_softcap>
+static int ggml_fattn_rdna2_probe_tile(const int cols_per_block, const bool emit) {
+    const int id = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[id].cc;
+    const int warp_size = 32;
+    int occupancy = 0;
+    cudaError_t status = cudaErrorInvalidValue;
+
+#define GGML_RDNA2_PROBE_TILE(COLS) do {                                                                                  \
+        if (cols_per_block == (COLS)) {                                                                                   \
+            if constexpr ((COLS) >= ncols2 && (COLS) % ncols2 == 0) {                                                    \
+                constexpr int ncols1 = (COLS) / ncols2;                                                                  \
+                const int nthreads = ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, (COLS), cc);                             \
+                fattn_kernel_t kernel = flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap>;                    \
+                status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy, kernel, nthreads, 0);                \
+                if (status != cudaSuccess) {                                                                             \
+                    (void) cudaGetLastError();                                                                            \
+                    occupancy = 0;                                                                                        \
+                }                                                                                                         \
+            }                                                                                                             \
+        }                                                                                                                 \
+    } while (0)
+
+    GGML_RDNA2_PROBE_TILE(4);
+    GGML_RDNA2_PROBE_TILE(8);
+    GGML_RDNA2_PROBE_TILE(16);
+    GGML_RDNA2_PROBE_TILE(32);
+#undef GGML_RDNA2_PROBE_TILE
+
+    if (emit) {
+        static std::atomic<unsigned long long> emitted { 0 };
+        const unsigned long long key = id >= 0 && id < 16 && cols_per_block >= 4
+            ? 1ULL << (id * 4 + (cols_per_block == 4 ? 0 : cols_per_block == 8 ? 1 : cols_per_block == 16 ? 2 : 3))
+            : 0;
+        if (key == 0 || (emitted.fetch_or(key, std::memory_order_relaxed) & key) == 0) {
+            std::fprintf(stderr,
+                "GGML_FATTN_RDNA2_CANDIDATE version=1 device=%d DKQ=%d DV=%d ncols2=%d total_cols=%d "
+                "occupancy=%d status=%d error=%s\n",
+                id, DKQ, DV, ncols2, cols_per_block, occupancy, (int) status,
+                cudaGetErrorString(status));
+            std::fflush(stderr);
+        }
+    }
+    return occupancy;
+}
+
+template <int DKQ, int DV, int ncols2, bool use_logit_softcap, int cols_per_block>
+static bool ggml_fattn_rdna2_launch_tile(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * dst,
+        const bool allow_zero_occupancy,
+        const char * path) {
+    if constexpr (cols_per_block < ncols2 || cols_per_block % ncols2 != 0) {
+        GGML_UNUSED_VARS(ctx, dst, allow_zero_occupancy, path);
+        return false;
+    } else {
+        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        constexpr int warp_size = 32;
+        constexpr int ncols1 = cols_per_block / ncols2;
+        const int nwarps = ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, cols_per_block, cc) / warp_size;
+        const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+        fattn_kernel_t kernel = flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap>;
+        launch_fattn<DV, ncols1, ncols2>(
+            ctx, dst, kernel, nwarps, 0, nbatch_fa, true, true, false, warp_size,
+            path, allow_zero_occupancy);
+        return true;
+    }
+}
+
+template <int DKQ, int DV, int ncols2, bool use_logit_softcap>
 static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
 
@@ -1161,6 +1230,48 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
     constexpr size_t nbytes_shared = 0;
 
 #ifdef GGML_USE_HIP
+    if constexpr (DKQ == 256 && DV == 256) {
+        const auto mode = ggml_fattn_rdna2_diag_path_get();
+        if (GGML_CUDA_CC_IS_RDNA2(cc) && mode != ggml_fattn_rdna2_diag_path::default_path &&
+            mode != ggml_fattn_rdna2_diag_path::vec) {
+            if (mode == ggml_fattn_rdna2_diag_path::automatic) {
+                const bool emit = true;
+                const int occ32 = ggml_fattn_rdna2_probe_tile<DKQ, DV, ncols2, use_logit_softcap>(32, emit);
+                const int occ16 = ggml_fattn_rdna2_probe_tile<DKQ, DV, ncols2, use_logit_softcap>(16, emit);
+                const int occ8  = ggml_fattn_rdna2_probe_tile<DKQ, DV, ncols2, use_logit_softcap>( 8, emit);
+                const int occ4  = ggml_fattn_rdna2_probe_tile<DKQ, DV, ncols2, use_logit_softcap>( 4, emit);
+                if (occ32 > 0 && ggml_fattn_rdna2_launch_tile<DKQ, DV, ncols2, use_logit_softcap, 32>(ctx, dst, false, "tile32-auto")) return;
+                if (occ16 > 0 && ggml_fattn_rdna2_launch_tile<DKQ, DV, ncols2, use_logit_softcap, 16>(ctx, dst, false, "tile16-auto")) return;
+                if (occ8  > 0 && ggml_fattn_rdna2_launch_tile<DKQ, DV, ncols2, use_logit_softcap,  8>(ctx, dst, false, "tile8-auto")) return;
+                if (occ4  > 0 && ggml_fattn_rdna2_launch_tile<DKQ, DV, ncols2, use_logit_softcap,  4>(ctx, dst, false, "tile4-auto")) return;
+                std::fprintf(stderr,
+                    "GGML_FATTN_RDNA2_CANDIDATE version=1 device=%d action=no_positive_occupancy "
+                    "fallback=smallest_compatible_direct\n", id);
+                std::fflush(stderr);
+                if (ggml_fattn_rdna2_launch_tile<DKQ, DV, ncols2, use_logit_softcap, 4>(ctx, dst, true, "tile4-auto-direct")) return;
+                if (ggml_fattn_rdna2_launch_tile<DKQ, DV, ncols2, use_logit_softcap, 8>(ctx, dst, true, "tile8-auto-direct")) return;
+                if (ggml_fattn_rdna2_launch_tile<DKQ, DV, ncols2, use_logit_softcap, 16>(ctx, dst, true, "tile16-auto-direct")) return;
+                if (ggml_fattn_rdna2_launch_tile<DKQ, DV, ncols2, use_logit_softcap, 32>(ctx, dst, true, "tile32-auto-direct")) return;
+            }
+
+            if (mode == ggml_fattn_rdna2_diag_path::tile4 &&
+                ggml_fattn_rdna2_launch_tile<DKQ, DV, ncols2, use_logit_softcap, 4>(ctx, dst, false, "tile4")) return;
+            if (mode == ggml_fattn_rdna2_diag_path::tile8 &&
+                ggml_fattn_rdna2_launch_tile<DKQ, DV, ncols2, use_logit_softcap, 8>(ctx, dst, false, "tile8")) return;
+            if (mode == ggml_fattn_rdna2_diag_path::tile16 &&
+                ggml_fattn_rdna2_launch_tile<DKQ, DV, ncols2, use_logit_softcap, 16>(ctx, dst, false, "tile16")) return;
+            if ((mode == ggml_fattn_rdna2_diag_path::tile32 || mode == ggml_fattn_rdna2_diag_path::tile32_direct) &&
+                ggml_fattn_rdna2_launch_tile<DKQ, DV, ncols2, use_logit_softcap, 32>(
+                    ctx, dst, mode == ggml_fattn_rdna2_diag_path::tile32_direct,
+                    mode == ggml_fattn_rdna2_diag_path::tile32_direct ? "tile32-direct" : "tile32")) return;
+
+            std::fprintf(stderr,
+                "GGML_FATTN_RDNA2: path=%s is incompatible with ncols2=%d; using default dispatcher\n",
+                ggml_fattn_rdna2_diag_path_name(mode), ncols2);
+            std::fflush(stderr);
+        }
+    }
+
     if constexpr (DKQ <= 128) {
         if (Q->ne[1] > 32/ncols2) {
             constexpr int cols_per_block = 64;
