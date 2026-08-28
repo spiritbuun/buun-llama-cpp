@@ -5,11 +5,11 @@ set -euo pipefail
 usage() {
     cat <<'EOF'
 Usage:
-  scripts/issue-108-rdna2-campaign.sh MODEL [OUTPUT_DIR] [-- EXTRA_SERVER_ARGS...]
+  scripts/issue-108-rdna2-campaign.sh SERVER MODEL [OUTPUT_DIR] [-- EXTRA_SERVER_ARGS...]
 
-Builds the issue-108 RDNA2 diagnostic server, generates one deterministic request containing
-exactly 1,601 model-tokenized prompt tokens, runs the diagnostic phases, selects the fastest
-valid Flash Attention path and ubatch automatically, and creates one .tar.gz result archive.
+Uses an already-built issue-108 RDNA2 diagnostic server, generates one deterministic request
+containing exactly 1,601 model-tokenized prompt tokens, runs the diagnostic phases, selects the
+fastest valid Flash Attention path and ubatch automatically, and creates one .tar.gz archive.
 
 The built-in server configuration matches the reported RX 6950 XT + RX 6800 workload:
   -ngl 99 -sm tensor -c 131072 -np 1 -b 32768 -ub 2048 -tb 24 -t 8
@@ -19,15 +19,14 @@ Use EXTRA_SERVER_ARGS for local necessities such as a tensor split. Do not pass 
 --flash-attn, --ubatch-size or -ct/--cache-type; the campaign controls those variables.
 
 Examples:
-  scripts/issue-108-rdna2-campaign.sh /models/Qwen3.8-27B-UD-Q4_K_XL.gguf
+  scripts/issue-108-rdna2-campaign.sh \
+      ./build/bin/llama-server \
+      /models/Qwen3.8-27B-UD-Q4_K_XL.gguf
 
-  scripts/issue-108-rdna2-campaign.sh /models/model.gguf issue-108-results -- \
+  scripts/issue-108-rdna2-campaign.sh ./build/bin/llama-server /models/model.gguf issue-108-results -- \
       --tensor-split 12,16
 
 Environment:
-  RDNA2_BUILD_DIR            default: build-issue108-rdna2
-  RDNA2_BUILD_JOBS           default: 4
-  RDNA2_SKIP_BUILD           set to 1 to use an existing build
   RDNA2_TARGET_PROMPT_TOKENS default: 1601
   RDNA2_PREDICT_TOKENS       default: 64 (enough to exercise MTP)
   RDNA2_PORT                 default: 18080
@@ -45,19 +44,25 @@ if [[ ${1:-} == -h || ${1:-} == --help ]]; then
     usage
     exit 0
 fi
-if [[ $# -lt 1 ]]; then
+if [[ $# -lt 2 ]]; then
     usage >&2
     exit 2
 fi
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-model=$1
-shift
+server=$1
+model=$2
+shift 2
 
+if [[ ! -x $server ]]; then
+    echo "server is not executable: $server" >&2
+    exit 2
+fi
 if [[ ! -f $model ]]; then
     echo "model does not exist: $model" >&2
     exit 2
 fi
+server=$(readlink -f "$server")
 model=$(readlink -f "$model")
 
 if [[ $# -gt 0 && $1 != -- ]]; then
@@ -95,18 +100,12 @@ mkdir -p "$output_root"
 output_root=$(readlink -f "$output_root")
 exec > >(tee -a "$output_root/campaign.log") 2>&1
 
-build_dir=${RDNA2_BUILD_DIR:-build-issue108-rdna2}
-if [[ $build_dir != /* ]]; then
-    build_dir="$repo_root/$build_dir"
-fi
-build_jobs=${RDNA2_BUILD_JOBS:-4}
 target_tokens=${RDNA2_TARGET_PROMPT_TOKENS:-1601}
 predict_tokens=${RDNA2_PREDICT_TOKENS:-64}
 port=${RDNA2_PORT:-18080}
 timeout_s=${RDNA2_TIMEOUT:-900}
 ubatch_candidates=${RDNA2_UBATCH_CANDIDATES:-"256 512 1024 2048 4096"}
 runner="$repo_root/scripts/issue-108-rdna2-sweep.sh"
-server="$build_dir/bin/llama-server"
 request="$output_root/request-${target_tokens}-tokens.json"
 prompt_text="$output_root/request-${target_tokens}-tokens.txt"
 
@@ -148,28 +147,12 @@ base_args=(
 echo "Issue 108 RDNA2 diagnostic campaign"
 echo "repo=$repo_root"
 echo "commit=$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || echo unknown)"
+echo "server=$server"
 echo "model=$model"
 echo "output=$output_root"
 echo "target_prompt_tokens=$target_tokens"
 echo "predict_tokens=$predict_tokens"
 printf 'extra_server_args='; printf '%q ' "${extra_server_args[@]}"; echo
-
-if [[ ${RDNA2_SKIP_BUILD:-0} != 1 ]]; then
-    echo "[$(date --iso-8601=seconds)] configuring gfx1030 Release build"
-    cmake -S "$repo_root" -B "$build_dir" \
-        -DGGML_HIP=ON \
-        -DAMDGPU_TARGETS=gfx1030 \
-        -DGGML_HIP_ROCWMMA_FATTN=OFF \
-        -DCMAKE_BUILD_TYPE=Release \
-        2>&1 | tee "$output_root/configure.log"
-    echo "[$(date --iso-8601=seconds)] building llama-server"
-    cmake --build "$build_dir" --target llama-server -j "$build_jobs" \
-        2>&1 | tee "$output_root/build.log"
-fi
-if [[ ! -x $server ]]; then
-    echo "built server is not executable: $server" >&2
-    exit 1
-fi
 
 tokenizer_pid=
 campaign_complete=0
