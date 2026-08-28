@@ -56,10 +56,11 @@ std::optional<llama_safetensors_source_name> llama_safetensors_map_decoder_tenso
         }
     }
 
-    static constexpr std::array<projection_name, 4> plain = {
+    static constexpr std::array<projection_name, 5> plain = {
         {
          { "attn_norm.weight", "input_layernorm.weight" },
          { "post_attention_norm.weight", "post_attention_layernorm.weight" },
+         { "ffn_norm.weight", "post_attention_layernorm.weight" },
          { "attn_q_norm.weight", "self_attn.q_norm.weight" },
          { "attn_k_norm.weight", "self_attn.k_norm.weight" },
          }

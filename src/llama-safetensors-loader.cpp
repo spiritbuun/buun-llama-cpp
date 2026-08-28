@@ -1,6 +1,7 @@
 #include "llama-safetensors.h"
 
 #include "llama-safetensors-importer.h"
+#include "llama-safetensors-qwen3.h"
 #include "llama-safetensors-qwen35.h"
 #include "llama-model-source.h"
 #include "llama.h"
@@ -33,10 +34,17 @@ std::unique_ptr<llama_safetensors_importer> create_qwen35_importer(
     return std::make_unique<llama_safetensors_qwen35_importer>(model_dir, config);
 }
 
+std::unique_ptr<llama_safetensors_importer> create_qwen3_importer(
+        const std::filesystem::path & model_dir,
+        const llama_safetensors_json & config) {
+    return std::make_unique<llama_safetensors_qwen3_importer>(model_dir, config);
+}
+
 std::unique_ptr<llama_safetensors_importer> select_importer(
         const std::filesystem::path & model_dir) {
     const llama_safetensors_json config = llama_safetensors_read_json(model_dir / "config.json");
-    static constexpr std::array<importer_registration, 1> importers = { {
+    static constexpr std::array<importer_registration, 2> importers = { {
+        { "qwen3", llama_safetensors_qwen3_importer::probe, create_qwen3_importer },
         { "qwen3_5", llama_safetensors_qwen35_importer::probe, create_qwen35_importer },
     } };
 

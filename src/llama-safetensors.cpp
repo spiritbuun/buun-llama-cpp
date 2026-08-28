@@ -295,8 +295,11 @@ llama_safetensors_quant_config llama_safetensors_quant_config::from_json(const l
     if (quant_method != "compressed-tensors") {
         throw std::runtime_error("native safetensors does not support quant_method '" + quant_method + "'");
     }
-    if (require_json_value(quant, "format", "quantization_config").get<std::string>() != "mixed-precision") {
-        throw std::runtime_error("native safetensors requires compressed-tensors format 'mixed-precision'");
+    const std::string container_format =
+        require_json_value(quant, "format", "quantization_config").get<std::string>();
+    if (container_format != "mixed-precision" && container_format != "float-quantized") {
+        throw std::runtime_error(
+            "native safetensors requires compressed-tensors format 'mixed-precision' or 'float-quantized'");
     }
 
     const json config_groups = require_json_value(quant, "config_groups", "quantization_config");
@@ -306,12 +309,18 @@ llama_safetensors_quant_config llama_safetensors_quant_config::from_json(const l
 
     for (const auto & [name, desc] : config_groups.items()) {
         const json        weights = require_json_value(desc, "weights", "quantization group '" + name + "'");
-        const std::string format =
-            require_json_value(desc, "format", "quantization group '" + name + "'").get<std::string>();
+        const std::string format = desc.value("format", container_format);
         const std::string type =
             require_json_value(weights, "type", "quantization group '" + name + "'").get<std::string>();
-        const auto require_null = [&](const char * key) {
-            if (!require_json_value(weights, key, "quantization group '" + name + "'").is_null()) {
+        const bool legacy_fp8 = container_format == "float-quantized";
+        const auto require_null = [&](const json & object, const char * key, const std::string & context) {
+            if (!object.contains(key)) {
+                if (legacy_fp8) {
+                    return;
+                }
+                throw std::runtime_error(context + " is missing '" + key + "'");
+            }
+            if (!object.at(key).is_null()) {
                 throw std::runtime_error("quantization group '" + name + "' requires null '" + key + "'");
             }
         };
@@ -334,8 +343,8 @@ llama_safetensors_quant_config llama_safetensors_quant_config::from_json(const l
                 require_json_value(weights, "scale_dtype", "quantization group '" + name + "'").get<std::string>();
             const std::string actorder =
                 require_json_value(weights, "actorder", "quantization group '" + name + "'").get<std::string>();
-            require_null("block_structure");
-            require_null("zp_dtype");
+            require_null(weights, "block_structure", "quantization group '" + name + "'");
+            require_null(weights, "zp_dtype", "quantization group '" + name + "'");
             if (type != "float" || num_bits != 4 || strategy != "tensor_group" || group_size != 16 ||
                 !symmetric || dynamic || scale_dtype != "torch.float8_e4m3fn" || actorder != "static") {
                 throw std::runtime_error("unsupported packed float quantization in group '" + name + "'");
@@ -361,11 +370,11 @@ llama_safetensors_quant_config llama_safetensors_quant_config::from_json(const l
                 require_json_value(weights, "num_bits", "quantization group '" + name + "'").get<uint32_t>();
             const std::string strategy =
                 require_json_value(weights, "strategy", "quantization group '" + name + "'").get<std::string>();
-            require_null("group_size");
-            require_null("block_structure");
-            require_null("scale_dtype");
-            require_null("zp_dtype");
-            require_null("actorder");
+            require_null(weights, "group_size", "quantization group '" + name + "'");
+            require_null(weights, "block_structure", "quantization group '" + name + "'");
+            require_null(weights, "scale_dtype", "quantization group '" + name + "'");
+            require_null(weights, "zp_dtype", "quantization group '" + name + "'");
+            require_null(weights, "actorder", "quantization group '" + name + "'");
             if (type != "float" || num_bits != 8 || strategy != "channel" || !symmetric || dynamic) {
                 throw std::runtime_error("unsupported FP8 quantization in group '" + name + "'");
             }
@@ -377,11 +386,11 @@ llama_safetensors_quant_config llama_safetensors_quant_config::from_json(const l
                 require_json_value(input, "strategy", "input activations for group '" + name + "'").get<std::string>() != "token" ||
                 require_json_value(input, "symmetric", "input activations for group '" + name + "'").get<bool>() != true ||
                 require_json_value(input, "dynamic", "input activations for group '" + name + "'").get<bool>() != true ||
-                !require_json_value(input, "group_size", "input activations for group '" + name + "'").is_null() ||
-                !require_json_value(input, "block_structure", "input activations for group '" + name + "'").is_null() ||
-                !require_json_value(input, "scale_dtype", "input activations for group '" + name + "'").is_null() ||
-                !require_json_value(input, "zp_dtype", "input activations for group '" + name + "'").is_null() ||
-                !require_json_value(input, "actorder", "input activations for group '" + name + "'").is_null()) {
+                (input.contains("group_size") && !input.at("group_size").is_null()) ||
+                (input.contains("block_structure") && !input.at("block_structure").is_null()) ||
+                (input.contains("scale_dtype") && !input.at("scale_dtype").is_null()) ||
+                (input.contains("zp_dtype") && !input.at("zp_dtype").is_null()) ||
+                (input.contains("actorder") && !input.at("actorder").is_null())) {
                 throw std::runtime_error("unsupported FP8 input activation contract in group '" + name + "'");
             }
         } else {
@@ -397,7 +406,11 @@ llama_safetensors_quant_config llama_safetensors_quant_config::from_json(const l
             if (!target.is_string()) {
                 throw std::runtime_error("non-string target in quantization group '" + name + "'");
             }
-            const std::string target_name = target.get<std::string>();
+            const std::string declared_target = target.get<std::string>();
+            // compressed-tensors uses module class names as selectors in
+            // older single-format checkpoints. Importers ask this registry
+            // only about projection modules, so Linear is their catch-all.
+            const std::string target_name = declared_target == "Linear" ? "re:.*" : declared_target;
             const auto existing = std::find_if(result.rules_.begin(), result.rules_.end(), [&](const rule & item) {
                 return item.target == target_name;
             });

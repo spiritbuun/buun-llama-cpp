@@ -32,6 +32,7 @@ class llama_safetensors_metadata_sink {
     void set_u32(std::string_view key, uint32_t value);
     void set_i32(std::string_view key, int32_t value);
     void set_f32(std::string_view key, float value);
+    void set_bool(std::string_view key, bool value);
     void set_i32_array(std::string_view key, const int32_t * values, size_t count);
     void set_string_array(std::string_view key, const std::vector<std::string> & values);
 
@@ -69,6 +70,7 @@ struct llama_safetensors_bpe_policy {
     std::optional<std::string> padding_token;
     bool                       angle_pipe_tokens_are_control = false;
     std::vector<std::string>   control_token_prefixes;
+    bool                       add_bos_token = false;
 };
 
 void llama_safetensors_emit_bpe_tokenizer(llama_safetensors_metadata_sink &    sink,

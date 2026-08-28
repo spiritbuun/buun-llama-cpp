@@ -75,6 +75,11 @@ void llama_safetensors_metadata_sink::set_f32(std::string_view key, float value)
     gguf_set_val_f32(context_, key_string.c_str(), value);
 }
 
+void llama_safetensors_metadata_sink::set_bool(std::string_view key, bool value) {
+    const std::string key_string(key);
+    gguf_set_val_bool(context_, key_string.c_str(), value);
+}
+
 void llama_safetensors_metadata_sink::set_i32_array(std::string_view key, const int32_t * values, size_t count) {
     const std::string key_string(key);
     gguf_set_arr_data(context_, key_string.c_str(), GGUF_TYPE_INT32, values, count);
@@ -205,6 +210,7 @@ void llama_safetensors_emit_bpe_tokenizer(llama_safetensors_metadata_sink &    s
     sink.set_string_array("tokenizer.ggml.merges", merges);
     sink.set_u32("tokenizer.ggml.bos_token_id", policy.bos_token_id);
     sink.set_u32("tokenizer.ggml.eos_token_id", policy.eos_token_id);
+    sink.set_bool("tokenizer.ggml.add_bos_token", policy.add_bos_token);
 
     if (policy.padding_token) {
         const auto it = std::find(tokens.begin(), tokens.end(), *policy.padding_token);

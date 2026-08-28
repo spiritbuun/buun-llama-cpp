@@ -318,14 +318,44 @@ Gate: the Qwen adapter contains no quant-format implementation and no complete t
 
 ### Phase 6 — Prove the seam with a second existing architecture
 
-- [ ] Select a dense architecture already well supported through GGUF and available in one supported safetensors quant format.
-- [ ] Add only its configuration/name/layout adapter.
-- [ ] Do not add a model graph or duplicate backend kernel for the sake of safetensors.
-- [ ] Document which portions were reused unchanged.
+- [x] Select a dense architecture already well supported through GGUF and available in one supported safetensors quant format.
+- [x] Add only its configuration/name/layout adapter.
+- [x] Do not add a model graph or duplicate backend kernel for the sake of safetensors.
+- [x] Document which portions were reused unchanged.
 
 Preferred proof target: a conventional dense Llama- or Qwen3-family model. A second irregular hybrid architecture should wait until the common path is proven.
 
 Gate: the second architecture loads through its existing `llama_model_*` class, matches a clean GGUF/reference KLD panel within the declared near-zero tolerance, and exercises the same backend kernels for equivalent runtime tensor types.
+
+Proof target: `RedHatAI/Qwen3-4B-FP8-dynamic`, a conventional 36-layer
+Qwen3 model with channel-scaled E4M3 projections. The adapter adds Qwen3
+configuration metadata and root names only. It reuses the ordinary decoder
+name mapper, tokenizer/metadata bridge, compressed-tensors parser, generic
+tensor materializer, existing `llama_model_qwen3` graph, and existing
+F8-E4M3/BF16-scale backend path unchanged. No Qwen3 safetensors graph or
+backend kernel was added.
+
+The proof also generalized two producer/container seams discovered by the
+second model: older compressed-tensors checkpoints may declare the
+single-format `float-quantized` schema and select projections by the `Linear`
+module class, and pure channel-FP8 GGUF export must preserve F8 tensors just as
+the mixed NVFP4+FP8 exporter already did.
+
+Gate results on one RTX A6000:
+
+- 651/651 canonical tensors matched the GGUF control byte-for-byte
+  (5,192,136,704 bytes).
+- Both paths exposed 145 F32, 254 BF16, and 252 F8-E4M3 tensors.
+- All 16,384 live WikiText logit rows matched bit-for-bit across the full
+  151,936-token vocabulary. The resulting KLD is exactly zero.
+- The native directory loaded through `llama_model_qwen3` and generated a
+  coherent greedy continuation.
+
+The live-logit gate is intentional. `llama-perplexity`'s `.kld` artifact
+quantizes saved log probabilities to `uint16_t`, so comparing a model to its
+own saved artifact is not an exact-zero anchor. Native and GGUF produced
+byte-identical per-position values even through that lossy instrument, but the
+live comparison is the proof of exact equality.
 
 ### Phase 7 — Loading and memory optimization
 

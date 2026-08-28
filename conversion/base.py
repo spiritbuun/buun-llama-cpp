@@ -156,6 +156,7 @@ class ModelBase:
         self._is_mxfp4 = False
         self._fp8_as_q8 = fp8_as_q8
         self._fp8_dequantized: set[str] = set()
+        self._has_fp8_channel = False
 
         # Apply heuristics to figure out typical tensor encoding based on first tensor's dtype
         # NOTE: can't use field "torch_dtype" in config.json, because some finetunes lie.
@@ -311,6 +312,8 @@ class ModelBase:
 
     @staticmethod
     def _compressed_target_matches(target: str, module_name: str) -> bool:
+        if target == "Linear":
+            return True
         if target.startswith("re:"):
             return re.match(target[3:], module_name) is not None
         return target == module_name
@@ -351,7 +354,8 @@ class ModelBase:
                 continue
             if (self.hparams.get("quantization_config") or {}).get("quant_method") == "compressed-tensors":
                 group = self._compressed_tensor_group(name.removesuffix(".weight"))
-                if group is None or group.get("format") != "float-quantized":
+                config_format = (self.hparams.get("quantization_config") or {}).get("format")
+                if group is None or group.get("format", config_format) != "float-quantized":
                     raise ValueError(f"FP8 tensor {name!r} is not assigned to a supported float-quantized group")
             scale = LazyTorchTensor.to_eager(self.model_tensors[scale_name]())
             weight, scale = self._transform_fp8_channel_weight(name, weight, scale)
@@ -383,6 +387,7 @@ class ModelBase:
 
         for name in consumed:
             self.model_tensors.pop(name, None)
+        self._has_fp8_channel |= bool(consumed)
 
     def dequant_model(self):
         # If all quantized tensors were already handled (e.g. pure NVFP4), skip
@@ -1002,6 +1007,8 @@ class ModelBase:
             self._generate_nvfp4_tensors()
             if not self._fp8_as_q8:
                 self._generate_fp8_channel_tensors()
+        elif quant_method == "compressed-tensors" and not self._fp8_as_q8:
+            self._generate_fp8_channel_tensors()
 
         self.dequant_model()
 
@@ -1151,6 +1158,8 @@ class ModelBase:
                 self.ftype = gguf.LlamaFileType.MOSTLY_NVFP4
             elif self._is_mxfp4:
                 self.ftype = gguf.LlamaFileType.MOSTLY_MXFP4_MOE
+            elif self._has_fp8_channel:
+                self.ftype = gguf.LlamaFileType.MOSTLY_F8_E4M3
 
         # Generate parameter weight class (useful for leader boards) if not yet determined
         if self.metadata.size_label is None and total_params > 0:
