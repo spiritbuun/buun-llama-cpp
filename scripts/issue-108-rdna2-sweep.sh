@@ -8,8 +8,10 @@ Usage:
   scripts/issue-108-rdna2-sweep.sh SERVER REQUEST_JSON OUTPUT_DIR -- SERVER_ARGS...
 
 REQUEST_JSON is posted unchanged to /completion for every run. SERVER_ARGS should contain the
-model, tensor split and any drafter/mmproj arguments, but should omit --port, --flash-attn,
---ubatch-size, -ct/--cache-type and --spec-type because this script controls those switches.
+model, tensor split and the normal drafter/mmproj arguments (including --spec-type). It should
+omit --port, --flash-attn, --ubatch-size and -ct/--cache-type because this script controls those
+switches. The "configured" arm preserves the supplied speculative configuration; the "none" arm
+appends --spec-type none as an explicit control.
 
 Environment controls (space-separated):
   RDNA2_PATHS       default: "auto tile4 tile8 tile16 tile32 tile32-direct vec"
