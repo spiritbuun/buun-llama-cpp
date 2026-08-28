@@ -17,8 +17,9 @@
 
 namespace {
 
-using importer_probe = bool (*)(const std::filesystem::path &);
-using importer_create = std::unique_ptr<llama_safetensors_importer> (*)(const std::filesystem::path &);
+using importer_probe = bool (*)(const llama_safetensors_json &);
+using importer_create = std::unique_ptr<llama_safetensors_importer> (*)(
+    const std::filesystem::path &, const llama_safetensors_json &);
 
 struct importer_registration {
     const char *    name;
@@ -27,19 +28,21 @@ struct importer_registration {
 };
 
 std::unique_ptr<llama_safetensors_importer> create_qwen35_importer(
-        const std::filesystem::path & model_dir) {
-    return std::make_unique<llama_safetensors_qwen35_importer>(model_dir);
+        const std::filesystem::path & model_dir,
+        const llama_safetensors_json & config) {
+    return std::make_unique<llama_safetensors_qwen35_importer>(model_dir, config);
 }
 
 std::unique_ptr<llama_safetensors_importer> select_importer(
         const std::filesystem::path & model_dir) {
+    const llama_safetensors_json config = llama_safetensors_read_json(model_dir / "config.json");
     static constexpr std::array<importer_registration, 1> importers = { {
         { "qwen3_5", llama_safetensors_qwen35_importer::probe, create_qwen35_importer },
     } };
 
     const importer_registration * match = nullptr;
     for (const importer_registration & candidate : importers) {
-        if (!candidate.probe(model_dir)) {
+        if (!candidate.probe(config)) {
             continue;
         }
         if (match != nullptr) {
@@ -50,10 +53,18 @@ std::unique_ptr<llama_safetensors_importer> select_importer(
         match = &candidate;
     }
     if (match == nullptr) {
+        const std::string model_type = config.value("model_type", std::string("<missing>"));
+        const std::string architectures = config.contains("architectures") ?
+            config.at("architectures").dump() : "<missing>";
+        const std::string quant_method = config.contains("quantization_config") &&
+                config.at("quantization_config").is_object() ?
+            config.at("quantization_config").value("quant_method", std::string("<missing>")) : "<missing>";
         throw std::runtime_error(
-            "unsupported native safetensors architecture in '" + model_dir.string() + "'");
+            "unsupported native safetensors architecture in '" + model_dir.string() +
+            "' (model_type=" + model_type + ", architectures=" + architectures +
+            ", quant_method=" + quant_method + ")");
     }
-    return match->create(model_dir);
+    return match->create(model_dir, config);
 }
 
 }  // namespace

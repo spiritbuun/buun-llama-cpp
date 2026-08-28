@@ -16,7 +16,7 @@ namespace {
 
 // compressed-tensors resolves overlapping targets in declaration order. Use
 // ordered_json for every parsed object so config_groups retains file order.
-using json = nlohmann::ordered_json;
+using json = llama_safetensors_json;
 
 constexpr uint64_t MAX_HEADER_SIZE = 100ULL * 1024 * 1024;
 
@@ -216,18 +216,6 @@ parsed_shard parse_shard(const std::filesystem::path & path, uint32_t shard_inde
     return result;
 }
 
-json read_json_file(const std::filesystem::path & path) {
-    std::ifstream in(path);
-    if (!in) {
-        throw std::runtime_error("failed to open JSON file '" + path.string() + "'");
-    }
-    try {
-        return json::parse(in);
-    } catch (const json::exception & e) {
-        throw std::runtime_error("invalid JSON in '" + path.string() + "': " + e.what());
-    }
-}
-
 const json & require_json_value(const json & object, const char * key, const std::string & context) {
     if (!object.is_object() || !object.contains(key)) {
         throw std::runtime_error(context + " is missing '" + key + "'");
@@ -263,8 +251,11 @@ bool llama_safetensors_quant_config::rule_matches(const rule & candidate, const 
 }
 
 llama_safetensors_quant_config llama_safetensors_quant_config::load(const std::filesystem::path & model_dir) {
+    return from_json(llama_safetensors_read_json(model_dir / "config.json"));
+}
+
+llama_safetensors_quant_config llama_safetensors_quant_config::from_json(const llama_safetensors_json & root) {
     llama_safetensors_quant_config result;
-    const json                     root  = read_json_file(model_dir / "config.json");
     const json                     quant = require_json_value(root, "quantization_config", "config.json");
     const std::string quant_method =
         require_json_value(quant, "quant_method", "quantization_config").get<std::string>();
@@ -460,7 +451,7 @@ llama_safetensors_registry llama_safetensors_registry::load(const std::filesyste
     std::map<std::string, std::string> expected_shards;
     std::set<std::string>              shard_names;
     if (std::filesystem::is_regular_file(index_path)) {
-        const json index = read_json_file(index_path);
+        const json index = llama_safetensors_read_json(index_path);
         if (!index.is_object() || !index.contains("weight_map") || !index.at("weight_map").is_object()) {
             throw std::runtime_error("safetensors index is missing an object-valued weight_map");
         }

@@ -43,17 +43,19 @@ safetensors directory
 
 - Only one architecture importer is registered so far (Qwen3.5), but selection
   now goes through an ambiguity-checking importer registry.
-- The importer manually constructs every GGUF-compatible model and tokenizer key.
+- The importer manually constructs Qwen-specific GGUF model keys; tokenizer,
+  sampling, RoPE parsing, and metadata storage are shared helpers.
 - Canonical-to-source name mapping, plain-tensor dtype conversion, and Qwen-specific
   permutations are still mixed in one file. Quant-format binding and validation
   now live in a reusable adapter.
 - Model validation is fixed to one Qwen3.5 geometry.
-- The quantization and architecture seams are separated, but the metadata and
-  transform helpers still need extraction before architecture two is cheap.
+- The quantization, architecture, and metadata seams are separated. Explicit
+  transform objects and shared ordinary-tensor naming remain before
+  architecture two is cheap.
 
 The duplicated target manifest has been removed. The next structural target is
-extracting reusable metadata, tokenizer, naming, and transform helpers so a
-second architecture does not copy Qwen-specific importer machinery.
+extracting reusable naming and transform helpers so a second architecture does
+not copy Qwen-specific importer machinery.
 
 ## 3. Required invariants
 
@@ -243,6 +245,11 @@ Each phase should be independently reviewable and should preserve a runnable Qwe
 
 Gate: both source models load and produce coherent greedy output, and the recorded performance is reproducible within the chosen thermal/clock tolerance.
 
+Current known exception: explicitly enabling the experimental Humming NVFP4
+path produced incoherent greedy output on the A6000 while the ordinary NVFP4
+path remained coherent. The experimental path stays opt-in and must not be
+treated as a correctness baseline until separately repaired and revalidated.
+
 ### Phase 1 — Introduce `llama_tensor_source` without changing behavior
 
 - [x] Define the internal source interface and ownership/lifetime rules.
@@ -280,11 +287,11 @@ Gate: quant-adapter unit tests cover each accepted and rejected contract; Qwen o
 
 ### Phase 4 — Extract reusable metadata and tokenizer helpers
 
-- [ ] Split generic JSON/file helpers from the Qwen adapter.
-- [ ] Add a metadata sink with strict required/optional field handling.
-- [ ] Extract tokenizer vocabulary, merges, added-token, special-token, and chat-template conversion.
-- [ ] Extract common RoPE and sampling-default helpers without weakening architecture validation.
-- [ ] Keep architecture-specific GGUF key selection in the architecture adapter.
+- [x] Split generic JSON/file helpers from the Qwen adapter.
+- [x] Add a metadata sink with strict required/optional field handling.
+- [x] Extract tokenizer vocabulary, merges, added-token, special-token, and chat-template conversion.
+- [x] Extract common RoPE and sampling-default helpers without weakening architecture validation.
+- [x] Keep architecture-specific GGUF key selection in the architecture adapter.
 
 Gate: tokenizer round-trip tests match canonical token IDs and encode/decode results; chat-template output matches the GGUF reference.
 
@@ -389,15 +396,14 @@ Questions reviewers must answer:
 
 ## 8. Recommended immediate order
 
-Phases 1–3 are implemented. Recommended next sequence:
+Phases 1–4 are implemented. Recommended next sequence:
 
 1. freeze the current NVFP4/block-FP8 correctness and performance baselines;
-2. extract metadata and tokenizer helpers;
-3. replace Qwen's ordinary projection table with shared naming templates and
+2. replace Qwen's ordinary projection table with shared naming templates and
    explicit transform objects;
-4. run the complete regression matrix;
-5. add one straightforward dense architecture as proof of the bridge;
-6. only then expand numerical-format coverage.
+3. run the complete regression matrix;
+4. add one straightforward dense architecture as proof of the bridge;
+5. only then expand numerical-format coverage.
 
 ## 9. Definition of done
 

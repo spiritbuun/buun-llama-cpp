@@ -126,7 +126,8 @@ struct temp_dir {
 
 int main(int argc, char ** argv) {
     if (argc == 4 && std::string(argv[1]) == "metadata") {
-        llama_safetensors_qwen35_importer importer(argv[2]);
+        llama_safetensors_qwen35_importer importer(
+            argv[2], llama_safetensors_read_json(std::filesystem::path(argv[2]) / "config.json"));
         gguf_context *                    actual              = importer.build_metadata();
         ggml_context *                    expected_tensor_ctx = nullptr;
         gguf_init_params                  params              = {
@@ -227,7 +228,8 @@ int main(int argc, char ** argv) {
         return mismatches == 0 ? 0 : 1;
     }
     if (argc == 4 && std::string(argv[1]) == "load") {
-        llama_safetensors_qwen35_importer importer(argv[2]);
+        llama_safetensors_qwen35_importer importer(
+            argv[2], llama_safetensors_read_json(std::filesystem::path(argv[2]) / "config.json"));
         ggml_context *                    tensor_ctx = nullptr;
         gguf_context *                    metadata   = nullptr;
         const bool                        native     = std::string(argv[3]) == "native";
@@ -317,7 +319,8 @@ int main(int argc, char ** argv) {
         return 0;
     }
     if (argc == 3) {
-        llama_safetensors_qwen35_importer importer(argv[1]);
+        llama_safetensors_qwen35_importer importer(
+            argv[1], llama_safetensors_read_json(std::filesystem::path(argv[1]) / "config.json"));
         ggml_context *                    tensor_ctx = nullptr;
         gguf_init_params                  params     = {
             /*.no_alloc = */ true,
@@ -365,7 +368,8 @@ int main(int argc, char ** argv) {
     }
     if (argc == 2) {
         const auto registry = llama_safetensors_registry::load(argv[1]);
-        const llama_safetensors_quant_adapters adapters(argv[1], registry);
+        const llama_safetensors_quant_adapters adapters(
+            llama_safetensors_read_json(std::filesystem::path(argv[1]) / "config.json"), registry);
         const llama_safetensors_quant_summary & summary = adapters.summary();
         std::cout << "shards=" << registry.shards().size() << " tensors=" << registry.tensors().size()
                   << " nvfp4=" << summary.nvfp4 << " fp8_channel=" << summary.fp8_channel
@@ -375,6 +379,76 @@ int main(int argc, char ** argv) {
     require(argc == 1, "usage: test-safetensors-registry [model-directory [control.gguf]]");
 
     temp_dir dir;
+
+    // Metadata and tokenizer conversion are shared by architecture importers.
+    // Keep their strict parsing and GGUF representation covered independently
+    // of the full Qwen model fixture.
+    {
+        const llama_safetensors_json generation = {
+            { "top_k", 7 }, { "top_p", 0.75f }, { "temperature", 0.5f },
+        };
+        const llama_safetensors_json tokenizer = {
+            { "model", {
+                { "vocab", { { "a", 0 }, { "b", 1 } } },
+                { "merges", { llama_safetensors_json::array({ "a", "b" }), "a b" } },
+            } },
+            { "added_tokens", {
+                { { "id", 2 }, { "content", "<|pad|>" }, { "special", true } },
+                { { "id", 3 }, { "content", "plain-added" }, { "special", false } },
+            } },
+        };
+
+        llama_safetensors_metadata_sink sink;
+        llama_safetensors_emit_sampling_defaults(sink, generation);
+        const auto rope = llama_safetensors_parse_rope(
+            llama_safetensors_json {
+                { "rope_theta", 1000000.0f },
+                { "partial_rotary_factor", 0.5f },
+                { "mrope_section", { 8, 8, 0 } },
+            },
+            { 1, 2, 3, 4 }, 0.25f);
+        require(rope.theta == 1000000.0f && rope.partial_rotary_factor == 0.5f &&
+                    rope.mrope_sections == std::array<int32_t, 4> { 8, 8, 0, 4 },
+                "generic RoPE parsing is wrong");
+        llama_safetensors_emit_bpe_tokenizer(
+            sink, tokenizer,
+            { "fixture", 4, 0, 1, std::string("<|pad|>"), true, {} },
+            std::string("{{ messages }}"));
+
+        gguf_context * metadata = sink.release();
+        const int64_t top_k = gguf_find_key(metadata, "general.sampling.top_k");
+        const int64_t top_p = gguf_find_key(metadata, "general.sampling.top_p");
+        const int64_t temp  = gguf_find_key(metadata, "general.sampling.temp");
+        const int64_t tokens = gguf_find_key(metadata, "tokenizer.ggml.tokens");
+        const int64_t types  = gguf_find_key(metadata, "tokenizer.ggml.token_type");
+        const int64_t pad    = gguf_find_key(metadata, "tokenizer.ggml.padding_token_id");
+        const int64_t chat   = gguf_find_key(metadata, "tokenizer.chat_template");
+        require(top_k >= 0 && gguf_get_val_i32(metadata, top_k) == 7 &&
+                    top_p >= 0 && gguf_get_val_f32(metadata, top_p) == 0.75f &&
+                    temp >= 0 && gguf_get_val_f32(metadata, temp) == 0.5f,
+                "generic sampling metadata is wrong");
+        require(tokens >= 0 && gguf_get_arr_n(metadata, tokens) == 4 &&
+                    std::string(gguf_get_arr_str(metadata, tokens, 2)) == "<|pad|>" &&
+                    types >= 0 && static_cast<const int32_t *>(gguf_get_arr_data(metadata, types))[2] == 3 &&
+                    static_cast<const int32_t *>(gguf_get_arr_data(metadata, types))[3] == 4 &&
+                    pad >= 0 && gguf_get_val_u32(metadata, pad) == 2 &&
+                    chat >= 0 && std::string(gguf_get_val_str(metadata, chat)) == "{{ messages }}",
+                "generic BPE tokenizer metadata is wrong");
+        gguf_free(metadata);
+
+        require_rejected(
+            [&] {
+                (void) llama_safetensors_parse_rope(
+                    llama_safetensors_json {
+                        { "rope_theta", 1.0f }, { "mrope_section", { 1, 2, 3, 4, 5 } },
+                    },
+                    { 0, 0, 0, 0 }, 1.0f);
+            },
+            "oversized mrope_section was accepted");
+        require_rejected(
+            [&] { (void) llama_safetensors_first_token_id(llama_safetensors_json::array(), "eos_token_id"); },
+            "empty token-id array was accepted");
+    }
 
     // Quant adapters are architecture-independent contracts. Exercise them
     // directly so an importer cannot accidentally make a correctness-critical
@@ -388,7 +462,8 @@ int main(int argc, char ** argv) {
         write_text(path / "config.json", fp8_channel_config);
         const auto registry = llama_safetensors_registry::load(path);
 
-        llama_safetensors_quant_adapters incomplete(path, registry);
+        llama_safetensors_quant_adapters incomplete(
+            llama_safetensors_read_json(path / "config.json"), registry);
         const auto weight = incomplete.bind("module", llama_safetensors_quant_role::WEIGHT);
         require(weight.has_value() && weight->target_type == GGML_TYPE_F8_E4M3,
                 "FP8 channel weight binding is wrong");
@@ -396,7 +471,8 @@ int main(int argc, char ** argv) {
         require_rejected([&] { incomplete.validate_complete(); },
                          "FP8 channel weight was accepted without its scale");
 
-        llama_safetensors_quant_adapters complete(path, registry);
+        llama_safetensors_quant_adapters complete(
+            llama_safetensors_read_json(path / "config.json"), registry);
         const auto complete_weight = complete.bind("module", llama_safetensors_quant_role::WEIGHT);
         const auto scale = complete.bind("module", llama_safetensors_quant_role::WEIGHT_SCALE);
         require(complete_weight.has_value() && scale.has_value() && scale->target_type == GGML_TYPE_BF16 &&
@@ -446,7 +522,8 @@ int main(int argc, char ** argv) {
         });
         write_text(path / "config.json", fp8_block_config);
         const auto registry = llama_safetensors_registry::load(path);
-        llama_safetensors_quant_adapters adapters(path, registry);
+        llama_safetensors_quant_adapters adapters(
+            llama_safetensors_read_json(path / "config.json"), registry);
         const auto weight = adapters.bind("module", llama_safetensors_quant_role::WEIGHT);
         const auto scale  = adapters.bind("module", llama_safetensors_quant_role::WEIGHT_SCALE);
         require(weight.has_value() && scale.has_value() && scale->target_type == GGML_TYPE_F32 &&
@@ -479,7 +556,8 @@ int main(int argc, char ** argv) {
         });
         write_text(path / "config.json", nvfp4_config);
         const auto registry = llama_safetensors_registry::load(path);
-        llama_safetensors_quant_adapters adapters(path, registry);
+        llama_safetensors_quant_adapters adapters(
+            llama_safetensors_read_json(path / "config.json"), registry);
         const auto weight = adapters.bind("module", llama_safetensors_quant_role::WEIGHT);
         const auto scale  = adapters.bind("module", llama_safetensors_quant_role::WEIGHT_SCALE);
         const auto input  = adapters.bind("module", llama_safetensors_quant_role::INPUT_SCALE);
@@ -606,7 +684,8 @@ int main(int argc, char ** argv) {
         R"({"weight_map":{"a":"model-00001-of-00002.safetensors","packed":"model-00001-of-00002.safetensors","fp8":"model-00002-of-00002.safetensors"}})");
     bool unsupported_rejected = false;
     try {
-        (void) llama_safetensors_qwen35_importer(dir.path);
+        (void) llama_safetensors_qwen35_importer(
+            dir.path, llama_safetensors_read_json(dir.path / "config.json"));
     } catch (const std::exception &) {
         unsupported_rejected = true;
     }

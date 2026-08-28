@@ -1,14 +1,10 @@
 #include "llama-safetensors-qwen35.h"
 #include "llama.h"
 
-#include "nlohmann/json.hpp"
-
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
-#include <fstream>
-#include <iterator>
 #include <limits>
 #include <regex>
 #include <stdexcept>
@@ -16,7 +12,7 @@
 
 namespace {
 
-using json = nlohmann::json;
+using json = llama_safetensors_json;
 
 enum class transform_kind {
     NONE,
@@ -37,26 +33,6 @@ bool is_qwen_offset_norm(std::string_view name) {
     return (ends_with(name, "norm.weight") && !ends_with(name, "linear_attn.norm.weight")) ||
            name.find("pre_fc_norm_embedding.weight") != std::string_view::npos ||
            name.find("pre_fc_norm_hidden.weight") != std::string_view::npos;
-}
-
-json read_json(const std::filesystem::path & path) {
-    std::ifstream input(path);
-    if (!input) {
-        throw std::runtime_error("failed to open JSON file '" + path.string() + "'");
-    }
-    try {
-        return json::parse(input);
-    } catch (const json::exception & error) {
-        throw std::runtime_error("invalid JSON in '" + path.string() + "': " + error.what());
-    }
-}
-
-std::string read_text(const std::filesystem::path & path) {
-    std::ifstream input(path, std::ios::binary);
-    if (!input) {
-        throw std::runtime_error("failed to open text file '" + path.string() + "'");
-    }
-    return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
 }
 
 const llama_safetensors_tensor & require_tensor(const llama_safetensors_registry & registry, const std::string & name) {
@@ -555,8 +531,7 @@ std::vector<uint8_t> bf16_add_one_to_f32(const std::vector<uint8_t> & source) {
     return result;
 }
 
-void validate_model_contract(const std::filesystem::path & model_dir) {
-    const json root = read_json(model_dir / "config.json");
+void validate_model_contract(const json & root) {
     if (root.value("model_type", std::string()) != "qwen3_5") {
         throw std::runtime_error("native Qwen3.5 importer requires model_type 'qwen3_5'");
     }
@@ -571,153 +546,81 @@ void validate_model_contract(const std::filesystem::path & model_dir) {
 
 }  // namespace
 
-llama_safetensors_qwen35_importer::llama_safetensors_qwen35_importer(const std::filesystem::path & model_dir) :
+llama_safetensors_qwen35_importer::llama_safetensors_qwen35_importer(
+        const std::filesystem::path & model_dir,
+        llama_safetensors_json config) :
     model_dir_(model_dir),
-    registry_(llama_safetensors_registry::load(model_dir)) {
-    validate_model_contract(model_dir_);
-    quant_ = std::make_unique<llama_safetensors_quant_adapters>(model_dir_, registry_);
+    config_(std::move(config)) {
+    validate_model_contract(config_);
+    generation_    = llama_safetensors_read_json(model_dir_ / "generation_config.json");
+    tokenizer_     = llama_safetensors_read_json(model_dir_ / "tokenizer.json");
+    chat_template_ = llama_safetensors_read_optional_text(model_dir_ / "chat_template.jinja");
+    registry_      = llama_safetensors_registry::load(model_dir_);
+    quant_         = std::make_unique<llama_safetensors_quant_adapters>(config_, registry_);
 }
 
-bool llama_safetensors_qwen35_importer::probe(const std::filesystem::path & model_dir) {
-    const json root = read_json(model_dir / "config.json");
-    return root.value("model_type", std::string()) == "qwen3_5";
+bool llama_safetensors_qwen35_importer::probe(const llama_safetensors_json & config) {
+    return config.value("model_type", std::string()) == "qwen3_5";
 }
 
 gguf_context * llama_safetensors_qwen35_importer::build_metadata() const {
-    const json root       = read_json(model_dir_ / "config.json");
-    const json text       = root.at("text_config");
-    const json rope       = text.at("rope_parameters");
-    const json generation = read_json(model_dir_ / "generation_config.json");
-    const json tokenizer  = read_json(model_dir_ / "tokenizer.json");
+    const json & text = config_.at("text_config");
+    const llama_safetensors_rope_config rope = llama_safetensors_parse_rope(
+        text.at("rope_parameters"), { 11, 11, 10, 0 }, 0.25f);
 
-    gguf_context * metadata = gguf_init_empty();
-    if (metadata == nullptr) {
-        throw std::runtime_error("failed to allocate native safetensors metadata");
+    llama_safetensors_metadata_sink sink;
+    sink.set_string("general.architecture", "qwen35");
+    sink.set_string("general.type", "model");
+    sink.set_string(
+        "general.name",
+        model_dir_.filename().empty() ? "Qwen3.5 Safetensors" : model_dir_.filename().string());
+    const llama_safetensors_quant_summary & quant_summary = quant_->summary();
+    sink.set_u32(
+        "general.file_type",
+        quant_summary.nvfp4 != 0 ? LLAMA_FTYPE_MOSTLY_NVFP4 : LLAMA_FTYPE_MOSTLY_F8_E4M3);
+    sink.set_u32("general.quantization_version", 2);
+    llama_safetensors_emit_sampling_defaults(sink, generation_);
+
+    const uint32_t n_layer = text.at("num_hidden_layers").get<uint32_t>();
+    const uint32_t n_mtp   = text.value("mtp_num_hidden_layers", config_.value("mtp_num_hidden_layers", 0U));
+    sink.set_u32("qwen35.block_count", n_layer + n_mtp);
+    sink.set_u32("qwen35.context_length", text.at("max_position_embeddings").get<uint32_t>());
+    sink.set_u32("qwen35.embedding_length", text.at("hidden_size").get<uint32_t>());
+    sink.set_u32("qwen35.feed_forward_length", text.at("intermediate_size").get<uint32_t>());
+    sink.set_u32("qwen35.attention.head_count", text.at("num_attention_heads").get<uint32_t>());
+    sink.set_u32("qwen35.attention.head_count_kv", text.at("num_key_value_heads").get<uint32_t>());
+    sink.set_i32_array(
+        "qwen35.rope.dimension_sections", rope.mrope_sections.data(), rope.mrope_sections.size());
+    sink.set_f32("qwen35.rope.freq_base", rope.theta);
+    sink.set_f32("qwen35.attention.layer_norm_rms_epsilon", text.at("rms_norm_eps").get<float>());
+    sink.set_u32("qwen35.attention.key_length", text.at("head_dim").get<uint32_t>());
+    sink.set_u32("qwen35.attention.value_length", text.at("head_dim").get<uint32_t>());
+    if (n_mtp != 0) {
+        sink.set_u32("qwen35.nextn_predict_layers", n_mtp);
     }
-    try {
-        gguf_set_val_str(metadata, "general.architecture", "qwen35");
-        gguf_set_val_str(metadata, "general.type", "model");
-        const std::string source_name = model_dir_.filename().empty() ?
-            "Qwen3.5 Safetensors" : model_dir_.filename().string();
-        gguf_set_val_str(metadata, "general.name", source_name.c_str());
-        const llama_safetensors_quant_summary & quant_summary = quant_->summary();
-        gguf_set_val_u32(
-            metadata, "general.file_type",
-            quant_summary.nvfp4 != 0 ? LLAMA_FTYPE_MOSTLY_NVFP4 : LLAMA_FTYPE_MOSTLY_F8_E4M3);
-        gguf_set_val_u32(metadata, "general.quantization_version", 2);
-        gguf_set_val_i32(metadata, "general.sampling.top_k", generation.value("top_k", 20));
-        gguf_set_val_f32(metadata, "general.sampling.top_p", generation.value("top_p", 0.95f));
-        gguf_set_val_f32(metadata, "general.sampling.temp", generation.value("temperature", 1.0f));
+    sink.set_u32("qwen35.ssm.conv_kernel", text.at("linear_conv_kernel_dim").get<uint32_t>());
+    sink.set_u32("qwen35.ssm.state_size", text.at("linear_key_head_dim").get<uint32_t>());
+    sink.set_u32("qwen35.ssm.group_count", text.at("linear_num_key_heads").get<uint32_t>());
+    sink.set_u32("qwen35.ssm.time_step_rank", text.at("linear_num_value_heads").get<uint32_t>());
+    sink.set_u32(
+        "qwen35.ssm.inner_size",
+        text.at("linear_num_value_heads").get<uint32_t>() * text.at("linear_value_head_dim").get<uint32_t>());
+    sink.set_u32("qwen35.full_attention_interval", text.value("full_attention_interval", 4U));
+    sink.set_u32(
+        "qwen35.rope.dimension_count",
+        static_cast<uint32_t>(text.at("head_dim").get<float>() * rope.partial_rotary_factor));
 
-        const uint32_t n_layer = text.at("num_hidden_layers").get<uint32_t>();
-        const uint32_t n_mtp   = text.value("mtp_num_hidden_layers", root.value("mtp_num_hidden_layers", 0U));
-        gguf_set_val_u32(metadata, "qwen35.block_count", n_layer + n_mtp);
-        gguf_set_val_u32(metadata, "qwen35.context_length", text.at("max_position_embeddings").get<uint32_t>());
-        gguf_set_val_u32(metadata, "qwen35.embedding_length", text.at("hidden_size").get<uint32_t>());
-        gguf_set_val_u32(metadata, "qwen35.feed_forward_length", text.at("intermediate_size").get<uint32_t>());
-        gguf_set_val_u32(metadata, "qwen35.attention.head_count", text.at("num_attention_heads").get<uint32_t>());
-        gguf_set_val_u32(metadata, "qwen35.attention.head_count_kv", text.at("num_key_value_heads").get<uint32_t>());
-        std::array<int32_t, 4> sections = { 11, 11, 10, 0 };
-        if (rope.contains("mrope_section")) {
-            const auto configured = rope.at("mrope_section").get<std::vector<int32_t>>();
-            for (size_t i = 0; i < std::min(configured.size(), sections.size()); ++i) {
-                sections[i] = configured[i];
-            }
-        }
-        gguf_set_arr_data(metadata, "qwen35.rope.dimension_sections", GGUF_TYPE_INT32, sections.data(),
-                          sections.size());
-        gguf_set_val_f32(metadata, "qwen35.rope.freq_base", rope.at("rope_theta").get<float>());
-        gguf_set_val_f32(metadata, "qwen35.attention.layer_norm_rms_epsilon", text.at("rms_norm_eps").get<float>());
-        gguf_set_val_u32(metadata, "qwen35.attention.key_length", text.at("head_dim").get<uint32_t>());
-        gguf_set_val_u32(metadata, "qwen35.attention.value_length", text.at("head_dim").get<uint32_t>());
-        if (n_mtp != 0) {
-            gguf_set_val_u32(metadata, "qwen35.nextn_predict_layers", n_mtp);
-        }
-        gguf_set_val_u32(metadata, "qwen35.ssm.conv_kernel", text.at("linear_conv_kernel_dim").get<uint32_t>());
-        gguf_set_val_u32(metadata, "qwen35.ssm.state_size", text.at("linear_key_head_dim").get<uint32_t>());
-        gguf_set_val_u32(metadata, "qwen35.ssm.group_count", text.at("linear_num_key_heads").get<uint32_t>());
-        gguf_set_val_u32(metadata, "qwen35.ssm.time_step_rank", text.at("linear_num_value_heads").get<uint32_t>());
-        gguf_set_val_u32(
-            metadata, "qwen35.ssm.inner_size",
-            text.at("linear_num_value_heads").get<uint32_t>() * text.at("linear_value_head_dim").get<uint32_t>());
-        gguf_set_val_u32(metadata, "qwen35.full_attention_interval", text.value("full_attention_interval", 4U));
-        gguf_set_val_u32(
-            metadata, "qwen35.rope.dimension_count",
-            static_cast<uint32_t>(text.at("head_dim").get<float>() * rope.value("partial_rotary_factor", 0.25f)));
-
-        const uint32_t           vocab_size = text.at("vocab_size").get<uint32_t>();
-        std::vector<std::string> tokens(vocab_size);
-        std::vector<int32_t>     token_types(vocab_size, 5);  // GGML unused token
-        for (uint32_t id = 0; id < vocab_size; ++id) {
-            tokens[id] = "[PAD" + std::to_string(id) + "]";
-        }
-        for (const auto & [token, id_json] : tokenizer.at("model").at("vocab").items()) {
-            const uint32_t id = id_json.get<uint32_t>();
-            if (id >= vocab_size) {
-                throw std::runtime_error("tokenizer vocabulary id exceeds configured vocabulary size");
-            }
-            tokens[id]      = token;
-            token_types[id] = 1;  // GGML normal token
-        }
-        for (const json & added : tokenizer.at("added_tokens")) {
-            const uint32_t id = added.at("id").get<uint32_t>();
-            if (id >= vocab_size) {
-                throw std::runtime_error("added token id exceeds configured vocabulary size");
-            }
-            const std::string content = added.at("content").get<std::string>();
-            tokens[id]                = content;
-            const bool looks_control  = added.value("special", false) ||
-                                       (content.rfind("<|", 0) == 0 && ends_with(content, "|>")) ||
-                                       content.rfind("<tts_", 0) == 0;
-            token_types[id] = looks_control ? 3 : 4;  // control or user-defined
-        }
-        std::vector<const char *> token_ptrs(tokens.size());
-        for (size_t i = 0; i < tokens.size(); ++i) {
-            token_ptrs[i] = tokens[i].c_str();
-        }
-        std::vector<std::string> merges;
-        merges.reserve(tokenizer.at("model").at("merges").size());
-        for (const json & merge : tokenizer.at("model").at("merges")) {
-            if (merge.is_array() && merge.size() == 2) {
-                merges.push_back(merge[0].get<std::string>() + " " + merge[1].get<std::string>());
-            } else if (merge.is_string()) {
-                merges.push_back(merge.get<std::string>());
-            } else {
-                throw std::runtime_error("unsupported tokenizer merge entry");
-            }
-        }
-        std::vector<const char *> merge_ptrs(merges.size());
-        for (size_t i = 0; i < merges.size(); ++i) {
-            merge_ptrs[i] = merges[i].c_str();
-        }
-        gguf_set_val_str(metadata, "tokenizer.ggml.model", "gpt2");
-        gguf_set_val_str(metadata, "tokenizer.ggml.pre", "qwen35");
-        gguf_set_arr_str(metadata, "tokenizer.ggml.tokens", token_ptrs.data(), token_ptrs.size());
-        gguf_set_arr_data(metadata, "tokenizer.ggml.token_type", GGUF_TYPE_INT32, token_types.data(),
-                          token_types.size());
-        gguf_set_arr_str(metadata, "tokenizer.ggml.merges", merge_ptrs.data(), merge_ptrs.size());
-        gguf_set_val_u32(metadata, "tokenizer.ggml.bos_token_id", generation.at("bos_token_id").get<uint32_t>());
-        const json eos = generation.at("eos_token_id");
-        gguf_set_val_u32(metadata, "tokenizer.ggml.eos_token_id",
-                         eos.is_array() ? eos[0].get<uint32_t>() : eos.get<uint32_t>());
-        const auto token_id = [&](const std::string & content) -> uint32_t {
-            const auto it = std::find(tokens.begin(), tokens.end(), content);
-            if (it == tokens.end()) {
-                throw std::runtime_error("token not found: '" + content + "'");
-            }
-            return static_cast<uint32_t>(it - tokens.begin());
-        };
-        gguf_set_val_u32(metadata, "tokenizer.ggml.padding_token_id", token_id("<|vision_pad|>"));
-        const auto chat_template = model_dir_ / "chat_template.jinja";
-        if (std::filesystem::exists(chat_template)) {
-            gguf_set_val_str(metadata, "tokenizer.chat_template", read_text(chat_template).c_str());
-        }
-
-        return metadata;
-    } catch (...) {
-        gguf_free(metadata);
-        throw;
-    }
+    llama_safetensors_bpe_policy tokenizer_policy {
+        "qwen35",
+        text.at("vocab_size").get<uint32_t>(),
+        llama_safetensors_first_token_id(generation_.at("bos_token_id"), "bos_token_id"),
+        llama_safetensors_first_token_id(generation_.at("eos_token_id"), "eos_token_id"),
+        std::string("<|vision_pad|>"),
+        true,
+        { "<tts_" },
+    };
+    llama_safetensors_emit_bpe_tokenizer(sink, tokenizer_, tokenizer_policy, chat_template_);
+    return sink.release();
 }
 
 bool llama_safetensors_qwen35_importer::describe(

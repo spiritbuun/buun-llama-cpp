@@ -5,7 +5,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <filesystem>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -45,7 +44,7 @@ struct llama_safetensors_quant_binding {
 class llama_safetensors_quant_adapters {
   public:
     llama_safetensors_quant_adapters(
-        const std::filesystem::path & model_dir,
+        const llama_safetensors_json & config,
         const llama_safetensors_registry & registry);
 
     std::optional<llama_safetensors_quant_binding> bind(

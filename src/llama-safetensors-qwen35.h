@@ -11,6 +11,7 @@
 #include <array>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -19,9 +20,11 @@
 // groups and materializes exactly one final tensor at a time.
 class llama_safetensors_qwen35_importer final : public llama_safetensors_importer {
   public:
-    explicit llama_safetensors_qwen35_importer(const std::filesystem::path & model_dir);
+    llama_safetensors_qwen35_importer(
+        const std::filesystem::path & model_dir,
+        llama_safetensors_json config);
 
-    static bool probe(const std::filesystem::path & model_dir);
+    static bool probe(const llama_safetensors_json & config);
 
     std::vector<uint8_t> materialize(
         const std::string & target_name, ggml_type target_type, size_t target_size) const override;
@@ -41,6 +44,10 @@ class llama_safetensors_qwen35_importer final : public llama_safetensors_importe
 
   private:
     std::filesystem::path      model_dir_;
+    llama_safetensors_json     config_;
+    llama_safetensors_json     generation_;
+    llama_safetensors_json     tokenizer_;
+    std::optional<std::string> chat_template_;
     llama_safetensors_registry registry_;
     std::unique_ptr<llama_safetensors_quant_adapters> quant_;
 };

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "llama-safetensors-metadata.h"
+
 #include <cstdint>
 #include <filesystem>
 #include <optional>
@@ -67,6 +69,7 @@ struct llama_safetensors_quant_group {
 class llama_safetensors_quant_config {
   public:
     static llama_safetensors_quant_config load(const std::filesystem::path & model_dir);
+    static llama_safetensors_quant_config from_json(const llama_safetensors_json & root);
 
     const llama_safetensors_quant_group * match(const std::string & module_name) const;
     bool                                  ignored(const std::string & module_name) const;

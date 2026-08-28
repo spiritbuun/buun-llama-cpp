@@ -84,9 +84,9 @@ std::vector<uint8_t> bf16_to_f32(const std::vector<uint8_t> & source) {
 }  // namespace
 
 llama_safetensors_quant_adapters::llama_safetensors_quant_adapters(
-        const std::filesystem::path & model_dir,
+        const llama_safetensors_json & config,
         const llama_safetensors_registry & registry) :
-    registry_(registry), config_(llama_safetensors_quant_config::load(model_dir)) {
+    registry_(registry), config_(llama_safetensors_quant_config::from_json(config)) {
     validate();
 }
 
