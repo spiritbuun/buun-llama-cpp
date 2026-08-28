@@ -90,6 +90,24 @@ static __device__ __forceinline__ void dequantize_q4_1(const void * vx, const in
     v.y = (v.y * dm.x) + dm.y;
 }
 
+static __device__ __forceinline__ float bf16_bits_to_float(const uint16_t bits) {
+    return __uint_as_float(uint32_t(bits) << 16);
+}
+
+static __device__ __forceinline__ void dequantize_q4_a32(
+        const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_q4_a32 * x = (const block_q4_a32 *) vx;
+    const int i0 = iqs;
+    const int i1 = i0 + 1;
+    const int g0 = i0 / QG4_A32;
+    const int g1 = i1 / QG4_A32;
+    const int z0 = (x[ib].z[g0 / 2] >> (4 * (g0 % 2))) & 0x0f;
+    const int z1 = (x[ib].z[g1 / 2] >> (4 * (g1 % 2))) & 0x0f;
+    const uint8_t packed = x[ib].qs[iqs / 2];
+    v.x = (int(packed & 0x0f) - z0) * bf16_bits_to_float(x[ib].d[g0]);
+    v.y = (int(packed >> 4)   - z1) * bf16_bits_to_float(x[ib].d[g1]);
+}
+
 static __device__ __forceinline__ void dequantize_q5_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q5_0 * x = (const block_q5_0 *) vx;
 
@@ -136,6 +154,14 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
 
     v.x *= d;
     v.y *= d;
+}
+
+static __device__ __forceinline__ void dequantize_q8_0_g128(
+        const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_q8_0_g128 * x = (const block_q8_0_g128 *) vx;
+    const float d = bf16_bits_to_float(x[ib].d);
+    v.x = float(x[ib].qs[iqs + 0]) * d;
+    v.y = float(x[ib].qs[iqs + 1]) * d;
 }
 
 //================================== k-quants

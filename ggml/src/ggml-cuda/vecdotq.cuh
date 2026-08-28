@@ -140,6 +140,8 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q4_0_q8_1_imp
 #define VDR_Q4_1_Q8_1_MMVQ 2
 #define VDR_Q4_1_Q8_1_MMQ  4
 
+#define VDR_Q4_A32_Q8_1_MMVQ 1
+
 template <int vdr> static __device__ __forceinline__ float vec_dot_q4_1_q8_1_impl(
     const int * v, const int * u, const half2 & dm4, const half2 & ds8) {
 
@@ -243,6 +245,8 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q5_1_q8_1_imp
 
 #define VDR_Q8_0_Q8_1_MMVQ 2
 #define VDR_Q8_0_Q8_1_MMQ 8
+
+#define VDR_Q8_0_G128_Q8_1_MMVQ 1
 
 template <typename T, int vdr> static __device__ __forceinline__ T vec_dot_q8_0_q8_1_impl(
     const int * v, const int * u, const T & d8_0, const T & d8_1) {
@@ -842,6 +846,35 @@ static __device__ __forceinline__ float vec_dot_q4_1_q8_1(
     return vec_dot_q4_1_q8_1_impl<VDR_Q4_1_Q8_1_MMVQ>(v, u, bq4_1->dm, bq8_1->ds);
 }
 
+static __device__ __forceinline__ float vec_dot_q4_a32_q8_1(
+        const void * __restrict__ vbq,
+        const block_q8_1 * __restrict__ bq8_1,
+        const int & kbx,
+        const int & iqs) {
+    const block_q4_a32 * bq4 = (const block_q4_a32 *) vbq + kbx;
+    const block_q8_1 * bq8 = bq8_1 + iqs;
+    const uint8_t * qs = bq4->qs + iqs*(QG4_A32/2);
+
+    int sumi = 0;
+#pragma unroll
+    for (int i = 0; i < QG4_A32/8; ++i) {
+        const int q = get_int_b1(qs, i);
+        const int u0 = get_int_b4(bq8->qs, 2*i + 0);
+        const int u1 = get_int_b4(bq8->qs, 2*i + 1);
+        const int u_even = __byte_perm(u0, u1, 0x6420);
+        const int u_odd  = __byte_perm(u0, u1, 0x7531);
+
+        sumi = ggml_cuda_dp4a(q & 0x0F0F0F0F, u_even, sumi);
+        sumi = ggml_cuda_dp4a((q >> 4) & 0x0F0F0F0F, u_odd, sumi);
+    }
+
+    const uint8_t zp = bq4->z[iqs/2];
+    const int zero = iqs & 1 ? zp >> 4 : zp & 0x0F;
+    const float d = __uint_as_float(uint32_t(bq4->d[iqs]) << 16);
+    const float2 ds8 = __half22float2(bq8->ds);
+    return d * (ds8.x*sumi - zero*ds8.y);
+}
+
 static __device__ __forceinline__ float vec_dot_q5_0_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
@@ -897,6 +930,25 @@ static __device__ __forceinline__ float vec_dot_q8_0_q8_1(
     }
 
     return vec_dot_q8_0_q8_1_impl<float, VDR_Q8_0_Q8_1_MMVQ>(v, u, bq8_0->d, __low2half(bq8_1->ds));
+}
+
+static __device__ __forceinline__ float vec_dot_q8_0_g128_q8_1(
+        const void * __restrict__ vbq,
+        const block_q8_1 * __restrict__ bq8_1,
+        const int & kbx,
+        const int & iqs) {
+    const block_q8_0_g128 * bq8_0 = (const block_q8_0_g128 *) vbq + kbx;
+    const block_q8_1 * bq8 = bq8_1 + iqs;
+    const int8_t * qs = bq8_0->qs + iqs*QK8_1;
+
+    int sumi = 0;
+#pragma unroll
+    for (int i = 0; i < QK8_1/4; ++i) {
+        sumi = ggml_cuda_dp4a(get_int_b1(qs, i), get_int_b4(bq8->qs, i), sumi);
+    }
+
+    const float d = __uint_as_float(uint32_t(bq8_0->d) << 16);
+    return d * __low2float(bq8->ds) * sumi;
 }
 
 static __device__ __forceinline__ float vec_dot_q2_K_q8_1(

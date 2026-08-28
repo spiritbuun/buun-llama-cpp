@@ -42,6 +42,10 @@ void quantize_row_q4_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, in
     quantize_row_q4_1_ref(x, y, k);
 }
 
+void quantize_row_q4_a32(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q4_a32_ref(x, y, k);
+}
+
 void quantize_row_q5_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q5_0_ref(x, y, k);
 }
@@ -52,6 +56,67 @@ void quantize_row_q5_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, in
 
 void quantize_row_q8_0_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q8_0_ref(x, y, k);
+}
+
+void quantize_row_q8_0_g128(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q8_0_g128_ref(x, y, k);
+}
+
+void ggml_vec_dot_q4_a32_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_ASSERT(n % QK4_A32 == 0);
+    GGML_ASSERT(nrc == 1);
+    UNUSED(bs);
+    UNUSED(bx);
+    UNUSED(by);
+
+    const block_q4_a32 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+    float sum = 0.0f;
+    for (int ib = 0; ib < n / QK4_A32; ++ib) {
+        for (int group = 0; group < QK4_A32 / QG4_A32; ++group) {
+            const ggml_bf16_t db = { x[ib].d[group] };
+            const float dx = ggml_bf16_to_fp32(db);
+            const int zero = (x[ib].z[group / 2] >> (4 * (group % 2))) & 0x0f;
+            const block_q8_0 * yb = &y[ib * (QK4_A32 / QK8_0) + group];
+            const float dy = GGML_CPU_FP16_TO_FP32(yb->d);
+            int dot = 0;
+            for (int i = 0; i < QG4_A32; ++i) {
+                const int index = group * QG4_A32 + i;
+                const int code = (x[ib].qs[index / 2] >> (4 * (index % 2))) & 0x0f;
+                dot += (code - zero) * yb->qs[i];
+            }
+            sum += dx * dy * dot;
+        }
+    }
+    *s = sum;
+}
+
+void ggml_vec_dot_q8_0_g128_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_ASSERT(n % QK8_0_G128 == 0);
+    GGML_ASSERT(nrc == 1);
+    UNUSED(bs);
+    UNUSED(bx);
+    UNUSED(by);
+
+    const block_q8_0_g128 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+    float sum = 0.0f;
+    for (int ib = 0; ib < n / QK8_0_G128; ++ib) {
+        const ggml_bf16_t db = { x[ib].d };
+        const float dx = ggml_bf16_to_fp32(db);
+        for (int group = 0; group < QK8_0_G128 / QK8_0; ++group) {
+            const block_q8_0 * yb = &y[ib * (QK8_0_G128 / QK8_0) + group];
+            const float dy = GGML_CPU_FP16_TO_FP32(yb->d);
+            int dot = 0;
+            for (int i = 0; i < QK8_0; ++i) {
+                dot += x[ib].qs[group * QK8_0 + i] * yb->qs[i];
+            }
+            sum += dx * dy * dot;
+        }
+    }
+    *s = sum;
 }
 
 void quantize_row_q8_1_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {

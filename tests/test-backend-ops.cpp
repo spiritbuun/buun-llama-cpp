@@ -9114,6 +9114,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F8_E4M3, GGML_TYPE_F32, 32, 1, k, {1, 1}, {1, 1}));
     }
 
+    // Source-faithful packed integer formats: n <= 8 exercises native MMVQ,
+    // while n == 9 exercises the generic dequantize + cuBLAS fallback.
+    for (ggml_type type_a : { GGML_TYPE_Q4_A32, GGML_TYPE_Q8_0_G128 }) {
+        for (int64_t n : { 1, 2, 4, 8, 9 }) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16, n, 256, {1, 1}, {1, 1}));
+        }
+    }
+
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
             test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  i, 256, { 1,  1}, {1, 1}));

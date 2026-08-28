@@ -444,7 +444,9 @@ extern "C" {
         GGML_TYPE_TURBO1_TCQ = 52, // turbo1 Trellis-Coded: FWHT + k=1/L=8 trellis, separate K/V 256-state codebooks (1.25 bpw)
         GGML_TYPE_Q2_0_G128 = 53, // 2-bit ternary weight quant, group-128 (PrismML Bonsai; on-disk type-42 remapped here at load)
         GGML_TYPE_F8_E4M3 = 54, // raw signed E4M3FN weights; external per-channel scale is a separate tensor
-        GGML_TYPE_COUNT   = 55,
+        GGML_TYPE_Q4_A32 = 55, // asymmetric 4-bit weights, BF16 scale + packed zero point per group-32 (4.625 bpw)
+        GGML_TYPE_Q8_0_G128 = 56, // symmetric 8-bit weights, one BF16 scale per group-128 (8.125 bpw)
+        GGML_TYPE_COUNT   = 57,
     };
 
     // precision

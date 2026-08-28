@@ -224,6 +224,19 @@ typedef struct {
 } block_q4_1;
 static_assert(sizeof(block_q4_1) == 2 * sizeof(ggml_half) + QK4_1 / 2, "wrong q4_1 block size/padding");
 
+// Canonical compressed-tensors W4A16 group-32 layout. Four affine groups share one
+// 128-value block. Besides preserving the source bits, the 128-value boundary lets
+// model loaders permute whole attention-head segments without unpacking the weights.
+#define QK4_A32 128
+#define QG4_A32 32
+#define QR4_A32 1
+typedef struct {
+    uint16_t d[QK4_A32 / QG4_A32]; // BF16 scales
+    uint8_t  z[QK4_A32 / QG4_A32 / 2]; // two 4-bit zero points per byte
+    uint8_t  qs[QK4_A32 / 2]; // adjacent values in low/high nibbles
+} block_q4_a32;
+static_assert(sizeof(block_q4_a32) == 74, "wrong q4_a32 block size/padding");
+
 #define QK_MXFP4 32
 typedef struct {
     uint8_t e; // E8M0
@@ -267,6 +280,15 @@ typedef struct {
     int8_t  qs[QK8_0]; // quants
 } block_q8_0;
 static_assert(sizeof(block_q8_0) == sizeof(ggml_half) + QK8_0, "wrong q8_0 block size/padding");
+
+// Canonical compressed-tensors W8A16 group-128 layout.
+#define QK8_0_G128 128
+#define QR8_0_G128 1
+typedef struct {
+    uint16_t d; // BF16 scale
+    int8_t   qs[QK8_0_G128];
+} block_q8_0_g128;
+static_assert(sizeof(block_q8_0_g128) == 130, "wrong q8_0_g128 block size/padding");
 
 #define QK8_1 32
 typedef struct {

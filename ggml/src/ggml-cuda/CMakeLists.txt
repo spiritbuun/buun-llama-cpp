@@ -184,7 +184,7 @@ if (CUDAToolkit_FOUND)
         target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_GDN_FLA_EMBEDDED)
     endif()
 
-    set_source_files_properties(humming-fp8.cu humming-fp8-block.cu humming-nvfp4.cu PROPERTIES
+    set_source_files_properties(humming-fp8.cu humming-fp8-block.cu humming-nvfp4.cu humming-q4_1.cu PROPERTIES
         CUDA_ARCHITECTURES "80-virtual;86-real"
         COMPILE_OPTIONS "--expt-relaxed-constexpr"
         INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/humming-vendor/include")

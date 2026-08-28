@@ -269,10 +269,10 @@ std::optional<llama_safetensors_quant_binding> llama_safetensors_quant_adapters:
         };
         if (group->num_bits == 4) {
             result.auxiliaries.push_back(module + ".weight_zero_point");
-            result.target_type     = GGML_TYPE_Q4_1;
+            result.target_type     = GGML_TYPE_Q4_A32;
             result.materialization = llama_safetensors_quant_materialization::PACKED_INT4_REPACK;
         } else {
-            result.target_type     = GGML_TYPE_Q8_0;
+            result.target_type     = GGML_TYPE_Q8_0_G128;
             result.materialization = llama_safetensors_quant_materialization::PACKED_INT8_REPACK;
         }
         return result;
@@ -457,7 +457,7 @@ void llama_safetensors_quant_adapters::validate() {
             const uint64_t groups = cols / group.group_size;
             dependencies_[tensor.name] = { scale.name, shape_desc.name };
             const bool common_valid = tensor.dtype == llama_safetensors_dtype::I32 && tensor.shape.size() == 2 &&
-                cols % group.group_size == 0 && cols % 32 == 0 && rows > 0 &&
+                cols % group.group_size == 0 && cols % 128 == 0 && rows > 0 &&
                 tensor.shape == std::vector<uint64_t>({ rows, cols / pack_factor }) &&
                 scale.dtype == llama_safetensors_dtype::BF16 &&
                 scale.shape == std::vector<uint64_t>({ rows, groups });
@@ -674,10 +674,8 @@ std::vector<uint8_t> llama_safetensors_quant_adapters::repack_packed_int4(
         const llama_safetensors_tensor & zero_desc,
         const uint8_t * zero,
         const std::array<uint64_t, 2> & weight_shape) const {
-    constexpr size_t qk = 32;
     constexpr size_t pack_factor = 8;
     constexpr size_t group_size = 32;
-    constexpr size_t block_size = 2 * sizeof(ggml_fp16_t) + qk / 2;
     const size_t rows = weight_shape[0];
     const size_t cols = weight_shape[1];
     const size_t groups = cols / group_size;
@@ -692,43 +690,41 @@ std::vector<uint8_t> llama_safetensors_quant_adapters::repack_packed_int4(
         throw std::runtime_error("inconsistent compressed-tensors INT4 group-32 source tensors");
     }
 
-    std::vector<uint8_t> result(rows * groups * block_size);
+    constexpr size_t block_values = 128;
+    constexpr size_t block_scales = 4 * sizeof(uint16_t);
+    constexpr size_t block_zeros  = 2;
+    constexpr size_t block_size   = block_scales + block_zeros + block_values / 2;
+    if (cols % block_values != 0) {
+        throw std::runtime_error("compressed-tensors INT4 rows must be divisible by 128");
+    }
+
+    std::vector<uint8_t> result(rows * (cols / block_values) * block_size);
     for (size_t row = 0; row < rows; ++row) {
-        for (size_t group = 0; group < groups; ++group) {
-            const float scale_f32 = load_bf16(scale + (row * groups + group) * sizeof(uint16_t));
-            if (!(scale_f32 > 0.0f) || !std::isfinite(scale_f32)) {
-                throw std::runtime_error("packed INT4 scale must be finite and positive");
-            }
-            const ggml_fp16_t scale_f16 = ggml_fp32_to_fp16(scale_f32);
-            if (!std::isfinite(ggml_fp16_to_fp32(scale_f16))) {
-                throw std::runtime_error("packed INT4 scale is not representable in Q4_1");
-            }
-            uint32_t packed_zero;
-            std::memcpy(&packed_zero,
-                        zero + ((row / pack_factor) * groups + group) * sizeof(packed_zero),
-                        sizeof(packed_zero));
-            const uint8_t zero_code = (packed_zero >> (4 * (row % pack_factor))) & 0x0f;
-            const ggml_fp16_t minimum = ggml_fp32_to_fp16(-scale_f32 * zero_code);
-            if (!std::isfinite(ggml_fp16_to_fp32(minimum))) {
-                throw std::runtime_error("packed INT4 minimum is not representable in Q4_1");
-            }
+        for (size_t ib = 0; ib < cols / block_values; ++ib) {
+            uint8_t * out = result.data() + (row * (cols / block_values) + ib) * block_size;
+            for (size_t local_group = 0; local_group < block_values / group_size; ++local_group) {
+                const size_t group = ib * (block_values / group_size) + local_group;
+                uint16_t scale_bits;
+                std::memcpy(&scale_bits, scale + (row * groups + group) * sizeof(scale_bits), sizeof(scale_bits));
+                const float scale_f32 = load_bf16(reinterpret_cast<const uint8_t *>(&scale_bits));
+                if (!(scale_f32 > 0.0f) || !std::isfinite(scale_f32)) {
+                    throw std::runtime_error("packed INT4 scale must be finite and positive");
+                }
+                std::memcpy(out + local_group * sizeof(scale_bits), &scale_bits, sizeof(scale_bits));
 
-            std::array<uint8_t, qk> codes;
-            for (size_t i = 0; i < qk; ++i) {
-                const size_t col = group * group_size + i;
-                uint32_t packed_weight;
-                std::memcpy(&packed_weight,
-                            weight + (row * packed_cols + col / pack_factor) * sizeof(packed_weight),
-                            sizeof(packed_weight));
-                codes[i] = (packed_weight >> (4 * (col % pack_factor))) & 0x0f;
+                uint32_t packed_zero;
+                std::memcpy(&packed_zero,
+                            zero + ((row / pack_factor) * groups + group) * sizeof(packed_zero),
+                            sizeof(packed_zero));
+                const uint8_t zero_code = (packed_zero >> (4 * (row % pack_factor))) & 0x0f;
+                out[block_scales + local_group / 2] |= zero_code << (4 * (local_group % 2));
             }
-
-            uint8_t * out = result.data() + (row * groups + group) * block_size;
-            std::memcpy(out, &scale_f16, sizeof(scale_f16));
-            std::memcpy(out + sizeof(scale_f16), &minimum, sizeof(minimum));
-            for (size_t i = 0; i < qk / 2; ++i) {
-                out[2 * sizeof(ggml_fp16_t) + i] = codes[i] | (codes[i + qk / 2] << 4);
-            }
+            // compressed-tensors packs consecutive low-to-high nibbles, which
+            // is already the canonical adjacent-pair byte order.
+            std::memcpy(
+                out + block_scales + block_zeros,
+                weight + (row * packed_cols + ib * (block_values / pack_factor)) * sizeof(uint32_t),
+                block_values / 2);
         }
     }
     return result;
@@ -740,10 +736,8 @@ std::vector<uint8_t> llama_safetensors_quant_adapters::repack_packed_int8(
         const llama_safetensors_tensor & scale_desc,
         const uint8_t * scale,
         const std::array<uint64_t, 2> & weight_shape) const {
-    constexpr size_t qk = 32;
     constexpr size_t pack_factor = 4;
     constexpr size_t group_size = 128;
-    constexpr size_t block_size = sizeof(ggml_fp16_t) + qk;
     const size_t rows = weight_shape[0];
     const size_t cols = weight_shape[1];
     const size_t groups = cols / group_size;
@@ -755,29 +749,28 @@ std::vector<uint8_t> llama_safetensors_quant_adapters::repack_packed_int8(
         throw std::runtime_error("inconsistent compressed-tensors INT8 group-128 source tensors");
     }
 
-    const size_t blocks_per_row = cols / qk;
+    constexpr size_t block_values = 128;
+    constexpr size_t block_size   = sizeof(uint16_t) + block_values;
+    if (cols % block_values != 0) {
+        throw std::runtime_error("compressed-tensors INT8 rows must be divisible by 128");
+    }
+
+    const size_t blocks_per_row = cols / block_values;
     std::vector<uint8_t> result(rows * blocks_per_row * block_size);
     for (size_t row = 0; row < rows; ++row) {
         for (size_t block = 0; block < blocks_per_row; ++block) {
-            const size_t group = block / (group_size / qk);
-            const float scale_f32 = load_bf16(scale + (row * groups + group) * sizeof(uint16_t));
+            const size_t group = block;
+            uint8_t * out = result.data() + (row * blocks_per_row + block) * block_size;
+            std::memcpy(out, scale + (row * groups + group) * sizeof(uint16_t), sizeof(uint16_t));
+            const float scale_f32 = load_bf16(out);
             if (!(scale_f32 > 0.0f) || !std::isfinite(scale_f32)) {
                 throw std::runtime_error("packed INT8 scale must be finite and positive");
             }
-            const ggml_fp16_t scale_f16 = ggml_fp32_to_fp16(scale_f32);
-            if (!std::isfinite(ggml_fp16_to_fp32(scale_f16))) {
-                throw std::runtime_error("packed INT8 scale is not representable in Q8_0");
-            }
-            uint8_t * out = result.data() + (row * blocks_per_row + block) * block_size;
-            std::memcpy(out, &scale_f16, sizeof(scale_f16));
-            for (size_t i = 0; i < qk; ++i) {
-                const size_t col = block * qk + i;
-                uint32_t packed_weight;
-                std::memcpy(&packed_weight,
-                            weight + (row * packed_cols + col / pack_factor) * sizeof(packed_weight),
-                            sizeof(packed_weight));
-                const uint8_t code = (packed_weight >> (8 * (col % pack_factor))) & 0xff;
-                out[sizeof(scale_f16) + i] = static_cast<uint8_t>(code - 128);
+            const uint8_t * packed = weight +
+                (row * packed_cols + block * (block_values / pack_factor)) * sizeof(uint32_t);
+            for (size_t i = 0; i < block_values; ++i) {
+                // Offset-binary to signed INT8 is exactly a sign-bit flip.
+                out[sizeof(uint16_t) + i] = packed[i] ^ 0x80;
             }
         }
     }

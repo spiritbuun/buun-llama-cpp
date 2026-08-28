@@ -1037,6 +1037,14 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q4_1> {
 };
 
 template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q4_A32> {
+    static constexpr int qk = QK4_A32;
+    static constexpr int qr = QR4_A32;
+    // One lane computes one complete affine group of 32 values.
+    static constexpr int qi = QK4_A32 / QG4_A32;
+};
+
+template<>
 struct ggml_cuda_type_traits<GGML_TYPE_Q5_0> {
     static constexpr int qk = QK5_0;
     static constexpr int qr = QR5_0;
@@ -1055,6 +1063,14 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q8_0> {
     static constexpr int qk = QK8_0;
     static constexpr int qr = QR8_0;
     static constexpr int qi = QI8_0;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q8_0_G128> {
+    static constexpr int qk = QK8_0_G128;
+    static constexpr int qr = QR8_0_G128;
+    // One lane computes one 32-value quarter of the group-128 block.
+    static constexpr int qi = QK8_0_G128 / QK8_1;
 };
 
 template<>

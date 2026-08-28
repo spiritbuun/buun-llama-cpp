@@ -219,6 +219,45 @@ void quantize_row_q4_1_ref(const float * GGML_RESTRICT x, block_q4_1 * GGML_REST
     }
 }
 
+void quantize_row_q4_a32_ref(const float * GGML_RESTRICT x, block_q4_a32 * GGML_RESTRICT y, int64_t k) {
+    GGML_ASSERT(k % QK4_A32 == 0);
+
+    const int64_t nb = k / QK4_A32;
+    for (int64_t ib = 0; ib < nb; ++ib) {
+        block_q4_a32 * block = &y[ib];
+        memset(block->z, 0, sizeof(block->z));
+        for (int group = 0; group < QK4_A32 / QG4_A32; ++group) {
+            const float * values = x + ib * QK4_A32 + group * QG4_A32;
+            float min = values[0];
+            float max = values[0];
+            for (int i = 1; i < QG4_A32; ++i) {
+                min = MIN(min, values[i]);
+                max = MAX(max, values[i]);
+            }
+
+            float scale = (max - min) / 15.0f;
+            if (!(scale > 0.0f)) {
+                scale = 1.0f;
+            }
+            const ggml_bf16_t scale_bf16 = ggml_fp32_to_bf16(scale);
+            block->d[group] = scale_bf16.bits;
+            scale = ggml_bf16_to_fp32(scale_bf16);
+            const int zero = MIN(15, MAX(0, (int) lrintf(-min / scale)));
+            block->z[group / 2] |= (uint8_t) zero << (4 * (group % 2));
+
+            for (int i = 0; i < QG4_A32; ++i) {
+                const int code = MIN(15, MAX(0, (int) lrintf(values[i] / scale) + zero));
+                const int index = group * QG4_A32 + i;
+                if ((index & 1) == 0) {
+                    block->qs[index / 2] = (uint8_t) code;
+                } else {
+                    block->qs[index / 2] |= (uint8_t) code << 4;
+                }
+            }
+        }
+    }
+}
+
 void quantize_row_q5_0_ref(const float * GGML_RESTRICT x, block_q5_0 * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK5_0;
 
@@ -329,6 +368,28 @@ void quantize_row_q8_0_ref(const float * GGML_RESTRICT x, block_q8_0 * GGML_REST
             const float x0 = x[i*QK8_0 + j]*id;
 
             y[i].qs[j] = roundf(x0);
+        }
+    }
+}
+
+void quantize_row_q8_0_g128_ref(const float * GGML_RESTRICT x, block_q8_0_g128 * GGML_RESTRICT y, int64_t k) {
+    GGML_ASSERT(k % QK8_0_G128 == 0);
+
+    const int64_t nb = k / QK8_0_G128;
+    for (int64_t ib = 0; ib < nb; ++ib) {
+        float amax = 0.0f;
+        for (int i = 0; i < QK8_0_G128; ++i) {
+            amax = MAX(amax, fabsf(x[ib * QK8_0_G128 + i]));
+        }
+        float scale = amax / 127.0f;
+        if (!(scale > 0.0f)) {
+            scale = 1.0f;
+        }
+        const ggml_bf16_t scale_bf16 = ggml_fp32_to_bf16(scale);
+        y[ib].d = scale_bf16.bits;
+        scale = ggml_bf16_to_fp32(scale_bf16);
+        for (int i = 0; i < QK8_0_G128; ++i) {
+            y[ib].qs[i] = (int8_t) MIN(127, MAX(-128, (int) lrintf(x[ib * QK8_0_G128 + i] / scale)));
         }
     }
 }
@@ -558,6 +619,24 @@ void dequantize_row_q4_1(const block_q4_1 * GGML_RESTRICT x, float * GGML_RESTRI
     }
 }
 
+void dequantize_row_q4_a32(const block_q4_a32 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    GGML_ASSERT(k % QK4_A32 == 0);
+
+    const int64_t nb = k / QK4_A32;
+    for (int64_t ib = 0; ib < nb; ++ib) {
+        for (int group = 0; group < QK4_A32 / QG4_A32; ++group) {
+            const ggml_bf16_t scale_bf16 = { x[ib].d[group] };
+            const float scale = ggml_bf16_to_fp32(scale_bf16);
+            const int zero = (x[ib].z[group / 2] >> (4 * (group % 2))) & 0x0f;
+            for (int i = 0; i < QG4_A32; ++i) {
+                const int index = group * QG4_A32 + i;
+                const int code = (x[ib].qs[index / 2] >> (4 * (index % 2))) & 0x0f;
+                y[ib * QK4_A32 + index] = (code - zero) * scale;
+            }
+        }
+    }
+}
+
 void dequantize_row_q5_0(const block_q5_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK5_0;
 
@@ -623,6 +702,19 @@ void dequantize_row_q8_0(const block_q8_0 * GGML_RESTRICT x, float * GGML_RESTRI
 
         for (int j = 0; j < qk; ++j) {
             y[i*qk + j] = x[i].qs[j]*d;
+        }
+    }
+}
+
+void dequantize_row_q8_0_g128(const block_q8_0_g128 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    GGML_ASSERT(k % QK8_0_G128 == 0);
+
+    const int64_t nb = k / QK8_0_G128;
+    for (int64_t ib = 0; ib < nb; ++ib) {
+        const ggml_bf16_t scale_bf16 = { x[ib].d };
+        const float scale = ggml_bf16_to_fp32(scale_bf16);
+        for (int i = 0; i < QK8_0_G128; ++i) {
+            y[ib * QK8_0_G128 + i] = x[ib].qs[i] * scale;
         }
     }
 }
@@ -5632,6 +5724,18 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
             {
                 VALIDATE_ROW_DATA_DM_F16_IMPL(block_q4_1, data, nb, d, m);
             } break;
+        case GGML_TYPE_Q4_A32:
+            {
+                const block_q4_a32 * q = (const block_q4_a32 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    for (size_t group = 0; group < QK4_A32 / QG4_A32; ++group) {
+                        if ((q[i].d[group] & 0x7f80) == 0x7f80) {
+                            fprintf(stderr, "%s: found non-finite BF16 scale at block %zu\n", __func__, i);
+                            return false;
+                        }
+                    }
+                }
+            } break;
         case GGML_TYPE_Q5_0:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_q5_0, data, nb);
@@ -5643,6 +5747,16 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_Q8_0:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_q8_0, data, nb);
+            } break;
+        case GGML_TYPE_Q8_0_G128:
+            {
+                const block_q8_0_g128 * q = (const block_q8_0_g128 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if ((q[i].d & 0x7f80) == 0x7f80) {
+                        fprintf(stderr, "%s: found non-finite BF16 scale at block %zu\n", __func__, i);
+                        return false;
+                    }
+                }
             } break;
         case GGML_TYPE_MXFP4:
             {

@@ -43,8 +43,10 @@ type, and token shapes.
 1. vLLM 0.28.0 at source revision
    `2cf0a6915ce544dc493a0990f2ea38d81601128a`, tensor parallel 1. Its source
    selects `CompressedTensorsWNA16` and `MarlinLinearKernel` for this contract.
-2. The exact source checkpoint occupies 21.09 GiB. vLLM reports 19.87 GiB of
-   model memory in text-only mode before KV allocation.
+2. The text-only source tensors selected by both engines occupy about 19.44 GiB
+   in their exact quantization contracts. vLLM reports 19.99 GiB of consumed
+   weights plus non-framework allocations after initialization (19.87 GiB in
+   its model-memory counter); keep those counters distinct.
 3. Measure PP from the differential `(p512,o1) - (p1,o1)` and TG from
    `(p1,o128) - (p1,o1)`, five warmed repeats.
 4. Measure llama.cpp with `llama-bench` at the same logical shapes and with
@@ -69,22 +71,45 @@ type, and token shapes.
 - Add synthetic fixtures with row-, lane-, group-, scale-, and zero-distinct
   values. Cover padding and malformed shapes.
 
-## Phase 2 — exact reference materialization
+## Phase 2 — portable reference materialization
 
-- Materialize asymmetric W4 group-32 into Q4_1. Each source group is already
-  one Q4_1 block: retain its 4-bit codes, store the BF16 scale as FP16, and fold
-  the unsigned zero point into Q4_1's minimum term.
-- Materialize symmetric W8 group-128 into four Q8_0 blocks. Decode each packed
-  byte to signed INT8 and repeat the group scale for the four 32-value blocks.
+- The first reference materialized asymmetric W4 group-32 into Q4_1, converting
+  BF16 scale/minimum metadata to FP16. Q4_1 is 5.0 bpw, not 4.5 bpw.
+- The first reference materialized symmetric W8 group-128 into four Q8_0
+  blocks, repeating the group scale for each 32-value block (8.5 bpw).
 - Apply Qwen3.5 recurrent row/column permutations to the canonical quantized
   blocks, not to packed source bytes. Row transforms move complete quantized
   rows; the value-head column transform moves aligned 32-value blocks.
 - Run CPU, CUDA, sanitizer, full-model coherence, and differential-logit gates.
 
-This phase intentionally reuses mature Q4_1/Q8_0 execution. It establishes an
-honest end-to-end baseline before adding a new kernel. Q4_1 is 4.5 bpw versus
-the source INT4 contract's 4.625 bpw. Q8_0 is 8.5 bpw versus the source INT8
-contract's 8.125 bpw, so only the INT8 subset has a resident-weight penalty.
+This phase intentionally reused mature Q4_1/Q8_0 execution to establish an
+end-to-end baseline. On the target model, however, that expanded the 312 W4
+modules by 0.895 GiB and the 88 W8 modules by 0.167 GiB: 1.062 GiB total.
+
+The production baseline therefore uses two source-faithful portable types:
+W4 asymmetric group-32 in 128-value blocks (4.625 bpw), and W8 symmetric
+group-128 (8.125 bpw). Both retain BF16 scales exactly. The W4 block boundary
+matches Qwen3.5's 128-wide recurrent value heads, so recurrent row/column
+permutations move whole blocks without decoding or changing the quantization.
+CUDA initially executes these through generic dequantization plus cuBLAS; the
+optimized executor must consume the same canonical allocation rather than
+retaining a second permanent packed copy.
+
+Measured on one RTX A6000 with the 27B gdn4 checkpoint:
+
+| executor | model bytes | peak process VRAM | PP512 | TG128 |
+| --- | ---: | ---: | ---: | ---: |
+| expanded Q4_1/Q8_0 reference | 20.505 GiB | — | 1494.57 t/s | 32.10 t/s |
+| compact, native MMVQ decode | 19.443 GiB | 18,728 MiB | 1160.68 t/s | 33.59 t/s |
+| vLLM | 19.87 GiB model counter | 19.99 GiB consumed | 1970.40 t/s | 34.01 t/s |
+
+llama.cpp cells report the three-repeat mean; the retained vLLM cell reports
+the warmed median from its differential harness.
+
+The native MMVQ result closes decode to within 1.2% of vLLM without a second
+packed allocation. The remaining measured gap is prompt processing: compact
+weights still take the generic dequantize-plus-cuBLAS path above the MMVQ batch
+limit. Phase 4C (native MMQ/GEMM) is therefore the next executor task.
 
 ## Phase 3 — profile before choosing a native executor
 
@@ -100,17 +125,15 @@ contract's 8.125 bpw, so only the INT8 subset has a resident-weight penalty.
 
 ## Phase 4 — close measured storage or execution gaps
 
-Candidate A, if INT8 storage matters: add a symmetric Q8 group-128 block type
-with one FP16 scale and 128 signed bytes (8.125 bpw). Its CUDA dot product reuses
-four Q8 activation sub-blocks under one weight scale. Provide CPU reference and
-HIP implementations before presenting it as generally supported.
+Candidate A: optimize the symmetric Q8 group-128 type with one BF16 scale and
+128 signed bytes (8.125 bpw). Its CUDA dot product can reuse four Q8 activation
+sub-blocks under one weight scale. Provide a HIP implementation before
+presenting it as generally supported.
 
-Candidate B, if W4A8 arithmetic or throughput is the limiting factor: add a
-W4A16 group-32 executor. Keep the architecture-independent tensor type and
-dispatch contract in ggml; perform any Ampere kernel-layout repack during load,
-as vLLM's `MarlinLinearKernel.process_weights_after_loading` does. Preserve a
-portable canonical representation for CPU/HIP/offload rather than making an
-opaque CUDA-only layout the model's sole storage.
+Candidate B: add a W4A16/W4A8 group-32 executor over the compact canonical
+type. A backend-private layout is acceptable only if it replaces, rather than
+duplicates, the device allocation and remains reconstructible for CPU/HIP
+offload. Prefer a kernel that reads canonical blocks directly.
 
 Candidate C, if the gap is primarily prefill: specialize MMQ/GEMM batch shapes
 without changing the stored representation. Candidate D, if it is decode:
