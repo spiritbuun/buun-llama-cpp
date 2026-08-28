@@ -1,4 +1,5 @@
 #include "llama-safetensors-qwen35.h"
+#include "llama-safetensors-names.h"
 #include "llama.h"
 
 #include <algorithm>
@@ -16,23 +17,40 @@ using json = llama_safetensors_json;
 
 enum class transform_kind {
     NONE,
-    QWEN_LINEAR,
+    OFFSET_NORM,
+    A_LOG,
+    QKV_ROWS,
+    V_ROWS,
+    HEAD_ROWS,
+    CONV_ROWS,
+    V_COLUMNS,
 };
 
 struct source_spec {
-    std::string    name;
-    transform_kind transform = transform_kind::NONE;
+    std::string name;
+    std::vector<transform_kind> transforms;
     std::optional<llama_safetensors_quant_binding> quant;
 };
 
-bool ends_with(std::string_view value, std::string_view suffix) {
-    return value.size() >= suffix.size() && value.substr(value.size() - suffix.size()) == suffix;
+struct qwen_geometry {
+    uint32_t n_layer;
+    uint32_t n_mtp;
+    uint32_t n_key_heads;
+    uint32_t n_value_heads;
+    uint32_t key_head_dim;
+    uint32_t value_head_dim;
+
+    uint32_t values_per_key() const {
+        return n_value_heads / n_key_heads;
+    }
+};
+
+bool has_transform(const source_spec & spec, transform_kind transform) {
+    return std::find(spec.transforms.begin(), spec.transforms.end(), transform) != spec.transforms.end();
 }
 
-bool is_qwen_offset_norm(std::string_view name) {
-    return (ends_with(name, "norm.weight") && !ends_with(name, "linear_attn.norm.weight")) ||
-           name.find("pre_fc_norm_embedding.weight") != std::string_view::npos ||
-           name.find("pre_fc_norm_hidden.weight") != std::string_view::npos;
+bool ends_with(std::string_view value, std::string_view suffix) {
+    return value.size() >= suffix.size() && value.substr(value.size() - suffix.size()) == suffix;
 }
 
 const llama_safetensors_tensor & require_tensor(const llama_safetensors_registry & registry, const std::string & name) {
@@ -68,12 +86,12 @@ size_t dtype_size(llama_safetensors_dtype dtype) {
     throw std::runtime_error("unknown safetensors dtype");
 }
 
-std::string layer_source_prefix(int layer) {
-    if (layer < 64) {
+std::string layer_source_prefix(int layer, const qwen_geometry & geometry) {
+    if (layer >= 0 && static_cast<uint32_t>(layer) < geometry.n_layer) {
         return "model.language_model.layers." + std::to_string(layer) + ".";
     }
-    if (layer == 64) {
-        return "mtp.layers.0.";
+    if (layer >= 0 && static_cast<uint32_t>(layer) < geometry.n_layer + geometry.n_mtp) {
+        return "mtp.layers." + std::to_string(static_cast<uint32_t>(layer) - geometry.n_layer) + ".";
     }
     throw std::runtime_error("native Qwen3.5 importer does not support layer " + std::to_string(layer));
 }
@@ -82,64 +100,49 @@ source_spec quantized_or_plain(
                     const llama_safetensors_quant_adapters & quant,
                     const std::string & module,
                     llama_safetensors_quant_role role,
-                    transform_kind transform,
+                    std::vector<transform_kind> transforms,
                     const std::string & plain_name) {
     if (auto binding = quant.bind(module, role)) {
-        return { binding->primary, transform, std::move(binding) };
+        return { binding->primary, std::move(transforms), std::move(binding) };
     }
-    return { plain_name, transform, std::nullopt };
+    return { plain_name, std::move(transforms), std::nullopt };
 }
 
-source_spec map_mlp(const llama_safetensors_quant_adapters & quant,
-                    const std::string &                prefix,
-                    std::string_view                   target_suffix,
-                    std::string_view                   target_proj,
-                    std::string_view                   source_proj) {
-    const std::string source_base = prefix + "mlp." + std::string(source_proj);
-    const std::string target_base = "ffn_" + std::string(target_proj);
-    const std::string rest(target_suffix.substr(target_base.size()));
-
-    if (rest == ".weight") {
+source_spec bind_source_name(
+        const llama_safetensors_quant_adapters & quant,
+        llama_safetensors_source_name source,
+        std::vector<transform_kind> transforms = {}) {
+    if (source.quant_role) {
         return quantized_or_plain(
-            quant, source_base, llama_safetensors_quant_role::WEIGHT,
-            transform_kind::NONE, source_base + ".weight");
+            quant, source.module, *source.quant_role, std::move(transforms), source.source);
     }
-    if (rest == ".scale") {
-        return quantized_or_plain(
-            quant, source_base, llama_safetensors_quant_role::WEIGHT_SCALE,
-            transform_kind::QWEN_LINEAR, source_base + ".weight_scale");
-    }
-    if (rest == ".input_scale") {
-        return quantized_or_plain(
-            quant, source_base, llama_safetensors_quant_role::INPUT_SCALE,
-            transform_kind::NONE, source_base + ".input_global_scale");
-    }
-    throw std::runtime_error("unsupported MLP target suffix '" + std::string(target_suffix) + "'");
+    return { std::move(source.source), std::move(transforms), std::nullopt };
 }
 
 source_spec map_target(
         const llama_safetensors_quant_adapters & quant,
+        const qwen_geometry & geometry,
         const std::string & target_name) {
     if (target_name == "token_embd.weight") {
-        return { "model.language_model.embed_tokens.weight", transform_kind::NONE, std::nullopt };
+        return { "model.language_model.embed_tokens.weight", {}, std::nullopt };
     }
     if (target_name == "output_norm.weight") {
-        return { "model.language_model.norm.weight", transform_kind::NONE, std::nullopt };
+        return { "model.language_model.norm.weight", { transform_kind::OFFSET_NORM }, std::nullopt };
     }
     if (target_name == "output.weight") {
         return quantized_or_plain(
             quant, "lm_head", llama_safetensors_quant_role::WEIGHT,
-            transform_kind::QWEN_LINEAR, "lm_head.weight");
+            {}, "lm_head.weight");
     }
     if (target_name == "output.scale") {
         return quantized_or_plain(
             quant, "lm_head", llama_safetensors_quant_role::WEIGHT_SCALE,
-            transform_kind::QWEN_LINEAR, "lm_head.weight_scale");
+            {}, "lm_head.weight_scale");
     }
     if (target_name == "output.input_scale") {
         return quantized_or_plain(
             quant, "lm_head", llama_safetensors_quant_role::INPUT_SCALE,
-            transform_kind::NONE, "lm_head.input_global_scale");
+            {}, "lm_head.input_global_scale");
     }
 
     static const std::regex layer_pattern(R"(^blk\.([0-9]+)\.(.+)$)");
@@ -149,95 +152,69 @@ source_spec map_target(
     }
     const int         layer  = std::stoi(match[1].str());
     const std::string suffix = match[2].str();
-    const std::string prefix = layer_source_prefix(layer);
+    const std::string prefix = layer_source_prefix(layer, geometry);
 
-    if (suffix.rfind("ffn_down", 0) == 0) {
-        return map_mlp(quant, prefix, suffix, "down", "down_proj");
-    }
-    if (suffix.rfind("ffn_gate", 0) == 0) {
-        return map_mlp(quant, prefix, suffix, "gate", "gate_proj");
-    }
-    if (suffix.rfind("ffn_up", 0) == 0) {
-        return map_mlp(quant, prefix, suffix, "up", "up_proj");
+    if (auto ordinary = llama_safetensors_map_decoder_tensor(prefix, suffix)) {
+        std::vector<transform_kind> transforms;
+        if (suffix == "attn_norm.weight" || suffix == "post_attention_norm.weight" ||
+            suffix == "attn_q_norm.weight" || suffix == "attn_k_norm.weight") {
+            transforms.push_back(transform_kind::OFFSET_NORM);
+        }
+        return bind_source_name(quant, std::move(*ordinary), std::move(transforms));
     }
 
-    const std::array<std::pair<std::string_view, std::string_view>, 18> ordinary = {
+    struct recurrent_name {
+        std::string_view target;
+        std::string_view source;
+        transform_kind transform;
+    };
+    static constexpr std::array<recurrent_name, 12> recurrent = {
         {
-         { "attn_norm.weight", "input_layernorm.weight" },
-         { "post_attention_norm.weight", "post_attention_layernorm.weight" },
-         { "attn_q.weight", "self_attn.q_proj.weight" },
-         { "attn_q.scale", "self_attn.q_proj.weight_scale" },
-         { "attn_k.weight", "self_attn.k_proj.weight" },
-         { "attn_k.scale", "self_attn.k_proj.weight_scale" },
-         { "attn_v.weight", "self_attn.v_proj.weight" },
-         { "attn_v.scale", "self_attn.v_proj.weight_scale" },
-         { "attn_output.weight", "self_attn.o_proj.weight" },
-         { "attn_output.scale", "self_attn.o_proj.weight_scale" },
-         { "attn_q_norm.weight", "self_attn.q_norm.weight" },
-         { "attn_k_norm.weight", "self_attn.k_norm.weight" },
-         { "attn_gate.weight", "linear_attn.in_proj_z.weight" },
-         { "attn_gate.scale", "linear_attn.in_proj_z.weight_scale" },
-         { "attn_qkv.weight", "linear_attn.in_proj_qkv.weight" },
-         { "attn_qkv.scale", "linear_attn.in_proj_qkv.weight_scale" },
-         { "ssm_norm.weight", "linear_attn.norm.weight" },
-         { "ssm_conv1d.weight", "linear_attn.conv1d.weight" },
+         { "attn_gate.weight", "linear_attn.in_proj_z.weight",       transform_kind::V_ROWS },
+         { "attn_gate.scale",  "linear_attn.in_proj_z.weight_scale", transform_kind::V_ROWS },
+         { "attn_qkv.weight",  "linear_attn.in_proj_qkv.weight",     transform_kind::QKV_ROWS },
+         { "attn_qkv.scale",   "linear_attn.in_proj_qkv.weight_scale", transform_kind::QKV_ROWS },
+         { "ssm_norm.weight",  "linear_attn.norm.weight",            transform_kind::NONE },
+         { "ssm_conv1d.weight", "linear_attn.conv1d.weight",         transform_kind::CONV_ROWS },
+         { "ssm_alpha.weight", "linear_attn.in_proj_a.weight",       transform_kind::HEAD_ROWS },
+         { "ssm_beta.weight",  "linear_attn.in_proj_b.weight",       transform_kind::HEAD_ROWS },
+         { "ssm_a",            "linear_attn.A_log",                  transform_kind::A_LOG },
+         { "ssm_dt.bias",      "linear_attn.dt_bias",                transform_kind::HEAD_ROWS },
+         { "ssm_out.weight",   "linear_attn.out_proj.weight",        transform_kind::V_COLUMNS },
+         { "ssm_out.scale",    "linear_attn.out_proj.weight_scale",  transform_kind::NONE },
          }
     };
-    for (const auto & [target, source] : ordinary) {
-        if (suffix == target) {
-            const std::string source_name = prefix + std::string(source);
-            const transform_kind transform = source_name.find("linear_attn.") != std::string::npos ?
-                transform_kind::QWEN_LINEAR : transform_kind::NONE;
-            if (ends_with(target, ".scale")) {
-                const std::string module = source_name.substr(
-                    0, source_name.size() - std::string_view(".weight_scale").size());
-                return quantized_or_plain(
-                    quant, module, llama_safetensors_quant_role::WEIGHT_SCALE,
-                    transform, source_name);
+    for (const recurrent_name & name : recurrent) {
+        if (suffix == name.target) {
+            llama_safetensors_source_name source {
+                prefix + std::string(name.source), {}, std::nullopt,
+            };
+            if (ends_with(name.target, ".scale")) {
+                source.module = source.source.substr(
+                    0, source.source.size() - std::string_view(".weight_scale").size());
+                source.quant_role = llama_safetensors_quant_role::WEIGHT_SCALE;
+            } else if (ends_with(name.target, ".weight")) {
+                source.module = source.source.substr(
+                    0, source.source.size() - std::string_view(".weight").size());
+                source.quant_role = llama_safetensors_quant_role::WEIGHT;
             }
-            if (ends_with(target, ".weight")) {
-                const std::string module = source_name.substr(
-                    0, source_name.size() - std::string_view(".weight").size());
-                return quantized_or_plain(
-                    quant, module, llama_safetensors_quant_role::WEIGHT,
-                    transform, source_name);
+            std::vector<transform_kind> transforms;
+            if (name.transform == transform_kind::A_LOG) {
+                transforms.push_back(transform_kind::A_LOG);
+                transforms.push_back(transform_kind::HEAD_ROWS);
+            } else if (name.transform != transform_kind::NONE) {
+                transforms.push_back(name.transform);
             }
-            return { source_name, transform, std::nullopt };
+            source_spec result = bind_source_name(quant, std::move(source), std::move(transforms));
+            if (suffix == "ssm_out.scale" && result.quant &&
+                result.quant->materialization == llama_safetensors_quant_materialization::FP8_BLOCK_SCALE) {
+                result.transforms.push_back(transform_kind::V_COLUMNS);
+            }
+            return result;
         }
     }
 
-    const std::array<std::pair<std::string_view, std::string_view>, 6> linear = {
-        {
-         { "ssm_alpha.weight", "linear_attn.in_proj_a.weight" },
-         { "ssm_beta.weight", "linear_attn.in_proj_b.weight" },
-         { "ssm_a", "linear_attn.A_log" },
-         { "ssm_dt.bias", "linear_attn.dt_bias" },
-         { "ssm_out.weight", "linear_attn.out_proj.weight" },
-         { "ssm_out.scale", "linear_attn.out_proj.weight_scale" },
-         }
-    };
-    for (const auto & [target, source] : linear) {
-        if (suffix == target) {
-            const std::string source_name = prefix + std::string(source);
-            if (ends_with(target, ".scale")) {
-                const std::string module = source_name.substr(
-                    0, source_name.size() - std::string_view(".weight_scale").size());
-                return quantized_or_plain(
-                    quant, module, llama_safetensors_quant_role::WEIGHT_SCALE,
-                    transform_kind::QWEN_LINEAR, source_name);
-            }
-            if (ends_with(target, ".weight")) {
-                const std::string module = source_name.substr(
-                    0, source_name.size() - std::string_view(".weight").size());
-                return quantized_or_plain(
-                    quant, module, llama_safetensors_quant_role::WEIGHT,
-                    transform_kind::QWEN_LINEAR, source_name);
-            }
-            return { source_name, transform_kind::QWEN_LINEAR, std::nullopt };
-        }
-    }
-
-    if (layer == 64) {
+    if (static_cast<uint32_t>(layer) >= geometry.n_layer) {
         const std::array<std::pair<std::string_view, std::string_view>, 4> mtp = {
             {
              { "nextn.eh_proj.weight", "mtp.fc.weight" },
@@ -248,7 +225,12 @@ source_spec map_target(
         };
         for (const auto & [target, source] : mtp) {
             if (suffix == target) {
-                return { std::string(source), transform_kind::NONE, std::nullopt };
+                const bool offset_norm = suffix != "nextn.eh_proj.weight";
+                std::vector<transform_kind> transforms;
+                if (offset_norm) {
+                    transforms.push_back(transform_kind::OFFSET_NORM);
+                }
+                return { std::string(source), std::move(transforms), std::nullopt };
             }
         }
     }
@@ -273,7 +255,7 @@ ggml_type target_type_for(
             }
             if (ends_with(target_name, ".scale") || target_name == "token_embd.weight" ||
                 (source.shape.size() >= 2 && target_name.find("ssm_conv1d.weight") == std::string::npos &&
-                 !is_qwen_offset_norm(source.name))) {
+                 !has_transform(spec, transform_kind::OFFSET_NORM))) {
                 return GGML_TYPE_BF16;
             }
             return GGML_TYPE_F32;
@@ -310,9 +292,9 @@ std::vector<int64_t> target_shape_for(
     return result;
 }
 
-std::vector<size_t> v_head_row_permutation(size_t head_dim) {
-    constexpr size_t    n_k       = 16;
-    constexpr size_t    n_v_per_k = 3;
+std::vector<size_t> v_head_row_permutation(const qwen_geometry & geometry, size_t head_dim) {
+    const size_t n_k       = geometry.n_key_heads;
+    const size_t n_v_per_k = geometry.values_per_key();
     std::vector<size_t> result(n_k * n_v_per_k * head_dim);
     for (size_t v = 0; v < n_v_per_k; ++v) {
         for (size_t k = 0; k < n_k; ++k) {
@@ -464,44 +446,66 @@ std::vector<uint8_t> negate_exp_bf16_to_f32(const std::vector<uint8_t> & source)
     return result;
 }
 
-std::vector<uint8_t> apply_qwen_transform(const llama_safetensors_tensor & tensor, std::vector<uint8_t> source) {
-    const std::string & name         = tensor.name;
-    const size_t        element_size = dtype_size(tensor.dtype);
-    const bool          block_scale  = ends_with(name, ".weight_scale_inv");
+std::vector<uint8_t> apply_layout_transform(
+        transform_kind transform,
+        const qwen_geometry & geometry,
+        const llama_safetensors_tensor & tensor,
+        bool block_scale,
+        std::vector<uint8_t> source) {
     if (tensor.shape.empty()) {
         return source;
     }
 
-    if (name.find(".linear_attn.in_proj_qkv.") != std::string::npos) {
-        const size_t qk_rows = block_scale ? 2 * 16 : 2 * 16 * 128;
-        const auto permutation = v_head_row_permutation(block_scale ? 1 : 128);
+    size_t key_head_dim   = geometry.key_head_dim;
+    size_t value_head_dim = geometry.value_head_dim;
+    if (block_scale) {
+        constexpr size_t block_size = 128;
+        if (key_head_dim % block_size != 0 || value_head_dim % block_size != 0) {
+            throw std::runtime_error("Qwen block-FP8 head dimensions must be divisible by 128");
+        }
+        key_head_dim /= block_size;
+        value_head_dim /= block_size;
+    }
+
+    switch (transform) {
+        case transform_kind::QKV_ROWS: {
+        const size_t qk_rows = 2 * geometry.n_key_heads * key_head_dim;
+        const auto permutation = v_head_row_permutation(geometry, value_head_dim);
         const size_t     rows        = tensor.shape[0];
         const size_t     row_size    = source.size() / rows;
         return permute_rows(source, row_size, qk_rows, permutation);
-    }
-    if (name.find(".linear_attn.in_proj_z.") != std::string::npos) {
-        const auto permutation = v_head_row_permutation(block_scale ? 1 : 128);
+        }
+        case transform_kind::V_ROWS: {
+        const auto permutation = v_head_row_permutation(geometry, value_head_dim);
         return permute_rows(source, source.size() / tensor.shape[0], 0, permutation);
-    }
-    if (name.find(".linear_attn.in_proj_a.") != std::string::npos ||
-        name.find(".linear_attn.in_proj_b.") != std::string::npos || ends_with(name, ".linear_attn.A_log") ||
-        ends_with(name, ".linear_attn.dt_bias")) {
-        const auto permutation = v_head_row_permutation(1);
+        }
+        case transform_kind::HEAD_ROWS: {
+        if (block_scale) {
+            throw std::runtime_error("Qwen per-head vector cannot use a block-FP8 scale transform");
+        }
+        const auto permutation = v_head_row_permutation(geometry, 1);
         return permute_rows(source, source.size() / tensor.shape[0], 0, permutation);
-    }
-    if (name.find(".linear_attn.conv1d.weight") != std::string::npos) {
-        constexpr size_t qk_rows     = 2 * 16 * 128;
-        const auto       permutation = v_head_row_permutation(128);
+        }
+        case transform_kind::CONV_ROWS: {
+        if (block_scale) {
+            throw std::runtime_error("Qwen convolution transform does not support block-FP8 scales");
+        }
+        const size_t qk_rows = 2 * geometry.n_key_heads * geometry.key_head_dim;
+        const auto permutation = v_head_row_permutation(geometry, geometry.value_head_dim);
         return permute_rows(source, source.size() / tensor.shape[0], qk_rows, permutation);
-    }
-    if (ends_with(name, ".linear_attn.out_proj.weight") ||
-        ends_with(name, ".linear_attn.out_proj.weight_scale_inv")) {
+        }
+        case transform_kind::V_COLUMNS: {
         if (tensor.shape.size() != 2) {
             throw std::runtime_error("unexpected linear-attention output projection rank");
         }
         return permute_columns(
-            source, tensor.shape[0], tensor.shape[1], element_size,
-            v_head_row_permutation(block_scale ? 1 : 128));
+            source, tensor.shape[0], tensor.shape[1], dtype_size(tensor.dtype),
+            v_head_row_permutation(geometry, value_head_dim));
+        }
+        case transform_kind::NONE:
+        case transform_kind::OFFSET_NORM:
+        case transform_kind::A_LOG:
+            break;
     }
     return source;
 }
@@ -531,17 +535,44 @@ std::vector<uint8_t> bf16_add_one_to_f32(const std::vector<uint8_t> & source) {
     return result;
 }
 
-void validate_model_contract(const json & root) {
+std::vector<uint8_t> add_one_f32(std::vector<uint8_t> source) {
+    if (source.size() % sizeof(float) != 0) {
+        throw std::runtime_error("invalid F32 byte count for offset-norm transform");
+    }
+    for (size_t i = 0; i < source.size() / sizeof(float); ++i) {
+        float value;
+        std::memcpy(&value, source.data() + i * sizeof(float), sizeof(value));
+        value += 1.0f;
+        std::memcpy(source.data() + i * sizeof(float), &value, sizeof(value));
+    }
+    return source;
+}
+
+qwen_geometry validate_model_contract(const json & root) {
     if (root.value("model_type", std::string()) != "qwen3_5") {
         throw std::runtime_error("native Qwen3.5 importer requires model_type 'qwen3_5'");
     }
     const json & text = root.at("text_config");
-    if (text.value("model_type", std::string()) != "qwen3_5_text" || text.value("num_hidden_layers", 0U) != 64 ||
-        text.value("linear_num_key_heads", 0U) != 16 || text.value("linear_num_value_heads", 0U) != 48 ||
-        text.value("linear_value_head_dim", 0U) != 128) {
-        throw std::runtime_error("native Qwen3.5 importer does not support this tensor geometry");
+    if (text.value("model_type", std::string()) != "qwen3_5_text") {
+        throw std::runtime_error("native Qwen3.5 importer requires text model_type 'qwen3_5_text'");
     }
 
+    const qwen_geometry geometry {
+        text.value("num_hidden_layers", 0U),
+        text.value("mtp_num_hidden_layers", root.value("mtp_num_hidden_layers", 0U)),
+        text.value("linear_num_key_heads", 0U),
+        text.value("linear_num_value_heads", 0U),
+        text.value("linear_key_head_dim", 0U),
+        text.value("linear_value_head_dim", 0U),
+    };
+    constexpr std::array<uint32_t, 3> supported_layers = { 24, 32, 64 };
+    if (std::find(supported_layers.begin(), supported_layers.end(), geometry.n_layer) == supported_layers.end() ||
+        geometry.n_mtp > 1 || geometry.n_key_heads == 0 || geometry.n_value_heads == 0 ||
+        geometry.n_value_heads % geometry.n_key_heads != 0 || geometry.key_head_dim == 0 ||
+        geometry.value_head_dim == 0 || geometry.key_head_dim != geometry.value_head_dim) {
+        throw std::runtime_error("native Qwen3.5 importer does not support this tensor geometry");
+    }
+    return geometry;
 }
 
 }  // namespace
@@ -551,12 +582,23 @@ llama_safetensors_qwen35_importer::llama_safetensors_qwen35_importer(
         llama_safetensors_json config) :
     model_dir_(model_dir),
     config_(std::move(config)) {
-    validate_model_contract(config_);
+    const qwen_geometry geometry = validate_model_contract(config_);
+    n_layer_        = geometry.n_layer;
+    n_mtp_          = geometry.n_mtp;
+    n_key_heads_    = geometry.n_key_heads;
+    n_value_heads_  = geometry.n_value_heads;
+    key_head_dim_   = geometry.key_head_dim;
+    value_head_dim_ = geometry.value_head_dim;
     generation_    = llama_safetensors_read_json(model_dir_ / "generation_config.json");
     tokenizer_     = llama_safetensors_read_json(model_dir_ / "tokenizer.json");
     chat_template_ = llama_safetensors_read_optional_text(model_dir_ / "chat_template.jinja");
     registry_      = llama_safetensors_registry::load(model_dir_);
     quant_         = std::make_unique<llama_safetensors_quant_adapters>(config_, registry_);
+    if (quant_->summary().fp8_block != 0 &&
+        (key_head_dim_ % 128 != 0 || value_head_dim_ % 128 != 0)) {
+        throw std::runtime_error(
+            "native Qwen3.5 block-FP8 import requires recurrent head dimensions divisible by 128");
+    }
 }
 
 bool llama_safetensors_qwen35_importer::probe(const llama_safetensors_json & config) {
@@ -629,7 +671,9 @@ bool llama_safetensors_qwen35_importer::describe(
         std::array<int64_t, GGML_MAX_DIMS> & ne) const {
     source_spec spec;
     try {
-        spec = map_target(*quant_, target_name);
+        spec = map_target(
+            *quant_, { n_layer_, n_mtp_, n_key_heads_, n_value_heads_, key_head_dim_, value_head_dim_ },
+            target_name);
     } catch (const std::runtime_error &) {
         return false;
     }
@@ -655,7 +699,9 @@ size_t llama_safetensors_qwen35_importer::tensor_capacity_hint() const {
 }
 
 void llama_safetensors_qwen35_importer::bind(const std::string & target_name) const {
-    const source_spec spec = map_target(*quant_, target_name);
+    const source_spec spec = map_target(
+        *quant_, { n_layer_, n_mtp_, n_key_heads_, n_value_heads_, key_head_dim_, value_head_dim_ },
+        target_name);
     if (spec.quant) {
         quant_->consume(*spec.quant);
     }
@@ -669,29 +715,48 @@ std::vector<uint8_t> llama_safetensors_qwen35_importer::materialize(const std::s
                                                                     ggml_type           target_type,
                                                                     size_t              target_size) const {
     try {
-        const source_spec                spec        = map_target(*quant_, target_name);
+        const qwen_geometry geometry {
+            n_layer_, n_mtp_, n_key_heads_, n_value_heads_, key_head_dim_, value_head_dim_,
+        };
+        const source_spec spec = map_target(*quant_, geometry, target_name);
         const llama_safetensors_tensor & source_desc = require_tensor(registry_, spec.name);
         std::vector<uint8_t> result = spec.quant ? quant_->read(*spec.quant) : registry_.read(source_desc);
 
-        if (is_qwen_offset_norm(source_desc.name) && source_desc.dtype == llama_safetensors_dtype::BF16 &&
-            target_type == GGML_TYPE_F32) {
-            result = bf16_add_one_to_f32(result);
-        } else if (ends_with(source_desc.name, ".linear_attn.A_log")) {
-            if (source_desc.dtype == llama_safetensors_dtype::BF16) {
-                result = negate_exp_bf16_to_f32(result);
-            } else if (source_desc.dtype == llama_safetensors_dtype::F32) {
-                result = negate_exp_f32(std::move(result));
+        bool value_converted = false;
+        const bool block_scale = spec.quant &&
+            spec.quant->materialization == llama_safetensors_quant_materialization::FP8_BLOCK_SCALE;
+        for (transform_kind transform : spec.transforms) {
+            if (transform == transform_kind::OFFSET_NORM) {
+                if (target_type != GGML_TYPE_F32) {
+                    throw std::runtime_error("Qwen offset norm requires an F32 target");
+                }
+                if (source_desc.dtype == llama_safetensors_dtype::BF16) {
+                    result = bf16_add_one_to_f32(result);
+                } else if (source_desc.dtype == llama_safetensors_dtype::F32) {
+                    result = add_one_f32(std::move(result));
+                } else {
+                    throw std::runtime_error("Qwen offset norm has unsupported dtype");
+                }
+                value_converted = true;
+            } else if (transform == transform_kind::A_LOG) {
+                if (source_desc.dtype == llama_safetensors_dtype::BF16) {
+                    result = negate_exp_bf16_to_f32(result);
+                } else if (source_desc.dtype == llama_safetensors_dtype::F32) {
+                    result = negate_exp_f32(std::move(result));
+                } else {
+                    throw std::runtime_error("Qwen A_log has unsupported dtype");
+                }
+                value_converted = true;
             } else {
-                throw std::runtime_error("Qwen A_log has unsupported dtype");
+                result = apply_layout_transform(
+                    transform, geometry, source_desc, block_scale, std::move(result));
             }
-            result = permute_rows(result, sizeof(float), 0, v_head_row_permutation(1));
-        } else {
-            result = apply_qwen_transform(source_desc, std::move(result));
-            if (spec.quant) {
-                result = quant_->finalize(*spec.quant, std::move(result));
-            } else if (target_type == GGML_TYPE_F32 && source_desc.dtype == llama_safetensors_dtype::BF16) {
-                result = bf16_to_f32(result);
-            }
+        }
+        if (spec.quant) {
+            result = quant_->finalize(*spec.quant, std::move(result));
+        } else if (!value_converted && target_type == GGML_TYPE_F32 &&
+                   source_desc.dtype == llama_safetensors_dtype::BF16) {
+            result = bf16_to_f32(result);
         }
 
         if (result.size() != target_size) {

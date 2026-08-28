@@ -50,4 +50,10 @@ class llama_safetensors_qwen35_importer final : public llama_safetensors_importe
     std::optional<std::string> chat_template_;
     llama_safetensors_registry registry_;
     std::unique_ptr<llama_safetensors_quant_adapters> quant_;
+    uint32_t n_layer_         = 0;
+    uint32_t n_mtp_           = 0;
+    uint32_t n_key_heads_     = 0;
+    uint32_t n_value_heads_   = 0;
+    uint32_t key_head_dim_    = 0;
+    uint32_t value_head_dim_  = 0;
 };

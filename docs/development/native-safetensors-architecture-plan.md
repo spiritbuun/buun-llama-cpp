@@ -297,12 +297,22 @@ Gate: tokenizer round-trip tests match canonical token IDs and encode/decode res
 
 ### Phase 5 — Reduce Qwen3.5 to architecture-specific policy
 
-- [ ] Replace imperative ordinary projection mapping with shared naming templates.
-- [ ] Keep only recurrent projection names, MTP names, and genuine Qwen exceptions locally.
-- [ ] Express row/column permutations as explicit transform objects.
-- [ ] Express offset-norm and `A_log` conversions as explicit transform objects.
-- [ ] Replace the fixed 27B check with validated geometry where the existing Qwen model implementation supports it.
+- [x] Replace imperative ordinary projection mapping with shared naming templates.
+- [x] Keep only recurrent projection names, MTP names, and genuine Qwen exceptions locally.
+- [x] Express row/column permutations as explicit transform objects.
+- [x] Express offset-norm and `A_log` conversions as explicit transform objects.
+- [x] Replace the fixed 27B check with validated geometry where the existing Qwen model implementation supports it.
 - [x] Report block-FP8 and NVFP4 source formats distinctly.
+
+The Qwen adapter now accepts the dense model implementation's 24-, 32-, and
+64-layer families, derives the recurrent K/V head grouping and dimensions from
+`text_config`, and maps MTP after the configured trunk rather than after a
+hard-coded layer 64. It rejects multiple MTP blocks, non-integral V/K head
+groups, unequal recurrent K/V dimensions (the current graph uses one SSM state
+dimension for both), and block-FP8 head layouts that cannot be expressed as an
+exact 128-row scale grid. Channel scales and block-grid scales carry distinct
+transform plans; in particular, an output channel scale is not permuted with
+the input columns of its weight.
 
 Gate: the Qwen adapter contains no quant-format implementation and no complete target manifest.
 

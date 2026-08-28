@@ -1,6 +1,7 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 #include "llama-safetensors-qwen35.h"
+#include "llama-safetensors-names.h"
 #include "llama-safetensors-quant.h"
 #include "llama-safetensors.h"
 #include "llama.h"
@@ -376,9 +377,103 @@ int main(int argc, char ** argv) {
                   << " fp8_block=" << summary.fp8_block << '\n';
         return 0;
     }
+
+    const auto q_proj = llama_safetensors_map_decoder_tensor(
+        "model.layers.7.", "attn_q.weight");
+    require(q_proj.has_value(), "shared decoder mapper missed attention Q");
+    require(q_proj->source == "model.layers.7.self_attn.q_proj.weight", "attention Q source name is wrong");
+    require(q_proj->module == "model.layers.7.self_attn.q_proj", "attention Q module name is wrong");
+    require(q_proj->quant_role == llama_safetensors_quant_role::WEIGHT, "attention Q quant role is wrong");
+
+    const auto ffn_scale = llama_safetensors_map_decoder_tensor(
+        "model.layers.3.", "ffn_down.scale");
+    require(ffn_scale.has_value(), "shared decoder mapper missed FFN scale");
+    require(ffn_scale->source == "model.layers.3.mlp.down_proj.weight_scale", "FFN scale source name is wrong");
+    require(
+        ffn_scale->quant_role == llama_safetensors_quant_role::WEIGHT_SCALE,
+        "FFN scale quant role is wrong");
+
+    const auto norm = llama_safetensors_map_decoder_tensor(
+        "model.layers.2.", "post_attention_norm.weight");
+    require(norm.has_value(), "shared decoder mapper missed post-attention norm");
+    require(
+        norm->source == "model.layers.2.post_attention_layernorm.weight" && !norm->quant_role,
+        "post-attention norm mapping is wrong");
+    require(
+        !llama_safetensors_map_decoder_tensor("model.layers.2.", "ssm_a").has_value(),
+        "shared decoder mapper accepted an architecture-specific tensor");
     require(argc == 1, "usage: test-safetensors-registry [model-directory [control.gguf]]");
 
     temp_dir dir;
+
+    // The dense runtime supports the 24-, 32-, and 64-layer Qwen3.5 families.
+    // The importer must derive recurrent head geometry from config rather than
+    // silently assuming the 27B layout.
+    {
+        const std::filesystem::path geometry_dir = dir.path / "geometry";
+        write_single_shard_model(
+            geometry_dir,
+            {
+                { "module.weight", "F8_E4M3", { 1, 1 }, { 0 } },
+                { "module.weight_scale", "BF16", { 1 }, { 0, 0 } },
+            });
+        write_text(geometry_dir / "generation_config.json", "{}");
+        write_text(geometry_dir / "tokenizer.json", "{}");
+
+        llama_safetensors_json config = {
+            { "model_type", "qwen3_5" },
+            { "text_config", {
+                { "model_type", "qwen3_5_text" },
+                { "num_hidden_layers", 24 },
+                { "mtp_num_hidden_layers", 1 },
+                { "linear_num_key_heads", 8 },
+                { "linear_num_value_heads", 16 },
+                { "linear_key_head_dim", 64 },
+                { "linear_value_head_dim", 64 },
+            } },
+        };
+        config["quantization_config"] =
+            llama_safetensors_json::parse(fp8_channel_config).at("quantization_config");
+        (void) llama_safetensors_qwen35_importer(geometry_dir, config);
+
+        config["text_config"]["num_hidden_layers"] = 48;
+        require_rejected(
+            [&] { (void) llama_safetensors_qwen35_importer(geometry_dir, config); },
+            "Qwen importer accepted a layer count unsupported by its model implementation");
+        config["text_config"]["num_hidden_layers"] = 32;
+        config["text_config"]["linear_num_value_heads"] = 15;
+        require_rejected(
+            [&] { (void) llama_safetensors_qwen35_importer(geometry_dir, config); },
+            "Qwen importer accepted non-integral recurrent head groups");
+        config["text_config"]["linear_num_value_heads"] = 16;
+        config["text_config"]["linear_value_head_dim"] = 32;
+        require_rejected(
+            [&] { (void) llama_safetensors_qwen35_importer(geometry_dir, config); },
+            "Qwen importer accepted unequal recurrent key/value dimensions");
+
+        const std::filesystem::path channel_dir = dir.path / "channel-transform";
+        const std::string channel_module =
+            "model.language_model.layers.0.linear_attn.out_proj";
+        write_single_shard_model(
+            channel_dir,
+            {
+                { channel_module + ".weight", "F8_E4M3", { 2, 2 }, { 0, 0, 0, 0 } },
+                { channel_module + ".weight_scale", "BF16", { 2 }, { 1, 2, 3, 4 } },
+            });
+        write_text(channel_dir / "generation_config.json", "{}");
+        write_text(channel_dir / "tokenizer.json", "{}");
+        config["text_config"]["num_hidden_layers"] = 24;
+        config["text_config"]["linear_num_key_heads"] = 1;
+        config["text_config"]["linear_num_value_heads"] = 2;
+        config["text_config"]["linear_key_head_dim"] = 1;
+        config["text_config"]["linear_value_head_dim"] = 1;
+        config["quantization_config"]["config_groups"]["fp8"]["targets"][0] = channel_module;
+        llama_safetensors_qwen35_importer channel_importer(channel_dir, config);
+        require(
+            channel_importer.materialize("blk.0.ssm_out.scale", GGML_TYPE_BF16, 4) ==
+                std::vector<uint8_t>({ 1, 2, 3, 4 }),
+            "Qwen output channel scale incorrectly followed the weight's column permutation");
+    }
 
     // Metadata and tokenizer conversion are shared by architecture importers.
     // Keep their strict parsing and GGUF representation covered independently

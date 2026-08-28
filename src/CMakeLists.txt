@@ -41,6 +41,7 @@ add_library(llama
             llama-safetensors.cpp
             llama-safetensors-loader.cpp
             llama-safetensors-metadata.cpp
+            llama-safetensors-names.cpp
             llama-safetensors-quant.cpp
             llama-safetensors-qwen35.cpp
             llama-vocab.cpp
