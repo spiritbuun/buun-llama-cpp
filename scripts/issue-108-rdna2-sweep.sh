@@ -192,6 +192,7 @@ run_one() {
     if command -v python3 >/dev/null && [[ -s $response ]]; then
         python3 - "$response" >> "$meta" <<'PY' || true
 import json
+import hashlib
 import sys
 
 try:
@@ -212,6 +213,10 @@ usage = obj.get("usage") or {}
 for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
     if key in usage:
         print(f"usage_{key}={usage[key]}")
+content = obj.get("content")
+if isinstance(content, str):
+    print(f"content_sha256={hashlib.sha256(content.encode('utf-8')).hexdigest()}")
+    print(f"content_bytes={len(content.encode('utf-8'))}")
 PY
     fi
 
