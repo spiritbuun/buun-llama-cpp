@@ -37,7 +37,10 @@ void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
 void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
-    const bool mtp_only = (hparams.n_layer_nextn > 0) && (ml.get_weight("blk.0.attn_norm.weight") == nullptr);
+    ggml_type trunk_type = GGML_TYPE_COUNT;
+    std::array<int64_t, GGML_MAX_DIMS> trunk_ne{};
+    const bool has_trunk = ml.get_tensor_info("blk.0.attn_norm.weight", trunk_type, trunk_ne);
+    const bool mtp_only = (hparams.n_layer_nextn > 0) && !has_trunk;
     const int trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
     int mtp_flags = !ml.load_mtp ? TENSOR_SKIP : 0;
 
@@ -46,9 +49,10 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
     // "d2t" tensor whose size is the draft vocab. Real trunks never have d2t, so this
     // is a no-op everywhere except a deliberately trimmed MTP-only draft.
     int64_t n_vocab_out = n_vocab;
-    const struct ggml_tensor * d2t_meta = ml.get_tensor_meta("d2t");
-    if (mtp_only && d2t_meta) {
-        n_vocab_out = d2t_meta->ne[0];
+    ggml_type d2t_type = GGML_TYPE_COUNT;
+    std::array<int64_t, GGML_MAX_DIMS> d2t_ne{};
+    if (mtp_only && ml.get_tensor_info("d2t", d2t_type, d2t_ne)) {
+        n_vocab_out = d2t_ne[0];
         d2t = create_tensor(tn(LLM_TENSOR_D2T), {n_vocab_out}, 0);
         LLAMA_LOG_INFO("%s: QWEN35 MTP using d2t draft-vocab trim (n_vocab_out = %lld)\n", __func__, (long long) n_vocab_out);
     }

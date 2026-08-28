@@ -6,6 +6,7 @@
 #include "llama-arch.h"
 #include "llama-hparams.h"
 #include "llama-mmap.h"
+#include "llama-model-source.h"
 
 #include "ggml-cpp.h"
 
@@ -72,6 +73,7 @@ struct llama_model_loader {
     int n_kv      = 0;
     int n_tensors = 0;
     int n_created = 0;
+    int tensor_capacity = 0;
 
     uint64_t n_elements = 0;
     size_t   n_bytes    = 0;
@@ -101,6 +103,7 @@ struct llama_model_loader {
     struct gguf_context * metadata; // either metadata_ptr.get() or externally set
     llama_model_set_tensor_data_t set_tensor_data;
     void * set_tensor_data_ud;
+    const llama_model_tensor_source * tensor_source;
     std::vector<ggml_context_ptr> contexts;
 
     std::string arch_name;
@@ -130,6 +133,7 @@ struct llama_model_loader {
         struct gguf_context * metadata,
         llama_model_set_tensor_data_t set_tensor_data,
         void * set_tensor_data_ud,
+        const llama_model_tensor_source * tensor_source,
         const std::string & fname,
         std::vector<std::string> & splits, // optional, only need if the split does not follow naming scheme
         FILE * file,
@@ -183,6 +187,8 @@ struct llama_model_loader {
 
     struct ggml_tensor * get_tensor_meta(const char * name) const;
 
+    bool get_tensor_info(const char * name, ggml_type & type, std::array<int64_t, GGML_MAX_DIMS> & ne) const;
+
     struct ggml_tensor * require_tensor_meta(const std::string & name) const;
 
     const struct ggml_tensor * check_tensor_dims(
@@ -211,6 +217,8 @@ struct llama_model_loader {
             llama_mlocks * lmlocks,
             llama_progress_callback progress_callback,
             void * progress_callback_user_data);
+
+    void validate_source_complete() const;
 
     std::string ftype_name() const;
 

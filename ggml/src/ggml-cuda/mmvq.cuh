@@ -4,6 +4,45 @@
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 
+#if !defined(GGML_USE_HIP)
+bool ggml_cuda_mul_mat_humming_fp8(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * src0,
+    const ggml_tensor * src1,
+    const ggml_tensor * ids,
+    ggml_tensor * dst,
+    const ggml_cuda_mm_fusion_args_host * fusion);
+
+bool ggml_cuda_mul_mat_humming_fp8_block(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * src0,
+    const ggml_tensor * src1,
+    ggml_tensor * dst);
+
+bool ggml_cuda_mul_mat_humming_fp8_block_fused(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * src0,
+    const ggml_tensor * src1,
+    const ggml_tensor * scale,
+    ggml_tensor * dst,
+    const ggml_cuda_mm_fusion_args_host * fusion);
+
+bool ggml_cuda_mul_mat_humming_fp8_block_swiglu(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * up,
+    const ggml_tensor * gate,
+    const ggml_tensor * src1,
+    ggml_tensor * dst);
+
+bool ggml_cuda_mul_mat_humming_nvfp4(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * src0,
+    const ggml_tensor * src1,
+    const ggml_tensor * ids,
+    ggml_tensor * dst,
+    const ggml_cuda_mm_fusion_args_host * fusion);
+#endif
+
 // Returns the maximum batch size for which MMVQ should be used for MUL_MAT_ID,
 // based on the quantization type and GPU architecture (compute capability).
 int get_mmvq_mmid_max_batch(ggml_type type, int cc);

@@ -40,8 +40,14 @@
 #include <cstdio>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
+
+#if !defined(GGML_USE_HIP)
+bool ggml_cuda_humming_fp8_is_repacked(const ggml_tensor * tensor);
+bool ggml_cuda_humming_nvfp4_is_repacked(const ggml_tensor * tensor);
+#endif
 
 #if defined(GGML_USE_HIP)
 #include "vendors/hip.h"
@@ -1480,6 +1486,50 @@ struct ggml_cuda_vbr_transcode_workspace {
     size_t              vmm_hw = 0;
 };
 
+#if !defined(GGML_USE_HIP)
+struct ggml_cuda_humming_fp8_cache_entry {
+    void * scale  = nullptr;
+    const void * source_scale = nullptr;
+    size_t scale_size  = 0;
+};
+
+struct ggml_cuda_humming_nvfp4_cache_entry {
+    void * weight = nullptr;
+    void * scale  = nullptr;
+    size_t weight_size = 0;
+    size_t scale_size  = 0;
+};
+
+struct ggml_cuda_humming_fp8_lock_storage {
+    int32_t * ptr = nullptr;
+    size_t count = 0;
+    // A captured CUDA graph may retain an older address after a wider batch
+    // grows this workspace. Keep those small allocations alive with the
+    // backend context rather than invalidating an existing graph.
+    std::vector<int32_t *> retired;
+};
+
+struct ggml_cuda_humming_input_storage {
+    nv_bfloat16 * ptr = nullptr;
+    size_t count = 0;
+    const ggml_tensor * source = nullptr;
+    size_t source_count = 0;
+    // CUDA graphs retain workspace addresses. Growth is rare (only when a
+    // wider graph is first seen), so preserve older allocations until the
+    // backend context is destroyed.
+    std::vector<nv_bfloat16 *> retired;
+};
+
+struct ggml_cuda_humming_prepared_activation {
+    nv_bfloat16 * ptr = nullptr;
+    size_t count = 0;
+    // A graph captured at a smaller microbatch retains the old address when a
+    // later graph grows this workspace. Preserve it until context teardown.
+    std::vector<nv_bfloat16 *> retired;
+};
+
+#endif
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1498,6 +1548,27 @@ struct ggml_backend_cuda_context {
     // planes can therefore reuse one context-owned, grow-only physical workspace without using
     // the generic pool (whose growth is fatal and cannot be projected by the KV controller).
     ggml_cuda_vbr_transcode_workspace vbr_transcode_workspace;
+
+#if !defined(GGML_USE_HIP)
+    // Proof-stage cache for the Ampere channel-E4M3 tensor-core executor. The
+    // final implementation will move this same-size derived representation
+    // into a repacking CUDA buffer so canonical and derived weights are never
+    // simultaneously resident. Keeping ownership context-local makes the
+    // prototype safe across independent llama contexts and CUDA devices.
+    std::unordered_map<const void *, ggml_cuda_humming_fp8_cache_entry> humming_fp8_cache;
+    std::unordered_map<const void *, ggml_cuda_humming_nvfp4_cache_entry> humming_nvfp4_cache;
+    ggml_cuda_humming_fp8_lock_storage humming_fp8_locks[GGML_CUDA_MAX_STREAMS];
+    ggml_cuda_humming_input_storage humming_inputs[GGML_CUDA_MAX_STREAMS];
+    std::unordered_set<const ggml_tensor *> humming_bf16_activations;
+    std::unordered_set<const void *> humming_deferred_bf16;
+    std::unordered_map<const ggml_tensor *, ggml_cuda_humming_prepared_activation> humming_prepared_activations;
+    std::unordered_set<const ggml_tensor *> humming_prepared_active;
+    // A concat node may evaluate the directly-dependent recurrent convolution
+    // while its inputs are still in their coalesced source layouts. The later
+    // SSM_CONV node is then a graph-order marker only. Entries live for one
+    // graph evaluation/capture and are consumed exactly once.
+    std::unordered_set<const ggml_tensor *> precomputed_ssm_convs;
+#endif
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
@@ -1608,6 +1679,12 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gate_bias = nullptr;
     const ggml_tensor * x_scale = nullptr;
     const ggml_tensor * gate_scale = nullptr;
+    // F32 activation multiplied by silu(projection output). This is distinct
+    // from gate, which denotes a second projection weight matrix.
+    const ggml_tensor * residual = nullptr;
+    ggml_tensor * residual_out = nullptr;
+    const ggml_tensor * rms_weight = nullptr;
+    float rms_eps = 0.0f;
     ggml_glu_op glu_op;
 };
 struct ggml_cuda_mm_fusion_args_device {
@@ -1616,6 +1693,7 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate_bias = nullptr;
     const void * x_scale = nullptr;
     const void * gate_scale = nullptr;
+    const float * residual = nullptr;
     ggml_glu_op glu_op;
 };
 

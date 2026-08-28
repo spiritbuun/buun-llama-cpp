@@ -2,11 +2,563 @@
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
+#if !defined(GGML_USE_HIP)
+#include "humming-fp8.cuh"
+#include "humming-fp8-block.cuh"
+#include "humming-nvfp4.cuh"
+#endif
 
 #include <cstdint>
 #include <limits>
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
+
+#if !defined(GGML_USE_HIP)
+static nv_bfloat16 * ggml_cuda_humming_prepare_input(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src,
+        size_t count,
+        cudaStream_t stream) {
+    auto & storage = ctx.humming_inputs[ctx.curr_stream_no];
+    if (storage.count < count) {
+        if (storage.ptr != nullptr) {
+            storage.retired.push_back(storage.ptr);
+        }
+        CUDA_CHECK(cudaMalloc(&storage.ptr, count * sizeof(nv_bfloat16)));
+        storage.count = count;
+        storage.source = nullptr;
+    }
+    if (storage.source != src || storage.source_count != count) {
+        ggml_cuda_humming_fp8_input_f32_to_bf16(
+            static_cast<const float *>(src->data), storage.ptr, count, stream);
+        storage.source = src;
+        storage.source_count = count;
+    }
+    return storage.ptr;
+}
+
+static bool ggml_cuda_humming_bf16_mlp_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_CUDA_HUMMING_BF16_MLP");
+        return value != nullptr && std::atoi(value) != 0;
+    }();
+    return enabled;
+}
+
+static bool ggml_cuda_humming_defer_conv_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_CUDA_HUMMING_DEFER_CONV");
+        return value != nullptr && std::atoi(value) != 0;
+    }();
+    return enabled;
+}
+
+static nv_bfloat16 * ggml_cuda_humming_get_input(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src,
+        size_t count,
+        cudaStream_t stream) {
+    auto prepared = ctx.humming_prepared_activations.find(src);
+    if (prepared != ctx.humming_prepared_activations.end() &&
+            ctx.humming_prepared_active.count(src) != 0) {
+        GGML_ASSERT(prepared->second.count >= count);
+        return prepared->second.ptr;
+    }
+    if (ggml_cuda_humming_bf16_mlp_enabled() && ctx.humming_bf16_activations.erase(src) != 0) {
+        return static_cast<nv_bfloat16 *>(src->data);
+    }
+    return ggml_cuda_humming_prepare_input(ctx, src, count, stream);
+}
+
+static bool ggml_cuda_humming_finish_residual_rms(
+        ggml_backend_cuda_context & ctx,
+        const ggml_cuda_mm_fusion_args_host * fusion,
+        const nv_bfloat16 * output,
+        ggml_tensor * dst,
+        int64_t n,
+        int64_t m,
+        cudaStream_t stream) {
+    if (fusion->residual == nullptr) {
+        return false;
+    }
+    if (fusion->rms_weight == nullptr) {
+        GGML_ASSERT(fusion->residual_out == nullptr);
+        GGML_ASSERT(fusion->residual->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(fusion->residual) && ggml_is_contiguous(dst));
+        GGML_ASSERT(ggml_nelements(fusion->residual) == m * n && ggml_nelements(dst) == m * n);
+        ggml_cuda_humming_fp8_residual_add(
+            output, static_cast<const float *>(fusion->residual->data),
+            static_cast<float *>(dst->data), m * n, stream);
+        return true;
+    }
+    GGML_ASSERT(fusion->residual_out != nullptr);
+    GGML_ASSERT(fusion->residual->type == GGML_TYPE_F32 &&
+                fusion->residual_out->type == GGML_TYPE_F32 &&
+                fusion->rms_weight->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(fusion->residual) &&
+                ggml_is_contiguous(fusion->residual_out) &&
+                ggml_is_contiguous(fusion->rms_weight) && ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_nelements(fusion->residual) == m * n &&
+                ggml_nelements(fusion->residual_out) == m * n &&
+                ggml_nelements(fusion->rms_weight) == n && ggml_nelements(dst) == m * n);
+
+    const size_t prepared_count = size_t(m) * size_t(n);
+    auto result = ctx.humming_prepared_activations.try_emplace(dst);
+    ggml_cuda_humming_prepared_activation & prepared = result.first->second;
+    if (prepared.count < prepared_count) {
+        if (prepared.ptr != nullptr) {
+            prepared.retired.push_back(prepared.ptr);
+        }
+        prepared.count = prepared_count;
+        CUDA_CHECK(cudaMalloc(&prepared.ptr, prepared.count * sizeof(nv_bfloat16)));
+    }
+    ctx.humming_prepared_active.insert(dst);
+
+    ggml_cuda_humming_residual_rms_prepare(
+        output,
+        static_cast<const float *>(fusion->residual->data),
+        static_cast<const float *>(fusion->rms_weight->data),
+        static_cast<float *>(fusion->residual_out->data),
+        static_cast<float *>(dst->data),
+        prepared.ptr,
+        n, m, fusion->rms_eps, stream);
+    return true;
+}
+
+bool ggml_cuda_mul_mat_humming_nvfp4(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * ids,
+        ggml_tensor * dst,
+        const ggml_cuda_mm_fusion_args_host * fusion) {
+    if (!ggml_cuda_humming_nvfp4_enabled() || src0->type != GGML_TYPE_NVFP4 ||
+        ids != nullptr || fusion == nullptr || fusion->x_scale == nullptr ||
+        fusion->x_bias != nullptr || fusion->gate_bias != nullptr ||
+        src1->ne[2] != 1 || src1->ne[3] != 1 || src0->ne[2] != 1 || src0->ne[3] != 1 ||
+        dst->ne[2] != 1 || dst->ne[3] != 1 ||
+        !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+
+    const int64_t k = src0->ne[0];
+    const int64_t n = src0->ne[1];
+    const int64_t m = src1->ne[1];
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!ggml_cuda_humming_nvfp4_supports_shape(n, k, m, cc) || src1->ne[0] != k ||
+        dst->ne[0] != n || dst->ne[1] != m) {
+        return false;
+    }
+
+    const ggml_tensor * x_scale = fusion->x_scale;
+    if (x_scale->type != GGML_TYPE_F32 || !ggml_is_contiguous(x_scale) || ggml_nelements(x_scale) != 1) {
+        return false;
+    }
+
+    const ggml_tensor * gate = fusion->gate;
+    const ggml_tensor * gate_scale = fusion->gate_scale;
+    if (gate != nullptr) {
+        if (fusion->glu_op != GGML_GLU_OP_SWIGLU || gate_scale == nullptr ||
+            gate->type != GGML_TYPE_NVFP4 || !ggml_are_same_shape(gate, src0) ||
+            !ggml_are_same_stride(gate, src0) || !ggml_is_contiguous(gate) ||
+            gate_scale->type != GGML_TYPE_F32 || !ggml_is_contiguous(gate_scale) ||
+            ggml_nelements(gate_scale) != 1) {
+            return false;
+        }
+    } else if (gate_scale != nullptr) {
+        return false;
+    }
+
+    cudaStream_t stream = ctx.stream();
+
+    auto & lock_storage = ctx.humming_fp8_locks[ctx.curr_stream_no];
+    const size_t required_locks = ((m + 127) / 128) * ((n + 63) / 64);
+    if (lock_storage.count < required_locks) {
+        if (lock_storage.ptr != nullptr) {
+            lock_storage.retired.push_back(lock_storage.ptr);
+        }
+        CUDA_CHECK(cudaMalloc(&lock_storage.ptr, required_locks * sizeof(int32_t)));
+        CUDA_CHECK(cudaMemsetAsync(lock_storage.ptr, 0, required_locks * sizeof(int32_t), stream));
+        lock_storage.count = required_locks;
+    }
+
+    const bool defer_conv = ggml_cuda_humming_defer_conv_enabled() && gate == nullptr &&
+                            fusion->residual == nullptr && n == 10240 && k == 5120 && m > 16;
+    ggml_cuda_pool_alloc<nv_bfloat16> output_scratch(ctx.pool());
+    nv_bfloat16 * output = defer_conv ? static_cast<nv_bfloat16 *>(dst->data) : output_scratch.alloc(m * n);
+    ggml_cuda_pool_alloc<nv_bfloat16> gate_output(ctx.pool());
+    if (gate != nullptr) {
+        gate_output.alloc(m * n);
+    }
+    nv_bfloat16 * input = ggml_cuda_humming_get_input(ctx, src1, m * k, stream);
+
+    const int sms = ggml_cuda_info().devices[ctx.device].nsm;
+    const size_t weight_size = size_t(n) * k / 2;
+    const size_t scale_size = size_t(n) * k / QK_NVFP4_SUB;
+    const bool inplace_repacked = ggml_cuda_humming_nvfp4_is_repacked(src0);
+    if (inplace_repacked) {
+        if (gate != nullptr && !ggml_cuda_humming_nvfp4_is_repacked(gate)) {
+            return false;
+        }
+        ggml_cuda_humming_nvfp4_launch(
+            input,
+            src0->data,
+            static_cast<const uint8_t *>(src0->data) + weight_size,
+            static_cast<const float *>(x_scale->data),
+            output, lock_storage.ptr, n, k, m, sms, stream);
+        if (gate != nullptr) {
+            ggml_cuda_humming_nvfp4_launch(
+                input,
+                gate->data,
+                static_cast<const uint8_t *>(gate->data) + weight_size,
+                static_cast<const float *>(gate_scale->data),
+                gate_output.get(), lock_storage.ptr, n, k, m, sms, stream);
+        }
+        if (defer_conv) {
+            ctx.humming_deferred_bf16.insert(dst->data);
+        } else if (ggml_cuda_humming_finish_residual_rms(ctx, fusion, output, dst, n, m, stream)) {
+            // The fused epilogue materializes both required F32 graph outputs
+            // and retains a BF16 normalized activation for following Humming projections.
+        } else if (gate != nullptr && ggml_cuda_humming_bf16_mlp_enabled() && n == 17408) {
+            ggml_cuda_humming_fp8_swiglu_bf16(
+                output, gate_output.get(), static_cast<nv_bfloat16 *>(dst->data), m * n, stream);
+            ctx.humming_bf16_activations.insert(dst);
+        } else {
+            ggml_cuda_humming_fp8_output_bf16_to_f32(
+                output, gate ? gate_output.get() : nullptr, static_cast<float *>(dst->data), m * n, stream);
+        }
+        return true;
+    }
+    static const bool cache_repack = [] {
+        const char * value = std::getenv("GGML_CUDA_HUMMING_NVFP4_CACHE");
+        return value != nullptr && std::atoi(value) != 0;
+    }();
+    if (cache_repack) {
+        auto prepare_weight = [&](const ggml_tensor * weight) {
+            auto [it, inserted] = ctx.humming_nvfp4_cache.try_emplace(weight->data);
+            ggml_cuda_humming_nvfp4_cache_entry & entry = it->second;
+            if (inserted) {
+                entry.weight_size = weight_size;
+                entry.scale_size = scale_size;
+                CUDA_CHECK(cudaMalloc(&entry.weight, weight_size));
+                CUDA_CHECK(cudaMalloc(&entry.scale, scale_size));
+                ggml_cuda_pool_alloc<uint8_t> original(ctx.pool(), weight_size);
+                ggml_cuda_humming_nvfp4_prepare(
+                    weight->data, original.get(), entry.weight, entry.scale, n, k, stream);
+            } else {
+                GGML_ASSERT(entry.weight_size == weight_size && entry.scale_size == scale_size);
+            }
+            return &entry;
+        };
+        ggml_cuda_humming_nvfp4_cache_entry * up_entry = prepare_weight(src0);
+        ggml_cuda_humming_nvfp4_launch(
+            input, up_entry->weight, up_entry->scale, static_cast<const float *>(x_scale->data),
+            output, lock_storage.ptr, n, k, m, sms, stream);
+        if (gate != nullptr) {
+            ggml_cuda_humming_nvfp4_cache_entry * gate_entry = prepare_weight(gate);
+            ggml_cuda_humming_nvfp4_launch(
+                input, gate_entry->weight, gate_entry->scale, static_cast<const float *>(gate_scale->data),
+                gate_output.get(), lock_storage.ptr, n, k, m, sms, stream);
+        }
+        if (defer_conv) {
+            ctx.humming_deferred_bf16.insert(dst->data);
+        } else if (ggml_cuda_humming_finish_residual_rms(ctx, fusion, output, dst, n, m, stream)) {
+            // The fused epilogue materializes both required F32 graph outputs
+            // and retains a BF16 normalized activation for following Humming
+            // projections.
+        } else if (gate != nullptr && ggml_cuda_humming_bf16_mlp_enabled() && n == 17408) {
+            ggml_cuda_humming_fp8_swiglu_bf16(
+                output, gate_output.get(), static_cast<nv_bfloat16 *>(dst->data), m * n, stream);
+            ctx.humming_bf16_activations.insert(dst);
+        } else {
+            ggml_cuda_humming_fp8_output_bf16_to_f32(
+                output, gate ? gate_output.get() : nullptr, static_cast<float *>(dst->data), m * n, stream);
+        }
+        return true;
+    }
+
+    auto prepare_and_launch = [&](const ggml_tensor * weight, const ggml_tensor * scale, nv_bfloat16 * result) {
+        // The canonical GGML layout remains the sole resident copy. Repack one
+        // projection at a time into bounded stream-ordered scratch so this path
+        // does not duplicate the model weights in VRAM.
+        ggml_cuda_pool_alloc<uint8_t> original(ctx.pool(), weight_size);
+        ggml_cuda_pool_alloc<uint8_t> repacked(ctx.pool(), weight_size);
+        ggml_cuda_pool_alloc<uint8_t> reordered_scale(ctx.pool(), scale_size);
+        ggml_cuda_humming_nvfp4_prepare(
+            weight->data, original.get(), repacked.get(), reordered_scale.get(), n, k, stream);
+        ggml_cuda_humming_nvfp4_launch(
+            input, repacked.get(), reordered_scale.get(), static_cast<const float *>(scale->data),
+            result, lock_storage.ptr, n, k, m, sms, stream);
+    };
+    prepare_and_launch(src0, x_scale, output);
+    if (gate != nullptr) {
+        prepare_and_launch(gate, gate_scale, gate_output.get());
+    }
+    if (defer_conv) {
+        ctx.humming_deferred_bf16.insert(dst->data);
+    } else if (ggml_cuda_humming_finish_residual_rms(ctx, fusion, output, dst, n, m, stream)) {
+        // The fused epilogue materializes both the residual and normalized F32
+        // tensors, plus a BF16 copy reused by every following Humming projection.
+    } else if (gate != nullptr && ggml_cuda_humming_bf16_mlp_enabled() && n == 17408) {
+        ggml_cuda_humming_fp8_swiglu_bf16(
+            output, gate_output.get(), static_cast<nv_bfloat16 *>(dst->data), m * n, stream);
+        ctx.humming_bf16_activations.insert(dst);
+    } else {
+        ggml_cuda_humming_fp8_output_bf16_to_f32(
+            output, gate ? gate_output.get() : nullptr, static_cast<float *>(dst->data), m * n, stream);
+    }
+    return true;
+}
+
+bool ggml_cuda_mul_mat_humming_fp8(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * ids,
+        ggml_tensor * dst,
+        const ggml_cuda_mm_fusion_args_host * fusion) {
+    if (!ggml_cuda_humming_fp8_enabled()) {
+        return false;
+    }
+
+    if (src0->type != GGML_TYPE_F8_E4M3 || !ggml_cuda_humming_fp8_is_repacked(src0) ||
+        ids != nullptr || fusion == nullptr ||
+        fusion->x_scale == nullptr || fusion->x_bias != nullptr || fusion->gate_bias != nullptr ||
+        src1->ne[2] != 1 || src1->ne[3] != 1 || src0->ne[2] != 1 || src0->ne[3] != 1 ||
+        dst->ne[2] != 1 || dst->ne[3] != 1 ||
+        !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+
+    const int64_t k = src0->ne[0];
+    const int64_t n = src0->ne[1];
+    const int64_t m = src1->ne[1];
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!ggml_cuda_humming_fp8_supports_shape(n, k, m, cc) || src1->ne[0] != k ||
+        dst->ne[0] != n || dst->ne[1] != m) {
+        return false;
+    }
+
+    const ggml_tensor * x_scale = fusion->x_scale;
+    if (x_scale->type != GGML_TYPE_BF16 || !ggml_is_contiguous(x_scale) ||
+        x_scale->ne[0] != n || x_scale->ne[1] != 1 || x_scale->ne[2] != 1 || x_scale->ne[3] != 1) {
+        return false;
+    }
+
+    const ggml_tensor * gate = fusion->gate;
+    const ggml_tensor * gate_scale = fusion->gate_scale;
+    if (gate != nullptr) {
+        if (fusion->glu_op != GGML_GLU_OP_SWIGLU || gate_scale == nullptr ||
+            gate->type != GGML_TYPE_F8_E4M3 || !ggml_cuda_humming_fp8_is_repacked(gate) ||
+            !ggml_are_same_shape(gate, src0) ||
+            !ggml_are_same_stride(gate, src0) || !ggml_is_contiguous(gate) ||
+            gate_scale->type != GGML_TYPE_BF16 || !ggml_is_contiguous(gate_scale) ||
+            gate_scale->ne[0] != n || gate_scale->ne[1] != 1 ||
+            gate_scale->ne[2] != 1 || gate_scale->ne[3] != 1) {
+            return false;
+        }
+    } else if (gate_scale != nullptr) {
+        return false;
+    }
+
+    cudaStream_t stream = ctx.stream();
+    auto prepare_weight = [&](const ggml_tensor * weight, const ggml_tensor * scale) {
+        auto [it, inserted] = ctx.humming_fp8_cache.try_emplace(weight->data);
+        ggml_cuda_humming_fp8_cache_entry & entry = it->second;
+        if (inserted) {
+            entry.scale_size = ggml_nbytes(scale);
+            entry.source_scale = scale->data;
+            CUDA_CHECK(cudaMalloc(&entry.scale, entry.scale_size));
+            ggml_cuda_humming_fp8_reorder_scale(
+                static_cast<const nv_bfloat16 *>(scale->data),
+                static_cast<nv_bfloat16 *>(entry.scale), n, stream);
+        } else {
+            GGML_ASSERT(entry.source_scale == scale->data);
+            GGML_ASSERT(entry.scale_size == ggml_nbytes(scale));
+        }
+        return &entry;
+    };
+
+    ggml_cuda_humming_fp8_cache_entry * up_entry = prepare_weight(src0, x_scale);
+    ggml_cuda_humming_fp8_cache_entry * gate_entry = gate ? prepare_weight(gate, gate_scale) : nullptr;
+
+    auto & lock_storage = ctx.humming_fp8_locks[ctx.curr_stream_no];
+    const size_t block_m = m <= 16 ? 16 : 128;
+    const size_t required_locks = ((m + block_m - 1) / block_m) * ((n + 63) / 64);
+    if (lock_storage.count < required_locks) {
+        if (lock_storage.ptr != nullptr) {
+            lock_storage.retired.push_back(lock_storage.ptr);
+        }
+        CUDA_CHECK(cudaMalloc(&lock_storage.ptr, required_locks * sizeof(int32_t)));
+        CUDA_CHECK(cudaMemsetAsync(lock_storage.ptr, 0, required_locks * sizeof(int32_t), stream));
+        lock_storage.count = required_locks;
+    }
+    int32_t * locks = lock_storage.ptr;
+
+    const bool defer_conv = ggml_cuda_humming_defer_conv_enabled() && gate == nullptr &&
+                            fusion->residual == nullptr && n == 10240 && k == 5120 && m > 16;
+    ggml_cuda_pool_alloc<nv_bfloat16> output_scratch(ctx.pool());
+    nv_bfloat16 * output = defer_conv ? static_cast<nv_bfloat16 *>(dst->data) : output_scratch.alloc(m * n);
+    ggml_cuda_pool_alloc<nv_bfloat16> gate_output(ctx.pool());
+    if (gate != nullptr) {
+        gate_output.alloc(m * n);
+    }
+    nv_bfloat16 * input = ggml_cuda_humming_get_input(ctx, src1, m * k, stream);
+
+    const int sms = ggml_cuda_info().devices[ctx.device].nsm;
+    ggml_cuda_humming_fp8_launch(
+        input, src0->data, static_cast<const nv_bfloat16 *>(up_entry->scale),
+        output, locks, n, k, m, sms, stream);
+    if (gate != nullptr) {
+        ggml_cuda_humming_fp8_launch(
+            input, gate->data, static_cast<const nv_bfloat16 *>(gate_entry->scale),
+            gate_output.get(), locks, n, k, m, sms, stream);
+    }
+    if (defer_conv) {
+        ctx.humming_deferred_bf16.insert(dst->data);
+    } else if (ggml_cuda_humming_finish_residual_rms(ctx, fusion, output, dst, n, m, stream)) {
+        // See the NVFP4 path above.
+    } else if (gate != nullptr && ggml_cuda_humming_bf16_mlp_enabled() && n == 17408) {
+        ggml_cuda_humming_fp8_swiglu_bf16(
+            output, gate_output.get(), static_cast<nv_bfloat16 *>(dst->data), m * n, stream);
+        ctx.humming_bf16_activations.insert(dst);
+    } else {
+        ggml_cuda_humming_fp8_output_bf16_to_f32(
+            output, gate ? gate_output.get() : nullptr,
+            static_cast<float *>(dst->data), m * n, stream);
+    }
+    return true;
+}
+
+static bool ggml_cuda_mul_mat_humming_fp8_block_impl(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * scale,
+        const ggml_tensor * gate,
+        const ggml_tensor * gate_scale,
+        ggml_tensor * dst,
+        const ggml_cuda_mm_fusion_args_host * fusion) {
+    if (!ggml_cuda_humming_fp8_enabled() || src0->type != GGML_TYPE_F8_E4M3 ||
+        !ggml_cuda_humming_fp8_is_repacked(src0) || scale == nullptr ||
+        scale->type != GGML_TYPE_F32 ||
+        src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+        dst->ne[2] != 1 || dst->ne[3] != 1 ||
+        !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) ||
+        !ggml_is_contiguous(scale) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+
+    if (gate != nullptr) {
+        if (gate_scale == nullptr || gate->type != GGML_TYPE_F8_E4M3 ||
+            !ggml_cuda_humming_fp8_is_repacked(gate) ||
+            !ggml_are_same_shape(gate, src0) || !ggml_are_same_stride(gate, src0) ||
+            !ggml_is_contiguous(gate) || gate_scale->type != GGML_TYPE_F32 ||
+            !ggml_are_same_shape(gate_scale, scale) || !ggml_is_contiguous(gate_scale)) {
+            return false;
+        }
+    } else if (gate_scale != nullptr) {
+        return false;
+    }
+
+    const int64_t k = src0->ne[0];
+    const int64_t n = src0->ne[1];
+    const int64_t m = src1->ne[1];
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (k % 128 != 0 || n % 128 != 0 || src1->ne[0] != k ||
+        scale->ne[0] != n / 128 || scale->ne[1] != k / 128 ||
+        scale->ne[2] != 1 || scale->ne[3] != 1 ||
+        dst->ne[0] != n || dst->ne[1] != m ||
+        !ggml_cuda_humming_fp8_block_supports_shape(n, k, m, cc)) {
+        return false;
+    }
+
+    cudaStream_t stream = ctx.stream();
+    auto & lock_storage = ctx.humming_fp8_locks[ctx.curr_stream_no];
+    const size_t block_m = m <= 16 ? 16 : 128;
+    const size_t required_locks = ((m + block_m - 1) / block_m) * ((n + 63) / 64);
+    if (lock_storage.count < required_locks) {
+        if (lock_storage.ptr != nullptr) {
+            lock_storage.retired.push_back(lock_storage.ptr);
+        }
+        CUDA_CHECK(cudaMalloc(&lock_storage.ptr, required_locks * sizeof(int32_t)));
+        CUDA_CHECK(cudaMemsetAsync(lock_storage.ptr, 0, required_locks * sizeof(int32_t), stream));
+        lock_storage.count = required_locks;
+    }
+
+    ggml_cuda_pool_alloc<nv_bfloat16> output(ctx.pool(), m * n);
+    ggml_cuda_pool_alloc<nv_bfloat16> gate_output(ctx.pool());
+    if (gate != nullptr) {
+        gate_output.alloc(m * n);
+    }
+    nv_bfloat16 * input = ggml_cuda_humming_get_input(ctx, src1, m * k, stream);
+    const int sms = ggml_cuda_info().devices[ctx.device].nsm;
+    ggml_cuda_humming_fp8_block_launch(
+        input, src0->data, static_cast<const float *>(scale->data), output.get(),
+        lock_storage.ptr, n, k, m, sms, stream);
+    if (gate != nullptr) {
+        ggml_cuda_humming_fp8_block_launch(
+            input, gate->data, static_cast<const float *>(gate_scale->data), gate_output.get(),
+            lock_storage.ptr, n, k, m, sms, stream);
+    }
+    if (fusion != nullptr && ggml_cuda_humming_finish_residual_rms(
+            ctx, fusion, output.get(), dst, n, m, stream)) {
+        // The fused epilogue materializes the required F32 graph outputs and
+        // retains a BF16 normalized activation for following projections.
+    } else if (gate != nullptr && ggml_cuda_humming_bf16_mlp_enabled() && n == 17408) {
+        ggml_cuda_humming_fp8_swiglu_bf16(
+            output.get(), gate_output.get(), static_cast<nv_bfloat16 *>(dst->data), m * n, stream);
+        ctx.humming_bf16_activations.insert(dst);
+    } else {
+        ggml_cuda_humming_fp8_output_bf16_to_f32(
+            output.get(), gate ? gate_output.get() : nullptr, static_cast<float *>(dst->data), m * n, stream);
+    }
+    return true;
+}
+
+bool ggml_cuda_mul_mat_humming_fp8_block(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        ggml_tensor * dst) {
+    return ggml_cuda_mul_mat_humming_fp8_block_impl(
+        ctx, src0, src1, dst->src[2], nullptr, nullptr, dst, nullptr);
+}
+
+bool ggml_cuda_mul_mat_humming_fp8_block_fused(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * scale,
+        ggml_tensor * dst,
+        const ggml_cuda_mm_fusion_args_host * fusion) {
+    if (fusion == nullptr || fusion->gate != nullptr || fusion->gate_scale != nullptr) {
+        return false;
+    }
+    return ggml_cuda_mul_mat_humming_fp8_block_impl(
+        ctx, src0, src1, scale, nullptr, nullptr, dst, fusion);
+}
+
+bool ggml_cuda_mul_mat_humming_fp8_block_swiglu(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * up,
+        const ggml_tensor * gate,
+        const ggml_tensor * src1,
+        ggml_tensor * dst) {
+    static const bool enabled = std::getenv("GGML_CUDA_DISABLE_HUMMING_FP8_BLOCK_SWIGLU") == nullptr;
+    if (!enabled) {
+        return false;
+    }
+    if (up == nullptr || gate == nullptr || up->op != GGML_OP_MUL_MAT || gate->op != GGML_OP_MUL_MAT ||
+        up->src[1] != src1 || gate->src[1] != src1 || up->src[2] == nullptr || gate->src[2] == nullptr ||
+        ggml_get_glu_op(dst) != GGML_GLU_OP_SWIGLU) {
+        return false;
+    }
+    return ggml_cuda_mul_mat_humming_fp8_block_impl(
+        ctx, up->src[0], src1, up->src[2], gate->src[0], gate->src[2], dst, nullptr);
+}
+#endif
 
 // Raw E4M3 weights have no embedded block metadata, but MMVQ consumes weights
 // in units aligned with one Q8_1 activation block. ggml_cuda_mul_mat_vec_q()
@@ -607,6 +1159,7 @@ static __global__ void mul_mat_vec_q(
     const float * gate_bias = nullptr;
     const void * x_scale = nullptr;
     const void * gate_scale = nullptr;
+    const float * residual = nullptr;
     ggml_glu_op active_glu;
 
     if constexpr (has_fusion) {
@@ -620,8 +1173,9 @@ static __global__ void mul_mat_vec_q(
         if constexpr (type == GGML_TYPE_NVFP4 || type == GGML_TYPE_F8_E4M3) {
             use_scale      = fusion.x_scale    != nullptr;
             use_gate_scale = fusion.gate_scale != nullptr && use_gate;
-            x_scale        = fusion.x_scale;
-            gate_scale     = fusion.gate_scale;
+        x_scale        = fusion.x_scale;
+        gate_scale     = fusion.gate_scale;
+        residual       = fusion.residual;
         }
     }
 
@@ -759,6 +1313,11 @@ static __global__ void mul_mat_vec_q(
                         result *= x_scales;
                     }
                     result += x_biases[j];
+                    if (residual != nullptr) {
+                        result += residual[sample_dst*stride_sample_dst +
+                                           channel_dst*stride_channel_dst +
+                                           j*stride_col_dst + row0 + i];
+                    }
                     if (use_gate) {
                         float gate_value = tmp_gate[j][i];
                         if constexpr (type == GGML_TYPE_NVFP4 || type == GGML_TYPE_F8_E4M3) {
@@ -787,7 +1346,7 @@ static __global__ void mul_mat_vec_q(
     }
 
     if constexpr (!has_fusion) {
-        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, active_glu, gate_bias, x_bias, x_scale, gate_scale, tmp_gate);
+        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, active_glu, gate_bias, x_bias, x_scale, gate_scale, residual, tmp_gate);
     }
     if constexpr (type != GGML_TYPE_NVFP4 && type != GGML_TYPE_F8_E4M3) {
         GGML_UNUSED_VARS(use_scale, use_gate_scale, x_scale, gate_scale, x_scales, gate_scales);
@@ -920,7 +1479,7 @@ static void mul_mat_vec_q_switch_fusion(
         const uint32_t ids_stride, cudaStream_t stream) {
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
-                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.residual != nullptr;
     if constexpr (c_ncols_dst == 1) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
@@ -1332,6 +1891,12 @@ void ggml_cuda_mul_mat_vec_q(
 
     GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE);
 
+#if !defined(GGML_USE_HIP)
+    if (ggml_cuda_mul_mat_humming_fp8(ctx, src0, src1, ids, dst, fusion)) {
+        return;
+    }
+#endif
+
     const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
     float         *  dst_d =       (float         *)  dst->data;
@@ -1385,6 +1950,12 @@ void ggml_cuda_mul_mat_vec_q(
                 GGML_ASSERT(ggml_nelements(fusion->gate_scale) == (ids ? src0->ne[2] : 1));
             }
             fusion_local.gate_scale = fusion->gate_scale->data;
+        }
+        if (fusion->residual) {
+            GGML_ASSERT(!ids && fusion->residual->type == GGML_TYPE_F32 &&
+                        ggml_is_contiguous(fusion->residual) &&
+                        ggml_are_same_shape(fusion->residual, dst));
+            fusion_local.residual = static_cast<const float *>(fusion->residual->data);
         }
         fusion_local.glu_op = fusion->glu_op;
     }

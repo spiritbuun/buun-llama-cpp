@@ -197,6 +197,7 @@ static __global__ void rms_norm_mul_bcast_f32(const float * __restrict__ x,
     }
 }
 
+
 template <int block_size>
 static __global__ void rms_norm_bf16(const nv_bfloat16 * x,
                                      nv_bfloat16 *       dst,
@@ -357,6 +358,40 @@ static __global__ void l2_norm_f32(
     }
 }
 
+template <int block_size>
+static __global__ void l2_norm_pair_f32(
+        const float * q, float * q_dst, const float * k, float * k_dst,
+        const int ncols, const int nrows, const int64_t stride_row,
+        const int64_t stride_channel, const int64_t stride_sample, const float eps) {
+    const bool is_k     = blockIdx.x >= nrows;
+    const int row       = blockIdx.x - (is_k ? nrows : 0);
+    const int channel   = blockIdx.y;
+    const int sample    = blockIdx.z;
+    const int tid       = threadIdx.x;
+    const int nchannels = gridDim.y;
+
+    const float * x = is_k ? k : q;
+    float * dst     = is_k ? k_dst : q_dst;
+    x   += sample*stride_sample + channel*stride_channel + row*stride_row;
+    dst += ((sample*nchannels + channel)*nrows + row)*ncols;
+
+    float tmp = 0.0f;
+    ggml_cuda_pdl_sync();
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    ggml_cuda_pdl_lc();
+
+    const float scale = rsqrtf(fmaxf(tmp, eps * eps));
+    for (int col = tid; col < ncols; col += block_size) {
+        dst[col] = scale * x[col];
+    }
+}
+
 static void norm_f32_cuda(
         const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream) {
@@ -452,10 +487,17 @@ static void rms_norm_mul_f32_cuda(const float *  x,
     // rows/channels/samples (the standard rms_norm weight), no add. Bit-identical to the
     // general kernel here but with far fewer params -> higher occupancy on the big block.
     if (add == nullptr && mul_nrows == 1 && mul_nchannels == 1 && mul_nsamples == 1 && mul_ncols == ncols) {
-        const int block_size = ncols < 1024 ? 256 : 1024;
+        static const bool use_d128_block = [] {
+            const char * value = std::getenv("GGML_CUDA_RMS_D128_BLOCK");
+            return value == nullptr || std::atoi(value) != 0;
+        }();
+        const int block_size = ncols <= 128 && use_d128_block ? 128 : ncols < 1024 ? 256 : 1024;
         const dim3 block_dims(block_size, 1, 1);
         const size_t nbytes_shared = block_size > WARP_SIZE ? 32 * sizeof(float) : 0;
-        if (block_size == 256) {
+        if (block_size == 128) {
+            rms_norm_mul_bcast_f32<128><<<blocks_num, block_dims, nbytes_shared, stream>>>(
+                x, mul, dst, ncols, stride_row, stride_channel, stride_sample, eps);
+        } else if (block_size == 256) {
             rms_norm_mul_bcast_f32<256><<<blocks_num, block_dims, nbytes_shared, stream>>>(
                 x, mul, dst, ncols, stride_row, stride_channel, stride_sample, eps);
         } else {
@@ -810,4 +852,33 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s03 = nb03 / ts0;
 
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+}
+
+void ggml_cuda_op_l2_norm_pair(
+        ggml_backend_cuda_context & ctx, ggml_tensor * q_dst, ggml_tensor * k_dst) {
+    const ggml_tensor * q = q_dst->src[0];
+    const ggml_tensor * k = k_dst->src[0];
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32);
+    GGML_ASSERT(q_dst->type == GGML_TYPE_F32 && k_dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(q, k) && ggml_are_same_shape(q_dst, k_dst));
+    GGML_ASSERT(q->ne[0] < 1024);
+
+    float q_eps;
+    float k_eps;
+    memcpy(&q_eps, q_dst->op_params, sizeof(float));
+    memcpy(&k_eps, k_dst->op_params, sizeof(float));
+    GGML_ASSERT(q_eps == k_eps && q_eps >= 0.0f);
+
+    const size_t ts = sizeof(float);
+    GGML_ASSERT(q->nb[0] == ts && k->nb[0] == ts);
+    GGML_ASSERT(q->nb[1] == k->nb[1] && q->nb[2] == k->nb[2] && q->nb[3] == k->nb[3]);
+
+    const dim3 blocks_num(2*q->ne[1], q->ne[2], q->ne[3]);
+    const dim3 block_dims(WARP_SIZE, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params = { blocks_num, block_dims, 0, ctx.stream() };
+    ggml_cuda_kernel_launch(l2_norm_pair_f32<WARP_SIZE>, launch_params,
+            (const float *) q->data, (float *) q_dst->data,
+            (const float *) k->data, (float *) k_dst->data,
+            q->ne[0], q->ne[1], q->nb[1]/ts, q->nb[2]/ts, q->nb[3]/ts, q_eps);
 }

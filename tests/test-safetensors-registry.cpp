@@ -1,8 +1,11 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 #include "llama-safetensors-qwen35.h"
+#include "llama-safetensors-quant.h"
 #include "llama-safetensors.h"
 #include "llama.h"
+
+#include "nlohmann/json.hpp"
 
 #include <array>
 #include <cmath>
@@ -17,6 +20,8 @@
 #include <vector>
 
 namespace {
+
+using json = nlohmann::json;
 
 void require(bool condition, const char * message) {
     if (!condition) {
@@ -43,6 +48,57 @@ void write_text(const std::filesystem::path & path, const std::string & text) {
     require(static_cast<bool>(out), "failed to create safetensors test metadata");
     out << text;
     require(static_cast<bool>(out), "failed to write safetensors test metadata");
+}
+
+struct tensor_fixture {
+    std::string          name;
+    std::string          dtype;
+    std::vector<uint64_t> shape;
+    std::vector<uint8_t> data;
+};
+
+void write_single_shard_model(
+        const std::filesystem::path & path,
+        const std::vector<tensor_fixture> & tensors) {
+    std::filesystem::create_directories(path);
+    json                 header = json::object();
+    std::vector<uint8_t> data;
+    for (const tensor_fixture & tensor : tensors) {
+        const size_t begin = data.size();
+        data.insert(data.end(), tensor.data.begin(), tensor.data.end());
+        header[tensor.name] = {
+            { "dtype", tensor.dtype },
+            { "shape", tensor.shape },
+            { "data_offsets", { begin, data.size() } },
+        };
+    }
+    write_shard(path / "model.safetensors", header.dump(), data);
+}
+
+template<typename Fn>
+void require_rejected(Fn && fn, const char * message) {
+    bool rejected = false;
+    try {
+        fn();
+    } catch (const std::runtime_error &) {
+        rejected = true;
+    }
+    require(rejected, message);
+}
+
+const char * fp8_channel_config =
+    R"({"quantization_config":{"quant_method":"compressed-tensors","format":"mixed-precision","config_groups":{"fp8":{"format":"float-quantized","targets":["module"],"input_activations":{"actorder":null,"block_structure":null,"dynamic":true,"group_size":null,"num_bits":8,"scale_dtype":null,"strategy":"token","symmetric":true,"type":"float","zp_dtype":null},"weights":{"actorder":null,"block_structure":null,"dynamic":false,"group_size":null,"num_bits":8,"scale_dtype":null,"strategy":"channel","symmetric":true,"type":"float","zp_dtype":null}}}}})";
+
+const char * fp8_block_config =
+    R"({"quantization_config":{"quant_method":"fp8","fmt":"e4m3","activation_scheme":"dynamic","weight_block_size":[128,128]}})";
+
+const char * nvfp4_config =
+    R"({"quantization_config":{"quant_method":"compressed-tensors","format":"mixed-precision","config_groups":{"nvfp4":{"format":"nvfp4-pack-quantized","targets":["module"],"input_activations":{"actorder":null,"block_structure":null,"dynamic":"local","group_size":16,"num_bits":4,"scale_dtype":"torch.float8_e4m3fn","strategy":"tensor_group","symmetric":true,"type":"float","zp_dtype":null},"weights":{"actorder":"static","block_structure":null,"dynamic":false,"group_size":16,"num_bits":4,"scale_dtype":"torch.float8_e4m3fn","strategy":"tensor_group","symmetric":true,"type":"float","zp_dtype":null}}}}})";
+
+std::vector<uint8_t> f32_bytes(float value) {
+    std::vector<uint8_t> result(sizeof(value));
+    std::memcpy(result.data(), &value, sizeof(value));
+    return result;
 }
 
 std::string read_text(const std::filesystem::path & path) {
@@ -136,34 +192,35 @@ int main(int argc, char ** argv) {
                 ++mismatches;
             }
         }
-        if (gguf_get_n_tensors(actual) != gguf_get_n_tensors(expected)) {
+        if (gguf_get_n_tensors(actual) != 0) {
+            std::cerr << "native metadata unexpectedly contains a tensor manifest\n";
             ++mismatches;
         }
         for (int64_t i = 0; i < gguf_get_n_tensors(expected); ++i) {
             const char *  name = gguf_get_tensor_name(expected, i);
-            const int64_t j    = gguf_find_tensor(actual, name);
-            if (j < 0) {
-                std::cerr << "missing tensor " << name << '\n';
+            ggml_type type;
+            std::array<int64_t, GGML_MAX_DIMS> ne;
+            if (!importer.describe(name, type, ne)) {
+                std::cerr << "source cannot describe tensor " << name << '\n';
                 ++mismatches;
                 continue;
             }
-            bool            mismatch = gguf_get_tensor_type(actual, j) != gguf_get_tensor_type(expected, i);
-            const int64_t * ane      = gguf_get_tensor_ne(actual, j);
+            bool            mismatch = type != gguf_get_tensor_type(expected, i);
             const int64_t * ene      = gguf_get_tensor_ne(expected, i);
             for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
-                mismatch |= ane[dim] != ene[dim];
+                mismatch |= ne[dim] != ene[dim];
             }
             if (mismatch) {
                 std::cerr << "tensor contract mismatch " << name
-                          << " actual_type=" << ggml_type_name(gguf_get_tensor_type(actual, j))
+                          << " actual_type=" << ggml_type_name(type)
                           << " expected_type=" << ggml_type_name(gguf_get_tensor_type(expected, i))
-                          << " actual_ne=" << ane[0] << ',' << ane[1] << ',' << ane[2] << ',' << ane[3]
+                          << " actual_ne=" << ne[0] << ',' << ne[1] << ',' << ne[2] << ',' << ne[3]
                           << " expected_ne=" << ene[0] << ',' << ene[1] << ',' << ene[2] << ',' << ene[3] << '\n';
                 ++mismatches;
             }
         }
-        std::cout << "actual_tensors=" << gguf_get_n_tensors(actual)
-                  << " expected_tensors=" << gguf_get_n_tensors(expected) << " mismatches=" << mismatches << '\n';
+        std::cout << "metadata_tensors=" << gguf_get_n_tensors(actual)
+                  << " source_contracts=" << gguf_get_n_tensors(expected) << " mismatches=" << mismatches << '\n';
         gguf_free(actual);
         gguf_free(expected);
         ggml_free(expected_tensor_ctx);
@@ -173,9 +230,8 @@ int main(int argc, char ** argv) {
         llama_safetensors_qwen35_importer importer(argv[2]);
         ggml_context *                    tensor_ctx = nullptr;
         gguf_context *                    metadata   = nullptr;
-        if (std::string(argv[3]) == "native") {
-            metadata = importer.build_metadata();
-        } else {
+        const bool                        native     = std::string(argv[3]) == "native";
+        if (!native) {
             gguf_init_params init_params = {
                 /*.no_alloc = */ true,
                 /*.ctx      = */ &tensor_ctx,
@@ -203,11 +259,15 @@ int main(int argc, char ** argv) {
         ggml_backend_load_all();
         llama_model_params model_params = llama_model_default_params();
         model_params.n_gpu_layers       = 99;
-        llama_model * model             = llama_model_init_from_user(metadata, set_tensor_data, &state, model_params);
+        llama_model * model = native ?
+            llama_model_load_from_safetensors_dir(argv[2], model_params) :
+            llama_model_init_from_user(metadata, set_tensor_data, &state, model_params);
         if (model == nullptr) {
             throw std::runtime_error("direct safetensors model load failed");
         }
-        std::cout << "loaded_tensors=" << state.tensors << " loaded_bytes=" << state.bytes << '\n';
+        if (!native) {
+            std::cout << "loaded_tensors=" << state.tensors << " loaded_bytes=" << state.bytes << '\n';
+        }
 
         const llama_vocab * vocab    = llama_model_get_vocab(model);
         const std::string   prompt   = "The capital of France is";
@@ -248,7 +308,9 @@ int main(int argc, char ** argv) {
         llama_sampler_free(sampler);
         llama_free(context);
         llama_model_free(model);
-        gguf_free(metadata);
+        if (metadata != nullptr) {
+            gguf_free(metadata);
+        }
         if (tensor_ctx != nullptr) {
             ggml_free(tensor_ctx);
         }
@@ -303,37 +365,161 @@ int main(int argc, char ** argv) {
     }
     if (argc == 2) {
         const auto registry = llama_safetensors_registry::load(argv[1]);
-        const auto quant    = llama_safetensors_quant_config::load(argv[1]);
-        size_t     nvfp4    = 0;
-        size_t     fp8      = 0;
-        for (const auto & tensor : registry.tensors()) {
-            std::string module_name;
-            if (tensor.name.size() > 14 && tensor.name.compare(tensor.name.size() - 14, 14, ".weight_packed") == 0) {
-                module_name = tensor.name.substr(0, tensor.name.size() - 14);
-            } else if (tensor.name.size() > 7 && tensor.name.compare(tensor.name.size() - 7, 7, ".weight") == 0) {
-                module_name = tensor.name.substr(0, tensor.name.size() - 7);
-            } else {
-                continue;
-            }
-            const auto * group = quant.match(module_name);
-            if (group == nullptr) {
-                continue;
-            }
-            if (tensor.dtype == llama_safetensors_dtype::U8 &&
-                group->format == llama_safetensors_quant_format::NVFP4_PACK) {
-                ++nvfp4;
-            } else if (tensor.dtype == llama_safetensors_dtype::F8_E4M3 &&
-                       group->format == llama_safetensors_quant_format::FP8_CHANNEL) {
-                ++fp8;
-            }
-        }
+        const llama_safetensors_quant_adapters adapters(argv[1], registry);
+        const llama_safetensors_quant_summary & summary = adapters.summary();
         std::cout << "shards=" << registry.shards().size() << " tensors=" << registry.tensors().size()
-                  << " nvfp4=" << nvfp4 << " fp8=" << fp8 << '\n';
+                  << " nvfp4=" << summary.nvfp4 << " fp8_channel=" << summary.fp8_channel
+                  << " fp8_block=" << summary.fp8_block << '\n';
         return 0;
     }
     require(argc == 1, "usage: test-safetensors-registry [model-directory [control.gguf]]");
 
     temp_dir dir;
+
+    // Quant adapters are architecture-independent contracts. Exercise them
+    // directly so an importer cannot accidentally make a correctness-critical
+    // scale optional while rearranging canonical names.
+    {
+        const auto path = dir.path / "fp8-channel";
+        write_single_shard_model(path, {
+            { "module.weight", "F8_E4M3", { 2, 32 }, std::vector<uint8_t>(64) },
+            { "module.weight_scale", "BF16", { 2 }, std::vector<uint8_t>(4) },
+        });
+        write_text(path / "config.json", fp8_channel_config);
+        const auto registry = llama_safetensors_registry::load(path);
+
+        llama_safetensors_quant_adapters incomplete(path, registry);
+        const auto weight = incomplete.bind("module", llama_safetensors_quant_role::WEIGHT);
+        require(weight.has_value() && weight->target_type == GGML_TYPE_F8_E4M3,
+                "FP8 channel weight binding is wrong");
+        incomplete.consume(*weight);
+        require_rejected([&] { incomplete.validate_complete(); },
+                         "FP8 channel weight was accepted without its scale");
+
+        llama_safetensors_quant_adapters complete(path, registry);
+        const auto complete_weight = complete.bind("module", llama_safetensors_quant_role::WEIGHT);
+        const auto scale = complete.bind("module", llama_safetensors_quant_role::WEIGHT_SCALE);
+        require(complete_weight.has_value() && scale.has_value() && scale->target_type == GGML_TYPE_BF16 &&
+                    scale->target_shape == std::vector<int64_t>({ 2 }),
+                "FP8 channel scale binding is wrong");
+        complete.consume(*complete_weight);
+        complete.consume(*scale);
+        complete.validate_complete();
+    }
+    {
+        const auto path = dir.path / "fp8-channel-missing-scale";
+        write_single_shard_model(path, {
+            { "module.weight", "F8_E4M3", { 2, 32 }, std::vector<uint8_t>(64) },
+        });
+        write_text(path / "config.json", fp8_channel_config);
+        const auto registry = llama_safetensors_registry::load(path);
+        require_rejected([&] { (void) llama_safetensors_quant_adapters(path, registry); },
+                         "FP8 channel contract accepted a missing scale");
+    }
+    {
+        const auto path = dir.path / "fp8-channel-wrong-scale-type";
+        write_single_shard_model(path, {
+            { "module.weight", "F8_E4M3", { 2, 32 }, std::vector<uint8_t>(64) },
+            { "module.weight_scale", "F16", { 2 }, std::vector<uint8_t>(4) },
+        });
+        write_text(path / "config.json", fp8_channel_config);
+        const auto registry = llama_safetensors_registry::load(path);
+        require_rejected([&] { (void) llama_safetensors_quant_adapters(path, registry); },
+                         "FP8 channel contract accepted the wrong scale dtype");
+    }
+    {
+        const auto path = dir.path / "fp8-channel-wrong-weight-type";
+        write_single_shard_model(path, {
+            { "module.weight", "BF16", { 2, 32 }, std::vector<uint8_t>(128) },
+            { "module.weight_scale", "BF16", { 2 }, std::vector<uint8_t>(4) },
+        });
+        write_text(path / "config.json", fp8_channel_config);
+        const auto registry = llama_safetensors_registry::load(path);
+        require_rejected([&] { (void) llama_safetensors_quant_adapters(path, registry); },
+                         "FP8 channel contract accepted a BF16 weight");
+    }
+    {
+        const auto path = dir.path / "fp8-block";
+        write_single_shard_model(path, {
+            { "module.weight", "F8_E4M3", { 128, 128 }, std::vector<uint8_t>(128 * 128) },
+            { "module.weight_scale_inv", "BF16", { 1, 1 }, std::vector<uint8_t>(2) },
+        });
+        write_text(path / "config.json", fp8_block_config);
+        const auto registry = llama_safetensors_registry::load(path);
+        llama_safetensors_quant_adapters adapters(path, registry);
+        const auto weight = adapters.bind("module", llama_safetensors_quant_role::WEIGHT);
+        const auto scale  = adapters.bind("module", llama_safetensors_quant_role::WEIGHT_SCALE);
+        require(weight.has_value() && scale.has_value() && scale->target_type == GGML_TYPE_F32 &&
+                    scale->materialization == llama_safetensors_quant_materialization::FP8_BLOCK_SCALE,
+                "FP8 block binding is wrong");
+        adapters.consume(*weight);
+        adapters.consume(*scale);
+        adapters.validate_complete();
+        require(adapters.finalize(*scale, adapters.read(*scale)).size() == sizeof(float),
+                "FP8 block scale conversion has the wrong size");
+    }
+    {
+        const auto path = dir.path / "fp8-block-wrong-grid";
+        write_single_shard_model(path, {
+            { "module.weight", "F8_E4M3", { 128, 128 }, std::vector<uint8_t>(128 * 128) },
+            { "module.weight_scale_inv", "BF16", { 1, 2 }, std::vector<uint8_t>(4) },
+        });
+        write_text(path / "config.json", fp8_block_config);
+        const auto registry = llama_safetensors_registry::load(path);
+        require_rejected([&] { (void) llama_safetensors_quant_adapters(path, registry); },
+                         "FP8 block contract accepted the wrong scale grid");
+    }
+    {
+        const auto path = dir.path / "nvfp4";
+        write_single_shard_model(path, {
+            { "module.weight_packed", "U8", { 2, 32 }, std::vector<uint8_t>(64) },
+            { "module.weight_scale", "F8_E4M3", { 2, 4 }, std::vector<uint8_t>(8, 0x38) },
+            { "module.weight_global_scale", "F32", {}, f32_bytes(1.0f) },
+            { "module.input_global_scale", "F32", {}, f32_bytes(1.0f) },
+        });
+        write_text(path / "config.json", nvfp4_config);
+        const auto registry = llama_safetensors_registry::load(path);
+        llama_safetensors_quant_adapters adapters(path, registry);
+        const auto weight = adapters.bind("module", llama_safetensors_quant_role::WEIGHT);
+        const auto scale  = adapters.bind("module", llama_safetensors_quant_role::WEIGHT_SCALE);
+        const auto input  = adapters.bind("module", llama_safetensors_quant_role::INPUT_SCALE);
+        require(weight.has_value() && weight->target_type == GGML_TYPE_NVFP4 &&
+                    weight->target_shape == std::vector<int64_t>({ 64, 2 }) &&
+                    adapters.read(*weight).size() == 72,
+                "NVFP4 packed-weight binding or repack is wrong");
+        require(scale.has_value() && input.has_value(), "NVFP4 global scale binding is incomplete");
+        adapters.consume(*weight);
+        adapters.consume(*scale);
+        adapters.consume(*input);
+        adapters.validate_complete();
+    }
+    {
+        const auto path = dir.path / "nvfp4-zero-point";
+        write_single_shard_model(path, {
+            { "module.weight_packed", "U8", { 2, 32 }, std::vector<uint8_t>(64) },
+            { "module.weight_scale", "F8_E4M3", { 2, 4 }, std::vector<uint8_t>(8, 0x38) },
+            { "module.weight_global_scale", "F32", {}, f32_bytes(1.0f) },
+            { "module.input_global_scale", "F32", {}, f32_bytes(1.0f) },
+            { "module.weight_zero_point", "U8", { 1 }, std::vector<uint8_t>(1) },
+        });
+        write_text(path / "config.json", nvfp4_config);
+        const auto registry = llama_safetensors_registry::load(path);
+        require_rejected([&] { (void) llama_safetensors_quant_adapters(path, registry); },
+                         "NVFP4 contract accepted a zero point");
+    }
+    {
+        const auto path = dir.path / "nvfp4-invalid-global-scale";
+        write_single_shard_model(path, {
+            { "module.weight_packed", "U8", { 2, 32 }, std::vector<uint8_t>(64) },
+            { "module.weight_scale", "F8_E4M3", { 2, 4 }, std::vector<uint8_t>(8, 0x38) },
+            { "module.weight_global_scale", "F32", {}, f32_bytes(0.0f) },
+            { "module.input_global_scale", "F32", {}, f32_bytes(1.0f) },
+        });
+        write_text(path / "config.json", nvfp4_config);
+        const auto registry = llama_safetensors_registry::load(path);
+        require_rejected([&] { (void) llama_safetensors_quant_adapters(path, registry); },
+                         "NVFP4 contract accepted a non-positive global scale");
+    }
 
     const std::string shard_a_header =
         R"({"a":{"dtype":"BF16","shape":[2],"data_offsets":[0,4]},"packed":{"dtype":"U8","shape":[2],"data_offsets":[4,6]}})";

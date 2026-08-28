@@ -4100,6 +4100,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+
     }
 
     // Staged DFlash decodes answer every eval-callback ask with "no" (hiddens are

@@ -1,4 +1,5 @@
 #include "gated_delta_net.cuh"
+#include "gated_delta_net_fla_ptx.cuh"
 #include "ggml-cuda/common.cuh"
 
 // RDNA3 wants 1 block/SM here: with 2 blocks/SM the compiler is forced under
@@ -282,8 +283,8 @@ static void ggml_cuda_op_gated_delta_net_impl(
 
     // strides in floats (beta strides used for both g and beta offset computation)
     const int64_t sq1 = nbq1 / sizeof(float);
-    const int64_t sq2 = nbq2 / sizeof(float);
-    const int64_t sq3 = nbq3 / sizeof(float);
+    int64_t sq2 = nbq2 / sizeof(float);
+    int64_t sq3 = nbq3 / sizeof(float);
     const int64_t sv1 = nbv1 / sizeof(float);
     const int64_t sv2 = nbv2 / sizeof(float);
     const int64_t sv3 = nbv3 / sizeof(float);
@@ -305,6 +306,16 @@ static void ggml_cuda_op_gated_delta_net_impl(
     if (cache != nullptr) {
         state_d           = cache->data;
         state_slot_stride = cache->slot_stride;
+    }
+
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (ggml_cuda_gdn_fla_ptx_supported(cc, kda, keep_rs, S_v, H, neqk1, n_tokens, n_seqs)) {
+        ggml_cuda_gdn_fla_ptx(ctx, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+                              sq1, sq2, sq3, sv1, sv2, sv3,
+                              cache != nullptr ? cache->rms_weight : nullptr,
+                              cache != nullptr ? cache->rms_output : nullptr,
+                              cache != nullptr ? cache->rms_eps : 0.0f);
+        return;
     }
 
     if (kda) {

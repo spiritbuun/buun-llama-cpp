@@ -4,6 +4,93 @@
 #include "mmvf.cuh"
 #include "convert.cuh"
 
+template <int block_size>
+static __global__ void qwen35_recurrent_gates_bf16(
+        const nv_bfloat16 * alpha_weight, const nv_bfloat16 * beta_weight,
+        const float * input, const float * dt, const float * a,
+        float * gate, float * beta, int ncols) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    const nv_bfloat162 * alpha2 = reinterpret_cast<const nv_bfloat162 *>(alpha_weight + row*ncols);
+    const nv_bfloat162 * beta2  = reinterpret_cast<const nv_bfloat162 *>(beta_weight  + row*ncols);
+    const float2 * input2 = reinterpret_cast<const float2 *>(input);
+
+    float alpha_sum = 0.0f;
+    float beta_sum  = 0.0f;
+    for (int col2 = tid; col2 < ncols/2; col2 += block_size) {
+        const float2 x = input2[col2];
+        const nv_bfloat162 aw = alpha2[col2];
+        const nv_bfloat162 bw = beta2[col2];
+        ggml_cuda_mad(alpha_sum, aw.x, x.x);
+        ggml_cuda_mad(alpha_sum, aw.y, x.y);
+        ggml_cuda_mad(beta_sum,  bw.x, x.x);
+        ggml_cuda_mad(beta_sum,  bw.y, x.y);
+    }
+
+    alpha_sum = warp_reduce_sum<warp_size>(alpha_sum);
+    beta_sum  = warp_reduce_sum<warp_size>(beta_sum);
+
+    __shared__ float warp_alpha[warp_size];
+    __shared__ float warp_beta[warp_size];
+    if (tid < warp_size) {
+        warp_alpha[tid] = 0.0f;
+        warp_beta[tid]  = 0.0f;
+    }
+    __syncthreads();
+    // The XOR warp reduction returns a mathematically complete sum in every
+    // lane, but floating-point association differs by lane. Letting all lanes
+    // race on one shared slot therefore made the selected value scheduling-
+    // dependent. Publish exactly one result per warp.
+    if (tid % warp_size == 0) {
+        warp_alpha[tid/warp_size] = alpha_sum;
+        warp_beta[tid/warp_size]  = beta_sum;
+    }
+    __syncthreads();
+
+    if (tid < warp_size) {
+        alpha_sum = warp_reduce_sum<warp_size>(warp_alpha[tid]);
+        beta_sum  = warp_reduce_sum<warp_size>(warp_beta[tid]);
+    }
+    if (tid == 0) {
+        const float alpha_biased = alpha_sum + dt[row];
+        const float alpha_softplus = alpha_biased > 20.0f
+            ? alpha_biased : logf(1.0f + expf(alpha_biased));
+        gate[row] = alpha_softplus * a[row];
+        beta[row] = 1.0f / (1.0f + expf(-beta_sum));
+    }
+}
+
+void ggml_cuda_op_qwen35_recurrent_gates(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * alpha_weight, const ggml_tensor * beta_weight,
+        const ggml_tensor * input, const ggml_tensor * dt, const ggml_tensor * a,
+        ggml_tensor * gate, ggml_tensor * beta) {
+    GGML_ASSERT(alpha_weight->type == GGML_TYPE_BF16 && beta_weight->type == GGML_TYPE_BF16);
+    GGML_ASSERT(input->type == GGML_TYPE_F32 && dt->type == GGML_TYPE_F32 && a->type == GGML_TYPE_F32);
+    GGML_ASSERT(gate->type == GGML_TYPE_F32 && beta->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(alpha_weight) && ggml_is_contiguous(beta_weight));
+    GGML_ASSERT(ggml_is_contiguous(input) && ggml_is_contiguous(dt) && ggml_is_contiguous(a));
+    GGML_ASSERT(ggml_is_contiguous(gate) && ggml_is_contiguous(beta));
+    GGML_ASSERT(alpha_weight->ne[0] == beta_weight->ne[0] && alpha_weight->ne[1] == beta_weight->ne[1]);
+    GGML_ASSERT(input->ne[0] == alpha_weight->ne[0] && input->ne[1] == 1);
+    GGML_ASSERT(ggml_nelements(dt) == alpha_weight->ne[1] && ggml_nelements(a) == alpha_weight->ne[1]);
+    GGML_ASSERT(ggml_nelements(gate) == alpha_weight->ne[1] && ggml_nelements(beta) == alpha_weight->ne[1]);
+    GGML_ASSERT(alpha_weight->ne[0] % 2 == 0);
+
+    constexpr int block_size = 256;
+    qwen35_recurrent_gates_bf16<block_size><<<alpha_weight->ne[1], block_size, 0, ctx.stream()>>>(
+        static_cast<const nv_bfloat16 *>(alpha_weight->data),
+        static_cast<const nv_bfloat16 *>(beta_weight->data),
+        static_cast<const float *>(input->data),
+        static_cast<const float *>(dt->data),
+        static_cast<const float *>(a->data),
+        static_cast<float *>(gate->data),
+        static_cast<float *>(beta->data),
+        alpha_weight->ne[0]);
+}
+
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
 static __global__ void mul_mat_vec_f(
         const T * x_ptr, const float * y_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,

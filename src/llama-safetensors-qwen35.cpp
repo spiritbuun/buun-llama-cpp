@@ -1,4 +1,5 @@
 #include "llama-safetensors-qwen35.h"
+#include "llama.h"
 
 #include "nlohmann/json.hpp"
 
@@ -12,7 +13,6 @@
 #include <regex>
 #include <stdexcept>
 #include <string_view>
-#include <unordered_set>
 
 namespace {
 
@@ -21,14 +21,12 @@ using json = nlohmann::json;
 enum class transform_kind {
     NONE,
     QWEN_LINEAR,
-    NVFP4,
-    RECIPROCAL_F32,
 };
 
 struct source_spec {
     std::string    name;
-    std::string    auxiliary;
     transform_kind transform = transform_kind::NONE;
+    std::optional<llama_safetensors_quant_binding> quant;
 };
 
 bool ends_with(std::string_view value, std::string_view suffix) {
@@ -101,10 +99,22 @@ std::string layer_source_prefix(int layer) {
     if (layer == 64) {
         return "mtp.layers.0.";
     }
-    throw std::runtime_error("native Qwen3.5 P0 does not support layer " + std::to_string(layer));
+    throw std::runtime_error("native Qwen3.5 importer does not support layer " + std::to_string(layer));
 }
 
-source_spec map_mlp(const llama_safetensors_registry & registry,
+source_spec quantized_or_plain(
+                    const llama_safetensors_quant_adapters & quant,
+                    const std::string & module,
+                    llama_safetensors_quant_role role,
+                    transform_kind transform,
+                    const std::string & plain_name) {
+    if (auto binding = quant.bind(module, role)) {
+        return { binding->primary, transform, std::move(binding) };
+    }
+    return { plain_name, transform, std::nullopt };
+}
+
+source_spec map_mlp(const llama_safetensors_quant_adapters & quant,
                     const std::string &                prefix,
                     std::string_view                   target_suffix,
                     std::string_view                   target_proj,
@@ -114,37 +124,46 @@ source_spec map_mlp(const llama_safetensors_registry & registry,
     const std::string rest(target_suffix.substr(target_base.size()));
 
     if (rest == ".weight") {
-        const std::string packed = source_base + ".weight_packed";
-        if (registry.find(packed) != nullptr) {
-            return { packed, source_base + ".weight_scale", transform_kind::NVFP4 };
-        }
-        return { source_base + ".weight", {}, transform_kind::NONE };
+        return quantized_or_plain(
+            quant, source_base, llama_safetensors_quant_role::WEIGHT,
+            transform_kind::NONE, source_base + ".weight");
     }
     if (rest == ".scale") {
-        const std::string global = source_base + ".weight_global_scale";
-        if (registry.find(global) != nullptr) {
-            return { global, {}, transform_kind::RECIPROCAL_F32 };
-        }
-        return { source_base + ".weight_scale", {}, transform_kind::QWEN_LINEAR };
+        return quantized_or_plain(
+            quant, source_base, llama_safetensors_quant_role::WEIGHT_SCALE,
+            transform_kind::QWEN_LINEAR, source_base + ".weight_scale");
     }
     if (rest == ".input_scale") {
-        return { source_base + ".input_global_scale", {}, transform_kind::RECIPROCAL_F32 };
+        return quantized_or_plain(
+            quant, source_base, llama_safetensors_quant_role::INPUT_SCALE,
+            transform_kind::NONE, source_base + ".input_global_scale");
     }
     throw std::runtime_error("unsupported MLP target suffix '" + std::string(target_suffix) + "'");
 }
 
-source_spec map_target(const llama_safetensors_registry & registry, const std::string & target_name) {
+source_spec map_target(
+        const llama_safetensors_quant_adapters & quant,
+        const std::string & target_name) {
     if (target_name == "token_embd.weight") {
-        return { "model.language_model.embed_tokens.weight", {}, transform_kind::NONE };
+        return { "model.language_model.embed_tokens.weight", transform_kind::NONE, std::nullopt };
     }
     if (target_name == "output_norm.weight") {
-        return { "model.language_model.norm.weight", {}, transform_kind::NONE };
+        return { "model.language_model.norm.weight", transform_kind::NONE, std::nullopt };
     }
     if (target_name == "output.weight") {
-        return { "lm_head.weight", {}, transform_kind::QWEN_LINEAR };
+        return quantized_or_plain(
+            quant, "lm_head", llama_safetensors_quant_role::WEIGHT,
+            transform_kind::QWEN_LINEAR, "lm_head.weight");
     }
     if (target_name == "output.scale") {
-        return { "lm_head.weight_scale", {}, transform_kind::QWEN_LINEAR };
+        return quantized_or_plain(
+            quant, "lm_head", llama_safetensors_quant_role::WEIGHT_SCALE,
+            transform_kind::QWEN_LINEAR, "lm_head.weight_scale");
+    }
+    if (target_name == "output.input_scale") {
+        return quantized_or_plain(
+            quant, "lm_head", llama_safetensors_quant_role::INPUT_SCALE,
+            transform_kind::NONE, "lm_head.input_global_scale");
     }
 
     static const std::regex layer_pattern(R"(^blk\.([0-9]+)\.(.+)$)");
@@ -157,13 +176,13 @@ source_spec map_target(const llama_safetensors_registry & registry, const std::s
     const std::string prefix = layer_source_prefix(layer);
 
     if (suffix.rfind("ffn_down", 0) == 0) {
-        return map_mlp(registry, prefix, suffix, "down", "down_proj");
+        return map_mlp(quant, prefix, suffix, "down", "down_proj");
     }
     if (suffix.rfind("ffn_gate", 0) == 0) {
-        return map_mlp(registry, prefix, suffix, "gate", "gate_proj");
+        return map_mlp(quant, prefix, suffix, "gate", "gate_proj");
     }
     if (suffix.rfind("ffn_up", 0) == 0) {
-        return map_mlp(registry, prefix, suffix, "up", "up_proj");
+        return map_mlp(quant, prefix, suffix, "up", "up_proj");
     }
 
     const std::array<std::pair<std::string_view, std::string_view>, 18> ordinary = {
@@ -190,11 +209,24 @@ source_spec map_target(const llama_safetensors_registry & registry, const std::s
     };
     for (const auto & [target, source] : ordinary) {
         if (suffix == target) {
-            const std::string    source_name = prefix + std::string(source);
-            const transform_kind transform   = source_name.find("linear_attn.") != std::string::npos ?
-                                                   transform_kind::QWEN_LINEAR :
-                                                   transform_kind::NONE;
-            return { source_name, {}, transform };
+            const std::string source_name = prefix + std::string(source);
+            const transform_kind transform = source_name.find("linear_attn.") != std::string::npos ?
+                transform_kind::QWEN_LINEAR : transform_kind::NONE;
+            if (ends_with(target, ".scale")) {
+                const std::string module = source_name.substr(
+                    0, source_name.size() - std::string_view(".weight_scale").size());
+                return quantized_or_plain(
+                    quant, module, llama_safetensors_quant_role::WEIGHT_SCALE,
+                    transform, source_name);
+            }
+            if (ends_with(target, ".weight")) {
+                const std::string module = source_name.substr(
+                    0, source_name.size() - std::string_view(".weight").size());
+                return quantized_or_plain(
+                    quant, module, llama_safetensors_quant_role::WEIGHT,
+                    transform, source_name);
+            }
+            return { source_name, transform, std::nullopt };
         }
     }
 
@@ -210,7 +242,22 @@ source_spec map_target(const llama_safetensors_registry & registry, const std::s
     };
     for (const auto & [target, source] : linear) {
         if (suffix == target) {
-            return { prefix + std::string(source), {}, transform_kind::QWEN_LINEAR };
+            const std::string source_name = prefix + std::string(source);
+            if (ends_with(target, ".scale")) {
+                const std::string module = source_name.substr(
+                    0, source_name.size() - std::string_view(".weight_scale").size());
+                return quantized_or_plain(
+                    quant, module, llama_safetensors_quant_role::WEIGHT_SCALE,
+                    transform_kind::QWEN_LINEAR, source_name);
+            }
+            if (ends_with(target, ".weight")) {
+                const std::string module = source_name.substr(
+                    0, source_name.size() - std::string_view(".weight").size());
+                return quantized_or_plain(
+                    quant, module, llama_safetensors_quant_role::WEIGHT,
+                    transform_kind::QWEN_LINEAR, source_name);
+            }
+            return { source_name, transform_kind::QWEN_LINEAR, std::nullopt };
         }
     }
 
@@ -225,7 +272,7 @@ source_spec map_target(const llama_safetensors_registry & registry, const std::s
         };
         for (const auto & [target, source] : mtp) {
             if (suffix == target) {
-                return { std::string(source), {}, transform_kind::NONE };
+                return { std::string(source), transform_kind::NONE, std::nullopt };
             }
         }
     }
@@ -233,93 +280,21 @@ source_spec map_target(const llama_safetensors_registry & registry, const std::s
     throw std::runtime_error("unsupported Qwen3.5 target tensor '" + target_name + "'");
 }
 
-std::vector<std::string> qwen35_target_names(const llama_safetensors_registry & registry) {
-    std::vector<std::string> names = {
-        "token_embd.weight",
-        "output_norm.weight",
-        "output.weight",
-        "output.scale",
-    };
-    const auto add_mlp = [&](int layer, const char * target, const char * source) {
-        const std::string target_base = "blk." + std::to_string(layer) + ".ffn_" + target;
-        const std::string source_base = layer_source_prefix(layer) + "mlp." + source;
-        names.push_back(target_base + ".weight");
-        if (registry.find(source_base + ".weight_packed") != nullptr) {
-            names.push_back(target_base + ".scale");
-            names.push_back(target_base + ".input_scale");
-        } else if (registry.find(source_base + ".weight_scale") != nullptr) {
-            names.push_back(target_base + ".scale");
-        }
-    };
-
-    for (int layer = 0; layer < 64; ++layer) {
-        const std::string base = "blk." + std::to_string(layer) + ".";
-        names.push_back(base + "attn_norm.weight");
-        names.push_back(base + "post_attention_norm.weight");
-        if (layer % 4 == 3) {
-            for (const char * projection : { "q", "k", "v" }) {
-                names.push_back(base + "attn_" + projection + ".weight");
-                names.push_back(base + "attn_" + projection + ".scale");
-            }
-            names.push_back(base + "attn_output.weight");
-            names.push_back(base + "attn_output.scale");
-            names.push_back(base + "attn_q_norm.weight");
-            names.push_back(base + "attn_k_norm.weight");
-        } else {
-            names.push_back(base + "attn_gate.weight");
-            names.push_back(base + "attn_gate.scale");
-            names.push_back(base + "attn_qkv.weight");
-            names.push_back(base + "attn_qkv.scale");
-            names.push_back(base + "ssm_a");
-            names.push_back(base + "ssm_alpha.weight");
-            names.push_back(base + "ssm_beta.weight");
-            names.push_back(base + "ssm_conv1d.weight");
-            names.push_back(base + "ssm_dt.bias");
-            names.push_back(base + "ssm_norm.weight");
-            names.push_back(base + "ssm_out.weight");
-            names.push_back(base + "ssm_out.scale");
-        }
-        add_mlp(layer, "down", "down_proj");
-        add_mlp(layer, "gate", "gate_proj");
-        add_mlp(layer, "up", "up_proj");
-    }
-
-    const std::string mtp = "blk.64.";
-    names.insert(names.end(), {
-                                  mtp + "attn_norm.weight",
-                                  mtp + "post_attention_norm.weight",
-                                  mtp + "attn_q.weight",
-                                  mtp + "attn_k.weight",
-                                  mtp + "attn_v.weight",
-                                  mtp + "attn_output.weight",
-                                  mtp + "attn_q_norm.weight",
-                                  mtp + "attn_k_norm.weight",
-                              });
-    add_mlp(64, "down", "down_proj");
-    add_mlp(64, "gate", "gate_proj");
-    add_mlp(64, "up", "up_proj");
-    names.insert(names.end(), {
-                                  mtp + "nextn.eh_proj.weight",
-                                  mtp + "nextn.enorm.weight",
-                                  mtp + "nextn.hnorm.weight",
-                                  mtp + "nextn.shared_head_norm.weight",
-                              });
-    return names;
-}
-
-ggml_type target_type_for(const llama_safetensors_registry & registry, const std::string & target_name) {
-    const source_spec spec = map_target(registry, target_name);
-    if (spec.transform == transform_kind::NVFP4) {
-        return GGML_TYPE_NVFP4;
-    }
-    if (spec.transform == transform_kind::RECIPROCAL_F32) {
-        return GGML_TYPE_F32;
+ggml_type target_type_for(
+        const llama_safetensors_registry & registry,
+        const source_spec & spec,
+        const std::string & target_name) {
+    if (spec.quant) {
+        return spec.quant->target_type;
     }
     const llama_safetensors_tensor & source = require_tensor(registry, spec.name);
     switch (source.dtype) {
         case llama_safetensors_dtype::F8_E4M3:
             return GGML_TYPE_F8_E4M3;
         case llama_safetensors_dtype::BF16:
+            if (ends_with(source.name, ".weight_scale_inv")) {
+                return GGML_TYPE_F32;
+            }
             if (ends_with(target_name, ".scale") || target_name == "token_embd.weight" ||
                 (source.shape.size() >= 2 && target_name.find("ssm_conv1d.weight") == std::string::npos &&
                  !is_qwen_offset_norm(source.name))) {
@@ -333,21 +308,13 @@ ggml_type target_type_for(const llama_safetensors_registry & registry, const std
     }
 }
 
-std::vector<int64_t> target_shape_for(const llama_safetensors_registry & registry, const std::string & target_name) {
-    const source_spec                spec   = map_target(registry, target_name);
+std::vector<int64_t> target_shape_for(
+        const llama_safetensors_registry & registry,
+        const source_spec & spec,
+        const std::string & target_name) {
     const llama_safetensors_tensor & source = require_tensor(registry, spec.name);
-    if (spec.transform == transform_kind::NVFP4) {
-        if (source.shape.size() != 2) {
-            throw std::runtime_error("invalid packed NVFP4 rank for '" + target_name + "'");
-        }
-        if (source.shape[1] > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) / 2 ||
-            source.shape[0] > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
-            throw std::runtime_error("packed NVFP4 shape exceeds runtime limits for '" + target_name + "'");
-        }
-        return { static_cast<int64_t>(source.shape[1] * 2), static_cast<int64_t>(source.shape[0]) };
-    }
-    if (spec.transform == transform_kind::RECIPROCAL_F32) {
-        return { 1 };
+    if (spec.quant) {
+        return spec.quant->target_shape;
     }
     if (ends_with(target_name, ".scale")) {
         return { static_cast<int64_t>(source.shape[0]) };
@@ -524,19 +491,20 @@ std::vector<uint8_t> negate_exp_bf16_to_f32(const std::vector<uint8_t> & source)
 std::vector<uint8_t> apply_qwen_transform(const llama_safetensors_tensor & tensor, std::vector<uint8_t> source) {
     const std::string & name         = tensor.name;
     const size_t        element_size = dtype_size(tensor.dtype);
+    const bool          block_scale  = ends_with(name, ".weight_scale_inv");
     if (tensor.shape.empty()) {
         return source;
     }
 
     if (name.find(".linear_attn.in_proj_qkv.") != std::string::npos) {
-        constexpr size_t qk_rows     = 2 * 16 * 128;
-        const auto       permutation = v_head_row_permutation(128);
+        const size_t qk_rows = block_scale ? 2 * 16 : 2 * 16 * 128;
+        const auto permutation = v_head_row_permutation(block_scale ? 1 : 128);
         const size_t     rows        = tensor.shape[0];
         const size_t     row_size    = source.size() / rows;
         return permute_rows(source, row_size, qk_rows, permutation);
     }
     if (name.find(".linear_attn.in_proj_z.") != std::string::npos) {
-        const auto permutation = v_head_row_permutation(128);
+        const auto permutation = v_head_row_permutation(block_scale ? 1 : 128);
         return permute_rows(source, source.size() / tensor.shape[0], 0, permutation);
     }
     if (name.find(".linear_attn.in_proj_a.") != std::string::npos ||
@@ -550,55 +518,16 @@ std::vector<uint8_t> apply_qwen_transform(const llama_safetensors_tensor & tenso
         const auto       permutation = v_head_row_permutation(128);
         return permute_rows(source, source.size() / tensor.shape[0], qk_rows, permutation);
     }
-    if (ends_with(name, ".linear_attn.out_proj.weight")) {
+    if (ends_with(name, ".linear_attn.out_proj.weight") ||
+        ends_with(name, ".linear_attn.out_proj.weight_scale_inv")) {
         if (tensor.shape.size() != 2) {
             throw std::runtime_error("unexpected linear-attention output projection rank");
         }
-        return permute_columns(source, tensor.shape[0], tensor.shape[1], element_size, v_head_row_permutation(128));
+        return permute_columns(
+            source, tensor.shape[0], tensor.shape[1], element_size,
+            v_head_row_permutation(block_scale ? 1 : 128));
     }
     return source;
-}
-
-std::vector<uint8_t> repack_nvfp4(const llama_safetensors_tensor & weight_desc,
-                                  const std::vector<uint8_t> &     weight,
-                                  const llama_safetensors_tensor & scale_desc,
-                                  const std::vector<uint8_t> &     scale) {
-    if (weight_desc.dtype != llama_safetensors_dtype::U8 || scale_desc.dtype != llama_safetensors_dtype::F8_E4M3 ||
-        weight_desc.shape.size() != 2 || scale_desc.shape.size() != 2) {
-        throw std::runtime_error("invalid NVFP4 source tensor contract");
-    }
-    const size_t rows        = weight_desc.shape[0];
-    const size_t packed_cols = weight_desc.shape[1];
-    const size_t blocks      = scale_desc.shape[1];
-    if (scale_desc.shape[0] != rows || packed_cols != blocks * 8 || blocks % 4 != 0 ||
-        weight.size() != rows * packed_cols || scale.size() != rows * blocks) {
-        throw std::runtime_error("inconsistent NVFP4 source tensor shapes");
-    }
-
-    std::vector<uint8_t> result(rows * (blocks / 4) * 36);
-    for (size_t row = 0; row < rows; ++row) {
-        for (size_t super = 0; super < blocks / 4; ++super) {
-            uint8_t * out = result.data() + (row * (blocks / 4) + super) * 36;
-            for (size_t block = 0; block < 4; ++block) {
-                const size_t block_index = 4 * super + block;
-                const uint8_t scale_byte = scale[row * blocks + block_index];
-                if ((scale_byte & 0x80) != 0 || scale_byte == 0x7f) {
-                    throw std::runtime_error("NVFP4 block scale is not a non-negative finite E4M3 value");
-                }
-                out[block] = scale_byte;
-                const uint8_t * in       = weight.data() + row * packed_cols + block_index * 8;
-                uint8_t         values[16];
-                for (size_t i = 0; i < 8; ++i) {
-                    values[2 * i + 0] = in[i] & 0x0f;
-                    values[2 * i + 1] = in[i] >> 4;
-                }
-                for (size_t i = 0; i < 8; ++i) {
-                    out[4 + block * 8 + i] = values[i] | (values[i + 8] << 4);
-                }
-            }
-        }
-    }
-    return result;
 }
 
 std::vector<uint8_t> bf16_to_f32(const std::vector<uint8_t> & source) {
@@ -626,71 +555,18 @@ std::vector<uint8_t> bf16_add_one_to_f32(const std::vector<uint8_t> & source) {
     return result;
 }
 
-void validate_p0_model_contract(const std::filesystem::path & model_dir, const llama_safetensors_registry & registry) {
+void validate_model_contract(const std::filesystem::path & model_dir) {
     const json root = read_json(model_dir / "config.json");
     if (root.value("model_type", std::string()) != "qwen3_5") {
-        throw std::runtime_error("native safetensors P0 supports only model_type 'qwen3_5'");
+        throw std::runtime_error("native Qwen3.5 importer requires model_type 'qwen3_5'");
     }
     const json & text = root.at("text_config");
     if (text.value("model_type", std::string()) != "qwen3_5_text" || text.value("num_hidden_layers", 0U) != 64 ||
         text.value("linear_num_key_heads", 0U) != 16 || text.value("linear_num_value_heads", 0U) != 48 ||
         text.value("linear_value_head_dim", 0U) != 128) {
-        throw std::runtime_error("native safetensors P0 does not support this Qwen3.5 tensor geometry");
+        throw std::runtime_error("native Qwen3.5 importer does not support this tensor geometry");
     }
 
-    const llama_safetensors_quant_config quant   = llama_safetensors_quant_config::load(model_dir);
-    size_t                               n_nvfp4 = 0;
-    size_t                               n_fp8   = 0;
-    for (const llama_safetensors_tensor & tensor : registry.tensors()) {
-        for (uint64_t dim : tensor.shape) {
-            if (dim == 0 || dim > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
-                throw std::runtime_error("unsupported dimension in source tensor '" + tensor.name + "'");
-            }
-        }
-        if (ends_with(tensor.name, ".weight_zero_point") || ends_with(tensor.name, ".zero_point")) {
-            throw std::runtime_error("native safetensors P0 does not support zero-point tensor '" + tensor.name + "'");
-        }
-
-        std::string                    module;
-        llama_safetensors_quant_format expected;
-        if (ends_with(tensor.name, ".weight_packed")) {
-            module   = tensor.name.substr(0, tensor.name.size() - std::string_view(".weight_packed").size());
-            expected = llama_safetensors_quant_format::NVFP4_PACK;
-            ++n_nvfp4;
-        } else if (tensor.dtype == llama_safetensors_dtype::F8_E4M3 && ends_with(tensor.name, ".weight")) {
-            module   = tensor.name.substr(0, tensor.name.size() - std::string_view(".weight").size());
-            expected = llama_safetensors_quant_format::FP8_CHANNEL;
-            ++n_fp8;
-        } else {
-            continue;
-        }
-
-        const llama_safetensors_quant_group * group = quant.match(module);
-        if (group == nullptr || group->format != expected) {
-            throw std::runtime_error("compressed-tensors contract does not match source tensor '" + tensor.name + "'");
-        }
-
-        if (expected == llama_safetensors_quant_format::FP8_CHANNEL) {
-            const std::string scale_name = module + ".weight_scale";
-            const auto &      scale      = require_tensor(registry, scale_name);
-            if (tensor.shape.size() != 2 || scale.dtype != llama_safetensors_dtype::BF16 || scale.shape.empty() ||
-                scale.shape.size() > 2 || scale.shape[0] != tensor.shape[0] ||
-                (scale.shape.size() == 2 && scale.shape[1] != 1)) {
-                throw std::runtime_error("invalid channel-scale contract for source tensor '" + tensor.name + "'");
-            }
-        } else {
-            const std::string scale_name = module + ".weight_scale";
-            const auto &      scale      = require_tensor(registry, scale_name);
-            if (tensor.shape.size() != 2 || scale.dtype != llama_safetensors_dtype::F8_E4M3 ||
-                scale.shape.size() != 2 || scale.shape[0] != tensor.shape[0] ||
-                tensor.shape[1] % 8 != 0 || tensor.shape[1] / 8 != scale.shape[1] || scale.shape[1] % 4 != 0) {
-                throw std::runtime_error("invalid packed NVFP4 scale contract for source tensor '" + tensor.name + "'");
-            }
-        }
-    }
-    if (n_nvfp4 == 0 || n_fp8 == 0) {
-        throw std::runtime_error("native safetensors P0 requires both packed NVFP4 and channel-scaled E4M3 weights");
-    }
 }
 
 }  // namespace
@@ -698,7 +574,13 @@ void validate_p0_model_contract(const std::filesystem::path & model_dir, const l
 llama_safetensors_qwen35_importer::llama_safetensors_qwen35_importer(const std::filesystem::path & model_dir) :
     model_dir_(model_dir),
     registry_(llama_safetensors_registry::load(model_dir)) {
-    validate_p0_model_contract(model_dir_, registry_);
+    validate_model_contract(model_dir_);
+    quant_ = std::make_unique<llama_safetensors_quant_adapters>(model_dir_, registry_);
+}
+
+bool llama_safetensors_qwen35_importer::probe(const std::filesystem::path & model_dir) {
+    const json root = read_json(model_dir / "config.json");
+    return root.value("model_type", std::string()) == "qwen3_5";
 }
 
 gguf_context * llama_safetensors_qwen35_importer::build_metadata() const {
@@ -715,8 +597,13 @@ gguf_context * llama_safetensors_qwen35_importer::build_metadata() const {
     try {
         gguf_set_val_str(metadata, "general.architecture", "qwen35");
         gguf_set_val_str(metadata, "general.type", "model");
-        gguf_set_val_str(metadata, "general.name", "Qwen3.6 27B NVFP4 Safetensors");
-        gguf_set_val_u32(metadata, "general.file_type", 39);
+        const std::string source_name = model_dir_.filename().empty() ?
+            "Qwen3.5 Safetensors" : model_dir_.filename().string();
+        gguf_set_val_str(metadata, "general.name", source_name.c_str());
+        const llama_safetensors_quant_summary & quant_summary = quant_->summary();
+        gguf_set_val_u32(
+            metadata, "general.file_type",
+            quant_summary.nvfp4 != 0 ? LLAMA_FTYPE_MOSTLY_NVFP4 : LLAMA_FTYPE_MOSTLY_F8_E4M3);
         gguf_set_val_u32(metadata, "general.quantization_version", 2);
         gguf_set_val_i32(metadata, "general.sampling.top_k", generation.value("top_k", 20));
         gguf_set_val_f32(metadata, "general.sampling.top_p", generation.value("top_p", 0.95f));
@@ -826,33 +713,6 @@ gguf_context * llama_safetensors_qwen35_importer::build_metadata() const {
             gguf_set_val_str(metadata, "tokenizer.chat_template", read_text(chat_template).c_str());
         }
 
-        const std::vector<std::string> target_names  = qwen35_target_names(registry_);
-        std::unordered_set<std::string> unique_names;
-        unique_names.reserve(target_names.size());
-        for (const std::string & name : target_names) {
-            if (!unique_names.insert(name).second) {
-                throw std::runtime_error("duplicate native target tensor '" + name + "'");
-            }
-            (void) map_target(registry_, name);
-        }
-        const size_t                   context_size  = ggml_tensor_overhead() * (target_names.size() + 1);
-        ggml_init_params               tensor_params = {
-            /*.mem_size   = */ context_size,
-            /*.mem_buffer = */ nullptr,
-            /*.no_alloc   = */ true,
-        };
-        ggml_context * tensor_context = ggml_init(tensor_params);
-        if (tensor_context == nullptr) {
-            throw std::runtime_error("failed to allocate native tensor metadata context");
-        }
-        for (const std::string & name : target_names) {
-            const ggml_type            type   = target_type_for(registry_, name);
-            const std::vector<int64_t> shape  = target_shape_for(registry_, name);
-            ggml_tensor *              tensor = ggml_new_tensor(tensor_context, type, shape.size(), shape.data());
-            ggml_set_name(tensor, name.c_str());
-            gguf_add_tensor(metadata, tensor);
-        }
-        ggml_free(tensor_context);
         return metadata;
     } catch (...) {
         gguf_free(metadata);
@@ -860,50 +720,74 @@ gguf_context * llama_safetensors_qwen35_importer::build_metadata() const {
     }
 }
 
+bool llama_safetensors_qwen35_importer::describe(
+        const std::string & target_name,
+        ggml_type & type,
+        std::array<int64_t, GGML_MAX_DIMS> & ne) const {
+    source_spec spec;
+    try {
+        spec = map_target(*quant_, target_name);
+    } catch (const std::runtime_error &) {
+        return false;
+    }
+    if (registry_.find(spec.name) == nullptr) {
+        return false;
+    }
+
+    type = target_type_for(registry_, spec, target_name);
+    const std::vector<int64_t> shape = target_shape_for(registry_, spec, target_name);
+    if (shape.size() > GGML_MAX_DIMS) {
+        throw std::runtime_error("target tensor rank exceeds GGML_MAX_DIMS for '" + target_name + "'");
+    }
+    ne.fill(1);
+    std::copy(shape.begin(), shape.end(), ne.begin());
+    return true;
+}
+
+size_t llama_safetensors_qwen35_importer::tensor_capacity_hint() const {
+    // Transforms can expose more canonical tensors than physical source
+    // tensors (for example weight, weight scale, and input scale). Reserving
+    // twice the registry size keeps this a conservative allocation hint.
+    return std::max<size_t>(256, registry_.tensors().size() * 2);
+}
+
+void llama_safetensors_qwen35_importer::bind(const std::string & target_name) const {
+    const source_spec spec = map_target(*quant_, target_name);
+    if (spec.quant) {
+        quant_->consume(*spec.quant);
+    }
+}
+
+void llama_safetensors_qwen35_importer::validate_complete() const {
+    quant_->validate_complete();
+}
+
 std::vector<uint8_t> llama_safetensors_qwen35_importer::materialize(const std::string & target_name,
                                                                     ggml_type           target_type,
                                                                     size_t              target_size) const {
     try {
-        const source_spec                spec        = map_target(registry_, target_name);
+        const source_spec                spec        = map_target(*quant_, target_name);
         const llama_safetensors_tensor & source_desc = require_tensor(registry_, spec.name);
-        std::vector<uint8_t>             result;
+        std::vector<uint8_t> result = spec.quant ? quant_->read(*spec.quant) : registry_.read(source_desc);
 
-        if (spec.transform == transform_kind::NVFP4) {
-            const llama_safetensors_tensor & scale_desc = require_tensor(registry_, spec.auxiliary);
-            result = repack_nvfp4(source_desc, registry_.read(source_desc), scale_desc, registry_.read(scale_desc));
-        } else if (spec.transform == transform_kind::RECIPROCAL_F32) {
-            if (source_desc.dtype != llama_safetensors_dtype::F32 || source_desc.size != sizeof(float)) {
-                throw std::runtime_error("invalid global-scale tensor '" + source_desc.name + "'");
-            }
-            const std::vector<uint8_t> raw = registry_.read(source_desc);
-            float                      source;
-            std::memcpy(&source, raw.data(), sizeof(source));
-            if (!std::isfinite(source) || source <= 0.0f) {
-                throw std::runtime_error("global scale must be finite and positive in tensor '" +
-                                         source_desc.name + "'");
-            }
-            const float reciprocal = 1.0f / source;
-            result.resize(sizeof(reciprocal));
-            std::memcpy(result.data(), &reciprocal, sizeof(reciprocal));
-        } else {
-            result = registry_.read(source_desc);
-            if (is_qwen_offset_norm(source_desc.name) && source_desc.dtype == llama_safetensors_dtype::BF16 &&
-                target_type == GGML_TYPE_F32) {
-                result = bf16_add_one_to_f32(result);
-            } else if (ends_with(source_desc.name, ".linear_attn.A_log")) {
-                if (source_desc.dtype == llama_safetensors_dtype::BF16) {
-                    result = negate_exp_bf16_to_f32(result);
-                } else if (source_desc.dtype == llama_safetensors_dtype::F32) {
-                    result = negate_exp_f32(std::move(result));
-                } else {
-                    throw std::runtime_error("Qwen A_log has unsupported dtype");
-                }
-                result = permute_rows(result, sizeof(float), 0, v_head_row_permutation(1));
+        if (is_qwen_offset_norm(source_desc.name) && source_desc.dtype == llama_safetensors_dtype::BF16 &&
+            target_type == GGML_TYPE_F32) {
+            result = bf16_add_one_to_f32(result);
+        } else if (ends_with(source_desc.name, ".linear_attn.A_log")) {
+            if (source_desc.dtype == llama_safetensors_dtype::BF16) {
+                result = negate_exp_bf16_to_f32(result);
+            } else if (source_desc.dtype == llama_safetensors_dtype::F32) {
+                result = negate_exp_f32(std::move(result));
             } else {
-                result = apply_qwen_transform(source_desc, std::move(result));
-                if (target_type == GGML_TYPE_F32 && source_desc.dtype == llama_safetensors_dtype::BF16) {
-                    result = bf16_to_f32(result);
-                }
+                throw std::runtime_error("Qwen A_log has unsupported dtype");
+            }
+            result = permute_rows(result, sizeof(float), 0, v_head_row_permutation(1));
+        } else {
+            result = apply_qwen_transform(source_desc, std::move(result));
+            if (spec.quant) {
+                result = quant_->finalize(*spec.quant, std::move(result));
+            } else if (target_type == GGML_TYPE_F32 && source_desc.dtype == llama_safetensors_dtype::BF16) {
+                result = bf16_to_f32(result);
             }
         }
 

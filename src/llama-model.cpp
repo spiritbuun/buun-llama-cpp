@@ -1456,12 +1456,26 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         load_arch_tensors(ml);
 
         const auto load_weight_scale = [&](const LLM_TN_IMPL & scale_name, ggml_tensor * weight) {
+            const std::string scale_tensor_name = scale_name.str();
             const bool f8_channel = weight->type == GGML_TYPE_F8_E4M3;
+            ggml_type scale_type = GGML_TYPE_COUNT;
+            std::array<int64_t, GGML_MAX_DIMS> scale_ne{};
+            const bool has_scale = f8_channel && ml.get_tensor_info(scale_tensor_name.c_str(), scale_type, scale_ne);
+            const bool f8_block = has_scale && scale_type == GGML_TYPE_F32;
             ggml_tensor * scale = create_tensor(
-                scale_name, { f8_channel ? weight->ne[1] : 1 }, f8_channel ? 0 : TENSOR_NOT_REQUIRED);
-            if (f8_channel && scale->type != GGML_TYPE_BF16) {
+                scale_name,
+                f8_block ? std::initializer_list<int64_t>{ scale_ne[0], scale_ne[1] } :
+                           std::initializer_list<int64_t>{ f8_channel ? weight->ne[1] : 1 },
+                f8_channel ? 0 : TENSOR_NOT_REQUIRED);
+            if (f8_channel && !f8_block && scale->type != GGML_TYPE_BF16) {
                 throw std::runtime_error(format(
                     "channel scale '%s' for F8 weight '%s' must be BF16", scale->name, weight->name));
+            }
+            if (f8_block && (scale->type != GGML_TYPE_F32 || weight->ne[0] % 128 != 0 ||
+                             weight->ne[1] % 128 != 0 || scale->ne[0] != weight->ne[1] / 128 ||
+                             scale->ne[1] != weight->ne[0] / 128)) {
+                throw std::runtime_error(format(
+                    "block scale '%s' does not match the 128x128 F8 weight '%s'", scale->name, weight->name));
             }
             return scale;
         };
@@ -1469,10 +1483,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (weight == nullptr || weight->type != GGML_TYPE_F8_E4M3) {
                 return;
             }
-            if (scale == nullptr || scale->type != GGML_TYPE_BF16 || scale->ne[0] != weight->ne[1] ||
-                scale->ne[1] != 1 || scale->ne[2] != 1 || scale->ne[3] != 1) {
+            const bool channel = scale != nullptr && scale->type == GGML_TYPE_BF16 &&
+                                 scale->ne[0] == weight->ne[1] && scale->ne[1] == 1 &&
+                                 scale->ne[2] == 1 && scale->ne[3] == 1;
+            const bool block = scale != nullptr && scale->type == GGML_TYPE_F32 &&
+                               weight->ne[0] % 128 == 0 && weight->ne[1] % 128 == 0 &&
+                               scale->ne[0] == weight->ne[1] / 128 && scale->ne[1] == weight->ne[0] / 128 &&
+                               scale->ne[2] == 1 && scale->ne[3] == 1;
+            if (!channel && !block) {
                 throw std::runtime_error(format(
-                    "F8 weight '%s' requires a BF16 channel scale with %" PRId64 " values",
+                    "F8 weight '%s' requires either a BF16 channel scale with %" PRId64
+                    " values or a matching F32 128x128 block scale",
                     weight->name, weight->ne[1]));
             }
         };
@@ -1799,6 +1820,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             return false;
         }
     }
+    ml.validate_source_complete();
 
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {

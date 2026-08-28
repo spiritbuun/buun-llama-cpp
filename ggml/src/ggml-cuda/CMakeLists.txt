@@ -106,7 +106,15 @@ if (CUDAToolkit_FOUND)
     list(FILTER GGML_SOURCES_CUDA EXCLUDE REGEX "bsa_.*\\.cu$")
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
+    option(GGML_CUDA_TURBO_FA "Build Turbo flash-attention template instances" ON)
+    if (GGML_CUDA_TURBO_FA)
+        add_compile_definitions(GGML_CUDA_TURBO_FA)
+    endif()
+
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")
+    if (NOT GGML_CUDA_TURBO_FA)
+        list(FILTER SRCS EXCLUDE REGEX "/fattn-mma-turbo.*\\.cu$")
+    endif()
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/mmq*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
@@ -126,18 +134,60 @@ if (CUDAToolkit_FOUND)
         list(APPEND GGML_SOURCES_CUDA ${SRCS})
         file(GLOB   SRCS "template-instances/fattn-vec*bf16-bf16.cu")
         list(APPEND GGML_SOURCES_CUDA ${SRCS})
-        file(GLOB   SRCS "template-instances/fattn-vec*turbo2_0*.cu")
-        list(APPEND GGML_SOURCES_CUDA ${SRCS})
-        file(GLOB   SRCS "template-instances/fattn-vec*turbo3_0*.cu")
-        list(APPEND GGML_SOURCES_CUDA ${SRCS})
-        file(GLOB   SRCS "template-instances/fattn-vec*turbo4_0*.cu")
-        list(APPEND GGML_SOURCES_CUDA ${SRCS})
+        if (GGML_CUDA_TURBO_FA)
+            file(GLOB   SRCS "template-instances/fattn-vec*turbo2_0*.cu")
+            list(APPEND GGML_SOURCES_CUDA ${SRCS})
+            file(GLOB   SRCS "template-instances/fattn-vec*turbo3_0*.cu")
+            list(APPEND GGML_SOURCES_CUDA ${SRCS})
+            file(GLOB   SRCS "template-instances/fattn-vec*turbo4_0*.cu")
+            list(APPEND GGML_SOURCES_CUDA ${SRCS})
+        endif()
     endif()
 
     ggml_add_backend_library(ggml-cuda
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}
                             )
+
+    # vLLM's exact-shape FLA kernels are shipped as SM86 cubins. On ELF
+    # x86-64, wrap them in read-only relocatable objects so ggml-cuda remains
+    # self-contained and needs no Triton/Python cache at runtime. Other host
+    # platforms retain the portable GDN fallback.
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+            CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$" AND
+            CMAKE_LINKER AND CMAKE_OBJCOPY)
+        set(GGML_CUDA_GDN_FLA_CUBINS
+            chunk_local_cumsum_scalar_kernel
+            chunk_scaled_dot_kkt_fwd_kernel
+            merge_16x16_to_64x64_inverse_kernel
+            recompute_w_u_fwd_kernel
+            chunk_gated_delta_rule_fwd_kernel_h_blockdim64
+            chunk_fwd_kernel_o)
+        set(GGML_CUDA_GDN_FLA_OBJECTS "")
+        foreach(KERNEL IN LISTS GGML_CUDA_GDN_FLA_CUBINS)
+            set(CUBIN_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/gdn-fla-sm86/${KERNEL}.cubin")
+            set(CUBIN_OBJECT "${CMAKE_CURRENT_BINARY_DIR}/${KERNEL}.cubin.o")
+            add_custom_command(
+                OUTPUT "${CUBIN_OBJECT}"
+                COMMAND "${CMAKE_LINKER}" -r -b binary -o "${CUBIN_OBJECT}" "${KERNEL}.cubin"
+                COMMAND "${CMAKE_OBJCOPY}" --rename-section
+                        .data=.rodata,alloc,load,readonly,data,contents "${CUBIN_OBJECT}"
+                COMMAND "${CMAKE_OBJCOPY}" --add-section .note.GNU-stack=/dev/null
+                        --set-section-flags .note.GNU-stack=noload,readonly "${CUBIN_OBJECT}"
+                DEPENDS "${CUBIN_SOURCE}"
+                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/gdn-fla-sm86"
+                VERBATIM)
+            set_source_files_properties("${CUBIN_OBJECT}" PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+            list(APPEND GGML_CUDA_GDN_FLA_OBJECTS "${CUBIN_OBJECT}")
+        endforeach()
+        target_sources(ggml-cuda PRIVATE ${GGML_CUDA_GDN_FLA_OBJECTS})
+        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_GDN_FLA_EMBEDDED)
+    endif()
+
+    set_source_files_properties(humming-fp8.cu humming-fp8-block.cu humming-nvfp4.cu PROPERTIES
+        CUDA_ARCHITECTURES "80-virtual;86-real"
+        COMPILE_OPTIONS "--expt-relaxed-constexpr"
+        INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/humming-vendor/include")
 
     add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
 

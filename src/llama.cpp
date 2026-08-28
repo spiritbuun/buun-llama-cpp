@@ -7,6 +7,7 @@
 #include "llama-mmap.h"
 #include "llama-vocab.h"
 #include "llama-model-loader.h"
+#include "llama-model-source.h"
 #include "llama-model-saver.h"
 #include "llama-model.h"
 #include "llama-safetensors.h"
@@ -306,9 +307,10 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
 
 // Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
+        const llama_model_tensor_source * tensor_source,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
     try {
-        llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
+        llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, tensor_source, fname, splits, file, params.load_mode,
             params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
 
         ml.print_info();
@@ -348,8 +350,10 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             throw std::runtime_error("error loading model vocabulary: " + std::string(e.what()));
         }
 
-        model->load_stats(ml);
-        model->print_info();
+        if (tensor_source == nullptr || params.vocab_only) {
+            model->load_stats(ml);
+            model->print_info();
+        }
 
         if (params.vocab_only) {
             LLAMA_LOG_INFO("%s: vocab only - skipping tensors\n", __func__);
@@ -358,6 +362,12 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
 
         if (!model->load_tensors(ml)) {
             return {-2, nullptr};
+        }
+        if (tensor_source != nullptr) {
+            // Direct sources discover their authoritative tensor set while
+            // load_tensors() runs.
+            model->load_stats(ml);
+            model->print_info();
         }
 
         return {0, model_ptr.release()};
@@ -371,6 +381,7 @@ static struct llama_model * llama_model_load_from_file_impl(
         struct gguf_context * metadata,
         llama_model_set_tensor_data_t set_tensor_data,
         void * set_tensor_data_ud,
+        const llama_model_tensor_source * tensor_source,
         const std::string & path_model,
         std::vector<std::string> & splits,
         FILE * file,
@@ -415,7 +426,8 @@ static struct llama_model * llama_model_load_from_file_impl(
         };
     }
 
-    const auto [status, model] = llama_model_load(metadata, set_tensor_data, set_tensor_data_ud, path_model, splits, file, params);
+    const auto [status, model] = llama_model_load(
+        metadata, set_tensor_data, set_tensor_data_ud, tensor_source, path_model, splits, file, params);
     GGML_ASSERT(status <= 0);
     if (status < 0) {
         if (status == -1) {
@@ -447,7 +459,24 @@ struct llama_model * llama_model_init_from_user(
     std::vector<std::string> splits = {};
     params.load_mode = LLAMA_LOAD_MODE_NONE;
     params.use_extra_bufts = false;
-    return llama_model_load_from_file_impl(metadata, set_tensor_data, set_tensor_data_ud, path_model, splits, /*file*/ nullptr, params);
+    return llama_model_load_from_file_impl(
+        metadata, set_tensor_data, set_tensor_data_ud, /*tensor_source*/ nullptr,
+        path_model, splits, /*file*/ nullptr, params);
+}
+
+llama_model * llama_model_init_from_source(
+        gguf_context * metadata,
+        const llama_model_tensor_source * source,
+        llama_model_params params) {
+    GGML_ASSERT(metadata != nullptr);
+    GGML_ASSERT(source != nullptr);
+    std::string path_model;
+    std::vector<std::string> splits;
+    params.load_mode = LLAMA_LOAD_MODE_NONE;
+    params.use_extra_bufts = false;
+    return llama_model_load_from_file_impl(
+        metadata, /*set_tensor_data*/ nullptr, /*set_tensor_data_ud*/ nullptr, source,
+        path_model, splits, /*file*/ nullptr, params);
 }
 // deprecated
 struct llama_model * llama_load_model_from_file(
@@ -475,7 +504,9 @@ struct llama_model * llama_model_load_from_file(
         return nullptr;
     }
     std::vector<std::string> splits = {};
-    return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, path_model, splits, /*file*/ nullptr, params);
+    return llama_model_load_from_file_impl(
+        nullptr, nullptr, nullptr, /*tensor_source*/ nullptr,
+        path_model, splits, /*file*/ nullptr, params);
 }
 
 struct llama_model * llama_model_load_from_splits(
@@ -491,7 +522,9 @@ struct llama_model * llama_model_load_from_splits(
     for (size_t i = 0; i < n_paths; ++i) {
         splits.push_back(paths[i]);
     }
-    return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, splits.front(), splits, /*file*/ nullptr, params);
+    return llama_model_load_from_file_impl(
+        nullptr, nullptr, nullptr, /*tensor_source*/ nullptr,
+        splits.front(), splits, /*file*/ nullptr, params);
 }
 
 struct llama_model * llama_model_load_from_file_ptr(FILE * file, struct llama_model_params params) {
@@ -501,7 +534,9 @@ struct llama_model * llama_model_load_from_file_ptr(FILE * file, struct llama_mo
     }
     std::string path_model;
     std::vector<std::string> splits = {};
-    return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, path_model, splits, file, params);
+    return llama_model_load_from_file_impl(
+        nullptr, nullptr, nullptr, /*tensor_source*/ nullptr,
+        path_model, splits, file, params);
 }
 
 void llama_model_save_to_file(const struct llama_model * model, const char * path_model) {

@@ -52,6 +52,7 @@ struct llama_safetensors_tensor {
 enum class llama_safetensors_quant_format {
     NVFP4_PACK,
     FP8_CHANNEL,
+    FP8_BLOCK,
 };
 
 struct llama_safetensors_quant_group {
@@ -96,7 +97,6 @@ class llama_safetensors_registry {
 
     const llama_safetensors_tensor * find(const std::string & name) const;
     std::vector<uint8_t>             read(const llama_safetensors_tensor & tensor) const;
-    std::vector<uint8_t>             read(const std::string & name) const;
 
     const std::vector<llama_safetensors_shard> &  shards() const;
     const std::vector<llama_safetensors_tensor> & tensors() const;

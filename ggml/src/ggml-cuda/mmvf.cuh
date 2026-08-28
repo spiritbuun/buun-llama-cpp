@@ -12,3 +12,9 @@ void ggml_cuda_op_mul_mat_vec_f(
     const int64_t src1_padded_row_size, cudaStream_t stream);
 
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11);
+
+void ggml_cuda_op_qwen35_recurrent_gates(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * alpha_weight, const ggml_tensor * beta_weight,
+    const ggml_tensor * input, const ggml_tensor * dt, const ggml_tensor * a,
+    ggml_tensor * gate, ggml_tensor * beta);

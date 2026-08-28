@@ -2,29 +2,45 @@
 
 #include "ggml.h"
 #include "gguf.h"
+#include "llama-safetensors-importer.h"
 #include "llama-safetensors.h"
+#include "llama-safetensors-quant.h"
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <vector>
 
-// P0 importer for Qwen3.5 dense compressed-tensors checkpoints. It maps the
+// Importer for Qwen3.5 dense compressed-tensors checkpoints. It maps the
 // logical GGUF tensor names used by the runtime back to their safetensors
 // groups and materializes exactly one final tensor at a time.
-class llama_safetensors_qwen35_importer {
+class llama_safetensors_qwen35_importer final : public llama_safetensors_importer {
   public:
     explicit llama_safetensors_qwen35_importer(const std::filesystem::path & model_dir);
 
-    std::vector<uint8_t> materialize(const std::string & target_name, ggml_type target_type, size_t target_size) const;
+    static bool probe(const std::filesystem::path & model_dir);
 
-    // Builds the complete runtime metadata and tensor-type manifest directly
-    // from config/tokenizer JSON and the source tensor registry. The caller
-    // owns the returned GGUF context.
-    gguf_context * build_metadata() const;
+    std::vector<uint8_t> materialize(
+        const std::string & target_name, ggml_type target_type, size_t target_size) const override;
+
+    bool describe(
+        const std::string & target_name,
+        ggml_type & type,
+        std::array<int64_t, GGML_MAX_DIMS> & ne) const override;
+
+    size_t tensor_capacity_hint() const override;
+    void bind(const std::string & target_name) const override;
+    void validate_complete() const override;
+
+    // Builds model/tokenizer metadata only. Tensor descriptions are answered
+    // on demand through describe(); the caller owns the returned context.
+    gguf_context * build_metadata() const override;
 
   private:
     std::filesystem::path      model_dir_;
     llama_safetensors_registry registry_;
+    std::unique_ptr<llama_safetensors_quant_adapters> quant_;
 };

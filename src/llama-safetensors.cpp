@@ -266,11 +266,46 @@ llama_safetensors_quant_config llama_safetensors_quant_config::load(const std::f
     llama_safetensors_quant_config result;
     const json                     root  = read_json_file(model_dir / "config.json");
     const json                     quant = require_json_value(root, "quantization_config", "config.json");
-    if (require_json_value(quant, "quant_method", "quantization_config").get<std::string>() != "compressed-tensors") {
-        throw std::runtime_error("native safetensors P0 requires quant_method 'compressed-tensors'");
+    const std::string quant_method =
+        require_json_value(quant, "quant_method", "quantization_config").get<std::string>();
+
+    if (quant_method == "fp8") {
+        const json block = require_json_value(quant, "weight_block_size", "quantization_config");
+        if (require_json_value(quant, "fmt", "quantization_config").get<std::string>() != "e4m3" ||
+            require_json_value(quant, "activation_scheme", "quantization_config").get<std::string>() != "dynamic" ||
+            !block.is_array() || block.size() != 2 || block[0].get<uint32_t>() != 128 ||
+            block[1].get<uint32_t>() != 128) {
+            throw std::runtime_error("unsupported native FP8 quantization contract");
+        }
+
+        llama_safetensors_quant_group group;
+        group.name            = "fp8-block-128x128";
+        group.format          = llama_safetensors_quant_format::FP8_BLOCK;
+        group.group_size      = 128;
+        group.block_structure = { 128, 128 };
+        result.groups_.push_back(std::move(group));
+        result.rules_.push_back(make_rule("re:.*", 0));
+
+        if (quant.contains("modules_to_not_convert")) {
+            const json & ignored = quant.at("modules_to_not_convert");
+            if (!ignored.is_array()) {
+                throw std::runtime_error("quantization_config.modules_to_not_convert must be an array");
+            }
+            for (const auto & target : ignored) {
+                if (!target.is_string()) {
+                    throw std::runtime_error("non-string module in quantization_config.modules_to_not_convert");
+                }
+                result.ignore_.push_back(make_rule(target.get<std::string>(), 0));
+            }
+        }
+        return result;
+    }
+
+    if (quant_method != "compressed-tensors") {
+        throw std::runtime_error("native safetensors does not support quant_method '" + quant_method + "'");
     }
     if (require_json_value(quant, "format", "quantization_config").get<std::string>() != "mixed-precision") {
-        throw std::runtime_error("native safetensors P0 requires compressed-tensors format 'mixed-precision'");
+        throw std::runtime_error("native safetensors requires compressed-tensors format 'mixed-precision'");
     }
 
     const json config_groups = require_json_value(quant, "config_groups", "quantization_config");
@@ -512,14 +547,6 @@ std::vector<uint8_t> llama_safetensors_registry::read(const llama_safetensors_te
         throw std::runtime_error("failed to read safetensors tensor '" + tensor.name + "'");
     }
     return result;
-}
-
-std::vector<uint8_t> llama_safetensors_registry::read(const std::string & name) const {
-    const llama_safetensors_tensor * tensor = find(name);
-    if (tensor == nullptr) {
-        throw std::runtime_error("safetensors tensor not found: '" + name + "'");
-    }
-    return read(*tensor);
 }
 
 const std::vector<llama_safetensors_shard> & llama_safetensors_registry::shards() const {

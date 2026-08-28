@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstring>
 #include <future>
+#include <limits>
 #include <regex>
 
 static const size_t kiB = 1024;
@@ -173,6 +174,7 @@ const char * llama_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q8_0:      name = LLAMA_FTYPE_PREFIX "Q8_0"; break;
         case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: name = LLAMA_FTYPE_PREFIX "MXFP4 MoE"; break;
         case LLAMA_FTYPE_MOSTLY_NVFP4:     name = LLAMA_FTYPE_PREFIX "NVFP4"; break;
+        case LLAMA_FTYPE_MOSTLY_F8_E4M3:   name = LLAMA_FTYPE_PREFIX "F8_E4M3"; break;
         case LLAMA_FTYPE_MOSTLY_Q2_K:      name = LLAMA_FTYPE_PREFIX "Q2_K - Medium"; break;
         case LLAMA_FTYPE_MOSTLY_Q2_K_S:    name = LLAMA_FTYPE_PREFIX "Q2_K - Small"; break;
         case LLAMA_FTYPE_MOSTLY_Q3_K_S:    name = LLAMA_FTYPE_PREFIX "Q3_K - Small"; break;
@@ -647,6 +649,7 @@ llama_model_loader::llama_model_loader(
         struct gguf_context * meta,
         llama_model_set_tensor_data_t set_tensor_data,
         void * set_tensor_data_ud,
+        const llama_model_tensor_source * tensor_source,
         const std::string & fname,
         std::vector<std::string> & splits,
         FILE * file,
@@ -656,7 +659,8 @@ llama_model_loader::llama_model_loader(
         bool load_mtp,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
-        : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
+        : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud),
+          tensor_source(tensor_source) {
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
         trace = atoi(getenv("LLAMA_TRACE"));
@@ -820,6 +824,15 @@ llama_model_loader::llama_model_loader(
 
     n_kv      = gguf_get_n_kv(metadata);
     n_tensors = files.empty() ? gguf_get_n_tensors(metadata) : weights_map.size();
+    if (tensor_source != nullptr) {
+        const size_t hint = tensor_source->tensor_capacity_hint();
+        if (hint > static_cast<size_t>(std::numeric_limits<int>::max())) {
+            throw std::runtime_error("tensor source capacity exceeds runtime limits");
+        }
+        tensor_capacity = static_cast<int>(hint);
+    } else {
+        tensor_capacity = n_tensors;
+    }
     if (files.empty()) {
         for (int64_t i = 0; i < n_tensors; ++i) {
             const int64_t * ne = gguf_get_tensor_ne(metadata, i);
@@ -892,6 +905,7 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_IQ4_XS:  ftype = LLAMA_FTYPE_MOSTLY_IQ4_XS;  break;
             case GGML_TYPE_IQ3_S:   ftype = LLAMA_FTYPE_MOSTLY_IQ3_S;   break;
             case GGML_TYPE_NVFP4:   ftype = LLAMA_FTYPE_MOSTLY_NVFP4;   break;
+            case GGML_TYPE_F8_E4M3: ftype = LLAMA_FTYPE_MOSTLY_F8_E4M3; break;
             case GGML_TYPE_Q1_0:    ftype = LLAMA_FTYPE_MOSTLY_Q1_0;    break;
             case GGML_TYPE_Q2_0:        ftype = LLAMA_FTYPE_MOSTLY_Q2_0;    break;
             case GGML_TYPE_Q2_0_G128:   ftype = LLAMA_FTYPE_MOSTLY_Q2_0;    break;
@@ -1030,6 +1044,28 @@ struct ggml_tensor * llama_model_loader::get_tensor_meta(const char * name) cons
         return nullptr;
     }
     return weight->tensor;
+}
+
+bool llama_model_loader::get_tensor_info(
+        const char * name, ggml_type & type, std::array<int64_t, GGML_MAX_DIMS> & ne) const {
+    if (const llama_tensor_weight * weight = get_weight(name)) {
+        type = weight->tensor->type;
+        std::copy_n(weight->tensor->ne, GGML_MAX_DIMS, ne.begin());
+        return true;
+    }
+    if (!files.empty()) {
+        return false;
+    }
+    if (tensor_source != nullptr && tensor_source->describe(name, type, ne)) {
+        return true;
+    }
+    const int64_t tid = gguf_find_tensor(metadata, name);
+    if (tid < 0) {
+        return false;
+    }
+    type = gguf_get_tensor_type(metadata, tid);
+    std::copy_n(gguf_get_tensor_ne(metadata, tid), GGML_MAX_DIMS, ne.begin());
+    return true;
 }
 
 struct ggml_tensor * llama_model_loader::require_tensor_meta(const std::string & name) const {
@@ -1246,7 +1282,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             // one ggml context per buffer type
-            int max_n_tensors = n_tensors;
+            int max_n_tensors = tensor_capacity;
             max_n_tensors += 1;                   // duplicated output tensor
             max_n_tensors += hparams.n_layer()*2; // duplicated rope freq tensors
             const size_t ctx_size = ggml_tensor_overhead()*max_n_tensors;
@@ -1410,15 +1446,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         if (flags & TENSOR_SKIP_IF_VIRTUAL) {
             return nullptr;
         }
-        ggml_type type = GGML_TYPE_F32;
-        const int64_t tid = gguf_find_tensor(metadata, tn.str().c_str());
-        if (tid == -1) {
+        ggml_type type;
+        std::array<int64_t, GGML_MAX_DIMS> source_ne;
+        if (!get_tensor_info(tn.str().c_str(), type, source_ne)) {
             if (flags & TENSOR_NOT_REQUIRED) {
                 return nullptr;
             }
             throw std::runtime_error(format("missing tensor '%s'", tn.str().c_str()));
         }
-        type = gguf_get_tensor_type(metadata, tid);
 
         // Optional tensors can have architecture-dependent dimensions that
         // make them inapplicable for this model.
@@ -1430,18 +1465,17 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
-        const int64_t * metadata_ne = gguf_get_tensor_ne(metadata, tid);
         if (flags & TENSOR_ALLOW_RESHAPE) {
             int64_t expected_elements = 1;
             int64_t metadata_elements = 1;
             for (size_t dim = 0; dim < GGML_MAX_DIMS; ++dim) {
                 const int64_t expected = dim < ne.size() ? ne.begin()[dim] : 1;
-                if (expected <= 0 || metadata_ne[dim] <= 0 ||
-                    expected > INT64_MAX / expected_elements || metadata_ne[dim] > INT64_MAX / metadata_elements) {
+                if (expected <= 0 || source_ne[dim] <= 0 ||
+                    expected > INT64_MAX / expected_elements || source_ne[dim] > INT64_MAX / metadata_elements) {
                     throw std::runtime_error(format("invalid dimensions for tensor '%s'", tn.str().c_str()));
                 }
                 expected_elements *= expected;
-                metadata_elements *= metadata_ne[dim];
+                metadata_elements *= source_ne[dim];
             }
             if (expected_elements != metadata_elements) {
                 throw std::runtime_error(format("tensor '%s' has %" PRId64 " elements, expected %" PRId64,
@@ -1450,10 +1484,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         } else {
             for (size_t dim = 0; dim < GGML_MAX_DIMS; ++dim) {
                 const int64_t expected = dim < ne.size() ? ne.begin()[dim] : 1;
-                if (metadata_ne[dim] != expected) {
+                if (source_ne[dim] != expected) {
                     throw std::runtime_error(format(
                         "tensor '%s' has wrong shape; dimension %zu is %" PRId64 ", expected %" PRId64,
-                        tn.str().c_str(), dim, metadata_ne[dim], expected));
+                        tn.str().c_str(), dim, source_ne[dim], expected));
                 }
             }
         }
@@ -1487,8 +1521,15 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
         ggml_set_name(ret, tn.str().c_str());
+        if (tensor_source != nullptr) {
+            tensor_source->bind(tn.str());
+        }
         if (!(flags & TENSOR_DUPLICATED)) {
             n_created++;
+            if (tensor_source != nullptr) {
+                n_elements += ggml_nelements(ret);
+                n_bytes    += ggml_nbytes(ret);
+            }
         }
         size_data += ggml_nbytes(ret);
         return ret;
@@ -1550,15 +1591,17 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 }
 
 void llama_model_loader::done_getting_tensors(bool partial) const {
-    if (n_created > n_tensors) {
-        throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_created));
-    }
-    if (n_created < n_tensors) {
-        if (!partial) {
-            throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created));
+    if (tensor_source == nullptr) {
+        if (n_created > n_tensors) {
+            throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_created));
         }
-        LLAMA_LOG_INFO("%s: partial load — used %d of %d tensors in the file (rest belong to a sibling model on the same .gguf)\n",
-                __func__, n_created, n_tensors);
+        if (n_created < n_tensors) {
+            if (!partial) {
+                throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created));
+            }
+            LLAMA_LOG_INFO("%s: partial load — used %d of %d tensors in the file (rest belong to a sibling model on the same .gguf)\n",
+                    __func__, n_created, n_tensors);
+        }
     }
     if (n_tensors_moved > 0) {
         LLAMA_LOG_DEBUG("%s: tensor '%s' (%s) (and %zu others) cannot be used with preferred buffer type %s, using %s instead\n",
@@ -1653,7 +1696,11 @@ bool llama_model_loader::load_all_data(
                                    progress_callback_user_data)) {
                 return false;
             }
-            set_tensor_data(t, set_tensor_data_ud);
+            if (tensor_source != nullptr) {
+                tensor_source->load(t);
+            } else {
+                set_tensor_data(t, set_tensor_data_ud);
+            }
             size_done += ggml_nbytes(t);
         }
         if (size_done >= size_data) {
@@ -1931,6 +1978,12 @@ bool llama_model_loader::load_all_data(
     }
 
     return true;
+}
+
+void llama_model_loader::validate_source_complete() const {
+    if (tensor_source != nullptr) {
+        tensor_source->validate_complete();
+    }
 }
 
 std::string llama_model_loader::ftype_name() const {
