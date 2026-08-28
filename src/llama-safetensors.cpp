@@ -377,10 +377,10 @@ llama_safetensors_quant_config llama_safetensors_quant_config::from_json(const l
     const std::string container_format =
         require_json_value(quant, "format", "quantization_config").get<std::string>();
     if (container_format != "mixed-precision" && container_format != "float-quantized" &&
-        container_format != "int-quantized") {
+        container_format != "int-quantized" && container_format != "pack-quantized") {
         throw std::runtime_error(
             "native safetensors requires compressed-tensors format 'mixed-precision', 'float-quantized', or "
-            "'int-quantized'");
+            "'int-quantized', or 'pack-quantized'");
     }
 
     const json config_groups = require_json_value(quant, "config_groups", "quantization_config");
@@ -413,7 +413,33 @@ llama_safetensors_quant_config llama_safetensors_quant_config::from_json(const l
         llama_safetensors_quant_group group;
         group.name = name;
 
-        if (format == "nvfp4-pack-quantized") {
+        if (format == "pack-quantized") {
+            const uint32_t num_bits =
+                require_json_value(weights, "num_bits", "quantization group '" + name + "'").get<uint32_t>();
+            const std::string strategy =
+                require_json_value(weights, "strategy", "quantization group '" + name + "'").get<std::string>();
+            const uint32_t group_size =
+                require_json_value(weights, "group_size", "quantization group '" + name + "'").get<uint32_t>();
+            const std::string actorder =
+                require_json_value(weights, "actorder", "quantization group '" + name + "'").get<std::string>();
+            require_null(weights, "block_structure", "quantization group '" + name + "'");
+            require_null(weights, "scale_dtype", "quantization group '" + name + "'");
+            const std::string group_context = "quantization group '" + name + "'";
+            const json & zp_dtype = require_json_value(weights, "zp_dtype", group_context);
+            const bool supported_int4 = num_bits == 4 && group_size == 32 && !symmetric &&
+                zp_dtype.is_string() && zp_dtype.get<std::string>() == "torch.int8";
+            const bool supported_int8 = num_bits == 8 && group_size == 128 && symmetric && zp_dtype.is_null();
+            if (type != "int" || strategy != "group" || dynamic || actorder != "static" ||
+                (!supported_int4 && !supported_int8)) {
+                throw std::runtime_error("unsupported packed integer quantization in group '" + name + "'");
+            }
+            require_null(desc, "input_activations", "quantization group '" + name + "'");
+            require_null(desc, "output_activations", "quantization group '" + name + "'");
+            group.format     = llama_safetensors_quant_format::PACKED_INT;
+            group.num_bits   = num_bits;
+            group.group_size = group_size;
+            group.symmetric  = symmetric;
+        } else if (format == "nvfp4-pack-quantized") {
             const uint32_t num_bits =
                 require_json_value(weights, "num_bits", "quantization group '" + name + "'").get<uint32_t>();
             const std::string strategy =

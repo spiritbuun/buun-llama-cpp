@@ -67,12 +67,15 @@ enum class llama_safetensors_quant_format {
     INT8_CHANNEL,
     AWQ_G128,
     GPTQ_G128,
+    PACKED_INT,
 };
 
 struct llama_safetensors_quant_group {
     std::string                    name;
     llama_safetensors_quant_format format;
+    uint32_t                       num_bits  = 0;
     uint32_t                       group_size = 0;
+    bool                           symmetric = true;
     std::vector<uint32_t>          block_structure;
 };
 

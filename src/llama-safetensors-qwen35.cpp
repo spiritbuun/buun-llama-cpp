@@ -362,6 +362,67 @@ std::vector<uint8_t> permute_columns(const std::vector<uint8_t> & source,
     return result;
 }
 
+std::vector<uint8_t> apply_quantized_layout_transform(
+        transform_kind transform,
+        const qwen_geometry & geometry,
+        ggml_type type,
+        const std::vector<int64_t> & shape,
+        std::vector<uint8_t> source) {
+    if (shape.size() != 2 || shape[0] <= 0 || shape[1] <= 0) {
+        throw std::runtime_error("quantized Qwen layout transform requires a rank-two tensor");
+    }
+    const size_t cols = shape[0];
+    const size_t rows = shape[1];
+    const size_t block_width = ggml_blck_size(type);
+    const size_t block_size = ggml_type_size(type);
+    if (block_width == 0 || cols % block_width != 0 ||
+        source.size() != rows * (cols / block_width) * block_size) {
+        throw std::runtime_error("quantized Qwen layout transform has an inconsistent block shape");
+    }
+
+    switch (transform) {
+        case transform_kind::QKV_ROWS: {
+            const size_t qk_rows = 2 * geometry.n_key_heads * geometry.key_head_dim;
+            return permute_rows(
+                source, source.size() / rows, qk_rows,
+                v_head_row_permutation(geometry, geometry.value_head_dim));
+        }
+        case transform_kind::V_ROWS:
+            return permute_rows(
+                source, source.size() / rows, 0,
+                v_head_row_permutation(geometry, geometry.value_head_dim));
+        case transform_kind::V_COLUMNS: {
+            const std::vector<size_t> element_permutation =
+                v_head_row_permutation(geometry, geometry.value_head_dim);
+            if (element_permutation.size() != cols) {
+                throw std::runtime_error("quantized Qwen value-column permutation shape mismatch");
+            }
+            std::vector<size_t> block_permutation(cols / block_width);
+            for (size_t dst = 0; dst < block_permutation.size(); ++dst) {
+                const size_t src_begin = element_permutation[dst * block_width];
+                if (src_begin % block_width != 0) {
+                    throw std::runtime_error("quantized Qwen value-column permutation is not block aligned");
+                }
+                for (size_t lane = 1; lane < block_width; ++lane) {
+                    if (element_permutation[dst * block_width + lane] != src_begin + lane) {
+                        throw std::runtime_error("quantized Qwen value-column permutation splits a quant block");
+                    }
+                }
+                block_permutation[dst] = src_begin / block_width;
+            }
+            return permute_columns(source, rows, block_permutation.size(), block_size, block_permutation);
+        }
+        case transform_kind::NONE:
+            return source;
+        case transform_kind::HEAD_ROWS:
+        case transform_kind::CONV_ROWS:
+        case transform_kind::OFFSET_NORM:
+        case transform_kind::A_LOG:
+            throw std::runtime_error("unsupported transform for a packed quantized Qwen projection");
+    }
+    throw std::runtime_error("unknown quantized Qwen layout transform");
+}
+
 // The GGUF converter casts BF16 A_log to F32 before torch.exp(). The
 // MKL-backed vector implementation used there differs by one ULP from a
 // correctly rounded exp for a small, finite subset of the BF16 domain. Recurrent
@@ -757,6 +818,9 @@ std::vector<uint8_t> llama_safetensors_qwen35_importer::materialize(const std::s
         bool value_converted = false;
         const bool block_scale = spec.quant &&
             spec.quant->materialization == llama_safetensors_quant_materialization::FP8_BLOCK_SCALE;
+        const bool canonical_packed_int = spec.quant &&
+            (spec.quant->materialization == llama_safetensors_quant_materialization::PACKED_INT4_REPACK ||
+             spec.quant->materialization == llama_safetensors_quant_materialization::PACKED_INT8_REPACK);
         for (transform_kind transform : spec.transforms) {
             if (transform == transform_kind::OFFSET_NORM) {
                 if (target_type != GGML_TYPE_F32) {
@@ -780,8 +844,11 @@ std::vector<uint8_t> llama_safetensors_qwen35_importer::materialize(const std::s
                 }
                 value_converted = true;
             } else {
-                result = apply_layout_transform(
-                    transform, geometry, source_desc, block_scale, std::move(result));
+                result = canonical_packed_int ?
+                    apply_quantized_layout_transform(
+                        transform, geometry, target_type, spec.quant->target_shape, std::move(result)) :
+                    apply_layout_transform(
+                        transform, geometry, source_desc, block_scale, std::move(result));
             }
         }
         if (spec.quant) {

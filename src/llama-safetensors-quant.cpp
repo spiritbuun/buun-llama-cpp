@@ -36,6 +36,36 @@ void require_positive_f32_scalar(
     }
 }
 
+std::array<uint64_t, 2> read_weight_shape(
+        const llama_safetensors_registry & registry, const std::string & module) {
+    const std::string shape_name = module + ".weight_shape";
+    const auto & desc = require_tensor(registry, shape_name);
+    if (desc.dtype != llama_safetensors_dtype::I64 || desc.shape != std::vector<uint64_t>({ 2 }) ||
+        desc.size != 2 * sizeof(int64_t)) {
+        throw std::runtime_error("invalid packed integer weight_shape for '" + module + "'");
+    }
+    const std::vector<uint8_t> raw = registry.read(desc);
+    std::array<uint64_t, 2> result;
+    for (size_t i = 0; i < result.size(); ++i) {
+        int64_t value;
+        std::memcpy(&value, raw.data() + i * sizeof(value), sizeof(value));
+        if (value <= 0) {
+            throw std::runtime_error("packed integer weight_shape must be positive for '" + module + "'");
+        }
+        result[i] = static_cast<uint64_t>(value);
+    }
+    return result;
+}
+
+float load_bf16(const uint8_t * source) {
+    uint16_t bits16;
+    std::memcpy(&bits16, source, sizeof(bits16));
+    const uint32_t bits32 = uint32_t(bits16) << 16;
+    float value;
+    std::memcpy(&value, &bits32, sizeof(value));
+    return value;
+}
+
 std::vector<int64_t> reversed_shape(const llama_safetensors_tensor & tensor) {
     std::vector<int64_t> result;
     result.reserve(tensor.shape.size());
@@ -131,6 +161,8 @@ bool llama_safetensors_quant_adapters::format_applies(
         case llama_safetensors_quant_format::AWQ_G128:
         case llama_safetensors_quant_format::GPTQ_G128:
             return registry_.find(module + ".qweight") != nullptr;
+        case llama_safetensors_quant_format::PACKED_INT:
+            return registry_.find(module + ".weight_packed") != nullptr;
         case llama_safetensors_quant_format::INT8_CHANNEL: {
             const auto * weight = registry_.find(module + ".weight");
             return weight != nullptr && weight->dtype == llama_safetensors_dtype::I8;
@@ -224,6 +256,28 @@ std::optional<llama_safetensors_quant_binding> llama_safetensors_quant_adapters:
         return result;
     }
 
+    if (group->format == llama_safetensors_quant_format::PACKED_INT) {
+        if (role != llama_safetensors_quant_role::WEIGHT) {
+            return std::nullopt;
+        }
+        const auto shape = read_weight_shape(registry_, module);
+        result.primary      = module + ".weight_packed";
+        result.auxiliaries  = { module + ".weight_scale", module + ".weight_shape" };
+        result.target_shape = {
+            static_cast<int64_t>(shape[1]),
+            static_cast<int64_t>(shape[0]),
+        };
+        if (group->num_bits == 4) {
+            result.auxiliaries.push_back(module + ".weight_zero_point");
+            result.target_type     = GGML_TYPE_Q4_1;
+            result.materialization = llama_safetensors_quant_materialization::PACKED_INT4_REPACK;
+        } else {
+            result.target_type     = GGML_TYPE_Q8_0;
+            result.materialization = llama_safetensors_quant_materialization::PACKED_INT8_REPACK;
+        }
+        return result;
+    }
+
     if (group->format == llama_safetensors_quant_format::INT8_CHANNEL) {
         if (role != llama_safetensors_quant_role::WEIGHT) {
             return std::nullopt;
@@ -275,10 +329,10 @@ const llama_safetensors_quant_summary & llama_safetensors_quant_adapters::summar
 }
 
 uint32_t llama_safetensors_quant_adapters::file_type() const {
-    if (summary_.awq + summary_.gptq != 0) {
+    if (summary_.awq + summary_.gptq + summary_.packed_int4 != 0) {
         return LLAMA_FTYPE_MOSTLY_Q4_1;
     }
-    if (summary_.w8a8 != 0) {
+    if (summary_.w8a8 + summary_.packed_int8 != 0) {
         return LLAMA_FTYPE_MOSTLY_Q8_0;
     }
     if (summary_.nvfp4 != 0) {
@@ -294,7 +348,16 @@ void llama_safetensors_quant_adapters::validate() {
                 throw std::runtime_error("unsupported dimension in source tensor '" + tensor.name + "'");
             }
         }
-        if (ends_with(tensor.name, ".weight_zero_point") || ends_with(tensor.name, ".zero_point")) {
+        if (ends_with(tensor.name, ".weight_zero_point")) {
+            const std::string module =
+                tensor.name.substr(0, tensor.name.size() - std::string_view(".weight_zero_point").size());
+            const auto * group = match(module);
+            if (group != nullptr && group->format == llama_safetensors_quant_format::PACKED_INT && !group->symmetric) {
+                continue;
+            }
+            throw std::runtime_error("unsupported zero-point tensor '" + tensor.name + "'");
+        }
+        if (ends_with(tensor.name, ".zero_point")) {
             throw std::runtime_error("unsupported zero-point tensor '" + tensor.name + "'");
         }
 
@@ -302,8 +365,20 @@ void llama_safetensors_quant_adapters::validate() {
         llama_safetensors_quant_format expected;
         if (ends_with(tensor.name, ".weight_packed")) {
             module = tensor.name.substr(0, tensor.name.size() - std::string_view(".weight_packed").size());
-            expected = llama_safetensors_quant_format::NVFP4_PACK;
-            ++summary_.nvfp4;
+            const auto * group = match(module);
+            if (group == nullptr) {
+                throw std::runtime_error("quantization contract does not match source tensor '" + tensor.name + "'");
+            }
+            expected = group->format;
+            if (expected == llama_safetensors_quant_format::NVFP4_PACK) {
+                ++summary_.nvfp4;
+            } else if (expected == llama_safetensors_quant_format::PACKED_INT && group->num_bits == 4) {
+                ++summary_.packed_int4;
+            } else if (expected == llama_safetensors_quant_format::PACKED_INT && group->num_bits == 8) {
+                ++summary_.packed_int8;
+            } else {
+                throw std::runtime_error("quantization contract does not match source tensor '" + tensor.name + "'");
+            }
         } else if (ends_with(tensor.name, ".qweight")) {
             module = tensor.name.substr(0, tensor.name.size() - std::string_view(".qweight").size());
             const llama_safetensors_quant_group * group = match(module);
@@ -369,7 +444,40 @@ void llama_safetensors_quant_adapters::validate() {
             throw std::runtime_error("compressed-tensors contract does not match source tensor '" + tensor.name + "'");
         }
 
-        if (expected == llama_safetensors_quant_format::AWQ_G128) {
+        if (expected == llama_safetensors_quant_format::PACKED_INT) {
+            const auto & group = *match(module);
+            const std::string scale_name = module + ".weight_scale";
+            const std::string shape_name = module + ".weight_shape";
+            const auto & scale = require_tensor(registry_, scale_name);
+            const auto & shape_desc = require_tensor(registry_, shape_name);
+            const auto shape = read_weight_shape(registry_, module);
+            const uint64_t rows = shape[0];
+            const uint64_t cols = shape[1];
+            const uint64_t pack_factor = 32 / group.num_bits;
+            const uint64_t groups = cols / group.group_size;
+            dependencies_[tensor.name] = { scale.name, shape_desc.name };
+            const bool common_valid = tensor.dtype == llama_safetensors_dtype::I32 && tensor.shape.size() == 2 &&
+                cols % group.group_size == 0 && cols % 32 == 0 && rows > 0 &&
+                tensor.shape == std::vector<uint64_t>({ rows, cols / pack_factor }) &&
+                scale.dtype == llama_safetensors_dtype::BF16 &&
+                scale.shape == std::vector<uint64_t>({ rows, groups });
+            if (!common_valid) {
+                throw std::runtime_error("invalid packed integer WNA16 contract for source tensor '" + tensor.name + "'");
+            }
+            if (group.num_bits == 4) {
+                const std::string zero_name = module + ".weight_zero_point";
+                const auto & zero = require_tensor(registry_, zero_name);
+                dependencies_[tensor.name].push_back(zero.name);
+                if (zero.dtype != llama_safetensors_dtype::I32 ||
+                    zero.shape != std::vector<uint64_t>({ (rows + 7) / 8, groups })) {
+                    throw std::runtime_error(
+                        "invalid packed integer zero-point contract for source tensor '" + tensor.name + "'");
+                }
+            } else if (registry_.find(module + ".weight_zero_point") != nullptr) {
+                throw std::runtime_error(
+                    "symmetric packed integer tensor has an unexpected zero point: '" + tensor.name + "'");
+            }
+        } else if (expected == llama_safetensors_quant_format::AWQ_G128) {
             const std::string qzeros_name = module + ".qzeros";
             const std::string scales_name = module + ".scales";
             const auto & qzeros = require_tensor(registry_, qzeros_name);
@@ -458,7 +566,8 @@ void llama_safetensors_quant_adapters::validate() {
             require_positive_f32_scalar(registry_, module + ".input_global_scale");
         }
     }
-    if (summary_.nvfp4 + summary_.fp8_channel + summary_.fp8_block + summary_.w8a8 + summary_.awq + summary_.gptq == 0) {
+    if (summary_.nvfp4 + summary_.fp8_channel + summary_.fp8_block + summary_.w8a8 + summary_.awq + summary_.gptq +
+            summary_.packed_int4 + summary_.packed_int8 == 0) {
         throw std::runtime_error("native safetensors model contains no supported quantized weights");
     }
 }
@@ -552,6 +661,124 @@ std::vector<uint8_t> llama_safetensors_quant_adapters::repack_w8a8(
             uint8_t * out = result.data() + (row * (cols / qk) + block) * block_size;
             std::memcpy(out, &scale_f16, sizeof(scale_f16));
             std::memcpy(out + sizeof(scale_f16), weight + row * cols + block * qk, qk);
+        }
+    }
+    return result;
+}
+
+std::vector<uint8_t> llama_safetensors_quant_adapters::repack_packed_int4(
+        const llama_safetensors_tensor & weight_desc,
+        const uint8_t * weight,
+        const llama_safetensors_tensor & scale_desc,
+        const uint8_t * scale,
+        const llama_safetensors_tensor & zero_desc,
+        const uint8_t * zero,
+        const std::array<uint64_t, 2> & weight_shape) const {
+    constexpr size_t qk = 32;
+    constexpr size_t pack_factor = 8;
+    constexpr size_t group_size = 32;
+    constexpr size_t block_size = 2 * sizeof(ggml_fp16_t) + qk / 2;
+    const size_t rows = weight_shape[0];
+    const size_t cols = weight_shape[1];
+    const size_t groups = cols / group_size;
+    const size_t packed_cols = cols / pack_factor;
+    const size_t packed_rows = (rows + pack_factor - 1) / pack_factor;
+    if (weight_desc.dtype != llama_safetensors_dtype::I32 ||
+        weight_desc.shape != std::vector<uint64_t>({ rows, packed_cols }) ||
+        scale_desc.dtype != llama_safetensors_dtype::BF16 ||
+        scale_desc.shape != std::vector<uint64_t>({ rows, groups }) ||
+        zero_desc.dtype != llama_safetensors_dtype::I32 ||
+        zero_desc.shape != std::vector<uint64_t>({ packed_rows, groups })) {
+        throw std::runtime_error("inconsistent compressed-tensors INT4 group-32 source tensors");
+    }
+
+    std::vector<uint8_t> result(rows * groups * block_size);
+    for (size_t row = 0; row < rows; ++row) {
+        for (size_t group = 0; group < groups; ++group) {
+            const float scale_f32 = load_bf16(scale + (row * groups + group) * sizeof(uint16_t));
+            if (!(scale_f32 > 0.0f) || !std::isfinite(scale_f32)) {
+                throw std::runtime_error("packed INT4 scale must be finite and positive");
+            }
+            const ggml_fp16_t scale_f16 = ggml_fp32_to_fp16(scale_f32);
+            if (!std::isfinite(ggml_fp16_to_fp32(scale_f16))) {
+                throw std::runtime_error("packed INT4 scale is not representable in Q4_1");
+            }
+            uint32_t packed_zero;
+            std::memcpy(&packed_zero,
+                        zero + ((row / pack_factor) * groups + group) * sizeof(packed_zero),
+                        sizeof(packed_zero));
+            const uint8_t zero_code = (packed_zero >> (4 * (row % pack_factor))) & 0x0f;
+            const ggml_fp16_t minimum = ggml_fp32_to_fp16(-scale_f32 * zero_code);
+            if (!std::isfinite(ggml_fp16_to_fp32(minimum))) {
+                throw std::runtime_error("packed INT4 minimum is not representable in Q4_1");
+            }
+
+            std::array<uint8_t, qk> codes;
+            for (size_t i = 0; i < qk; ++i) {
+                const size_t col = group * group_size + i;
+                uint32_t packed_weight;
+                std::memcpy(&packed_weight,
+                            weight + (row * packed_cols + col / pack_factor) * sizeof(packed_weight),
+                            sizeof(packed_weight));
+                codes[i] = (packed_weight >> (4 * (col % pack_factor))) & 0x0f;
+            }
+
+            uint8_t * out = result.data() + (row * groups + group) * block_size;
+            std::memcpy(out, &scale_f16, sizeof(scale_f16));
+            std::memcpy(out + sizeof(scale_f16), &minimum, sizeof(minimum));
+            for (size_t i = 0; i < qk / 2; ++i) {
+                out[2 * sizeof(ggml_fp16_t) + i] = codes[i] | (codes[i + qk / 2] << 4);
+            }
+        }
+    }
+    return result;
+}
+
+std::vector<uint8_t> llama_safetensors_quant_adapters::repack_packed_int8(
+        const llama_safetensors_tensor & weight_desc,
+        const uint8_t * weight,
+        const llama_safetensors_tensor & scale_desc,
+        const uint8_t * scale,
+        const std::array<uint64_t, 2> & weight_shape) const {
+    constexpr size_t qk = 32;
+    constexpr size_t pack_factor = 4;
+    constexpr size_t group_size = 128;
+    constexpr size_t block_size = sizeof(ggml_fp16_t) + qk;
+    const size_t rows = weight_shape[0];
+    const size_t cols = weight_shape[1];
+    const size_t groups = cols / group_size;
+    const size_t packed_cols = cols / pack_factor;
+    if (weight_desc.dtype != llama_safetensors_dtype::I32 ||
+        weight_desc.shape != std::vector<uint64_t>({ rows, packed_cols }) ||
+        scale_desc.dtype != llama_safetensors_dtype::BF16 ||
+        scale_desc.shape != std::vector<uint64_t>({ rows, groups })) {
+        throw std::runtime_error("inconsistent compressed-tensors INT8 group-128 source tensors");
+    }
+
+    const size_t blocks_per_row = cols / qk;
+    std::vector<uint8_t> result(rows * blocks_per_row * block_size);
+    for (size_t row = 0; row < rows; ++row) {
+        for (size_t block = 0; block < blocks_per_row; ++block) {
+            const size_t group = block / (group_size / qk);
+            const float scale_f32 = load_bf16(scale + (row * groups + group) * sizeof(uint16_t));
+            if (!(scale_f32 > 0.0f) || !std::isfinite(scale_f32)) {
+                throw std::runtime_error("packed INT8 scale must be finite and positive");
+            }
+            const ggml_fp16_t scale_f16 = ggml_fp32_to_fp16(scale_f32);
+            if (!std::isfinite(ggml_fp16_to_fp32(scale_f16))) {
+                throw std::runtime_error("packed INT8 scale is not representable in Q8_0");
+            }
+            uint8_t * out = result.data() + (row * blocks_per_row + block) * block_size;
+            std::memcpy(out, &scale_f16, sizeof(scale_f16));
+            for (size_t i = 0; i < qk; ++i) {
+                const size_t col = block * qk + i;
+                uint32_t packed_weight;
+                std::memcpy(&packed_weight,
+                            weight + (row * packed_cols + col / pack_factor) * sizeof(packed_weight),
+                            sizeof(packed_weight));
+                const uint8_t code = (packed_weight >> (8 * (col % pack_factor))) & 0xff;
+                out[sizeof(scale_f16) + i] = static_cast<uint8_t>(code - 128);
+            }
         }
     }
     return result;
@@ -737,6 +964,22 @@ std::vector<uint8_t> llama_safetensors_quant_adapters::read(
         const source_bytes qzeros(registry_, qzeros_desc);
         const source_bytes scales(registry_, scales_desc);
         return repack_gptq(primary, qweight.data(), qzeros_desc, qzeros.data(), scales_desc, scales.data());
+    }
+    if (binding.materialization == llama_safetensors_quant_materialization::PACKED_INT4_REPACK ||
+        binding.materialization == llama_safetensors_quant_materialization::PACKED_INT8_REPACK) {
+        const std::string suffix = ".weight_packed";
+        const std::string module = binding.primary.substr(0, binding.primary.size() - suffix.size());
+        const auto weight_shape = read_weight_shape(registry_, module);
+        const auto & scale_desc = require_tensor(registry_, binding.auxiliaries.at(0));
+        const source_bytes packed_weight(registry_, primary);
+        const source_bytes scale(registry_, scale_desc);
+        if (binding.materialization == llama_safetensors_quant_materialization::PACKED_INT4_REPACK) {
+            const auto & zero_desc = require_tensor(registry_, binding.auxiliaries.at(2));
+            const source_bytes zero(registry_, zero_desc);
+            return repack_packed_int4(
+                primary, packed_weight.data(), scale_desc, scale.data(), zero_desc, zero.data(), weight_shape);
+        }
+        return repack_packed_int8(primary, packed_weight.data(), scale_desc, scale.data(), weight_shape);
     }
     if (binding.materialization == llama_safetensors_quant_materialization::RECIPROCAL_F32) {
         if (primary.dtype != llama_safetensors_dtype::F32 || primary.size != sizeof(float)) {
