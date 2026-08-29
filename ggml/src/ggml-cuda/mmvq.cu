@@ -168,7 +168,7 @@ static nv_bfloat16 * ggml_cuda_humming_prepare_input(
 static bool ggml_cuda_humming_bf16_mlp_enabled() {
     static const bool enabled = [] {
         const char * value = std::getenv("GGML_CUDA_HUMMING_BF16_MLP");
-        return value != nullptr && std::atoi(value) != 0;
+        return value == nullptr || std::atoi(value) != 0;
     }();
     return enabled;
 }
