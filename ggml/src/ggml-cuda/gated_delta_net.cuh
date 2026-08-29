@@ -8,8 +8,10 @@ struct ggml_cuda_gated_delta_net_fused_cache {
 
     // Optional FLA-only output epilogue. When populated, the imported BF16
     // attention result is normalized directly into rms_output instead of
-    // first being expanded into the GDN node's temporary F32 output.
+    // first being expanded into the GDN node's temporary F32 output. When
+    // rms_gate is set, its SiLU gate and final multiply are folded in too.
     const float * rms_weight = nullptr;
+    const float * rms_gate   = nullptr;
     float *       rms_output = nullptr;
     float         rms_eps    = 0.0f;
 };

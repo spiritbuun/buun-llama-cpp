@@ -3440,6 +3440,33 @@ static int ggml_cuda_try_gdn_cache_fusion(
                 fused_state_cpy.rms_output = static_cast<float *>(mul->data);
                 memcpy(&fused_state_cpy.rms_eps, rms->op_params, sizeof(float));
                 skip = rms_idx + 1 - node_idx;
+
+                int silu_idx = rms_idx + 2;
+                while (silu_idx < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[silu_idx])) {
+                    ++silu_idx;
+                }
+                const int gated_idx = silu_idx + 1;
+                if (n_tokens > 1 && gated_idx < cgraph->n_nodes) {
+                    const ggml_tensor * silu = cgraph->nodes[silu_idx];
+                    const ggml_tensor * gated = cgraph->nodes[gated_idx];
+                    const ggml_tensor * gate = silu->src[0];
+                    const bool gated_inputs =
+                        (gated->src[0] == mul && gated->src[1] == silu) ||
+                        (gated->src[1] == mul && gated->src[0] == silu);
+                    if (silu->op == GGML_OP_UNARY && ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU &&
+                            gated->op == GGML_OP_MUL && gated_inputs && gate != nullptr &&
+                            gate->type == GGML_TYPE_F32 && silu->type == GGML_TYPE_F32 &&
+                            gated->type == GGML_TYPE_F32 && ggml_is_contiguous(gate) &&
+                            ggml_is_contiguous(silu) && ggml_is_contiguous(gated) &&
+                            ggml_are_same_shape(gate, mul) && ggml_are_same_shape(silu, mul) &&
+                            ggml_are_same_shape(gated, mul) &&
+                            ggml_node_get_use_count(cgraph, rms_idx + 1) == 1 &&
+                            ggml_node_get_use_count(cgraph, silu_idx) == 1) {
+                        fused_state_cpy.rms_gate = static_cast<const float *>(gate->data);
+                        fused_state_cpy.rms_output = static_cast<float *>(gated->data);
+                        skip = gated_idx - node_idx;
+                    }
+                }
             }
         }
     }

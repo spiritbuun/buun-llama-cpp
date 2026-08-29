@@ -521,11 +521,15 @@ again byte-identical to the same SHA-256 baseline. The consumer scan is strict:
 an output tensor, a non-matmul use, or an unsupported projection preserves the
 ordinary F32 materialization.
 
-A larger GDN epilogue experiment also fused the following RMS normalization,
-SiLU gate, and multiply. It removed 48 SiLU launches and improved PP2048 from
-1703.45 to 1711.49 t/s, but making the independent gate projection available
-early changed decode graph ordering and reduced TG128 from 32.66 to 32.36 t/s.
-That trade was rejected and its code removed.
+A GDN epilogue also folds the following RMS normalization, SiLU gate, and
+multiply into the BF16 output unpack. The raw gate projection is made available
+early only when each sequence contains more than one token, so decode retains
+its original graph order. This removes 48 unary-gated launches per PP512 pass;
+the fused unpack costs 2.28 ms instead of 1.57 ms, while removing about 2.78 ms
+of unary work. Two order-balanced PP2048 pairs on the retained stack measured
+1724.72 versus 1718.46 t/s (+0.36%). The earlier decode regression therefore
+does not apply to this prefill-only form. Its 121 MiB logits file was
+byte-identical to the same reference SHA-256.
 
 Packing the recurrent Q/K/V and Z projections into the same 16,384-row Marlin
 launch was also tested because vLLM represents those checkpoint tensors as one

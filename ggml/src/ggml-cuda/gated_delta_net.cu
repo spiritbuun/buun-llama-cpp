@@ -335,6 +335,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
                               sq1, sq2, sq3, sv1, sv2, sv3,
                               l2_eps,
                               cache != nullptr ? cache->rms_weight : nullptr,
+                              cache != nullptr ? cache->rms_gate : nullptr,
                               cache != nullptr ? cache->rms_output : nullptr,
                               cache != nullptr ? cache->rms_eps : 0.0f);
         return;

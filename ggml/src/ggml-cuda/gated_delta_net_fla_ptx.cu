@@ -1,4 +1,5 @@
 #include "gated_delta_net_fla_ptx.cuh"
+#include "unary.cuh"
 
 #if !defined(GGML_USE_HIP)
 
@@ -249,8 +250,9 @@ __global__ void unpack_gdn_state_f32(const float * src, float * dst) {
     }
 }
 
+template <bool fuse_gate>
 __global__ void unpack_gdn_rms_f32(
-        const nv_bfloat16 * src, const float * weight, float * dst, float eps) {
+        const nv_bfloat16 * src, const float * weight, const float * gate, float * dst, float eps) {
     const int64_t row_native = blockIdx.x;
     const int d = threadIdx.x;
     const int64_t t = row_native / GDN_H;
@@ -262,7 +264,13 @@ __global__ void unpack_gdn_rms_f32(
     extern __shared__ float s_sum[];
     sum = block_reduce<block_reduce_method::SUM, GDN_D>(sum, s_sum);
     const float scale = rsqrtf(sum / GDN_D + eps);
-    dst[row_native * GDN_D + d] = scale * x * weight[d];
+    const int64_t output_idx = row_native * GDN_D + d;
+    const float normalized = scale * x * weight[d];
+    if constexpr (fuse_gate) {
+        dst[output_idx] = ggml_cuda_op_silu_single(gate[output_idx]) * normalized;
+    } else {
+        dst[output_idx] = normalized;
+    }
 
 }
 
@@ -307,7 +315,7 @@ void ggml_cuda_gdn_fla_ptx(
         int64_t sq1, int64_t sq2, int64_t sq3,
         int64_t sv1, int64_t sv2, int64_t sv3,
         float l2_eps,
-        const float * rms_weight, float * rms_output, float rms_eps) {
+        const float * rms_weight, const float * rms_gate, float * rms_output, float rms_eps) {
     cudaStream_t stream = ctx.stream();
     fla_modules & m = get_modules();
 
@@ -387,8 +395,13 @@ void ggml_cuda_gdn_fla_ptx(
     launch(m.funcs[K_OUTPUT], {4, GDN_NT, GDN_H}, {64, 1, 1}, 20480, cu_stream, output_args);
     if (rms_output != nullptr) {
         GGML_ASSERT(rms_weight != nullptr);
-        unpack_gdn_rms_f32<<<GDN_T * GDN_H, GDN_D, 32 * sizeof(float), stream>>>(
-            out.get(), rms_weight, rms_output, rms_eps);
+        if (rms_gate != nullptr) {
+            unpack_gdn_rms_f32<true><<<GDN_T * GDN_H, GDN_D, 32 * sizeof(float), stream>>>(
+                out.get(), rms_weight, rms_gate, rms_output, rms_eps);
+        } else {
+            unpack_gdn_rms_f32<false><<<GDN_T * GDN_H, GDN_D, 32 * sizeof(float), stream>>>(
+                out.get(), rms_weight, nullptr, rms_output, rms_eps);
+        }
         unpack_gdn_state_f32<<<(n_state + threads - 1) / threads, threads, 0, stream>>>(
             state_out_p.get(), state_out);
     } else {
@@ -403,6 +416,6 @@ void ggml_cuda_gdn_fla_ptx(
 bool ggml_cuda_gdn_fla_ptx_supported(int, bool, bool, int64_t, int64_t, int64_t, int64_t, int64_t) { return false; }
 void ggml_cuda_gdn_fla_ptx(ggml_backend_cuda_context &, const float *, const float *, const float *,
         const float *, const float *, const float *, float *, float *, int64_t, int64_t, int64_t,
-        int64_t, int64_t, int64_t, float, const float *, float *, float) { GGML_ABORT("FLA PTX is CUDA-only"); }
+        int64_t, int64_t, int64_t, float, const float *, const float *, float *, float) { GGML_ABORT("FLA PTX is CUDA-only"); }
 
 #endif

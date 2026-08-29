@@ -258,6 +258,9 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
 
     ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
     cb(z, "z", il);
+    if (ubatch.n_seq_tokens > 1) {
+        ggml_build_forward_expand(gf, z);
+    }
 
     return { qkv_mixed, z };
 }
