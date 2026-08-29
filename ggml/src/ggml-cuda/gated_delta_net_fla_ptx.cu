@@ -119,6 +119,80 @@ __global__ void pack_gdn_inputs_bf16(
     GGML_UNUSED(sv3);
 }
 
+// Preserve llama.cpp's L2_NORM arithmetic exactly while eliding its F32
+// destination. Eight warps normalize eight Q/K rows per CTA; the remaining
+// CTAs copy V. All three outputs land directly in the BF16 layout consumed by
+// the embedded FLA kernels.
+__global__ void pack_gdn_inputs_l2_bf16(
+        const float * q, const float * k, const float * v,
+        const float * g, const float * beta, const float * state,
+        nv_bfloat16 * qp, nv_bfloat16 * kp, nv_bfloat16 * vp,
+        float * gp, float * betap, float * statep,
+        int64_t sq1, int64_t sq2, int64_t sq3,
+        int64_t sv1, int64_t sv2, int64_t sv3, float eps, bool pack_heads) {
+    constexpr int rows_per_block = 8;
+    constexpr int n_qk_rows = 2 * GDN_T * GDN_HK;
+    constexpr int norm_blocks = n_qk_rows / rows_per_block;
+
+    if (blockIdx.x < norm_blocks) {
+        const int warp = threadIdx.x / WARP_SIZE;
+        const int lane = threadIdx.x % WARP_SIZE;
+        const int row = int(blockIdx.x) * rows_per_block + warp;
+        const bool is_k = row >= GDN_T * GDN_HK;
+        const int qk_row = row - (is_k ? GDN_T * GDN_HK : 0);
+        const int t = qk_row / GDN_HK;
+        const int h = qk_row % GDN_HK;
+        const float * src = is_k ? k : q;
+        nv_bfloat16 * dst = is_k ? kp : qp;
+        src += h * sq1 + t * sq2;
+        dst += qk_row * GDN_D;
+
+        float values[GDN_D / WARP_SIZE];
+        float sum = 0.0f;
+#pragma unroll
+        for (int j = 0; j < GDN_D / WARP_SIZE; ++j) {
+            values[j] = src[lane + j * WARP_SIZE];
+            sum += values[j] * values[j];
+        }
+        sum = warp_reduce_sum(sum);
+        const float scale = rsqrtf(fmaxf(sum, eps * eps));
+#pragma unroll
+        for (int j = 0; j < GDN_D / WARP_SIZE; ++j) {
+            dst[lane + j * WARP_SIZE] = scale * values[j];
+        }
+    } else {
+        const int64_t i = (int64_t(blockIdx.x) - norm_blocks) * blockDim.x + threadIdx.x;
+        constexpr int64_t n_v = int64_t(GDN_T) * GDN_H * GDN_D;
+        if (i < n_v) {
+            const int64_t d = i % GDN_D;
+            const int64_t h = (i / GDN_D) % GDN_H;
+            const int64_t t = i / (GDN_D * GDN_H);
+            const int64_t h_native = h / 3 + GDN_HK * (h % 3);
+            vp[i] = v[d + h_native * sv1 + t * sv2];
+        }
+        if (pack_heads) {
+            constexpr int64_t n_g = int64_t(GDN_T) * GDN_H;
+            constexpr int64_t state_stride = int64_t(GDN_D) * GDN_D;
+            constexpr int64_t n_state = int64_t(GDN_H) * state_stride;
+            if (i < n_g) {
+                const int64_t h = i % GDN_H;
+                const int64_t t = i / GDN_H;
+                const int64_t h_native = h / 3 + GDN_HK * (h % 3);
+                gp[i]    = g[t * GDN_H + h_native];
+                betap[i] = beta[t * GDN_H + h_native];
+            }
+            if (i < n_state) {
+                const int64_t inner = i % state_stride;
+                const int64_t h = i / state_stride;
+                const int64_t h_native = h / 3 + GDN_HK * (h % 3);
+                statep[i] = state[h_native * state_stride + inner];
+            }
+        }
+    }
+    GGML_UNUSED(sq3);
+    GGML_UNUSED(sv3);
+}
+
 __global__ void pack_gdn_heads_f32(
         const float * g, const float * beta, const float * state,
         float * gp, float * betap, float * statep) {
@@ -189,6 +263,7 @@ __global__ void unpack_gdn_rms_f32(
     sum = block_reduce<block_reduce_method::SUM, GDN_D>(sum, s_sum);
     const float scale = rsqrtf(sum / GDN_D + eps);
     dst[row_native * GDN_D + d] = scale * x * weight[d];
+
 }
 
 __global__ void init_gdn_varlen_metadata(int * cu_seqlens, int * chunk_indices, int64_t * chunk_offsets) {
@@ -231,6 +306,7 @@ void ggml_cuda_gdn_fla_ptx(
         float * dst, float * state_out,
         int64_t sq1, int64_t sq2, int64_t sq3,
         int64_t sv1, int64_t sv2, int64_t sv3,
+        float l2_eps,
         const float * rms_weight, float * rms_output, float rms_eps) {
     cudaStream_t stream = ctx.stream();
     fla_modules & m = get_modules();
@@ -262,11 +338,28 @@ void ggml_cuda_gdn_fla_ptx(
     ggml_cuda_pool_alloc<int64_t>     chunk_offsets(ctx.pool(), 2);
 
     constexpr int threads = 256;
-    pack_gdn_inputs_bf16<<<(n_v + threads - 1) / threads, threads, 0, stream>>>(
-        q, k, v, q_p.get(), k_p.get(), v_p.get(), sq1, sq2, sq3, sv1, sv2, sv3);
-    CUDA_CHECK(cudaGetLastError());
-    pack_gdn_heads_f32<<<(n_state + threads - 1) / threads, threads, 0, stream>>>(
-        g, beta, state_in, g_p.get(), beta_p.get(), state_in_p.get());
+    if (l2_eps >= 0.0f) {
+        static const bool fuse_head_pack = [] {
+            const char * value = std::getenv("GGML_CUDA_GDN_FUSE_HEAD_PACK");
+            return value == nullptr || std::atoi(value) != 0;
+        }();
+        constexpr int rows_per_block = 8;
+        constexpr int norm_blocks = 2 * GDN_T * GDN_HK / rows_per_block;
+        const int v_blocks = (n_v + threads - 1) / threads;
+        pack_gdn_inputs_l2_bf16<<<norm_blocks + v_blocks, threads, 0, stream>>>(
+            q, k, v, g, beta, state_in,
+            q_p.get(), k_p.get(), v_p.get(), g_p.get(), beta_p.get(), state_in_p.get(),
+            sq1, sq2, sq3, sv1, sv2, sv3, l2_eps, fuse_head_pack);
+        if (!fuse_head_pack) {
+            pack_gdn_heads_f32<<<(n_state + threads - 1) / threads, threads, 0, stream>>>(
+                g, beta, state_in, g_p.get(), beta_p.get(), state_in_p.get());
+        }
+    } else {
+        pack_gdn_inputs_bf16<<<(n_v + threads - 1) / threads, threads, 0, stream>>>(
+            q, k, v, q_p.get(), k_p.get(), v_p.get(), sq1, sq2, sq3, sv1, sv2, sv3);
+        pack_gdn_heads_f32<<<(n_state + threads - 1) / threads, threads, 0, stream>>>(
+            g, beta, state_in, g_p.get(), beta_p.get(), state_in_p.get());
+    }
     CUDA_CHECK(cudaGetLastError());
     init_gdn_varlen_metadata<<<1, GDN_NT, 0, stream>>>(
         cu_seqlens.get(), chunk_indices.get(), chunk_offsets.get());
@@ -310,6 +403,6 @@ void ggml_cuda_gdn_fla_ptx(
 bool ggml_cuda_gdn_fla_ptx_supported(int, bool, bool, int64_t, int64_t, int64_t, int64_t, int64_t) { return false; }
 void ggml_cuda_gdn_fla_ptx(ggml_backend_cuda_context &, const float *, const float *, const float *,
         const float *, const float *, const float *, float *, float *, int64_t, int64_t, int64_t,
-        int64_t, int64_t, int64_t, const float *, float *, float) { GGML_ABORT("FLA PTX is CUDA-only"); }
+        int64_t, int64_t, int64_t, float, const float *, float *, float) { GGML_ABORT("FLA PTX is CUDA-only"); }
 
 #endif

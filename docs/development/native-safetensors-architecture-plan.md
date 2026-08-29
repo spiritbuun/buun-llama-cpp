@@ -467,6 +467,117 @@ direct mapped upload. HIP and multi-device split inherit established
 Q8_0/Q4_1 kernels and placement semantics, but still need real-machine
 regression runs before release.
 
+### Rejected experiment — packed sibling projections
+
+The A6000 comparison exposed a graph-topology difference rather than a weak
+integer kernel. In one PP512 pass, native Q4 Marlin plus Q8 MMQ consumed about
+231.5 ms, while vLLM's Marlin families consumed about 239.6 ms. vLLM packs
+attention Q/K/V, dense gate/up, recurrent QKV/Z, and recurrent beta/alpha.
+
+A complete dense gate/up proof concatenated the two canonical Q4-A32 tensors
+without increasing steady model bytes, built one matmul followed by typed
+half-row views, and added a dedicated Marlin BF16 split-SwiGLU epilogue. This
+closed the accidental generic-fallback regression, but the resulting
+34,816-row Marlin launch was slower than the established pair of 17,408-row
+launches on Ampere:
+
+| A6000, PP512/TG128, same binary | PP512 t/s | TG128 t/s |
+|---|---:|---:|
+| separate gate/up | 1696.7–1702.9 | 32.71–32.79 |
+| packed gate/up + fused split-SwiGLU | 1613.3–1626.8 | 32.25–32.77 |
+
+Packing therefore lost about 4.7% prefill with no decode benefit. The code was
+removed. Do not generalize vLLM's packed-module topology onto the current
+Ampere Marlin executor; reconsider it only alongside a kernel whose tiling was
+designed and benchmarked for the wider projections.
+
+### Retained Ampere recurrent-path fusions
+
+Two exact Qwen3.8 recurrent-prefill fusions were retained for the native
+group-affine path on an RTX A6000:
+
+- paired Q/K L2 normalization now runs in the FLA BF16 input packer, preserving
+  llama.cpp's reduction order and `rsqrtf(fmaxf(sum, eps*eps))` contract while
+  avoiding the intermediate F32 tensors; and
+- a Q4-A32 recurrent projection can leave its already-rounded BF16 output in
+  the graph destination for the split convolution to consume directly, rather
+  than widening it to F32 only for the convolution to read it back as BF16.
+
+The first changes the measured kernels from 1.309 ms of L2 normalization plus
+2.242 ms of ordinary packing to 2.383 ms of combined normalization and packing
+per PP512 pass. The second removes 48 BF16-to-F32 output conversions and changes
+the 48 recurrent convolution launches from 3.632 ms in F32 to 2.299 ms in BF16.
+Together, the final five-sample A6000 measurements were 1704.16 PP2048 t/s and
+32.66 TG128 t/s. The control, L2-fused, and convolution-deferred 121 MiB logits
+files were byte-identical, with SHA-256
+`8a2ea9c88341c96c593821f2c9c920844f95e5eb48c8d7aaead5e20ccc181833`.
+
+The residual/RMS epilogue now also omits its F32 normalized output when every
+consumer is a supported Q4-A32 Marlin projection and can therefore reuse the
+epilogue's persistent BF16 activation. Two order-balanced PP2048 pairs measured
+1708.99 versus 1705.75 t/s and 1704.56 versus 1700.54 t/s, a combined gain of
+about 0.22%. TG128 remained flat at 32.64 t/s. The resulting logits file was
+again byte-identical to the same SHA-256 baseline. The consumer scan is strict:
+an output tensor, a non-matmul use, or an unsupported projection preserves the
+ordinary F32 materialization.
+
+A larger GDN epilogue experiment also fused the following RMS normalization,
+SiLU gate, and multiply. It removed 48 SiLU launches and improved PP2048 from
+1703.45 to 1711.49 t/s, but making the independent gate projection available
+early changed decode graph ordering and reduced TG128 from 32.66 to 32.36 t/s.
+That trade was rejected and its code removed.
+
+Packing the recurrent Q/K/V and Z projections into the same 16,384-row Marlin
+launch was also tested because vLLM represents those checkpoint tensors as one
+merged projection. The combined Marlin kernel took essentially the same time
+as the two original kernels, while splitting its output back into the existing
+Q/K/V and Z graph tensors cost about 3 ms per PP512 pass. Steady PP2048 was
+1701.06 t/s, a tie/slight loss against 1700.5--1705.8 t/s controls, and the
+proof required about 1.9 GiB of duplicate packed weights. The implementation
+was removed. A production packed loader would eliminate the duplicate weights,
+but not the measured output-split cost, so it is not justified for the current
+Ampere Marlin executor.
+
+The two small recurrent beta/alpha BF16 projections share one F32 input. The
+ordinary cuBLAS path converted that input independently for both projections.
+Reusing the existing per-stream BF16 image for the second projection removes
+54 conversion launches per PP512 pass while leaving both GEMMs unchanged. A
+stable PP2048 A6000 pair measured 1718.94 versus 1702.50 t/s (+0.97%); TG128
+was unchanged. The 121 MiB logits file was byte-identical to the baseline SHA
+above. The retained matcher is deliberately narrow (`[48,5120]` BF16 weights,
+F32 input, prefill only), because those two consumers do not mutate their
+shared source between reads.
+
+A generic version was also measured at 1720.53 versus 1697.40 PP2048 t/s, but
+changed the logits file. Tensor identity alone is not a valid general cache
+key: graph storage may be updated in place between consumers. The broad form
+was rejected as a correctness bug rather than accepted as an additional small
+performance gain.
+
+Two smaller prefill launch fusions follow vLLM's fused Qwen GDN preparation
+without changing either projection or the embedded FLA math. First, the two
+ordinary beta/alpha cuBLAS projections now feed one pointwise epilogue for
+add/softplus/multiply and sigmoid. Two order-balanced pairs measured a combined
+1721.13 versus 1718.02 PP2048 t/s (+0.18%). Batch-one decode retains its older
+specialized dot-and-gate kernel. Second, the existing Q/K/V L2+BF16 pack launch
+also copies the already-computed gate, beta, and recurrent state into FLA head
+order; its V grid already spans all of those elements. This removes the
+separate head-pack launch and measured a combined 1716.28 versus 1713.26 t/s
+(+0.18%) in two order-balanced pairs. Both changes are Ampere GDN-prefill-only;
+their stacked 121 MiB logits file was byte-identical to the same reference SHA.
+The retained stack measured a steady PP512 median of 1728.95 t/s, a PP2048
+median of 1704.58 t/s (1706.03 mean), and a TG128 median of 32.75 t/s on the
+A6000.
+
+Two further exact handoff fusions did not earn retention. Copying the recurrent
+state into graph order inside the following RMS epilogue removed 48 launches
+and about 0.54 ms of profiled work, but two order-balanced PP2048 pairs were a
+tie: their combined means differed by less than 0.2%, and the combined median
+favored the original schedule. Deferring the recurrent Z/gate projection's
+already-rounded BF16 output directly into the SiLU-and-multiply consumer also
+removed 48 widening launches, but lost 0.28% in both combined mean and median
+(1709.97 versus 1714.84 t/s mean). Both implementations were removed.
+
 ## 6. Test matrix
 
 ### Structural tests

@@ -30,6 +30,14 @@ static bool ggml_cuda_humming_finish_residual_rms(
     int64_t m,
     cudaStream_t stream);
 
+static bool ggml_cuda_marlin_q4_defer_conv_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_CUDA_MARLIN_Q4_DEFER_CONV");
+        return value == nullptr || std::atoi(value) != 0;
+    }();
+    return enabled;
+}
+
 bool ggml_cuda_mul_mat_marlin_q4_a32(
         ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0,
@@ -111,13 +119,18 @@ bool ggml_cuda_mul_mat_marlin_q4_a32(
     }
 
     nv_bfloat16 * input = ggml_cuda_humming_get_input(ctx, src1, size_t(m) * k, stream);
-    ggml_cuda_pool_alloc<nv_bfloat16> output(ctx.pool(), size_t(m) * n);
+    const bool defer_conv = ggml_cuda_marlin_q4_defer_conv_enabled() && gate == nullptr &&
+                            fusion == nullptr && n == 10240 && k == 5120 && m > 16;
+    const bool defer_output = defer_conv;
+    ggml_cuda_pool_alloc<nv_bfloat16> output_scratch(ctx.pool());
+    nv_bfloat16 * output = defer_output ? static_cast<nv_bfloat16 *>(dst->data) :
+                                         output_scratch.alloc(size_t(m) * n);
     ggml_cuda_pool_alloc<nv_bfloat16> gate_output(ctx.pool());
     if (gate != nullptr) {
         gate_output.alloc(size_t(m) * n);
     }
     ggml_cuda_marlin_q4_a32_launch(
-        input, entry.weight, entry.scale, entry.zero, output.get(), lock_storage.ptr,
+        input, entry.weight, entry.scale, entry.zero, output, lock_storage.ptr,
         n, k, m, ctx.device, ggml_cuda_info().devices[ctx.device].nsm, stream);
     if (gate != nullptr) {
         ggml_cuda_marlin_q4_a32_launch(
@@ -126,17 +139,19 @@ bool ggml_cuda_mul_mat_marlin_q4_a32(
             ggml_cuda_info().devices[ctx.device].nsm, stream);
     }
 
-    if (fusion != nullptr && fusion->residual != nullptr &&
-            ggml_cuda_humming_finish_residual_rms(ctx, fusion, output.get(), dst, n, m, stream)) {
+    if (defer_output) {
+        ctx.humming_deferred_bf16.insert(dst->data);
+    } else if (fusion != nullptr && fusion->residual != nullptr &&
+            ggml_cuda_humming_finish_residual_rms(ctx, fusion, output, dst, n, m, stream)) {
         // The fused epilogue materializes the required F32 graph outputs and
         // preserves a BF16 normalized activation for following projections.
     } else if (gate != nullptr && ggml_cuda_humming_bf16_mlp_enabled() && n == 17408) {
         ggml_cuda_humming_fp8_swiglu_bf16(
-            output.get(), gate_output.get(), static_cast<nv_bfloat16 *>(dst->data), size_t(m) * n, stream);
+            output, gate_output.get(), static_cast<nv_bfloat16 *>(dst->data), size_t(m) * n, stream);
         ctx.humming_bf16_activations.insert(dst);
     } else {
         ggml_cuda_humming_fp8_output_bf16_to_f32(
-            output.get(), gate != nullptr ? gate_output.get() : nullptr,
+            output, gate != nullptr ? gate_output.get() : nullptr,
             static_cast<float *>(dst->data), size_t(m) * n, stream);
     }
     return true;
@@ -247,7 +262,7 @@ static bool ggml_cuda_humming_finish_residual_rms(
         static_cast<const float *>(fusion->residual->data),
         static_cast<const float *>(fusion->rms_weight->data),
         static_cast<float *>(fusion->residual_out->data),
-        static_cast<float *>(dst->data),
+        fusion->materialize_rms_output ? static_cast<float *>(dst->data) : nullptr,
         prepared.ptr,
         n, m, fusion->rms_eps, stream);
     return true;

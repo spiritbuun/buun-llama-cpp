@@ -1587,6 +1587,10 @@ struct ggml_backend_cuda_context {
     ggml_cuda_humming_input_storage humming_inputs[GGML_CUDA_MAX_STREAMS];
     std::unordered_set<const ggml_tensor *> humming_bf16_activations;
     std::unordered_set<const void *> humming_deferred_bf16;
+    // Qwen recurrent prefill can defer its paired L2 outputs to the FLA input
+    // packer, which applies the same reduction while writing BF16 directly.
+    // Entries are produced and consumed within one graph evaluation.
+    std::unordered_set<const void *> gdn_deferred_l2;
     std::unordered_map<const ggml_tensor *, ggml_cuda_humming_prepared_activation> humming_prepared_activations;
     std::unordered_set<const ggml_tensor *> humming_prepared_active;
     // A concat node may evaluate the directly-dependent recurrent convolution
@@ -1710,6 +1714,7 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * residual = nullptr;
     ggml_tensor * residual_out = nullptr;
     const ggml_tensor * rms_weight = nullptr;
+    bool materialize_rms_output = true;
     float rms_eps = 0.0f;
     ggml_glu_op glu_op;
 };

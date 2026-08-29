@@ -263,8 +263,29 @@ static void ggml_cuda_op_gated_delta_net_impl(
 
     const int64_t rq3 = nev3 / neq3;
 
-    const float * q_d = (const float *) src_q->data;
-    const float * k_d = (const float *) src_k->data;
+#if !defined(GGML_USE_HIP)
+    const bool defer_q_l2 = ctx.gdn_deferred_l2.erase(src_q->data) != 0;
+    const bool defer_k_l2 = ctx.gdn_deferred_l2.erase(src_k->data) != 0;
+#else
+    const bool defer_q_l2 = false;
+    const bool defer_k_l2 = false;
+#endif
+    GGML_ASSERT(defer_q_l2 == defer_k_l2);
+
+    const ggml_tensor * packed_q = defer_q_l2 ? src_q->src[0] : src_q;
+    const ggml_tensor * packed_k = defer_k_l2 ? src_k->src[0] : src_k;
+    GGML_ASSERT(packed_q && packed_k);
+
+    float l2_eps = -1.0f;
+    if (defer_q_l2) {
+        float k_eps = -1.0f;
+        memcpy(&l2_eps, src_q->op_params, sizeof(float));
+        memcpy(&k_eps, src_k->op_params, sizeof(float));
+        GGML_ASSERT(l2_eps >= 0.0f && l2_eps == k_eps);
+    }
+
+    const float * q_d = (const float *) packed_q->data;
+    const float * k_d = (const float *) packed_k->data;
     const float * v_d = (const float *) src_v->data;
     const float * g_d = (const float *) src_g->data;
     const float * b_d = (const float *) src_beta->data;
@@ -282,9 +303,9 @@ static void ggml_cuda_op_gated_delta_net_impl(
     GGML_ASSERT(ggml_is_contiguous(src_state));
 
     // strides in floats (beta strides used for both g and beta offset computation)
-    const int64_t sq1 = nbq1 / sizeof(float);
-    int64_t sq2 = nbq2 / sizeof(float);
-    int64_t sq3 = nbq3 / sizeof(float);
+    const int64_t sq1 = packed_q->nb[1] / sizeof(float);
+    int64_t sq2 = packed_q->nb[2] / sizeof(float);
+    int64_t sq3 = packed_q->nb[3] / sizeof(float);
     const int64_t sv1 = nbv1 / sizeof(float);
     const int64_t sv2 = nbv2 / sizeof(float);
     const int64_t sv3 = nbv3 / sizeof(float);
@@ -312,6 +333,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
     if (ggml_cuda_gdn_fla_ptx_supported(cc, kda, keep_rs, S_v, H, neqk1, n_tokens, n_seqs)) {
         ggml_cuda_gdn_fla_ptx(ctx, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                               sq1, sq2, sq3, sv1, sv2, sv3,
+                              l2_eps,
                               cache != nullptr ? cache->rms_weight : nullptr,
                               cache != nullptr ? cache->rms_output : nullptr,
                               cache != nullptr ? cache->rms_eps : 0.0f);

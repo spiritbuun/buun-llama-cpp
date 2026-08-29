@@ -13,4 +13,5 @@ void ggml_cuda_gdn_fla_ptx(
         float * dst, float * state_out,
         int64_t sq1, int64_t sq2, int64_t sq3,
         int64_t sv1, int64_t sv2, int64_t sv3,
+        float l2_eps = -1.0f,
         const float * rms_weight = nullptr, float * rms_output = nullptr, float rms_eps = 0.0f);

@@ -18,3 +18,9 @@ void ggml_cuda_op_qwen35_recurrent_gates(
     const ggml_tensor * alpha_weight, const ggml_tensor * beta_weight,
     const ggml_tensor * input, const ggml_tensor * dt, const ggml_tensor * a,
     ggml_tensor * gate, ggml_tensor * beta);
+
+void ggml_cuda_op_qwen35_recurrent_gate_epilogue(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * alpha, const ggml_tensor * beta_input,
+    const ggml_tensor * dt, const ggml_tensor * a,
+    ggml_tensor * gate, ggml_tensor * beta);
