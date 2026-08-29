@@ -578,6 +578,28 @@ already-rounded BF16 output directly into the SiLU-and-multiply consumer also
 removed 48 widening launches, but lost 0.28% in both combined mean and median
 (1709.97 versus 1714.84 t/s mean). Both implementations were removed.
 
+### Retained W8 MMQ activation reuse
+
+The mixed INT4/INT8 Qwen3.8 checkpoint has 88 W8A8 projections per PP pass.
+The ordinary MMQ entry quantized its F32 activation independently for every
+projection, even when dense gate/up or attention Q/K/V consume the same graph
+tensor. Two exact CUDA changes remove that duplicated work:
+
+- adjacent same-shape Q8_0_G128 projections use the existing paired-MMQ
+  executor, extended to ordinary dense matmuls, so gate/up share one Q8_1
+  activation image; and
+- a graph proof recognizes exactly three direct Q8 matmul consumers of one
+  activation, rejects any other consumer or unsafe output-range overlap, and
+  lets Q/K/V reuse one grow-only per-stream image. The largest observed image
+  is about 2.8 MiB. Ambiguous graphs and non-CUDA backends fall back unchanged.
+
+Together these reduce `quantize_mmq_q8_1` from 88 launches / 2.38 ms to 48
+launches / 1.46 ms per PP512 pass. Order-balanced PP2048 gates measured
+paired-MMQ at 1714.33 versus 1707.34 t/s (+0.41%), then Q/K/V reuse at 1713.92
+versus 1707.59 t/s (+0.37%) with pairing enabled in both arms. Batch-one uses
+MMVQ and declines both paths. The combined logits file remained byte-identical
+to SHA-256 `8a2ea9c88341c96c593821f2c9c920844f95e5eb48c8d7aaead5e20ccc181833`.
+
 ## 6. Test matrix
 
 ### Structural tests

@@ -804,6 +804,13 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         for (nv_bfloat16 * ptr : input.retired) {
             CUDA_CHECK(cudaFree(ptr));
         }
+        auto & q8 = mmq_q8_activations[i];
+        if (q8.ptr != nullptr) {
+            CUDA_CHECK(cudaFree(q8.ptr));
+        }
+        for (char * ptr : q8.retired) {
+            CUDA_CHECK(cudaFree(ptr));
+        }
     }
 #endif
 
@@ -3940,6 +3947,55 @@ static bool ggml_cuda_all_consumers_use_marlin_bf16(
     return found;
 }
 
+#if !defined(GGML_USE_HIP)
+static void ggml_cuda_prepare_q8_activation_reuse(
+        ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int node_index) {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_CUDA_MMQ_Q8_REUSE");
+        return value == nullptr || std::atoi(value) != 0;
+    }();
+    const ggml_tensor * node = cgraph->nodes[node_index];
+    if (!enabled || node->op != GGML_OP_MUL_MAT || node->src[0] == nullptr || node->src[1] == nullptr ||
+            node->src[0]->type != GGML_TYPE_Q8_0_G128 || node->src[1]->type != GGML_TYPE_F32 ||
+            node->src[2] != nullptr) {
+        return;
+    }
+
+    const ggml_tensor * activation = node->src[1];
+    const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+    if (!ggml_cuda_should_use_mmq(node->src[0]->type, cc, activation->ne[1], /*n_experts=*/0)) {
+        return;
+    }
+    std::array<int, 3> consumers{};
+    int n_consumers = 0;
+    for (int j = 0; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * candidate = cgraph->nodes[j];
+        bool uses_activation = false;
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (candidate->src[s] == activation) {
+                if (uses_activation || s != 1 || candidate->op != GGML_OP_MUL_MAT ||
+                        candidate->src[0] == nullptr || candidate->src[0]->type != GGML_TYPE_Q8_0_G128 ||
+                        candidate->src[2] != nullptr || candidate->type != GGML_TYPE_F32 ||
+                        candidate->src[0]->ne[0] != node->src[0]->ne[0] || n_consumers == 3) {
+                    return;
+                }
+                uses_activation = true;
+                consumers[n_consumers++] = j;
+            }
+        }
+    }
+
+    if (n_consumers != 3 || consumers[0] != node_index) {
+        return;
+    }
+    if (!ggml_cuda_check_fusion_memory_ranges(
+                cgraph, node_index, consumers[2] - node_index + 1, consumers.data(), n_consumers)) {
+        return;
+    }
+    cuda_ctx->mmq_q8_reuse_requests.emplace(activation, n_consumers);
+}
+#endif
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static const bool disable_fusion = [] {
@@ -3951,6 +4007,38 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+#if !defined(GGML_USE_HIP)
+    if (node->op == GGML_OP_MUL_MAT && node->src[1] != nullptr &&
+            node->src[1]->ne[1] > MMVQ_MAX_BATCH_SIZE) {
+        ggml_cuda_prepare_q8_activation_reuse(cuda_ctx, cgraph, i);
+    }
+#endif
+
+    static const bool q8_pair_enabled = [] {
+        const char * value = std::getenv("GGML_CUDA_MMQ_Q8_PAIR");
+        return value == nullptr || std::atoi(value) != 0;
+    }();
+    if (q8_pair_enabled && i + 1 < cgraph->n_nodes && node->op == GGML_OP_MUL_MAT &&
+            node->src[1] != nullptr && node->src[1]->ne[1] > MMVQ_MAX_BATCH_SIZE) {
+        ggml_tensor * pair = cgraph->nodes[i + 1];
+        const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+        const int pair_outputs[] = { i, i + 1 };
+        if (pair->op == GGML_OP_MUL_MAT && node->src[0] && node->src[1] &&
+                node->src[2] == nullptr && pair->src[2] == nullptr &&
+                node->src[0]->type == GGML_TYPE_Q8_0_G128 &&
+                pair->src[0]->type == node->src[0]->type &&
+                pair->src[1] == node->src[1] &&
+                ggml_are_same_shape(pair->src[0], node->src[0]) &&
+                ggml_are_same_stride(pair->src[0], node->src[0]) &&
+                ggml_are_same_shape(pair, node) && ggml_are_same_stride(pair, node) &&
+                ggml_cuda_should_use_mmq(node->src[0]->type, cc, node->src[1]->ne[1], /*n_experts=*/0) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, pair_outputs, 2)) {
+            ggml_cuda_mul_mat_q_pair(
+                *cuda_ctx, node->src[0], pair->src[0], node->src[1], nullptr, node, pair);
+            return 1;
+        }
+    }
 
     // Qwen recurrent attention normalizes matching Q and K views side by side.
     // One grid preserves the ordinary per-row reduction while removing one
@@ -5529,6 +5617,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         input.source = nullptr;
         input.source_count = 0;
     }
+    for (auto & q8 : cuda_ctx->mmq_q8_activations) {
+        q8.source = nullptr;
+    }
+    cuda_ctx->mmq_q8_reuse_requests.clear();
     cuda_ctx->humming_bf16_activations.clear();
     cuda_ctx->humming_prepared_active.clear();
     cuda_ctx->precomputed_ssm_convs.clear();

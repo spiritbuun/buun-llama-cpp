@@ -98,7 +98,6 @@ static void ggml_cuda_mul_mat_q_impl(
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
     GGML_ASSERT((src0_pair == nullptr) == (dst_pair == nullptr));
-    GGML_ASSERT(!src0_pair || ids);
     GGML_ASSERT(!src0_pair || (src0_pair->type == src0->type && dst_pair->type == dst->type));
     GGML_ASSERT(!src0_pair || (ggml_are_same_shape(src0_pair, src0) && ggml_are_same_stride(src0_pair, src0)));
     GGML_ASSERT(!dst_pair || (ggml_are_same_shape(dst_pair, dst) && ggml_are_same_stride(dst_pair, dst)));
@@ -152,13 +151,39 @@ static void ggml_cuda_mul_mat_q_impl(
     if (!ids) {
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block +
             ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
-        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+        ggml_cuda_pool_alloc<char> src1_q8_1_pool(ctx.pool());
+        char * src1_q8_1 = nullptr;
+        bool quantize_src1 = true;
+#if !defined(GGML_USE_HIP)
+        auto reuse = src0->type == GGML_TYPE_Q8_0_G128 ? ctx.mmq_q8_reuse_requests.find(src1) :
+                                                         ctx.mmq_q8_reuse_requests.end();
+        if (reuse != ctx.mmq_q8_reuse_requests.end()) {
+            auto & storage = ctx.mmq_q8_activations[ctx.curr_stream_no];
+            if (storage.bytes < nbytes_src1_q8_1) {
+                if (storage.ptr != nullptr) {
+                    storage.retired.push_back(storage.ptr);
+                }
+                CUDA_CHECK(cudaMalloc(&storage.ptr, nbytes_src1_q8_1));
+                storage.bytes = nbytes_src1_q8_1;
+                storage.source = nullptr;
+            }
+            src1_q8_1 = storage.ptr;
+            quantize_src1 = storage.source != src1;
+            storage.source = src1;
+            if (--reuse->second == 0) {
+                ctx.mmq_q8_reuse_requests.erase(reuse);
+            }
+        }
+#endif
+        if (src1_q8_1 == nullptr) {
+            src1_q8_1 = src1_q8_1_pool.alloc(nbytes_src1_q8_1);
+        }
         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
         if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
             src1_scale.alloc(ne13*ne12*ne11);
         }
 
-        {
+        if (quantize_src1) {
             const int64_t s11 = src1->nb[1] / ts_src1;
             const int64_t s12 = src1->nb[2] / ts_src1;
             const int64_t s13 = src1->nb[3] / ts_src1;
@@ -166,11 +191,11 @@ static void ggml_cuda_mul_mat_q_impl(
                 static constexpr size_t align_float8 = 32;
                 const bool use_aligned_float8 = ggml_cuda_is_aligned(src1, align_float8);
                 static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));
-                quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1, src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
 
             } else {
-                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1, src0->type, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
             }
             CUDA_CHECK(cudaGetLastError());
@@ -183,13 +208,19 @@ static void ggml_cuda_mul_mat_q_impl(
         const int64_t s13 = ne12*s12;
 
         const mmq_args args = {
-            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
+            src0_d, src0->type, reinterpret_cast<const int *>(src1_q8_1), nullptr, nullptr, dst_d,
             src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? src1_scale.ptr : nullptr,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
             ne1};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+        if (src0_pair) {
+            mmq_args pair_args = args;
+            pair_args.x   = static_cast<const char *>(src0_pair->data);
+            pair_args.dst = static_cast<float *>(dst_pair->data);
+            ggml_cuda_mul_mat_q_switch_type(ctx, pair_args, stream);
+        }
         return;
     }
 

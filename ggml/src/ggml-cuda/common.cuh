@@ -1553,6 +1553,13 @@ struct ggml_cuda_humming_prepared_activation {
     std::vector<nv_bfloat16 *> retired;
 };
 
+struct ggml_cuda_q8_activation_storage {
+    char * ptr = nullptr;
+    size_t bytes = 0;
+    const ggml_tensor * source = nullptr;
+    std::vector<char *> retired;
+};
+
 #endif
 
 struct ggml_backend_cuda_context {
@@ -1585,6 +1592,8 @@ struct ggml_backend_cuda_context {
     std::unordered_map<const void *, ggml_cuda_marlin_q4_a32_cache_entry> marlin_q4_a32_cache;
     ggml_cuda_humming_fp8_lock_storage humming_fp8_locks[GGML_CUDA_MAX_STREAMS];
     ggml_cuda_humming_input_storage humming_inputs[GGML_CUDA_MAX_STREAMS];
+    ggml_cuda_q8_activation_storage mmq_q8_activations[GGML_CUDA_MAX_STREAMS];
+    std::unordered_map<const ggml_tensor *, int> mmq_q8_reuse_requests;
     std::unordered_set<const ggml_tensor *> humming_bf16_activations;
     std::unordered_set<const void *> humming_deferred_bf16;
     // Qwen recurrent prefill can defer its paired L2 outputs to the FLA input
