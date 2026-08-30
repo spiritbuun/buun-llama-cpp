@@ -769,7 +769,8 @@ static void test_prepared_release_capability() {
     CHECK(project()(released, quote.projected_domains));
     stale_ledger.gauge_set(
         llama_cache_acct_category::checkpoint_state_payload,
-        HOST, llama_cache_acct_measure::reserved, 0);
+        HOST, llama_cache_acct_measure::reserved, 1);
+    CHECK(stale_ledger.snapshot().serial != stale_serial);
     auto stale_pin = server_cache_recovery_pin::acquire(
         &releases, release_pin, { { 99 } }, {});
     auto serial_conflict = server_cache_prepare_release_set(

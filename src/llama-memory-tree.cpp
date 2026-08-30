@@ -3,6 +3,7 @@
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-idx.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
@@ -27,6 +28,13 @@ bool collect_impl(
             hybrid_iswa->get_mem_recr(),
             checkpoint_child_dependency_mode::absent });
         return true;
+    }
+    // Indexed hybrid memory has a third, indexed attention component whose
+    // artifact semantics are not represented by the two-child hybrid shape.
+    // Refuse it explicitly until the indexed topology has its own collector;
+    // falling through to llama_memory_hybrid would silently omit that state.
+    if (dynamic_cast<llama_memory_hybrid_idx *>(memory)) {
+        return false;
     }
     if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory)) {
         output.push_back({ uint32_t(output.size()), hybrid->get_mem_attn(), nullptr,

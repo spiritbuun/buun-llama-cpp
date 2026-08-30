@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cinttypes>
+#include <thread>
 
 #define QUE_INF(fmt, ...) LOG_INF("que  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define QUE_WRN(fmt, ...) LOG_WRN("que  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -83,9 +84,14 @@ void server_queue::idle_capture_session::reset() noexcept {
 }
 
 server_queue::~server_queue() {
-    std::unique_lock<std::mutex> lock(mutex_tasks);
-    idle_capture_stopped = true;
-    cancel_idle_capture_locked();
+    {
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        idle_capture_stopped = true;
+        cancel_idle_capture_locked();
+        running = false;
+    }
+    condition_tasks.notify_all();
+    worker_stop();
 }
 
 void server_queue::cancel_idle_capture_locked() noexcept {
@@ -97,8 +103,8 @@ void server_queue::cancel_idle_capture_locked() noexcept {
 server_queue::idle_capture_session
 server_queue::try_begin_idle_capture() noexcept {
     std::unique_lock<std::mutex> lock(mutex_tasks);
-    if (idle_capture_stopped || !queue_tasks.empty() ||
-        !queue_tasks_deferred.empty()) {
+    if (idle_capture_stopped || worker.busy || !queue_tasks.empty() ||
+        !queue_tasks_deferred.empty() || !queue_tasks_unhandled.empty()) {
         return {};
     }
     try {
@@ -131,8 +137,8 @@ server_queue::try_begin_prompt_boundary_capture() noexcept {
         queue_tasks.begin(), queue_tasks.end(), [](const server_task & task) {
             return task.type == SERVER_TASK_TYPE_NEXT_RESPONSE;
         });
-    if (idle_capture_stopped || !only_scheduler_wakes ||
-        !queue_tasks_deferred.empty()) {
+    if (idle_capture_stopped || worker.busy || !only_scheduler_wakes ||
+        !queue_tasks_deferred.empty() || !queue_tasks_unhandled.empty()) {
         return {};
     }
     try {
@@ -171,11 +177,14 @@ server_queue::diagnostic_snapshot server_queue::diagnostics(
         result.sleeping = sleeping;
         result.maintenance_requested = idle_maintenance_requested.load(
             std::memory_order_acquire);
-        result.queued = queue_tasks.size();
+        result.queued = queue_tasks.size() + queue_tasks_unhandled.size();
         result.deferred = queue_tasks_deferred.size();
         result.posts = diagnostic_posts_;
         result.dequeues = diagnostic_dequeues_;
         for (const auto & task : queue_tasks) {
+            result.matching_queued += task_ids.count(task.id) != 0;
+        }
+        for (const auto & task : queue_tasks_unhandled) {
             result.matching_queued += task_ids.count(task.id) != 0;
         }
         for (const auto & task : queue_tasks_deferred) {
@@ -185,6 +194,10 @@ server_queue::diagnostic_snapshot server_queue::diagnostics(
         // Diagnostics must never perturb request processing.
     }
     return result;
+}
+
+static bool task_resets_idle_timer(server_task_type type) {
+    return type != SERVER_TASK_TYPE_METRICS;
 }
 
 int server_queue::post(server_task && task, bool front) {
@@ -197,7 +210,8 @@ int server_queue::post(server_task && task, bool front) {
     if (task.type == SERVER_TASK_TYPE_CANCEL) {
         cleanup_pending_task(task.id_target);
     }
-    const int task_id = task.id;
+    const int  task_id     = task.id;
+    const bool reset_timer = task_resets_idle_timer(task.type);
     QUE_DBG("new task, id = %d, front = %d\n", task_id, front);
     if (front) {
         queue_tasks.push_front(std::move(task));
@@ -209,11 +223,14 @@ int server_queue::post(server_task && task, bool front) {
         QUE_INF(
             "CACHE_QUEUE event=post task=%d count=1 front=%d queued=%zu "
             "deferred=%zu posts=%" PRIu64 " dequeues=%" PRIu64 "\n",
-            task_id, int(front), queue_tasks.size(),
+            task_id, int(front),
+            queue_tasks.size() + queue_tasks_unhandled.size(),
             queue_tasks_deferred.size(), diagnostic_posts_,
             diagnostic_dequeues_);
     }
-    time_last_task = ggml_time_ms();
+    if (reset_timer) {
+        time_last_task = ggml_time_ms();
+    }
     condition_tasks.notify_one();
     return task_id;
 }
@@ -226,6 +243,7 @@ int server_queue::post(std::vector<server_task> && tasks, bool front) {
     size_t diagnostic_task_count = 0;
     int first_task_id = -1;
     int last_task_id = -1;
+    bool reset_timer = false;
     for (auto & task : tasks) {
         if (task.id == -1) {
             task.id = id++;
@@ -241,6 +259,7 @@ int server_queue::post(std::vector<server_task> && tasks, bool front) {
             last_task_id = task.id;
             ++diagnostic_task_count;
         }
+        reset_timer |= task_resets_idle_timer(task.type);
         QUE_DBG("new task, id = %d/%d, front = %d\n", task.id, (int) tasks.size(), front);
         if (front) {
             queue_tasks.push_front(std::move(task));
@@ -255,10 +274,13 @@ int server_queue::post(std::vector<server_task> && tasks, bool front) {
             "front=%d queued=%zu deferred=%zu posts=%" PRIu64
             " dequeues=%" PRIu64 "\n",
             first_task_id, last_task_id, diagnostic_task_count, int(front),
-            queue_tasks.size(), queue_tasks_deferred.size(),
+            queue_tasks.size() + queue_tasks_unhandled.size(),
+            queue_tasks_deferred.size(),
             diagnostic_posts_, diagnostic_dequeues_);
     }
-    time_last_task = ggml_time_ms();
+    if (reset_timer) {
+        time_last_task = ggml_time_ms();
+    }
     condition_tasks.notify_one();
     return 0;
 }
@@ -328,6 +350,168 @@ void server_queue::terminate() {
     condition_tasks.notify_all();
 }
 
+bool server_queue::process_new_tasks(bool is_yielding) {
+    while (true) {
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        if (!running) {
+            QUE_DBG("%s", "terminate\n");
+            return true;
+        }
+        if (queue_tasks.empty()) {
+            return false;
+        }
+        server_task task = std::move(queue_tasks.front());
+        queue_tasks.pop_front();
+        if (diagnostics_enabled() &&
+            task.type != SERVER_TASK_TYPE_NEXT_RESPONSE) {
+            ++diagnostic_dequeues_;
+            QUE_INF(
+                "CACHE_QUEUE event=dequeue task=%d queued=%zu deferred=%zu "
+                "posts=%" PRIu64 " dequeues=%" PRIu64 "\n",
+                task.id, queue_tasks.size() + queue_tasks_unhandled.size(),
+                queue_tasks_deferred.size(), diagnostic_posts_,
+                diagnostic_dequeues_);
+        }
+        lock.unlock();
+
+        QUE_DBG("processing task, id = %d\n", task.id);
+        if (!callback_new_task(std::move(task), is_yielding)) {
+            // set it aside, do not put it back in the queue, else we offer it again in a loop
+            GGML_ASSERT(is_yielding && "a task can only be declined while yielding");
+            QUE_DBG("task declined, id = %d\n", task.id);
+            lock.lock();
+            queue_tasks_unhandled.push_back(std::move(task));
+        }
+    }
+}
+
+void server_queue::worker_loop() {
+    while (true) {
+        {
+            std::unique_lock<std::mutex> lock(mutex_tasks);
+            // wait on busy instead of yielding - busy stays set even when the yield already ended
+            worker.cv.wait(lock, [&]{
+                return worker.stop || worker.busy;
+            });
+            if (worker.stop) {
+                return;
+            }
+        }
+
+        // process tasks while the yield is active
+        while (true) {
+            bool terminated = false;
+            try {
+                // note: do not hold any lock here, the callback may post new tasks
+                terminated = process_new_tasks(true);
+            } catch (...) {
+                std::unique_lock<std::mutex> lock(mutex_tasks);
+                worker.exception = std::current_exception();
+                break;
+            }
+
+            std::unique_lock<std::mutex> lock(mutex_tasks);
+            if (terminated || worker.stop || !worker.yielding) {
+                break;
+            }
+            if (!queue_tasks.empty()) {
+                continue; // a new task arrived in the meantime
+            }
+            condition_tasks.wait(lock, [&]{
+                return worker.stop || !running || !worker.yielding || !queue_tasks.empty();
+            });
+        }
+
+        // signal to yield_to_queue() that no more tasks will be processed
+        {
+            std::unique_lock<std::mutex> lock(mutex_tasks);
+            worker.busy = false;
+        }
+        condition_tasks.notify_all();
+    }
+}
+
+void server_queue::worker_stop() {
+    if (!worker.thread.joinable()) {
+        return;
+    }
+    {
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        worker.stop = true;
+    }
+    worker.cv.notify_one();
+    condition_tasks.notify_all();
+    worker.thread.join();
+}
+
+void server_queue::yield_to_queue(std::function<void()> && work) {
+    GGML_ASSERT(worker.thread.joinable() && "yield_to_queue() requires start_loop() to be running");
+
+    QUE_DBG("%s", "yielding to queue\n");
+
+    {
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        GGML_ASSERT(!worker.busy && "yield_to_queue() cannot be nested");
+        worker.busy     = true;
+        worker.yielding = true;
+    }
+    worker.cv.notify_one();
+
+    // run the work on the current thread, so that all ggml compute stays on the same thread
+    std::exception_ptr exception;
+    try {
+        work();
+    } catch (...) {
+        exception = std::current_exception();
+    }
+
+    {
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+
+        // the yield is over, wait for the worker to finish its current task
+        worker.yielding = false;
+        condition_tasks.notify_all();
+        condition_tasks.wait(lock, [&]{
+            return !worker.busy;
+        });
+
+        // put the declined tasks back, keeping their order
+        while (!queue_tasks_unhandled.empty()) {
+            queue_tasks.push_front(std::move(queue_tasks_unhandled.back()));
+            queue_tasks_unhandled.pop_back();
+        }
+
+        // make sure to avoid idle timeout here
+        time_last_task = ggml_time_ms();
+
+        // an exception from work() takes precedence over the one from the worker
+        if (!exception) {
+            std::swap(exception, worker.exception);
+        } else {
+            worker.exception = nullptr;
+        }
+    }
+
+    QUE_DBG("%s", "done yielding to queue\n");
+
+    // note: rethrow only after the declined tasks are back in the queue, so they are not lost
+    if (exception) {
+        std::rethrow_exception(exception);
+    }
+}
+
+std::exception_ptr server_queue::yield_to_queue_capture_exception(
+        std::function<void()> && work,
+        const std::exception_ptr & delayed_work_exception) noexcept {
+    try {
+        yield_to_queue(std::move(work));
+    } catch (...) {
+        return delayed_work_exception ? delayed_work_exception : std::current_exception();
+    }
+
+    return delayed_work_exception;
+}
+
 void server_queue::start_loop(int64_t idle_sleep_ms) {
     {
         std::unique_lock<std::mutex> lock(mutex_tasks);
@@ -337,6 +521,13 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
         running = true;
         time_last_task = ggml_time_ms();
     }
+
+    // spawn the worker thread used by yield_to_queue()
+    GGML_ASSERT(!worker.thread.joinable() && "start_loop() is already running");
+    worker.stop     = false;
+    worker.busy     = false;
+    worker.yielding = false;
+    worker.thread = std::thread([this]() { worker_loop(); });
 
     constexpr auto max_wait_time = std::chrono::seconds(1);
     auto should_sleep = [&]() -> bool {
@@ -350,42 +541,22 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
 
     while (true) {
         QUE_DBG("%s", "processing new tasks\n");
-
-        while (true) {
-            std::unique_lock<std::mutex> lock(mutex_tasks);
-            if (!running) {
-                QUE_DBG("%s", "terminate\n");
-                return;
-            }
-            if (queue_tasks.empty()) {
-                lock.unlock();
-                break;
-            }
-            server_task task = std::move(queue_tasks.front());
-            queue_tasks.pop_front();
-            if (diagnostics_enabled() &&
-                task.type != SERVER_TASK_TYPE_NEXT_RESPONSE) {
-                ++diagnostic_dequeues_;
-                QUE_INF(
-                    "CACHE_QUEUE event=dequeue task=%d queued=%zu deferred=%zu "
-                    "posts=%" PRIu64 " dequeues=%" PRIu64 "\n",
-                    task.id, queue_tasks.size(), queue_tasks_deferred.size(),
-                    diagnostic_posts_, diagnostic_dequeues_);
-            }
-            lock.unlock();
-
-            QUE_DBG("processing task, id = %d\n", task.id);
-            callback_new_task(std::move(task));
+        if (process_new_tasks(false)) {
+            break; // terminate
         }
+
         // all tasks in the current loop is processed, slots data is now ready
         QUE_DBG("%s", "update slots\n");
 
         // this will run the main inference process for all slots
+        const int64_t t_update_slots = ggml_time_ms();
         callback_update_slots();
         {
             // update_slots() may take a while to finish, we need to make sure it's not counted as idle
+            // shift instead of reset, so that non-task_resets_idle_timer tasks do not delay the sleep
             std::unique_lock<std::mutex> lock(mutex_tasks);
-            time_last_task = ggml_time_ms();
+            const int64_t now = ggml_time_ms();
+            time_last_task = std::min(now, time_last_task + (now - t_update_slots));
         }
 
         QUE_DBG("%s", "waiting for new tasks\n");
@@ -399,8 +570,13 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
             if (should_sleep()) {
                 QUE_INF("%s", "entering sleeping state\n");
                 sleeping = true;
-                callback_sleeping_state(true);
                 req_stop_sleeping = false;
+                // Call order cb0 -> cb1 -> cb{N}
+                lock.unlock();
+                for (auto & cb : callback_sleeping_state) {
+                    cb(true);
+                }
+                lock.lock();
                 // wait until we are requested to exit sleeping state
                 condition_tasks.wait(lock, [&]{
                     return (!running || req_stop_sleeping);
@@ -410,7 +586,12 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                 }
                 QUE_INF("%s", "exiting sleeping state\n");
                 req_stop_sleeping = false;
-                callback_sleeping_state(false);
+                // Call order cb{N} -> cb1 -> cb0
+                lock.unlock();
+                for (size_t i = callback_sleeping_state.size(); i > 0; i--) {
+                    callback_sleeping_state[i - 1](false);
+                }
+                lock.lock();
                 sleeping = false;
                 time_last_task = ggml_time_ms();
                 condition_tasks.notify_all(); // notify wait_until_no_sleep()
@@ -444,6 +625,8 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
             }
         }
     }
+
+    worker_stop();
 }
 
 void server_queue::cleanup_pending_task(int id_target) {
@@ -452,11 +635,15 @@ void server_queue::cleanup_pending_task(int id_target) {
         return task.id == id_target;
     };
     queue_tasks.erase(
-        std::remove_if(queue_tasks.begin(),          queue_tasks.end(),          rm_func),
+        std::remove_if(queue_tasks.begin(),           queue_tasks.end(),           rm_func),
         queue_tasks.end());
     queue_tasks_deferred.erase(
-        std::remove_if(queue_tasks_deferred.begin(), queue_tasks_deferred.end(), rm_func),
+        std::remove_if(queue_tasks_deferred.begin(),  queue_tasks_deferred.end(),  rm_func),
         queue_tasks_deferred.end());
+    // a task declined while yielding is not in queue_tasks yet, but it can still be cancelled
+    queue_tasks_unhandled.erase(
+        std::remove_if(queue_tasks_unhandled.begin(), queue_tasks_unhandled.end(), rm_func),
+        queue_tasks_unhandled.end());
 }
 
 //

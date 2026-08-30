@@ -87,6 +87,8 @@ add_library(${TARGET}
     imatrix-loader.cpp
     imatrix-loader.h
     json-schema-to-grammar.cpp
+    json.cpp
+    json.h
     llguidance.cpp
     log.cpp
     log.h
@@ -133,8 +135,8 @@ add_library(${TARGET}
     )
 
 set_target_properties(${TARGET} PROPERTIES
-    VERSION ${LLAMA_INSTALL_VERSION}
-    SOVERSION 0
+    VERSION ${LLAMA_VERSION_BASE}
+    SOVERSION ${LLAMA_VERSION_MAJOR}
     MACHO_CURRENT_VERSION 0 # keep macOS linker from seeing oversized version number
 )
 
@@ -147,6 +149,7 @@ target_include_directories(${TARGET} PUBLIC . ../vendor)
 # the internal SHA-256 primitive and carry no process-local accounting handles.
 set_source_files_properties(common-cache-plan-estimate.cpp common-retention-sidecar.cpp mtp-vocab-trim.cpp
     PROPERTIES INCLUDE_DIRECTORIES ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries     (${TARGET} PUBLIC vendor::nlohmann vendor::sheredom)
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 
 if (LLAMA_SUBPROCESS)

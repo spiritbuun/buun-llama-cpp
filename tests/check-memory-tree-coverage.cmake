@@ -18,8 +18,8 @@ endif()
 # Classes deliberately NOT covered by the walker. Every entry needs a reason and
 # an owner decision; stale entries (class gone, or class now in the ladder) fail
 # the scan so this list cannot rot.
-# None of these were ever *decided* unsupported — they postdate the walker and no
-# one extended it. This list records that fact instead of letting it stay silent.
+# This list makes each unsupported topology an explicit, reviewable decision
+# instead of letting a new class silently fall through the walker.
 # The walker only feeds the VBR artifact capture/adopt paths; ordinary context
 # checkpoints do not route through it.
 #   llama_kv_cache_dsa  — composes TWO coupled llama_kv_cache children (kv_mla +
@@ -28,6 +28,11 @@ endif()
 #                         the inner caches accept turbo/VBR types (epoch already
 #                         forwarded as the sum of both) — supporting this is a
 #                         real design task, not a ladder entry.
+#   llama_kv_cache_dsa_iswa — adds an SWA cache beside llama_kv_cache_dsa. The
+#                         DSA child still has the unsupported coupled-attention
+#                         topology above, so exposing only the SWA child would
+#                         make an incomplete artifact. It belongs to the same
+#                         dedicated collector project as dsa.
 #   llama_kv_cache_dsv4 — postdates the walker. VBR IS threaded to its four kv
 #                         children since 2026-08-10 (per-cache controllers need no
 #                         walker), but checkpoint capture stays uncovered: the csa/
@@ -39,6 +44,7 @@ endif()
 #                         status as dsv4.
 set(KNOWN_UNCOVERED
     llama_kv_cache_dsa
+    llama_kv_cache_dsa_iswa
     llama_kv_cache_dsv4
     llama_kv_cache_msa)
 
@@ -46,15 +52,41 @@ file(GLOB memory_headers
     "${SOURCE_ROOT}/src/llama-memory*.h"
     "${SOURCE_ROOT}/src/llama-kv-cache*.h")
 
-set(subclasses "")
+set(inheritance_edges "")
 foreach(path IN LISTS memory_headers)
     file(READ "${path}" text)
-    string(REGEX MATCHALL "class (llama_[a-z0-9_]+)[ \t\r\n]*:[ \t\r\n]*public llama_memory_i" hits "${text}")
+    string(REGEX MATCHALL
+        "class[ \t\r\n]+llama_[a-z0-9_]+[ \t\r\n]*:[ \t\r\n]*public[ \t\r\n]+llama_[a-z0-9_]+"
+        hits "${text}")
     foreach(hit IN LISTS hits)
-        string(REGEX REPLACE "class (llama_[a-z0-9_]+).*" "\\1" name "${hit}")
-        list(APPEND subclasses "${name}")
+        string(REGEX REPLACE
+            "class[ \t\r\n]+(llama_[a-z0-9_]+)[ \t\r\n]*:[ \t\r\n]*public[ \t\r\n]+(llama_[a-z0-9_]+)"
+            "\\1|\\2" edge "${hit}")
+        list(APPEND inheritance_edges "${edge}")
     endforeach()
 endforeach()
+
+# Include indirect descendants as well as direct subclasses. In particular,
+# llama_memory_hybrid_idx derives from llama_memory_hybrid; omitting transitive
+# inheritance makes its required derived-before-base refusal cast look stale.
+set(subclasses "")
+set(changed TRUE)
+while(changed)
+    set(changed FALSE)
+    foreach(edge IN LISTS inheritance_edges)
+        string(REPLACE "|" ";" pair "${edge}")
+        list(GET pair 0 name)
+        list(GET pair 1 base)
+        list(FIND subclasses "${base}" base_is_subclass)
+        if(base STREQUAL "llama_memory_i" OR NOT base_is_subclass EQUAL -1)
+            list(FIND subclasses "${name}" already_present)
+            if(already_present EQUAL -1)
+                list(APPEND subclasses "${name}")
+                set(changed TRUE)
+            endif()
+        endif()
+    endforeach()
+endwhile()
 list(REMOVE_DUPLICATES subclasses)
 list(LENGTH subclasses n_subclasses)
 if (n_subclasses EQUAL 0)

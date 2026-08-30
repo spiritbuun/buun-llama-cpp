@@ -106,6 +106,17 @@ if (LLAMA_BUILD_TESTS)
     add_test(NAME test-server-media-prefix COMMAND test-server-media-prefix)
     set_property(TEST test-server-media-prefix PROPERTY LABELS main)
 
+    add_executable(test-server-mmproj-lifecycle
+        ${CMAKE_SOURCE_DIR}/tests/test-server-mmproj-lifecycle.cpp)
+    target_link_libraries(test-server-mmproj-lifecycle PRIVATE
+        server-context mtmd llama llama-common)
+    target_include_directories(test-server-mmproj-lifecycle PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/tools/mtmd)
+    target_compile_features(test-server-mmproj-lifecycle PRIVATE cxx_std_17)
+    add_test(NAME test-server-mmproj-lifecycle
+        COMMAND test-server-mmproj-lifecycle)
+    set_property(TEST test-server-mmproj-lifecycle PROPERTY LABELS main)
+
     add_executable(test-server-prompt-cache ${CMAKE_SOURCE_DIR}/tests/test-server-prompt-cache.cpp)
     target_link_libraries(test-server-prompt-cache PRIVATE server-context mtmd llama llama-common)
     target_include_directories(test-server-prompt-cache PRIVATE

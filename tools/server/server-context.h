@@ -4,14 +4,40 @@
 #include "server-task.h"
 #include "server-queue.h"
 
-#include <nlohmann/json_fwd.hpp>
+#include "json.h"
 
 #include <cstddef>
 #include <memory>
+#include <mutex>
 #include <set>
 
 struct server_context_impl; // private implementation
 class server_cache_control_authority;
+
+enum class server_speculative_decode_terminal {
+    success,
+    preserve_hard_seal,
+    ordinary_ret_error,
+    retry,
+    reset_committed_then_throw,
+};
+
+server_speculative_decode_terminal
+server_speculative_decode_terminal_resolve(
+    int decode_result,
+    bool hard_seal_terminal,
+    bool single_token_batch,
+    bool selected_exception,
+    bool speculative_ok) noexcept;
+
+struct server_committed_decode_reset_test_result {
+    bool processing_prompt_cleared = false;
+    bool processing_family_cleared = false;
+    bool idle_prompt_preserved = false;
+};
+
+server_committed_decode_reset_test_result
+server_committed_decode_reset_for_test();
 
 struct server_vbr_occupied_quarantine_reset_result {
     bool replay_preserved_prefix = false;
@@ -57,6 +83,22 @@ struct server_rejected_prompt_preservation_result {
 
 server_rejected_prompt_preservation_result
 server_rejected_prompt_preservation_for_test();
+
+struct server_mmproj_lifecycle_test_result {
+    bool null_binding_clears_views = false;
+    bool restored_binding_updates_views = false;
+    bool failed_recreation_stays_null = false;
+    bool normal_restore_once = false;
+    bool thrown_media_restore_once = false;
+    bool thrown_callback_restore_once = false;
+    bool throwing_restore_not_retried = false;
+};
+
+// TEST-ONLY model-free exercise of the production slot rebinder and exactly-once
+// restoration guard. It uses opaque pointer identities but never dereferences
+// them, so ownership transitions can be proved without loading a projector.
+server_mmproj_lifecycle_test_result
+server_mmproj_lifecycle_for_test();
 
 struct server_vbr_retention_wiring_result {
     bool slot_metadata_wired = false;
@@ -292,15 +334,25 @@ private:
     std::unique_ptr<server_res_generator> handle_slots_capture(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_slots_import(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_embeddings_impl(const server_http_req & req, task_response_type res_type);
-    std::unique_ptr<server_res_generator> handle_count_tokens(const llama_vocab * vocab, mtmd_context * mctx, const server_http_req & req, task_response_type res_type);
+    std::unique_ptr<server_res_generator> handle_count_tokens(const llama_vocab * vocab, mtmd_context * mctx, const mtmd_helper_init_opt & init_opt, const server_http_req & req, task_response_type res_type);
 
     // using unique_ptr to allow late initialization of const
     std::unique_ptr<const server_context_meta> meta;
 
     const common_params & params;
-    const server_context_impl & ctx_server;
+    server_context_impl & ctx_server;
 
     server_queue & queue_tasks;
     server_response & queue_results;
     std::unique_ptr<server_res_generator> create_response(bool bypass_sleep = false);
+
+    // cached responses, to be used during sleep
+    std::mutex     mutex_cache;
+    json           cached_models  = nullptr;
+    json           cached_props   = nullptr;
+    server_metrics cached_metrics;
+    // set when a scrape during sleep already reported the throughput buckets
+    bool           should_reset_buckets = false;
+    // call right before sleep to update the cached responses
+    void update_cached_responses(bool is_sleeping);
 };
