@@ -2,6 +2,8 @@
 #include "common.h"
 #include "log.h"
 #include "llama-cpp.h"
+#include "../src/llama-context.h"
+#include "../src/llama-model.h"
 
 #include <algorithm>
 #include <clocale>
@@ -368,6 +370,137 @@ static bool test_seq_file_integrity(
         const llama_tokens         & tokens) {
     static constexpr size_t SEQ_FILE_HEADER_SIZE = 24;
 
+    std::array<uint8_t, 32> family = {};
+    const bool has_family_identity = llama_model_semantic_family_digest(
+        model, family.data());
+    const auto family_now = [&]() {
+        std::array<uint8_t, 32> value = {};
+        if (!llama_model_semantic_family_digest(model, value.data())) {
+            value.fill(0);
+        }
+        return value;
+    };
+    if (has_family_identity) {
+        const std::string saved_name = model->name;
+        model->name = saved_name + "-renamed-requantized-finetune";
+        bool nonsemantic_stable = family_now() == family;
+        model->name = saved_name;
+
+        // Quantization/file metadata and model labels are deliberately not
+        // part of the semantic family.  The receipt owns the effective
+        // architecture/KV/tokenizer shape below, not model weight identity.
+        static constexpr const char * metadata_keys[] = {
+            "general.file_type",
+            "general.quantization_version",
+        };
+        for (const char * key : metadata_keys) {
+            const auto it = model->gguf_kv.find(key);
+            const bool had_value = it != model->gguf_kv.end();
+            const std::string saved_value = had_value ? it->second : std::string();
+            model->gguf_kv[key] = "different-quant-or-finetune-metadata";
+            nonsemantic_stable = nonsemantic_stable && family_now() == family;
+            if (had_value) {
+                model->gguf_kv[key] = saved_value;
+            } else {
+                model->gguf_kv.erase(key);
+            }
+        }
+        if (!nonsemantic_stable) {
+            LOG_ERR("%s: nonsemantic model/quant metadata changed family identity\n", __func__);
+            return false;
+        }
+    }
+    const auto require_family_mutation = [&](auto & field, auto replacement,
+                                              const char * label) {
+        const auto saved = field;
+        field = replacement;
+        const bool changed = family_now() != family;
+        field = saved;
+        if (!changed) {
+            LOG_ERR("%s: %s did not change semantic-family identity\n",
+                    __func__, label);
+        }
+        return changed;
+    };
+    if (has_family_identity &&
+       (!require_family_mutation(model->arch, LLM_ARCH_UNKNOWN, "architecture") ||
+        !require_family_mutation(model->hparams.n_embd,
+            model->hparams.n_embd + 1, "embedding shape") ||
+        !require_family_mutation(model->hparams.n_head_kv_arr[0],
+            model->hparams.n_head_kv_arr[0] + 1, "KV layout") ||
+        !require_family_mutation(model->hparams.n_ff_arr[0],
+            model->hparams.n_ff_arr[0] + 1, "per-layer FFN shape") ||
+        !require_family_mutation(model->hparams.n_expert,
+            model->hparams.n_expert + 1, "expert count") ||
+        !require_family_mutation(model->hparams.n_expert_used,
+            model->hparams.n_expert_used + 1, "selected expert count") ||
+        !require_family_mutation(model->hparams.n_expert_shared,
+            model->hparams.n_expert_shared + 1, "shared expert topology") ||
+        !require_family_mutation(model->hparams.n_expert_groups,
+            model->hparams.n_expert_groups + 1, "expert group topology") ||
+        !require_family_mutation(model->hparams.expert_group_scale,
+            model->hparams.expert_group_scale + 1.0f, "expert group scale") ||
+        !require_family_mutation(model->hparams.expert_gating_func,
+            model->hparams.expert_gating_func + 1, "expert gating policy") ||
+        !require_family_mutation(model->hparams.f_attn_logit_softcapping,
+            model->hparams.f_attn_logit_softcapping + 1.0f,
+            "attention logit policy") ||
+        !require_family_mutation(model->hparams.f_attention_scale,
+            model->hparams.f_attention_scale + 1.0f,
+            "attention scale") ||
+        !require_family_mutation(model->hparams.rope_finetuned,
+            !model->hparams.rope_finetuned, "RoPE fine-tuned policy") ||
+        !require_family_mutation(model->hparams.n_rot_full,
+            model->hparams.n_rot_full + 1, "RoPE dimensions") ||
+        !require_family_mutation(model->hparams.rope_freq_base_train,
+            model->hparams.rope_freq_base_train + 1.0f, "RoPE base") ||
+        !require_family_mutation(model->hparams.rope_freq_scale_train,
+            model->hparams.rope_freq_scale_train + 1.0f, "RoPE scale") ||
+        !require_family_mutation(model->hparams.rope_sections[0],
+            model->hparams.rope_sections[0] + 1, "RoPE sections") ||
+        !require_family_mutation(model->hparams.rope_pattern[0],
+            model->hparams.rope_pattern[0] ^ 1u, "RoPE layer pattern") ||
+        !require_family_mutation(model->hparams.rope_type,
+            static_cast<llama_rope_type>(uint32_t(model->hparams.rope_type) + 1),
+            "RoPE type") ||
+        !require_family_mutation(model->hparams.rope_scaling_type_train,
+            static_cast<llama_rope_scaling_type>(
+                uint32_t(model->hparams.rope_scaling_type_train) + 1),
+            "RoPE scaling type") ||
+        !require_family_mutation(model->hparams.swa_type,
+            static_cast<llama_swa_type>(uint32_t(model->hparams.swa_type) + 1),
+            "SWA type") ||
+        !require_family_mutation(model->hparams.n_swa,
+            model->hparams.n_swa + 1, "SWA window") ||
+        !require_family_mutation(model->hparams.is_recr_impl[0],
+            model->hparams.is_recr_impl[0] ^ 1u, "recurrent layout") ||
+        !require_family_mutation(model->hparams.ssm_dt_rank,
+            model->hparams.ssm_dt_rank + 1, "SSM rank") ||
+        !require_family_mutation(model->hparams.ssm_n_group,
+            model->hparams.ssm_n_group + 1, "SSM groups") ||
+        !require_family_mutation(model->hparams.ssm_dt_b_c_rms,
+            !model->hparams.ssm_dt_b_c_rms, "SSM normalization") ||
+        !require_family_mutation(model->hparams.dflash2_conv_kernel_size,
+            model->hparams.dflash2_conv_kernel_size + 1,
+            "recurrent convolution shape") ||
+        !require_family_mutation(model->hparams.is_indexer_full_impl[0],
+            model->hparams.is_indexer_full_impl[0] ^ 1u, "index layout"))) {
+        return false;
+    }
+    if (has_family_identity) {
+        auto & token0 = const_cast<llama_vocab::token_data &>(
+            model->vocab.get_token_data(0));
+        const std::string saved_token0 = token0.text;
+        token0.text.push_back('\0');
+        const bool token_mapping_changed = family_now() != family;
+        token0.text = saved_token0;
+        if (!token_mapping_changed) {
+            LOG_ERR("%s: same-size vocabulary mapping mutation was accepted\n",
+                    __func__);
+            return false;
+        }
+    }
+
     auto params_ctx = common_context_params_to_llama(params);
     params_ctx.n_ctx      = 256;
     params_ctx.n_seq_max  = 1;
@@ -437,6 +570,8 @@ static bool test_seq_file_integrity(
                 __func__, file_bytes.size(), saved_size);
         return false;
     }
+    const size_t token_begin = SEQ_FILE_HEADER_SIZE + sizeof(uint32_t);
+    const size_t token_bytes = n_tokens*sizeof(llama_token);
 
     uint64_t declared_size = 0;
     memcpy(&declared_size, file_bytes.data() + 2*sizeof(uint32_t), sizeof(declared_size));
@@ -461,6 +596,97 @@ static bool test_seq_file_integrity(
     std::vector<uint8_t> state_dst;
     if (!get_seq_state(ctx_dst.get(), state_dst) || state_dst != state_src) {
         LOG_ERR("%s: sequence state differs after file round-trip\n", __func__);
+        return false;
+    }
+
+    // Prepare A once, replace the pathname with a separately authenticated B,
+    // and apply A without reopening the path. Then restore A at the path to
+    // mutation-pin A->B->A pathname ABA independently of the retained bytes.
+    llama_state_seq_file_snapshot prepared_a;
+    if (!llama_state_seq_file_snapshot_prepare(seq_path.c_str(), prepared_a)) {
+        LOG_ERR("%s: failed to prepare immutable sequence snapshot A\n", __func__);
+        return false;
+    }
+    std::vector<uint8_t> file_b = file_bytes;
+    file_b[token_begin] ^= 1;
+    static constexpr uint64_t FNV1A64_OFFSET_BASIS = UINT64_C(14695981039346656037);
+    static constexpr uint64_t FNV1A64_PRIME        = UINT64_C(1099511628211);
+    const auto rewrite_checksum = [&](std::vector<uint8_t> & bytes) {
+        uint64_t checksum = FNV1A64_OFFSET_BASIS;
+        for (size_t i = SEQ_FILE_HEADER_SIZE; i < bytes.size(); ++i) {
+            checksum ^= bytes[i];
+            checksum *= FNV1A64_PRIME;
+        }
+        memcpy(bytes.data() + 2*sizeof(uint32_t) + sizeof(uint64_t),
+               &checksum, sizeof(checksum));
+    };
+    rewrite_checksum(file_b);
+    {
+        std::ofstream output(seq_path, std::ios::binary | std::ios::trunc);
+        output.write((const char *) file_b.data(), file_b.size());
+        if (!output) {
+            LOG_ERR("%s: failed to replace snapshot path with B\n", __func__);
+            return false;
+        }
+    }
+    llama_tokens prepared_tokens(n_tokens, LLAMA_TOKEN_NULL);
+    size_t prepared_count = 0;
+    ctx_dst->synchronize();
+    const size_t prepared_read = ctx_dst->state_seq_apply_file_snapshot(
+        0, prepared_a, prepared_tokens.data(), prepared_tokens.size(),
+        &prepared_count);
+    if (prepared_read != saved_size || prepared_count != n_tokens ||
+            !std::equal(tokens.begin(), tokens.begin() + n_tokens,
+                        prepared_tokens.begin()) ||
+            !get_seq_state(ctx_dst.get(), state_dst) || state_dst != state_src) {
+        LOG_ERR("%s: prepared A did not apply exactly after pathname replacement\n", __func__);
+        return false;
+    }
+    {
+        std::ofstream output(seq_path, std::ios::binary | std::ios::trunc);
+        output.write((const char *) file_bytes.data(), file_bytes.size());
+        if (!output) {
+            LOG_ERR("%s: failed to complete A-B-A pathname mutant\n", __func__);
+            return false;
+        }
+    }
+    std::vector<uint8_t> prepared_token_copy;
+    if (!prepared_a.copy_packed_token_bytes(prepared_token_copy) ||
+            prepared_token_copy.size() != n_tokens*sizeof(llama_token) ||
+            std::memcmp(prepared_token_copy.data(), tokens.data(),
+                        prepared_token_copy.size()) != 0) {
+        LOG_ERR("%s: prepared snapshot changed across A-B-A pathname mutation\n", __func__);
+        return false;
+    }
+
+    // The only inspection door returns a copy of the packed token envelope.
+    // Mutating that copy must leave the sealed snapshot and its exact A state
+    // unchanged across the A-B-A pathname replacement above.
+    llama_tokens post_prepare_tokens(n_tokens, LLAMA_TOKEN_NULL);
+    size_t post_prepare_count = 0;
+    std::vector<uint8_t> post_prepare_state_before;
+    if (!get_seq_state(ctx_dst.get(), post_prepare_state_before)) {
+        LOG_ERR("%s: failed to read destination before prepared mutation\n", __func__);
+        return false;
+    }
+    prepared_token_copy[0] ^= 1;
+    const size_t mutated_apply = ctx_dst->state_seq_apply_file_snapshot(
+        0, prepared_a, post_prepare_tokens.data(), post_prepare_tokens.size(),
+        &post_prepare_count);
+    std::vector<uint8_t> prepared_token_copy_after;
+    std::vector<uint8_t> post_prepare_state_after;
+    if (mutated_apply != saved_size ||
+            post_prepare_count != n_tokens ||
+            !std::equal(tokens.begin(), tokens.begin() + n_tokens,
+                        post_prepare_tokens.begin()) ||
+            !prepared_a.copy_packed_token_bytes(prepared_token_copy_after) ||
+            prepared_token_copy_after.size() != n_tokens*sizeof(llama_token) ||
+            std::memcmp(prepared_token_copy_after.data(), tokens.data(),
+                        prepared_token_copy_after.size()) != 0 ||
+            !get_seq_state(ctx_dst.get(), post_prepare_state_after) ||
+            post_prepare_state_after != post_prepare_state_before) {
+        LOG_ERR("%s: packed-token copy mutation changed the sealed snapshot\n",
+                __func__);
         return false;
     }
 
@@ -516,8 +742,6 @@ static bool test_seq_file_integrity(
     // Flip an authenticated token byte rather than assuming every
     // architecture has a nonempty sequence-memory payload. Diffusion-style
     // models can validly persist only the token envelope.
-    const size_t token_begin = SEQ_FILE_HEADER_SIZE + sizeof(uint32_t);
-    const size_t token_bytes = n_tokens*sizeof(llama_token);
     if (token_bytes == 0 || token_begin + token_bytes > file_bytes.size()) {
         LOG_ERR("%s: saved sequence state has no token payload\n", __func__);
         return false;
@@ -555,8 +779,6 @@ static bool test_seq_file_integrity(
         memcpy(malformed_state.data() + 2*sizeof(uint32_t),
                &malformed_size, sizeof(malformed_size));
 
-        static constexpr uint64_t FNV1A64_OFFSET_BASIS = UINT64_C(14695981039346656037);
-        static constexpr uint64_t FNV1A64_PRIME        = UINT64_C(1099511628211);
         uint64_t malformed_checksum = FNV1A64_OFFSET_BASIS;
         for (size_t i = SEQ_FILE_HEADER_SIZE; i < malformed_state.size(); ++i) {
             malformed_checksum ^= malformed_state[i];

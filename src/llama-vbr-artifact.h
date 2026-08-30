@@ -105,6 +105,7 @@ enum class vbr_artifact_companion_kind : uint8_t {
     typed_accelerator,
     required_spec_payload,
     frontier_logits,
+    qsa_index,
     _count,
 };
 
@@ -126,7 +127,7 @@ static_assert(static_cast<uint8_t>(vbr_artifact_recoverability::_count) == 1);
 static_assert(static_cast<uint8_t>(vbr_artifact_clean_stash_state::_count) == 3);
 static_assert(static_cast<uint8_t>(vbr_artifact_consistency_kind::_count) == 2);
 static_assert(static_cast<uint8_t>(vbr_artifact_section_kind::_count) == 4);
-static_assert(static_cast<uint8_t>(vbr_artifact_companion_kind::_count) == 4);
+static_assert(static_cast<uint8_t>(vbr_artifact_companion_kind::_count) == 5);
 static_assert(static_cast<uint8_t>(vbr_artifact_accounting_role::_count) == 6);
 
 // Repeatable byte source. The encoder's final write pass recomputes and verifies every embedded

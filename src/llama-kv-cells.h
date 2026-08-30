@@ -474,29 +474,21 @@ public:
     // sets "has_shift" to true
     // note: call only if the cell is not empty
     bool pos_add(uint32_t i, llama_pos d) {
-        assert(i < pos.size());
-        assert(pos[i] != -1);
+        return pos_add_impl(i, d, true, false);
+    }
 
-        seq_pos_rm(i);
+    // Text-only M-RoPE broadcasts the temporal position into the x/y planes.
+    // Keep all three pieces of metadata coherent while queuing the matching
+    // rotary-key update.
+    bool pos_add_mrope_text(uint32_t i, llama_pos d) {
+        return pos_add_impl(i, d, true, true);
+    }
 
-        pos[i]   += d;
-        shift[i] += d;
-
-        has_shift = true;
-
-        if (pos[i] < 0) {
-            seq[i].reset();
-            pos[i] = -1;
-            shift[i] = 0;
-
-            used.erase(i);
-
-            return true;
-        }
-
-        seq_pos_add(i);
-
-        return false;
+    // Some auxiliary caches (Qwen4 QSA) retain raw, pre-RoPE keys.  Their
+    // block metadata follows the shifted text position, but their key bytes
+    // must never be submitted to the K-shift graph.
+    bool pos_add_mrope_text_raw(uint32_t i, llama_pos d) {
+        return pos_add_impl(i, d, false, true);
     }
 
     // pos[i] = pos[i] / d
@@ -519,6 +511,38 @@ public:
     }
 
 private:
+    bool pos_add_impl(uint32_t i, llama_pos d, bool rotate_key, bool broadcast_text) {
+        assert(i < pos.size());
+        assert(pos[i] != -1);
+
+        seq_pos_rm(i);
+
+        pos[i] += d;
+        if (broadcast_text) {
+            ext[i].x += d;
+            ext[i].y += d;
+        }
+        if (rotate_key) {
+            shift[i] += d;
+        }
+
+        has_shift = has_shift || rotate_key;
+
+        if (pos[i] < 0) {
+            seq[i].reset();
+            pos[i] = -1;
+            shift[i] = 0;
+
+            used.erase(i);
+
+            return true;
+        }
+
+        seq_pos_add(i);
+
+        return false;
+    }
+
     bool has_shift = false;
 
     // set of indices of used cells (i.e. pos[i] != -1, allowed to not have any seq_id)

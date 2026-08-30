@@ -37,7 +37,8 @@ public:
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
                             /* the indexer cache exists only if this is given */
-    const layer_filter_cb & filter_idx);
+    const layer_filter_cb & filter_idx,
+    const llama_memory_vbr_params & vbr = {});
 
     ~llama_memory_hybrid_idx() = default;
 
@@ -54,10 +55,21 @@ public:
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
+    bool can_seq_rm_partial() const override {
+        return llama_memory_hybrid::can_seq_rm_partial() &&
+            (!mem_idx || mem_idx->can_seq_rm_partial());
+    }
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+    bool seq_rm_attn(llama_seq_id seq_id,                            llama_pos p0, llama_pos p1) override;
+    bool seq_rm_transient(llama_seq_id seq_id,                       llama_pos p0, llama_pos p1) override;
+    bool seq_rm_attn_transient(llama_seq_id seq_id,                  llama_pos p0, llama_pos p1) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
+    bool try_seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
+    bool try_seq_cp_transient(
+            llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;

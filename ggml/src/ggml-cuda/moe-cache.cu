@@ -163,6 +163,7 @@ struct moe_cache_config {
     bool serial_fill = true;
     bool serial_fill_explicit = false;
     bool force_dedicated_mmv = false;
+    bool force_dedicated_down_mmv = false;
     int overlap_cpu_rows = -1;
     bool overlap_cpu_rows_explicit = false;
     int expert_parallel = 0;
@@ -242,6 +243,7 @@ struct moe_cache_device {
     long long fused_nodes = 0;
     long long full_fused_rows = 0;
     long long full_fused_nodes = 0;
+    long long dedicated_down_mmv_dispatches = 0;
     long long nodes = 0;
     long long collect_calls = 0;
     // Dispatch mutex contention that turned a potential cache hit into a
@@ -617,6 +619,9 @@ static moe_cache_config moe_cache_read_config() {
     }
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_DEDICATED_MMV", 0, 1, value)) {
         config.force_dedicated_mmv = value != 0;
+    }
+    if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_DOWN_DEDICATED_MMV", 0, 1, value)) {
+        config.force_dedicated_down_mmv = value != 0;
     }
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_OVERLAP_CPU_ROWS", 0, 8, value)) {
         config.overlap_cpu_rows = (int)value;
@@ -1480,7 +1485,7 @@ static void moe_cache_log_stats(moe_cache_device & device) {
         used += pool.n_slots - pool.free_slots.size();
     }
     const long long total = device.hits + device.misses;
-    MOE_CACHE_LOG("[moe-cache] CUDA%d hits=%lld/%lld (%.1f%%) used=%zu/%zu enqueued=%lld filled=%lld fill-fail=%lld evictions=%lld skips=%lld admission=%lld queue=%zu jobs/%zu MiB dispatch-fail=%lld collect-fail=%lld act-dedup=%lld cpu-overlap=%lld fusion=%lld/%lld pairs=%lld/%lld/%lld/%lld fusion-attempts=%lld fusion-nodes=%lld full-fusion=%lld/%lld bypass=%lld\n",
+    MOE_CACHE_LOG("[moe-cache] CUDA%d hits=%lld/%lld (%.1f%%) used=%zu/%zu enqueued=%lld filled=%lld fill-fail=%lld evictions=%lld skips=%lld admission=%lld queue=%zu jobs/%zu MiB dispatch-fail=%lld collect-fail=%lld act-dedup=%lld cpu-overlap=%lld fusion=%lld/%lld pairs=%lld/%lld/%lld/%lld fusion-attempts=%lld fusion-nodes=%lld full-fusion=%lld/%lld down-mmv-dedicated=%lld bypass=%lld\n",
             device.physical, device.hits, total,
             total ? 100.0 * (double)device.hits / (double)total : 0.0,
             used, slots, device.inserts, device.fills, device.fill_failures,
@@ -1494,6 +1499,7 @@ static void moe_cache_log_stats(moe_cache_device & device) {
             device.fused_attempts,
             device.fused_nodes,
             device.full_fused_rows, device.full_fused_nodes,
+            device.dedicated_down_mmv_dispatches,
             device.contention_bypasses);
 }
 
@@ -1513,7 +1519,7 @@ static void moe_cache_log_configuration(moe_cache_session & session) {
             std::to_string(session.config.readmit_after) + "-replace"
         : "1-complete/" + std::to_string(session.config.admit_after) +
             "-partial/" + std::to_string(session.config.readmit_after) + "-replace";
-    MOE_CACHE_LOG("[moe-cache] configured: mode=%s devices=%zu budget=%s reserve=%zu MiB min-slab=%zu MiB min-expert=%zu KiB max-batch=%d inserts=%d admit=%s cpu-overlap=%s fills=%s expert-parallel=%d\n",
+    MOE_CACHE_LOG("[moe-cache] configured: mode=%s devices=%zu budget=%s reserve=%zu MiB min-slab=%zu MiB min-expert=%zu KiB max-batch=%d inserts=%d admit=%s cpu-overlap=%s fills=%s expert-parallel=%d down-mmv=%s\n",
             session.config.automatic ? "auto" : "on",
             session.devices.size(), budget.c_str(),
             session.config.reserve_mb,
@@ -1524,7 +1530,8 @@ static void moe_cache_log_configuration(moe_cache_session & session) {
             admission.c_str(),
             overlap_cpu_rows.c_str(),
             session.config.serial_fill ? "serial" : "parallel",
-            session.config.expert_parallel);
+            session.config.expert_parallel,
+            session.config.force_dedicated_down_mmv ? "dedicated" : "generic");
 }
 
 static void * moe_cache_session_create(
@@ -2433,7 +2440,6 @@ static int moe_cache_dispatch_internal(
     const float * unique_act_rows[moe_cache_node_rows_max];
     int32_t activation_indices[moe_cache_node_rows_max];
     int activation_rows = 0;
-    bool modulo_activation = true;
     for (int index = 0; index < n_hits; index++) {
         if (slot_indices[index] < 0 || slot_indices[index] >= pool.n_slots ||
             (fused && (gate_slot_indices[index] < 0 ||
@@ -2452,7 +2458,10 @@ static int moe_cache_dispatch_internal(
             unique_act_rows[activation_rows++] = act_rows[index];
         }
         activation_indices[index] = activation;
-        modulo_activation &= activation == index % activation_rows;
+    }
+    bool modulo_activation = true;
+    for (int index = 0; index < n_hits; index++) {
+        modulo_activation &= activation_indices[index] == index % activation_rows;
     }
 
     const int64_t padded_n_in =
@@ -2602,13 +2611,13 @@ static int moe_cache_dispatch_internal(
                     up_min, up_max, gate_min, gate_max,
                     device.compute_stream);
         } else {
-            ggml_cuda_moe_cache_mmv(
+            (void)ggml_cuda_moe_cache_mmv(
                     pool.slab, (ggml_type)wtype,
                     (const char *)device.d_act_q8, d_ids,
                     use_activation_map ? d_ids + n_hits : nullptr,
                     device.d_out, n_in, n_out, pool.n_slots,
                     (int64_t)pool.expert_size, n_hits, activation_rows,
-                    device.compute_stream);
+                    false, device.compute_stream);
         }
         ok = moe_cache_cuda_ok(
                 device, cudaPeekAtLastError(), "expert matvec launch", true);
@@ -2622,13 +2631,16 @@ static int moe_cache_dispatch_internal(
         ok = moe_cache_cuda_ok(
                 device, cudaPeekAtLastError(), "intermediate activation quantization", true);
     }
+    ggml_cuda_moe_cache_mmv_path down_mmv_path =
+        ggml_cuda_moe_cache_mmv_path::generic;
     if (ok && full) {
-        ggml_cuda_moe_cache_mmv(
+        down_mmv_path = ggml_cuda_moe_cache_mmv(
                 down_pool->slab, (ggml_type)down_pool->wtype,
                 (const char *)device.d_act_q8, d_ids + 2 * n_hits,
                 nullptr, device.d_out, n_out, node->n_out,
                 down_pool->n_slots, (int64_t)down_pool->expert_size,
-                n_hits, n_hits, device.compute_stream);
+                n_hits, n_hits, session.config.force_dedicated_down_mmv,
+                device.compute_stream);
         ok = moe_cache_cuda_ok(
                 device, cudaPeekAtLastError(), "down expert matvec launch", true);
     }
@@ -2641,6 +2653,9 @@ static int moe_cache_dispatch_internal(
     }
 
     device.activation_dedup += n_hits - activation_rows;
+    if (full && down_mmv_path == ggml_cuda_moe_cache_mmv_path::dedicated) {
+        device.dedicated_down_mmv_dispatches++;
+    }
     node->dispatched = true;
     return 1;
 }

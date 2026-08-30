@@ -1251,6 +1251,7 @@ struct test_case {
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     virtual bool use_weight_context() { return false; }
+    virtual ggml_backend_buffer_usage buffer_usage() { return GGML_BACKEND_BUFFER_USAGE_ANY; }
 
     ggml_cgraph * gf = nullptr;
     ggml_cgraph * gb = nullptr;
@@ -1429,6 +1430,7 @@ struct test_case {
             printf("failed to allocate tensors [%s] ", ggml_backend_name(backend1));
             return test_status_t::FAIL;
         }
+        ggml_backend_buffer_set_usage(buf.get(), buffer_usage());
 
         // build graph
         ggml_build_forward_expand(gf, out);
@@ -1589,6 +1591,7 @@ struct test_case {
             printf("failed to allocate tensors\n");
             return false;
         }
+        ggml_backend_buffer_set_usage(buf.get(), buffer_usage());
 
         // randomize tensors
         initialize_tensors(ctx.get());
@@ -3419,6 +3422,192 @@ struct test_softcap : public test_case {
         ggml_set_name(out, "out");
 
         return out;
+    }
+};
+
+// Four HC streams collapsed with the exact left-associated ADD -> ADD -> ADD -> SCALE tail.
+struct test_hc_stream_mean_fusion : public test_case {
+    enum class variant {
+        valid,
+        swapped_first_add,
+        wrong_scale,
+        extra_consumer,
+    };
+
+    int64_t n_embd;
+    int64_t nt;
+    variant v;
+
+    test_hc_stream_mean_fusion(int64_t n_embd, int64_t nt, variant v = variant::valid)
+        : n_embd(n_embd), nt(nt), v(v) {}
+
+    std::string op_desc(ggml_tensor *) override { return "HC_STREAM_MEAN_FUSION"; }
+    std::string vars() override {
+        return "n_embd=" + std::to_string(n_embd) + ",nt=" + std::to_string(nt) +
+            ",variant=" + std::to_string((int) v);
+    }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        constexpr int64_t hc = 4;
+        ggml_tensor * streams = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, nt);
+        const size_t stream_bytes = ggml_row_size(streams->type, n_embd);
+        const size_t token_stride = stream_bytes*hc;
+        ggml_tensor * slices[hc];
+        for (int64_t c = 0; c < hc; ++c) {
+            slices[c] = ggml_view_2d(ctx, streams, n_embd, nt, token_stride, stream_bytes*c);
+        }
+        ggml_tensor * mixed = ggml_cont(ctx, slices[0]);
+        mixed = v == variant::swapped_first_add
+            ? ggml_add(ctx, slices[1], mixed) : ggml_add(ctx, mixed, slices[1]);
+        ggml_tensor * first_add = mixed;
+        mixed = ggml_add(ctx, mixed, slices[2]);
+        mixed = ggml_add(ctx, mixed, slices[3]);
+        mixed = ggml_scale(ctx, mixed, v == variant::wrong_scale ? 0.2f : 0.25f);
+        if (v == variant::extra_consumer) {
+            mixed = ggml_add(ctx, mixed, first_add);
+        }
+        ggml_set_name(mixed, "out");
+        return mixed;
+    }
+};
+
+// Qwen4 HC grouped RMSNorm, flattened reshape, and per-channel gamma multiply.
+struct test_hc_grouped_rms_fusion : public test_case {
+    enum class variant { valid, extra_reshape_consumer };
+
+    int64_t n_embd;
+    int64_t hc;
+    int64_t nt;
+    variant v;
+
+    test_hc_grouped_rms_fusion(int64_t n_embd, int64_t hc, int64_t nt, variant v = variant::valid)
+        : n_embd(n_embd), hc(hc), nt(nt), v(v) {}
+
+    std::string op_desc(ggml_tensor *) override { return "HC_GROUPED_RMS_FUSION"; }
+    std::string vars() override {
+        return "n_embd=" + std::to_string(n_embd) + ",hc=" + std::to_string(hc) +
+            ",nt=" + std::to_string(nt) + ",variant=" + std::to_string((int) v);
+    }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, nt);
+        ggml_tensor * rms = ggml_rms_norm(ctx, x, 1e-6f);
+        ggml_tensor * reshape = ggml_reshape_2d(ctx, rms, n_embd*hc, nt);
+        ggml_tensor * gamma = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd*hc);
+        ggml_tensor * mul = ggml_mul(ctx, reshape, gamma);
+        ggml_tensor * out = v == variant::extra_reshape_consumer
+            ? ggml_add(ctx, mul, reshape) : mul;
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// Q8_0 generic MMV followed by the Qwen4 HC scale and SiLU epilogue.
+struct test_mmvq_post_silu_fusion : public test_case {
+    enum class variant { valid, wrong_factor, extra_consumer, force_mmq, padded_compute_view, small_k };
+
+    int64_t m;
+    int64_t k;
+    variant v;
+
+    test_mmvq_post_silu_fusion(int64_t m, int64_t k, variant v = variant::valid)
+        : m(m), k(k), v(v) {}
+
+    std::string op_desc(ggml_tensor *) override { return "MMVQ_POST_SILU_FUSION"; }
+    std::string vars() override {
+        return "m=" + std::to_string(m) + ",k=" + std::to_string(k) +
+            ",variant=" + std::to_string((int) v);
+    }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override {
+        return v == variant::padded_compute_view ? 5e-5 : 1e-7;
+    }
+    ggml_backend_buffer_usage buffer_usage() override {
+        return v == variant::padded_compute_view
+            ? GGML_BACKEND_BUFFER_USAGE_COMPUTE : GGML_BACKEND_BUFFER_USAGE_ANY;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * weights = nullptr;
+        if (v == variant::padded_compute_view) {
+            ggml_tensor * storage = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k, m + 1);
+            weights = ggml_view_2d(ctx, storage, k, m, storage->nb[1], 0);
+        } else {
+            weights = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k, m);
+        }
+        ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_tensor * mm = ggml_mul_mat(ctx, weights, input);
+        if (v == variant::force_mmq) {
+            ggml_mul_mat_set_hint(mm, GGML_HINT_FORCE_MMQ);
+        }
+        ggml_tensor * scale = ggml_scale(ctx, mm, v == variant::wrong_factor ? 0.5f : 0.25f);
+        ggml_tensor * silu = ggml_silu(ctx, scale);
+        ggml_tensor * out = v == variant::extra_consumer ? ggml_add(ctx, silu, mm) : silu;
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// Qwen4 residual HC combine: SCALE -> SIGMOID -> SCALE -> REPEAT -> MUL -> ADD.
+struct test_hc_combine_fusion : public test_case {
+    enum class variant {
+        valid,
+        swapped_add,
+        wrong_input_scale,
+        wrong_output_scale,
+        wrong_unary,
+        extra_consumer,
+        inplace_add,
+        aliased_block_inject,
+    };
+
+    int64_t n_embd;
+    int64_t hc;
+    int64_t nt;
+    variant v;
+
+    test_hc_combine_fusion(int64_t n_embd, int64_t hc, int64_t nt, variant v = variant::valid)
+        : n_embd(n_embd), hc(hc), nt(nt), v(v) {}
+
+    std::string op_desc(ggml_tensor *) override { return "HC_COMBINE_FUSION"; }
+    std::string vars() override {
+        return "n_embd=" + std::to_string(n_embd) + ",hc=" + std::to_string(hc) +
+            ",nt=" + std::to_string(nt) + ",variant=" + std::to_string((int) v);
+    }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, nt);
+        ggml_tensor * shared = v == variant::aliased_block_inject
+            ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd*nt) : nullptr;
+        ggml_tensor * block = v == variant::aliased_block_inject
+            ? ggml_view_2d(ctx, shared, n_embd, nt, n_embd*sizeof(float), 0)
+            : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, nt);
+        ggml_tensor * inject = v == variant::aliased_block_inject
+            ? ggml_view_2d(ctx, shared, hc, nt, hc*sizeof(float), 0)
+            : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, nt);
+        ggml_tensor * scale_in = ggml_scale(ctx, inject,
+            v == variant::wrong_input_scale ? 0.5f : 1.0f/(float) hc);
+        ggml_tensor * sigmoid = v == variant::wrong_unary
+            ? ggml_tanh(ctx, scale_in) : ggml_sigmoid(ctx, scale_in);
+        ggml_tensor * scale_out = ggml_scale(ctx, sigmoid,
+            v == variant::wrong_output_scale ? 1.0f : 2.0f);
+        ggml_tensor * weights = ggml_reshape_3d(ctx, scale_out, 1, hc, nt);
+        ggml_tensor * block_view = ggml_reshape_3d(ctx, block, n_embd, 1, nt);
+        ggml_tensor * repeated = ggml_repeat_4d(ctx, block_view, n_embd, hc, nt, 1);
+        ggml_tensor * product = ggml_mul(ctx, repeated, weights);
+        ggml_tensor * combined = v == variant::inplace_add
+            ? ggml_add_inplace(ctx, residual, product)
+            : v == variant::swapped_add
+                ? ggml_add(ctx, product, residual) : ggml_add(ctx, residual, product);
+        if (v == variant::extra_consumer) {
+            ggml_tensor * expanded_weights = ggml_repeat_4d(ctx, weights, n_embd, hc, nt, 1);
+            combined = ggml_add(ctx, combined, expanded_weights);
+        }
+        ggml_set_name(combined, "out");
+        return combined;
     }
 };
 
@@ -9262,6 +9451,41 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {10, 10, 10, 10}, 2.0f, 1.0f, true)); // inplace test
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {100, 10, 10, 10}, 2.0f, 1.0f));
     test_cases.emplace_back(new test_softcap(GGML_TYPE_F32, {10, 10, 10, 10}, 50.0f));
+    test_cases.emplace_back(new test_hc_stream_mean_fusion(31, 1));
+    test_cases.emplace_back(new test_hc_stream_mean_fusion(257, 17));
+    test_cases.emplace_back(new test_hc_stream_mean_fusion(256, 3));
+    test_cases.emplace_back(new test_hc_stream_mean_fusion(127, 5,
+        test_hc_stream_mean_fusion::variant::swapped_first_add));
+    test_cases.emplace_back(new test_hc_stream_mean_fusion(127, 5,
+        test_hc_stream_mean_fusion::variant::wrong_scale));
+    test_cases.emplace_back(new test_hc_stream_mean_fusion(127, 5,
+        test_hc_stream_mean_fusion::variant::extra_consumer));
+    test_cases.emplace_back(new test_hc_grouped_rms_fusion(31, 4, 1));
+    test_cases.emplace_back(new test_hc_grouped_rms_fusion(257, 4, 17));
+    test_cases.emplace_back(new test_hc_grouped_rms_fusion(1024, 8, 3));
+    test_cases.emplace_back(new test_hc_grouped_rms_fusion(127, 4, 5,
+        test_hc_grouped_rms_fusion::variant::extra_reshape_consumer));
+    test_cases.emplace_back(new test_mmvq_post_silu_fusion(257, 5120));
+    test_cases.emplace_back(new test_mmvq_post_silu_fusion(127, 5120,
+        test_mmvq_post_silu_fusion::variant::wrong_factor));
+    test_cases.emplace_back(new test_mmvq_post_silu_fusion(127, 5120,
+        test_mmvq_post_silu_fusion::variant::extra_consumer));
+    test_cases.emplace_back(new test_mmvq_post_silu_fusion(127, 5120,
+        test_mmvq_post_silu_fusion::variant::force_mmq));
+    test_cases.emplace_back(new test_mmvq_post_silu_fusion(127, 5088,
+        test_mmvq_post_silu_fusion::variant::padded_compute_view));
+    test_cases.emplace_back(new test_mmvq_post_silu_fusion(127, 512,
+        test_mmvq_post_silu_fusion::variant::small_k));
+    test_cases.emplace_back(new test_hc_combine_fusion(31, 1, 1));
+    test_cases.emplace_back(new test_hc_combine_fusion(257, 4, 17));
+    test_cases.emplace_back(new test_hc_combine_fusion(256, 8, 3));
+    test_cases.emplace_back(new test_hc_combine_fusion(127, 4, 5, test_hc_combine_fusion::variant::swapped_add));
+    test_cases.emplace_back(new test_hc_combine_fusion(127, 4, 5, test_hc_combine_fusion::variant::wrong_input_scale));
+    test_cases.emplace_back(new test_hc_combine_fusion(127, 4, 5, test_hc_combine_fusion::variant::wrong_output_scale));
+    test_cases.emplace_back(new test_hc_combine_fusion(127, 4, 5, test_hc_combine_fusion::variant::wrong_unary));
+    test_cases.emplace_back(new test_hc_combine_fusion(127, 4, 5, test_hc_combine_fusion::variant::extra_consumer));
+    test_cases.emplace_back(new test_hc_combine_fusion(127, 4, 5, test_hc_combine_fusion::variant::inplace_add));
+    test_cases.emplace_back(new test_hc_combine_fusion(127, 4, 5, test_hc_combine_fusion::variant::aliased_block_inject));
     test_cases.emplace_back(new test_silu_back());
 
     for (float eps : { 0.0f, 1e-6f, 1e-4f, 1e-1f, 10.f }) {
@@ -9408,6 +9632,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
 #endif
+
+    // Q8_0 decode MMV: representative K with a non-divisible output row count.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 257, 1, 5120));
+
 
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
@@ -11296,6 +11524,27 @@ int main(int argc, char ** argv) {
     const char * test_file_path = nullptr;
     int parallel_workers = 1;
 
+    struct q8_0_mmv_dispatch_stats {
+        uint64_t baseline;
+        uint64_t nwarps_2;
+    };
+    using q8_0_mmv_stats_reset_fn = void (*)();
+    using q8_0_mmv_stats_get_fn = void (*)(uint64_t *, uint64_t *);
+    using q8_0_mmv_compute_capability_fn = int (*)();
+    const char * q8_0_mmv_expected_path = std::getenv("GGML_TEST_Q8_0_MMV_EXPECT_PATH");
+
+    struct fusion_dispatch_stats {
+        uint64_t dispatches;
+        uint64_t nodes_skipped;
+    };
+    using fusion_stats_reset_fn = void (*)();
+    using fusion_stats_get_fn = void (*)(uint64_t *, uint64_t *);
+    using q8_post_kernel_stats_get_fn = void (*)(uint64_t *);
+    const char * hc_combine_expected_dispatch = std::getenv("GGML_TEST_HC_COMBINE_EXPECT_DISPATCH");
+    const char * hc_stream_mean_expected_dispatch = std::getenv("GGML_TEST_HC_STREAM_MEAN_EXPECT_DISPATCH");
+    const char * hc_grouped_rms_expected_dispatch = std::getenv("GGML_TEST_HC_GROUPED_RMS_EXPECT_DISPATCH");
+    const char * q8_post_silu_expected_dispatch = std::getenv("GGML_TEST_Q8_POST_SILU_EXPECT_DISPATCH");
+
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "test") == 0) {
             mode = MODE_TEST;
@@ -11406,6 +11655,100 @@ int main(int argc, char ** argv) {
             ggml_backend_set_n_threads_fn(backend.get(), N_THREADS);
         }
 
+        q8_0_mmv_stats_reset_fn q8_stats_reset = nullptr;
+        q8_0_mmv_stats_get_fn q8_stats_get = nullptr;
+        q8_0_mmv_compute_capability_fn q8_compute_capability = nullptr;
+        bool q8_stats_hooks_ok = true;
+        if (q8_0_mmv_expected_path != nullptr) {
+            q8_stats_reset = (q8_0_mmv_stats_reset_fn) ggml_backend_reg_get_proc_address(
+                reg, "ggml_cuda_q8_0_mmv_test_stats_reset");
+            q8_stats_get = (q8_0_mmv_stats_get_fn) ggml_backend_reg_get_proc_address(
+                reg, "ggml_cuda_q8_0_mmv_test_stats_get");
+            q8_compute_capability = (q8_0_mmv_compute_capability_fn) ggml_backend_reg_get_proc_address(
+                reg, "ggml_cuda_q8_0_mmv_test_compute_capability");
+            q8_stats_hooks_ok = q8_stats_reset != nullptr && q8_stats_get != nullptr && q8_compute_capability != nullptr;
+            if (q8_stats_hooks_ok) {
+                q8_stats_reset();
+            } else {
+                std::fprintf(stderr, "Q8_0 MMV dispatch: CUDA test hooks unavailable\n");
+            }
+        }
+
+        fusion_stats_reset_fn hc_stats_reset = nullptr;
+        fusion_stats_get_fn hc_stats_get = nullptr;
+        bool hc_stats_hooks_ok = true;
+        if (hc_combine_expected_dispatch != nullptr) {
+            hc_stats_reset = (fusion_stats_reset_fn) ggml_backend_reg_get_proc_address(
+                reg, "ggml_cuda_hc_combine_test_stats_reset");
+            hc_stats_get = (fusion_stats_get_fn) ggml_backend_reg_get_proc_address(
+                reg, "ggml_cuda_hc_combine_test_stats_get");
+            hc_stats_hooks_ok = hc_stats_reset != nullptr && hc_stats_get != nullptr;
+            if (hc_stats_hooks_ok) {
+                hc_stats_reset();
+            } else {
+                std::fprintf(stderr, "HC-combine dispatch: CUDA test hooks unavailable\n");
+            }
+        }
+
+        fusion_stats_reset_fn hc_stream_stats_reset = nullptr;
+        fusion_stats_get_fn hc_stream_stats_get = nullptr;
+        bool hc_stream_stats_hooks_ok = true;
+        if (hc_stream_mean_expected_dispatch != nullptr) {
+            hc_stream_stats_reset = (fusion_stats_reset_fn) ggml_backend_reg_get_proc_address(
+                reg, "ggml_cuda_hc_stream_mean_test_stats_reset");
+            hc_stream_stats_get = (fusion_stats_get_fn) ggml_backend_reg_get_proc_address(
+                reg, "ggml_cuda_hc_stream_mean_test_stats_get");
+            hc_stream_stats_hooks_ok = hc_stream_stats_reset != nullptr && hc_stream_stats_get != nullptr;
+            if (hc_stream_stats_hooks_ok) {
+                hc_stream_stats_reset();
+            } else {
+                std::fprintf(stderr, "HC stream-mean dispatch: CUDA test hooks unavailable\n");
+            }
+        }
+
+        fusion_stats_reset_fn hc_grouped_rms_stats_reset = nullptr;
+        fusion_stats_get_fn hc_grouped_rms_stats_get = nullptr;
+        bool hc_grouped_rms_stats_hooks_ok = true;
+        if (hc_grouped_rms_expected_dispatch != nullptr) {
+            hc_grouped_rms_stats_reset = (fusion_stats_reset_fn) ggml_backend_reg_get_proc_address(
+                reg, "ggml_cuda_hc_grouped_rms_test_stats_reset");
+            hc_grouped_rms_stats_get = (fusion_stats_get_fn) ggml_backend_reg_get_proc_address(
+                reg, "ggml_cuda_hc_grouped_rms_test_stats_get");
+            hc_grouped_rms_stats_hooks_ok = hc_grouped_rms_stats_reset && hc_grouped_rms_stats_get;
+            if (hc_grouped_rms_stats_hooks_ok) {
+                hc_grouped_rms_stats_reset();
+            } else {
+                std::fprintf(stderr, "HC grouped-RMS dispatch: CUDA test hooks unavailable\n");
+            }
+        }
+
+        fusion_stats_reset_fn q8_post_graph_stats_reset = nullptr;
+        fusion_stats_get_fn q8_post_graph_stats_get = nullptr;
+        fusion_stats_reset_fn q8_post_kernel_stats_reset = nullptr;
+        q8_post_kernel_stats_get_fn q8_post_kernel_stats_get = nullptr;
+        q8_0_mmv_compute_capability_fn q8_post_compute_capability = nullptr;
+        bool q8_post_stats_hooks_ok = true;
+        if (q8_post_silu_expected_dispatch != nullptr) {
+            q8_post_graph_stats_reset = (fusion_stats_reset_fn) ggml_backend_reg_get_proc_address(
+                reg, "ggml_cuda_q8_post_silu_test_graph_stats_reset");
+            q8_post_graph_stats_get = (fusion_stats_get_fn) ggml_backend_reg_get_proc_address(
+                reg, "ggml_cuda_q8_post_silu_test_graph_stats_get");
+            q8_post_kernel_stats_reset = (fusion_stats_reset_fn) ggml_backend_reg_get_proc_address(
+                reg, "ggml_cuda_q8_post_silu_test_kernel_stats_reset");
+            q8_post_kernel_stats_get = (q8_post_kernel_stats_get_fn) ggml_backend_reg_get_proc_address(
+                reg, "ggml_cuda_q8_post_silu_test_kernel_stats_get");
+            q8_post_compute_capability = (q8_0_mmv_compute_capability_fn) ggml_backend_reg_get_proc_address(
+                reg, "ggml_cuda_q8_post_silu_test_compute_capability");
+            q8_post_stats_hooks_ok = q8_post_graph_stats_reset && q8_post_graph_stats_get &&
+                q8_post_kernel_stats_reset && q8_post_kernel_stats_get && q8_post_compute_capability;
+            if (q8_post_stats_hooks_ok) {
+                q8_post_graph_stats_reset();
+                q8_post_kernel_stats_reset();
+            } else {
+                std::fprintf(stderr, "Q8 post-SiLU dispatch: CUDA test hooks unavailable\n");
+            }
+        }
+
         size_t free, total;  // NOLINT
         ggml_backend_dev_memory(dev, &free, &total);
         output_printer->print_backend_init(backend_init_info(i, ggml_backend_dev_count(), ggml_backend_dev_name(dev),
@@ -11413,6 +11756,102 @@ int main(int argc, char ** argv) {
                                                              total / 1024 / 1024, free / 1024 / 1024, true));
 
         bool ok = test_backend(backend.get(), dev, mode, op_names_filter, params_filter, output_printer.get(), test_file_path, parallel_workers);
+
+        if (q8_0_mmv_expected_path != nullptr && q8_stats_hooks_ok) {
+            q8_0_mmv_dispatch_stats stats = {};
+            q8_stats_get(&stats.baseline, &stats.nwarps_2);
+            const int cc = q8_compute_capability();
+            const bool expect_auto = std::strcmp(q8_0_mmv_expected_path, "auto") == 0;
+            const bool expect_tuned = std::strcmp(q8_0_mmv_expected_path, "nwarps_2") == 0 ||
+                                      (expect_auto && cc == 860);
+            const bool expect_baseline = std::strcmp(q8_0_mmv_expected_path, "baseline") == 0 ||
+                                         (expect_auto && cc != 860);
+            const bool stats_ok = (expect_tuned && stats.nwarps_2 > 0 && stats.baseline == 0) ||
+                                  (expect_baseline && stats.baseline > 0 && stats.nwarps_2 == 0);
+            if (!stats_ok) {
+                std::fprintf(stderr,
+                    "Q8_0 MMV dispatch: expected %s at cc=%d, baseline=%" PRIu64 ", nwarps_2=%" PRIu64 "\n",
+                    q8_0_mmv_expected_path, cc, stats.baseline, stats.nwarps_2);
+                ok = false;
+            }
+        } else if (q8_0_mmv_expected_path != nullptr) {
+            ok = false;
+        }
+
+        if (hc_combine_expected_dispatch != nullptr && hc_stats_hooks_ok) {
+            fusion_dispatch_stats stats = {};
+            hc_stats_get(&stats.dispatches, &stats.nodes_skipped);
+            const bool expect_enabled = std::strcmp(hc_combine_expected_dispatch, "enabled") == 0;
+            const bool expect_disabled = std::strcmp(hc_combine_expected_dispatch, "disabled") == 0;
+            const bool stats_ok = (expect_enabled && stats.dispatches == 1 && stats.nodes_skipped == 5) ||
+                                  (expect_disabled && stats.dispatches == 0 && stats.nodes_skipped == 0);
+            if (!stats_ok) {
+                std::fprintf(stderr,
+                    "HC-combine dispatch: expected %s, dispatches=%" PRIu64 ", nodes_skipped=%" PRIu64 "\n",
+                    hc_combine_expected_dispatch, stats.dispatches, stats.nodes_skipped);
+                ok = false;
+            }
+        } else if (hc_combine_expected_dispatch != nullptr) {
+            ok = false;
+        }
+
+        if (hc_stream_mean_expected_dispatch != nullptr && hc_stream_stats_hooks_ok) {
+            fusion_dispatch_stats stats = {};
+            hc_stream_stats_get(&stats.dispatches, &stats.nodes_skipped);
+            const bool expect_enabled = std::strcmp(hc_stream_mean_expected_dispatch, "enabled") == 0;
+            const bool expect_disabled = std::strcmp(hc_stream_mean_expected_dispatch, "disabled") == 0;
+            const bool stats_ok = (expect_enabled && stats.dispatches == 1 && stats.nodes_skipped == 5) ||
+                                  (expect_disabled && stats.dispatches == 0 && stats.nodes_skipped == 0);
+            if (!stats_ok) {
+                std::fprintf(stderr,
+                    "HC stream-mean dispatch: expected %s, dispatches=%" PRIu64 ", nodes_skipped=%" PRIu64 "\n",
+                    hc_stream_mean_expected_dispatch, stats.dispatches, stats.nodes_skipped);
+                ok = false;
+            }
+        } else if (hc_stream_mean_expected_dispatch != nullptr) {
+            ok = false;
+        }
+
+        if (hc_grouped_rms_expected_dispatch != nullptr && hc_grouped_rms_stats_hooks_ok) {
+            fusion_dispatch_stats stats = {};
+            hc_grouped_rms_stats_get(&stats.dispatches, &stats.nodes_skipped);
+            const bool expect_enabled = std::strcmp(hc_grouped_rms_expected_dispatch, "enabled") == 0;
+            const bool expect_disabled = std::strcmp(hc_grouped_rms_expected_dispatch, "disabled") == 0;
+            const bool stats_ok = (expect_enabled && stats.dispatches == 1 && stats.nodes_skipped == 2) ||
+                                  (expect_disabled && stats.dispatches == 0 && stats.nodes_skipped == 0);
+            if (!stats_ok) {
+                std::fprintf(stderr,
+                    "HC grouped-RMS dispatch: expected %s, dispatches=%" PRIu64 ", nodes_skipped=%" PRIu64 "\n",
+                    hc_grouped_rms_expected_dispatch, stats.dispatches, stats.nodes_skipped);
+                ok = false;
+            }
+        } else if (hc_grouped_rms_expected_dispatch != nullptr) {
+            ok = false;
+        }
+
+        if (q8_post_silu_expected_dispatch != nullptr && q8_post_stats_hooks_ok) {
+            fusion_dispatch_stats graph_stats = {};
+            uint64_t tuned_post_dispatches = 0;
+            q8_post_graph_stats_get(&graph_stats.dispatches, &graph_stats.nodes_skipped);
+            q8_post_kernel_stats_get(&tuned_post_dispatches);
+            const int cc = q8_post_compute_capability();
+            const bool expect_enabled = std::strcmp(q8_post_silu_expected_dispatch, "enabled") == 0 && cc == 860;
+            const bool expect_disabled = std::strcmp(q8_post_silu_expected_dispatch, "disabled") == 0 || cc != 860;
+            const bool stats_ok = (expect_enabled && graph_stats.dispatches == 1 &&
+                                      graph_stats.nodes_skipped == 2 && tuned_post_dispatches == 1) ||
+                                  (expect_disabled && graph_stats.dispatches == 0 &&
+                                      graph_stats.nodes_skipped == 0 && tuned_post_dispatches == 0);
+            if (!stats_ok) {
+                std::fprintf(stderr,
+                    "Q8 post-SiLU dispatch: expected %s at cc=%d, graph=%" PRIu64
+                    ", skipped=%" PRIu64 ", tuned-post=%" PRIu64 "\n",
+                    q8_post_silu_expected_dispatch, cc, graph_stats.dispatches,
+                    graph_stats.nodes_skipped, tuned_post_dispatches);
+                ok = false;
+            }
+        } else if (q8_post_silu_expected_dispatch != nullptr) {
+            ok = false;
+        }
 
         if (ok) {
             n_ok++;

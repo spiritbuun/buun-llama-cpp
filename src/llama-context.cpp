@@ -615,7 +615,9 @@ llama_context::llama_context(
             const bool vbr_layer_schedule = turbo_vbr_layer_schedule_enabled();
             // dynamic VBR with the f16 entry tier: no turbo types at init, but later degrades
             // flip tensors to turbo (FA-only decode) and the VMM gate needs v_trans == false
-            if (turbo_k || turbo_v || vbr_layer_schedule || params.vbr_dynamic) {
+            const bool needs_device_fa = cparams.offload_kqv &&
+                (turbo_k || turbo_v || vbr_layer_schedule || params.vbr_dynamic);
+            if (needs_device_fa) {
                 if (!cparams.flash_attn) {
                     LLAMA_LOG_WARN("%s: turbo/VBR KV cache requires Flash Attention — enabling automatically\n", __func__);
                     cparams.flash_attn = true;
@@ -6382,94 +6384,151 @@ static FILE * llama_state_seq_open_temp_file(const char * filepath, std::string 
     throw std::runtime_error(format("failed to create a unique temporary sequence state file for %s", filepath));
 }
 
-size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
-    llama_file file(filepath, "rb");
+bool llama_state_seq_file_snapshot::copy_packed_token_bytes(
+        std::vector<uint8_t> & output) const noexcept {
+    output.clear();
+    if (!valid()) {
+        return false;
+    }
+    try {
+        const size_t size = size_t(token_count_)*sizeof(llama_token);
+        output.assign(payload_.begin() + sizeof(uint32_t),
+                      payload_.begin() + sizeof(uint32_t) + size);
+        return true;
+    } catch (...) {
+        output.clear();
+        return false;
+    }
+}
 
-    // Read MAGIC + VERSION first so legacy and foreign files are rejected with
-    // the same explicit diagnostic as before.
-    if (file.size() < 2*sizeof(uint32_t)) {
-        LLAMA_LOG_ERROR("%s: sequence state file is too small for magic and version: %zu bytes\n",
-                        __func__, file.size());
+size_t llama_state_seq_file_snapshot::packed_token_size() const noexcept {
+    return valid() ? size_t(token_count_)*sizeof(llama_token) : 0;
+}
+
+uint32_t llama_state_seq_file_snapshot::token_count() const noexcept {
+    return valid() ? token_count_ : 0;
+}
+
+bool llama_state_seq_file_snapshot::valid() const noexcept {
+    return total_size_ >= LLAMA_STATE_SEQ_FILE_HEADER_SIZE &&
+        payload_.size() == total_size_ - LLAMA_STATE_SEQ_FILE_HEADER_SIZE &&
+        payload_.size() >= sizeof(uint32_t) &&
+        uint64_t(token_count_)*sizeof(llama_token) <=
+            payload_.size() - sizeof(uint32_t);
+}
+
+void llama_state_seq_file_snapshot::clear() noexcept {
+    total_size_ = 0;
+    token_count_ = 0;
+    payload_.clear();
+}
+
+bool llama_state_seq_file_snapshot_prepare(
+        const char * filepath,
+        llama_state_seq_file_snapshot & output) noexcept {
+    output.clear();
+    try {
+        llama_file file(filepath, "rb");
+
+        if (file.size() < 2*sizeof(uint32_t)) {
+            LLAMA_LOG_ERROR("%s: sequence state file is too small for magic and version: %zu bytes\n",
+                            __func__, file.size());
+            return false;
+        }
+
+        const uint32_t magic   = file.read_u32();
+        const uint32_t version = file.read_u32();
+        if (magic != LLAMA_STATE_SEQ_MAGIC || version != LLAMA_STATE_SEQ_VERSION) {
+            LLAMA_LOG_ERROR("%s: unknown (magic, version) for sequence state file: %08x, %08x\n", __func__, magic, version);
+            return false;
+        }
+
+        if (file.size() < LLAMA_STATE_SEQ_FILE_HEADER_SIZE) {
+            LLAMA_LOG_ERROR("%s: truncated sequence state file header: %zu < %zu bytes\n",
+                            __func__, file.size(), LLAMA_STATE_SEQ_FILE_HEADER_SIZE);
+            return false;
+        }
+
+        file.read_raw(&output.total_size_, sizeof(output.total_size_));
+        uint64_t payload_checksum = 0;
+        file.read_raw(&payload_checksum, sizeof(payload_checksum));
+
+        if (output.total_size_ != file.size()) {
+            LLAMA_LOG_ERROR("%s: sequence state file length mismatch: declared %" PRIu64 ", actual %zu\n",
+                            __func__, output.total_size_, file.size());
+            output.clear();
+            return false;
+        }
+
+        output.payload_.resize(file.size() - LLAMA_STATE_SEQ_FILE_HEADER_SIZE);
+        file.read_raw(output.payload_.data(), output.payload_.size());
+
+        const uint64_t checksum_actual = llama_state_seq_file_checksum(
+            output.payload_.data(), output.payload_.size());
+        if (payload_checksum != checksum_actual) {
+            LLAMA_LOG_ERROR("%s: sequence state file checksum mismatch: declared %016" PRIx64 ", actual %016" PRIx64 "\n",
+                            __func__, payload_checksum, checksum_actual);
+            output.clear();
+            return false;
+        }
+
+        if (output.payload_.size() < sizeof(uint32_t)) {
+            LLAMA_LOG_ERROR("%s: sequence state payload is too small for token count: %zu bytes\n",
+                            __func__, output.payload_.size());
+            output.clear();
+            return false;
+        }
+
+        memcpy(&output.token_count_, output.payload_.data(), sizeof(output.token_count_));
+        if (!output.valid()) {
+            LLAMA_LOG_ERROR("%s: token data exceeds sequence state payload: %u\n",
+                            __func__, output.token_count_);
+            output.clear();
+            return false;
+        }
+        return true;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error preparing sequence state file: %s\n", __func__, err.what());
+        output.clear();
+        return false;
+    }
+}
+
+size_t llama_context::state_seq_apply_file_snapshot(
+        llama_seq_id seq_id,
+        const llama_state_seq_file_snapshot & snapshot,
+        llama_token * tokens_out,
+        size_t n_token_capacity,
+        size_t * n_token_count_out) {
+    if (!snapshot.valid()) {
+        LLAMA_LOG_ERROR("%s: invalid prepared sequence state snapshot\n", __func__);
         return 0;
     }
-
-    const uint32_t magic   = file.read_u32();
-    const uint32_t version = file.read_u32();
-    if (magic != LLAMA_STATE_SEQ_MAGIC || version != LLAMA_STATE_SEQ_VERSION) {
-        LLAMA_LOG_ERROR("%s: unknown (magic, version) for sequence state file: %08x, %08x\n", __func__, magic, version);
-        return 0;
-    }
-
-    if (file.size() < LLAMA_STATE_SEQ_FILE_HEADER_SIZE) {
-        LLAMA_LOG_ERROR("%s: truncated sequence state file header: %zu < %zu bytes\n",
-                        __func__, file.size(), LLAMA_STATE_SEQ_FILE_HEADER_SIZE);
-        return 0;
-    }
-
-    uint64_t total_size = 0;
-    uint64_t checksum   = 0;
-    file.read_raw(&total_size, sizeof(total_size));
-    file.read_raw(&checksum,   sizeof(checksum));
-
-    if (total_size != file.size()) {
-        LLAMA_LOG_ERROR("%s: sequence state file length mismatch: declared %" PRIu64 ", actual %zu\n",
-                        __func__, total_size, file.size());
-        return 0;
-    }
-
-    const size_t payload_size = file.size() - LLAMA_STATE_SEQ_FILE_HEADER_SIZE;
-    std::vector<uint8_t> payload(payload_size);
-    file.read_raw(payload.data(), payload.size());
-
-    const uint64_t checksum_actual = llama_state_seq_file_checksum(payload.data(), payload.size());
-    if (checksum != checksum_actual) {
-        LLAMA_LOG_ERROR("%s: sequence state file checksum mismatch: declared %016" PRIx64 ", actual %016" PRIx64 "\n",
-                        __func__, checksum, checksum_actual);
-        return 0;
-    }
-
-    if (payload.size() < sizeof(uint32_t)) {
-        LLAMA_LOG_ERROR("%s: sequence state payload is too small for token count: %zu bytes\n",
-                        __func__, payload.size());
-        return 0;
-    }
-
-    uint32_t n_token_count = 0;
-    memcpy(&n_token_count, payload.data(), sizeof(n_token_count));
     if (n_token_count_out == nullptr) {
         LLAMA_LOG_ERROR("%s: token count output pointer is null\n", __func__);
         return 0;
     }
 
-    const size_t token_capacity_in_payload = (payload.size() - sizeof(uint32_t))/sizeof(llama_token);
-    if (n_token_count > token_capacity_in_payload) {
-        LLAMA_LOG_ERROR("%s: token data exceeds sequence state payload: %u > %zu\n",
-                        __func__, n_token_count, token_capacity_in_payload);
-        return 0;
-    }
-
     if (tokens_out == nullptr) {
-        // Query mode authenticates the complete fork header and payload before
-        // exposing the count, and never mutates the destination sequence.
-        *n_token_count_out = n_token_count;
-        return (size_t) total_size;
+        *n_token_count_out = snapshot.token_count_;
+        return size_t(snapshot.total_size_);
     }
-    if (n_token_count > n_token_capacity) {
+    if (snapshot.token_count_ > n_token_capacity) {
         LLAMA_LOG_ERROR("%s: token count in sequence state file exceeded capacity! %u > %zu\n",
-                        __func__, n_token_count, n_token_capacity);
+                        __func__, snapshot.token_count_, n_token_capacity);
         return 0;
     }
 
-    const size_t tokens_size  = sizeof(llama_token)*(size_t) n_token_count;
+    const size_t tokens_size  = size_t(snapshot.token_count_)*sizeof(llama_token);
     const size_t state_offset = sizeof(uint32_t) + tokens_size;
-    const size_t state_size   = payload.size() - state_offset;
+    const size_t state_size   = snapshot.payload_.size() - state_offset;
 
     // The complete file has now passed length, checksum, and token bounds
     // validation. state_seq_read_data() has no non-mutating parser, so a
     // checksum-valid semantic/structural failure is made coherent by clearing
     // the destination sequence after the read attempt.
     try {
-        llama_io_read_host io(payload.data() + state_offset, state_size);
+        llama_io_read_host io(snapshot.payload_.data() + state_offset, state_size);
         const size_t nread = state_seq_read_data(io, seq_id, 0);
         // Architectures without sequence memory legitimately serialize an
         // empty state after the token envelope. A zero-byte read is valid
@@ -6494,13 +6553,23 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
     }
 
     if (tokens_size > 0) {
-        memcpy(tokens_out, payload.data() + sizeof(uint32_t), tokens_size);
+        memcpy(tokens_out, snapshot.payload_.data() + sizeof(uint32_t),
+               tokens_size);
     }
     // Publish caller-visible outputs only after the semantic state restore has
     // succeeded. A checksum-valid but structurally invalid state must leave
     // both the token buffer and count untouched.
-    *n_token_count_out = n_token_count;
-    return (size_t) total_size;
+    *n_token_count_out = snapshot.token_count_;
+    return size_t(snapshot.total_size_);
+}
+
+size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+    llama_state_seq_file_snapshot snapshot;
+    if (!llama_state_seq_file_snapshot_prepare(filepath, snapshot)) {
+        return 0;
+    }
+    return state_seq_apply_file_snapshot(
+        seq_id, snapshot, tokens_out, n_token_capacity, n_token_count_out);
 }
 
 size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * filepath, const llama_token * tokens, size_t n_token_count) {
@@ -6687,6 +6756,14 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
         }
         for (const auto & [buft, size] : memory->memory_breakdown_fixed()) {
             ret[buft].context_fixed += size;
+        }
+        for (const auto & [buft, size] : memory->memory_breakdown_vbr_managed()) {
+            ret[buft].context_vbr_managed += size;
+        }
+        for (const auto & [buft, mb] : ret) {
+            GGML_UNUSED(buft);
+            GGML_ASSERT(mb.context_fixed <= mb.context);
+            GGML_ASSERT(mb.context_vbr_managed <= mb.context);
         }
     }
     if (model.hparams.no_alloc) {
@@ -7069,7 +7146,9 @@ llama_context * llama_init_from_model(
         const bool turbo_k = ggml_is_turbo_kv_type(params.type_k);
         const bool turbo_v = ggml_is_turbo_kv_type(params.type_v);
         const bool vbr_layer_schedule = turbo_vbr_layer_schedule_enabled();
-        if ((turbo_k || turbo_v || vbr_layer_schedule) && params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+        const bool needs_device_fa = params.offload_kqv &&
+            (turbo_k || turbo_v || vbr_layer_schedule || params.vbr_dynamic);
+        if (needs_device_fa && params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
             LLAMA_LOG_WARN("%s: turbo/VBR KV cache requires flash attention — enabling automatically\n", __func__);
             params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
         }

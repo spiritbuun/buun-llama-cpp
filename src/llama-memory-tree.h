@@ -7,6 +7,7 @@
 
 class llama_kv_cache;
 class llama_memory_i;
+class llama_memory_hybrid_idx;
 class llama_memory_recurrent;
 
 // Canonical pre-order view of the memory tree. Both checkpoint generation
@@ -17,6 +18,9 @@ struct llama_memory_tree_child {
     llama_memory_recurrent * recurrent = nullptr;
     checkpoint_child_dependency_mode dependency_mode =
         checkpoint_child_dependency_mode::absent;
+    // Optional fixed-precision index state that must travel atomically with
+    // this attention child. It is a companion, never another VBR controller.
+    llama_memory_hybrid_idx * qsa_index_owner = nullptr;
 };
 
 bool llama_memory_tree_collect(

@@ -200,7 +200,7 @@ The following environment variables are implementation controls, not a stable co
 | --- | ---: | --- |
 | `GGML_CUDA_MOE_CACHE_RESERVE_MB` | `3072` | VRAM left outside the cache on each device |
 | `GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB` | hardware dependent | Minimum bytes per expert, in KiB; `512` when all selected devices are compute capability 8.0 or newer and `1024` otherwise |
-| `GGML_CUDA_MOE_CACHE_MAX_BATCH` | `8` | Maximum tokens in an eligible node |
+| `GGML_CUDA_MOE_CACHE_MAX_BATCH` | `10` | Maximum tokens in an eligible node |
 | `GGML_CUDA_MOE_CACHE_INSERTS` | `8` (`16` with expert parallelism) | Maximum admissions per node |
 | `GGML_CUDA_MOE_CACHE_ADMIT_AFTER` | adaptive | Override the initial miss count; by default it is `1` for complete pools and `2` for capacity-constrained pools |
 | `GGML_CUDA_MOE_CACHE_THROTTLE` | `8` (`40` with expert parallelism) | Fresh misses required before replacing a full-pool entry |
@@ -210,6 +210,7 @@ The following environment variables are implementation controls, not a stable co
 | `GGML_CUDA_MOE_CACHE_NDEV` | all | Maximum selected CUDA devices used by a session |
 | `GGML_CUDA_MOE_CACHE_SERIAL_FILL` | hardware dependent | Serialize fills across devices; defaults to `0` with at least two compute capability 8.0 or newer devices and `1` otherwise |
 | `GGML_CUDA_MOE_CACHE_DEDICATED_MMV` | `0` | Force the cache-specific activation-map matvec; compatible routing uses the existing modulo-index MMV path by default |
+| `GGML_CUDA_MOE_CACHE_DOWN_DEDICATED_MMV` | `0` | Use the cache-specific MMV for a full-fusion down projection; the generic modulo-index MMV remains the default |
 | `GGML_CUDA_MOE_CACHE_OVERLAP_CPU_ROWS` | automatic | Rows retained on CPU only when every row is resident; an explicit value from `0` through `8` overrides the size-aware policy |
 | `GGML_CUDA_MOE_CACHE_MIN_CC` | mode dependent | Override the minimum compute capability encoded as `major * 100 + minor * 10` |
 

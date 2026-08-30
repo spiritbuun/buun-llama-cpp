@@ -90,6 +90,7 @@ class vbr_recurrent_parsed_image final :
     llama_memory_recurrent * target = nullptr;
     llama_pos position = -1;
     std::vector<recurrent_tensor_row> r;
+    std::vector<recurrent_tensor_row> p;
     std::vector<recurrent_tensor_row> s;
 };
 
@@ -117,6 +118,7 @@ class vbr_recurrent_prepared_image final :
             const vbr_recurrent_parsed_image & parsed) noexcept {
         if (parsed.target != &target || parsed.position < 0 ||
             parsed.r.size() != target.r_l.size() ||
+            parsed.p.size() != target.p_l.size() ||
             parsed.s.size() != target.s_l.size()) {
             return false;
         }
@@ -140,6 +142,7 @@ class vbr_recurrent_prepared_image final :
             return true;
         };
         return rows_compatible(target.r_l, parsed.r) &&
+               rows_compatible(target.p_l, parsed.p) &&
                rows_compatible(target.s_l, parsed.s);
     }
 
@@ -206,6 +209,7 @@ class vbr_recurrent_prepared_image final :
                 return true;
             };
             return write(target.r_l, parsed.r) &&
+                   write(target.p_l, parsed.p) &&
                    write(target.s_l, parsed.s);
         } catch (...) {
             return false;
@@ -231,6 +235,7 @@ class vbr_recurrent_prepared_image final :
                           return !cell.is_empty();
                       })) ||
                 parsed->r.size() != target->r_l.size() ||
+                parsed->p.size() != target->p_l.size() ||
                 parsed->s.size() != target->s_l.size()) {
                 return false;
             }
@@ -289,6 +294,7 @@ class vbr_recurrent_prepared_image final :
                 uint32_t(destination) >= target.n_seq_max ||
                 expected.target != &target || target.used != 1 ||
                 expected.r.size() != target.r_l.size() ||
+                expected.p.size() != target.p_l.size() ||
                 expected.s.size() != target.s_l.size()) {
                 return false;
             }
@@ -300,6 +306,10 @@ class vbr_recurrent_prepared_image final :
             }
             size_t max_row_bytes = 0;
             for (const auto & value : expected.r) {
+                max_row_bytes = std::max(
+                    max_row_bytes, size_t(value.row_bytes));
+            }
+            for (const auto & value : expected.p) {
                 max_row_bytes = std::max(
                     max_row_bytes, size_t(value.row_bytes));
             }
@@ -349,6 +359,7 @@ class vbr_recurrent_prepared_image final :
                 return true;
             };
             return rows_match(target.r_l, expected.r) &&
+                   rows_match(target.p_l, expected.p) &&
                    rows_match(target.s_l, expected.s);
         } catch (...) {
             return false;
@@ -515,32 +526,61 @@ bool vbr_parse_recurrent_companion(
         parsed->target = target;
         parsed->position = position;
         parsed->r.resize(n_layer);
+        parsed->p.resize(n_layer);
         parsed->s.resize(n_layer);
-        const auto read_rows = [&](const std::vector<ggml_tensor *> & tensors,
-                                   std::vector<recurrent_tensor_row> & rows) {
-            for (size_t i = 0; i < tensors.size(); ++i) {
-                if (!tensors[i]) {
-                    continue;
-                }
-                int32_t type = -1;
-                uint64_t row_bytes = 0;
-                if (!cursor.scalar(type) ||
-                    type != int32_t(tensors[i]->type) ||
-                    !cursor.scalar(row_bytes) ||
-                    row_bytes != uint64_t(ggml_row_size(
-                        tensors[i]->type, tensors[i]->ne[0])) ||
-                    row_bytes > std::numeric_limits<size_t>::max() ||
-                    !cursor.block(rows[i].bytes, size_t(row_bytes))) {
-                    return false;
-                }
-                rows[i].present = true;
-                rows[i].type = tensors[i]->type;
-                rows[i].row_bytes = row_bytes;
+        const auto read_typed_row = [&](ggml_tensor * tensor,
+                                        recurrent_tensor_row & row) {
+            int32_t type = -1;
+            uint64_t row_bytes = 0;
+            if (!cursor.scalar(type) || type != int32_t(tensor->type) ||
+                !cursor.scalar(row_bytes) ||
+                row_bytes != uint64_t(ggml_row_size(
+                    tensor->type, tensor->ne[0])) ||
+                row_bytes > std::numeric_limits<size_t>::max() ||
+                !cursor.block(row.bytes, size_t(row_bytes))) {
+                return false;
             }
+            row.present = true;
+            row.type = tensor->type;
+            row.row_bytes = row_bytes;
             return true;
         };
-        if (!read_rows(target->r_l, parsed->r) ||
-            !read_rows(target->s_l, parsed->s) || !cursor.finished()) {
+        // PLE layers serialize one additional convolution-history row
+        // immediately after their R row.  Unlike R/S, its type is implicit in
+        // the model tensor; the native sequence-state format stores only the
+        // row byte count before the payload.
+        for (size_t i = 0; i < target->r_l.size(); ++i) {
+            auto * recurrent = target->r_l[i];
+            if (!recurrent) {
+                continue;
+            }
+            if (!read_typed_row(recurrent, parsed->r[i])) {
+                return false;
+            }
+            auto * tensor = target->p_l[i];
+            if (!tensor) {
+                continue;
+            }
+            uint64_t row_bytes = 0;
+            auto & row = parsed->p[i];
+            if (!cursor.scalar(row_bytes) ||
+                row_bytes != uint64_t(ggml_row_size(
+                    tensor->type, tensor->ne[0])) ||
+                row_bytes > std::numeric_limits<size_t>::max() ||
+                !cursor.block(row.bytes, size_t(row_bytes))) {
+                return false;
+            }
+            row.present = true;
+            row.type = tensor->type;
+            row.row_bytes = row_bytes;
+        }
+        for (size_t i = 0; i < target->s_l.size(); ++i) {
+            if (target->s_l[i] &&
+                !read_typed_row(target->s_l[i], parsed->s[i])) {
+                return false;
+            }
+        }
+        if (!cursor.finished()) {
             return false;
         }
         output = std::move(parsed);

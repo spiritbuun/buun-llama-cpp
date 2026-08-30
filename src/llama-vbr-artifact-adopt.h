@@ -96,6 +96,23 @@ class vbr_prepared_companion_image {
     vbr_prepared_companion_image() = default;
 };
 
+// Logical-to-physical image prepared for one attention child but not yet
+// published. Layout-aware companions use it to stage mirrored state into the
+// exact cells that will become visible at the composite commit.
+struct vbr_companion_cell_placement {
+    uint32_t stream = 0;
+    uint32_t physical_cell = 0;
+    llama_pos logical_position = -1;
+    int32_t ext_x = 0;
+    int32_t ext_y = 0;
+    llama_token token = LLAMA_TOKEN_NULL;
+};
+
+struct vbr_companion_attention_layout {
+    uint32_t child_id = UINT32_MAX;
+    std::vector<vbr_companion_cell_placement> cells;
+};
+
 // Provider callbacks are closed over one companion target. `prepare` runs
 // after unit H2D and may either build an off-side image or install reversible
 // state in an otherwise-empty target. `recheck` is the allocation-free late
@@ -112,6 +129,14 @@ struct vbr_companion_adoption_provider {
         std::unique_ptr<vbr_parsed_companion_image> parsed,
         llama_seq_id destination,
         std::unique_ptr<vbr_prepared_companion_image> & output) noexcept = nullptr;
+    // Layout-aware form for a companion that mirrors one attention child.
+    // Exactly one of prepare/prepare_with_layout is used.
+    bool (*prepare_with_layout)(
+        const void * context,
+        std::unique_ptr<vbr_parsed_companion_image> parsed,
+        llama_seq_id destination,
+        const vbr_companion_attention_layout & layout,
+        std::unique_ptr<vbr_prepared_companion_image> & output) noexcept = nullptr;
     // Occupied replacement authenticates the live target against `recovery`
     // before installing `incoming`. The callback must publish `output`
     // before its first destructive mutation so the common rollback loop can
@@ -122,6 +147,14 @@ struct vbr_companion_adoption_provider {
         std::unique_ptr<vbr_parsed_companion_image> recovery,
         llama_seq_id destination,
         std::unique_ptr<vbr_prepared_companion_image> & output) noexcept = nullptr;
+    bool (*prepare_replacement_with_layout)(
+        const void * context,
+        std::unique_ptr<vbr_parsed_companion_image> incoming,
+        std::unique_ptr<vbr_parsed_companion_image> recovery,
+        llama_seq_id destination,
+        const vbr_companion_attention_layout & layout,
+        std::unique_ptr<vbr_prepared_companion_image> & output) noexcept = nullptr;
+    uint32_t attention_child_id = UINT32_MAX;
     // Late complete-tree drift gate. It must be allocation-free and describe the
     // same target object as target_cookie/prepare/publish_swap.
     bool (*target_empty)(const void * context) noexcept = nullptr;

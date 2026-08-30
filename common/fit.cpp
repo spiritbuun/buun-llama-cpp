@@ -350,6 +350,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
             ret.back().mb.context       += mb.context;
             ret.back().mb.compute       += mb.compute;
             ret.back().mb.context_fixed += mb.context_fixed;
+            ret.back().mb.context_vbr_managed += mb.context_vbr_managed;
             continue;
         }
 
@@ -363,6 +364,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
                 ret[i].mb.context       += mb.context;
                 ret[i].mb.compute       += mb.compute;
                 ret[i].mb.context_fixed += mb.context_fixed;
+                ret[i].mb.context_vbr_managed += mb.context_vbr_managed;
                 break;
             }
         }
@@ -660,6 +662,7 @@ static void common_params_fit_impl(
                         dmds_extra[id].mb.context       += mb_extra.context;
                         dmds_extra[id].mb.compute       += mb_extra.compute;
                         dmds_extra[id].mb.context_fixed += mb_extra.context_fixed;
+                        dmds_extra[id].mb.context_vbr_managed += mb_extra.context_vbr_managed;
                         mapped = true;
                         break;
                     }
@@ -680,6 +683,7 @@ static void common_params_fit_impl(
             dmds[id].mb.context += dmds_extra[id].mb.context;
             dmds[id].mb.compute += dmds_extra[id].mb.compute;
             dmds[id].mb.context_fixed += dmds_extra[id].mb.context_fixed;
+            dmds[id].mb.context_vbr_managed += dmds_extra[id].mb.context_vbr_managed;
         }
     };
 
@@ -792,15 +796,16 @@ static void common_params_fit_impl(
         return result;
     };
 
-    // context bytes that scale with n_ctx (KV only): byte->token capacity math and floor-cost
-    // comparisons must exclude the n_seq_max-sized recurrent state or a constant term skews them
-    auto sum_context_kv_bytes = [&](const dmds_t & dmds) {
+    // Context bytes whose representation is selected by Turbo/VBR. This is intentionally not
+    // `context - context_fixed`: an auxiliary index cache can scale with n_ctx while remaining
+    // fixed-layout and outside the controller budget.
+    auto sum_context_vbr_managed_bytes = [&](const dmds_t & dmds) {
         int64_t result = 0;
         if (nd == 0) {
-            result += dmds.back().mb.context - dmds.back().mb.context_fixed;
+            result += dmds.back().mb.context_vbr_managed;
         } else {
             for (size_t id = 0; id < nd; id++) {
-                result += dmds[id].mb.context - dmds[id].mb.context_fixed;
+                result += dmds[id].mb.context_vbr_managed;
             }
         }
         return result;
@@ -866,10 +871,12 @@ static void common_params_fit_impl(
             // The runtime VBR budget controls only the target KV. Reserve the complete extra
             // model/context/compute allocation first; its fixed-F16 KV cannot be spent by the
             // target controller or scaled by the target's floor-mix ratio.
+            const int64_t context_fixed_layout =
+                (int64_t) target.mb.context - (int64_t) target.mb.context_vbr_managed;
             budget_gr += std::max<int64_t>(0,
                 target.total - (int64_t) target.mb.model - (int64_t) target.mb.compute
-                    - (int64_t) target.mb.context_fixed - (int64_t) extra_mb.total() - margins[id]);
-            ctx_kv += (int64_t) target.mb.context - (int64_t) target.mb.context_fixed;
+                    - context_fixed_layout - (int64_t) extra_mb.total() - margins[id]);
+            ctx_kv += (int64_t) target.mb.context_vbr_managed;
         }
         ctx_kv = (int64_t) ((double) ctx_kv * vbr_kv_scale); // floor-mix cost, not price-tier
         budget_gr -= vbr_scratch_excess(hp_nct);
@@ -916,12 +923,12 @@ static void common_params_fit_impl(
             // measured free. Once the probe honors no_alloc, only this subtraction charges it.)
             int64_t b = 0;
             if (nd == 0) {
-                b = (int64_t) (dmds_target_full.back().mb.context - dmds_target_full.back().mb.context_fixed)
+                b = (int64_t) dmds_target_full.back().mb.context_vbr_managed
                     + projected_free_host - margins[0];
             } else {
                 for (size_t id = 0; id < nd; id++) {
                     b += std::max<int64_t>(0,
-                            (int64_t) (dmds_target_full[id].mb.context - dmds_target_full[id].mb.context_fixed)
+                            (int64_t) dmds_target_full[id].mb.context_vbr_managed
                             + projected_free_per_device[id] - margins[id]);
                 }
             }
@@ -945,7 +952,7 @@ static void common_params_fit_impl(
         // cannot deliver the full context there (the runtime will also warn, at fill).
         const double floor_bpv = cparams->vbr_min_bits > 0.0 ? cparams->vbr_min_bits
                                                              : vbr_type_bits(GGML_TYPE_TURBO1_TCQ);
-        const int64_t ctx_priced = sum_context_kv_bytes(dmds_target_full);
+        const int64_t ctx_priced = sum_context_vbr_managed_bytes(dmds_target_full);
         // fire for the tier-exact default floor too (scale 1): a budget below the floor-cost
         // full context is the only startup signal for the runtime's warn-once-exceed state
         if (ctx_priced > 0 && (double) budget < (double) ctx_priced * vbr_kv_scale) {
@@ -977,7 +984,7 @@ static void common_params_fit_impl(
         // common_fit_params); scale to the achievable floor-mix cost so these byte->token
         // estimates are true floor capacities, capped at the trained context (beyond it rope
         // is invalid and compute growth unaccounted)
-        const int64_t ctx_full = (int64_t) ((double) sum_context_kv_bytes(dmds_full) * vbr_kv_scale);
+        const int64_t ctx_full = (int64_t) ((double) sum_context_vbr_managed_bytes(dmds_full) * vbr_kv_scale);
         if (ctx_full <= 0) {
             return uint32_t(0);
         }
@@ -991,7 +998,7 @@ static void common_params_fit_impl(
         const dmds_t dmds_probe = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
         cparams->n_ctx = 0;
 
-        const int64_t ctx_probe = (int64_t) ((double) sum_context_kv_bytes(dmds_probe) * vbr_kv_scale);
+        const int64_t ctx_probe = (int64_t) ((double) sum_context_vbr_managed_bytes(dmds_probe) * vbr_kv_scale);
         if (ctx_probe <= 0 || ctx_full <= ctx_probe) {
             return vbr_scale_est((uint64_t) budget_bytes * hp_nct / (uint64_t) ctx_full);
         }

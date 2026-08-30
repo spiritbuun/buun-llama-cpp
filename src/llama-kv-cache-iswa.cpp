@@ -381,6 +381,14 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_iswa::memory_breakdo
     return mb;
 }
 
+std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_iswa::memory_breakdown_vbr_managed() const {
+    std::map<ggml_backend_buffer_type_t, size_t> mb = kv_base->memory_breakdown_vbr_managed();
+    for (const auto & buft_size : kv_swa->memory_breakdown_vbr_managed()) {
+        mb[buft_size.first] += buft_size.second;
+    }
+    return mb;
+}
+
 llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     GGML_UNUSED(embd_all);
 

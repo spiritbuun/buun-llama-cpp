@@ -209,10 +209,21 @@ public:
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
 
+    // Position-only edit for an auxiliary cache whose keys are stored before
+    // RoPE (currently Qwen4 QSA).  This is intentionally not a llama_memory_i
+    // operation: only the owning composite may assert that its child is raw.
+    void seq_add_raw_mrope(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift);
+
+    // Preflight for the narrow broadcast-text operation.  Composite owners use
+    // it before touching any child, so a 2-D/multimodal cell cannot leave a
+    // half-shifted hybrid timeline.
+    bool can_shift_qwen4_text_range(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
+
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
+    std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown_vbr_managed() const override;
 
     // state write/load
 
@@ -225,6 +236,8 @@ public:
 
     uint32_t get_size()     const;
     uint32_t get_n_stream() const;
+    uint32_t get_stream_for_seq(llama_seq_id seq_id) const;
+    bool state_empty() const;
 
     // monotone counter of in-place VBR tier flips — graph reuse fences on it.
     // A share-linked cache (mem_other) views the owner's tensors, so its graphs must
@@ -1604,6 +1617,14 @@ private:
 
     size_t size_k_bytes() const;
     size_t size_v_bytes() const;
+
+    bool supports_qwen4_text_mrope_shift() const;
+    void seq_add_impl(
+            llama_seq_id seq_id,
+               llama_pos p0,
+               llama_pos p1,
+               llama_pos shift,
+                    bool raw_keys);
 
     ggml_tensor * build_rope_shift(
             const llama_cparams & cparams,

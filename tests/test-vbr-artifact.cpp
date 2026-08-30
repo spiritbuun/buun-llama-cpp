@@ -1455,6 +1455,53 @@ struct catalog_fixture {
     }
 };
 
+static void test_catalog_accounting_setup_preserves_shared_gauges() {
+    catalog_fixture f(false);
+    constexpr uint64_t live_qsa_bytes = 1481448;
+
+    const auto allocation = f.ledger.new_alloc();
+    CHECK(allocation);
+    const auto operation = f.ledger.reserve(
+        llama_cache_acct_category::typed_accelerator_payload,
+        f.host, {}, live_qsa_bytes, live_qsa_bytes);
+    CHECK(operation);
+    CHECK(f.ledger.stage(operation, allocation, live_qsa_bytes));
+    CHECK(f.ledger.commit(operation, live_qsa_bytes));
+
+    const vbr_artifact_portable_domain host {
+        llama_cache_acct_residency::pageable_host,
+        llama_cache_acct_domain_kind::not_applicable,
+        UINT32_MAX,
+        UINT16_MAX,
+    };
+    f.package.manifest.accounting.push_back({
+        vbr_artifact_accounting_role::typed_accelerator_payload,
+        host, 64, 64, llama_cache_acct_attr_kind::artifact,
+    });
+    CHECK(f.catalog->configure_accounting(f.package));
+
+    auto snapshot = f.ledger.snapshot();
+    CHECK(catalog_cell(
+        snapshot,
+        llama_cache_acct_category::typed_accelerator_payload,
+        f.host,
+        llama_cache_acct_measure::logical_payload).value == live_qsa_bytes);
+    CHECK(catalog_cell(
+        snapshot,
+        llama_cache_acct_category::typed_accelerator_payload,
+        f.host,
+        llama_cache_acct_measure::resident_allocated).value == live_qsa_bytes);
+
+    CHECK(f.ledger.release(operation));
+    snapshot = f.ledger.snapshot();
+    CHECK(snapshot.faults_overflow == 0);
+    CHECK(catalog_cell(
+        snapshot,
+        llama_cache_acct_category::typed_accelerator_payload,
+        f.host,
+        llama_cache_acct_measure::logical_payload).value == 0);
+}
+
 static vbr_verified_segment verified_segment(
         const catalog_fixture::shard_completion & completion,
         size_t split = SIZE_MAX) {
@@ -9400,6 +9447,7 @@ int main(int argc, char ** argv) {
     test_companion_payload();
     test_stream_larger_than_capture_ring();
     test_catalog_streaming_protocol();
+    test_catalog_accounting_setup_preserves_shared_gauges();
     test_catalog_multi_unit_atomic_publish();
     test_catalog_streaming_companion_lifetime();
     test_catalog_charge_once_and_retire();

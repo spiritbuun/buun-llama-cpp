@@ -208,6 +208,13 @@ int llama_completion(int argc, char ** argv) {
         params.ctx_shift = false;
     }
 
+    if (params.grp_attn_n != 1 &&
+        (llama_model_rope_type(model) == LLAMA_ROPE_TYPE_MROPE ||
+         llama_model_rope_type(model) == LLAMA_ROPE_TYPE_IMROPE)) {
+        LOG_ERR("%s: Self-Extend is not supported for M-RoPE models\n", __func__);
+        return 1;
+    }
+
     std::string path_session = params.path_prompt_cache;
     std::vector<llama_token> session_tokens;
 

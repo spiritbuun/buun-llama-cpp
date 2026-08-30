@@ -392,6 +392,12 @@ struct llama_memory_i {
 
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
 
+    // The subset of memory_breakdown() whose representation and physical footprint are selected
+    // by the attention Turbo/VBR policy. This is deliberately narrower than all context-linear
+    // memory: auxiliary index caches can grow with n_ctx while remaining fixed-layout and outside
+    // the controller's budget. Empty for memories with no Turbo/VBR-managed attention storage.
+    virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown_vbr_managed() const { return {}; }
+
     // the subset of memory_breakdown() that does NOT scale with the context length (e.g. the
     // recurrent-state cache, sized by n_seq_max). Reported so budget math can charge it even
     // where the context-linear part cancels out of a projection. Empty for pure KV caches.

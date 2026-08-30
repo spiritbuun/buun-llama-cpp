@@ -54,6 +54,7 @@ add_library(llama
             llama-vbr-artifact-validate.cpp
             llama-vbr-artifact-stage.cpp
             llama-vbr-artifact-adopt.cpp
+            llama-vbr-qsa-index.cpp
             llama-vbr-downward.cpp
             llama-vbr-upward.cpp
             llama-vbr-explicit-capture.cpp

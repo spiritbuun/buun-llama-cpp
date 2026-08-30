@@ -4,8 +4,78 @@ import base64
 import requests
 import struct
 
-# sequence state file: magic(4) version(4) payload_size(4), then payload_size llama_token words
-STATE_FILE_HEADER_SIZE = 12
+# v3 sequence-state envelope: magic/version/total-size/FNV payload checksum,
+# then packed-token count, opaque packed words, and the model state payload.
+STATE_FILE_HEADER_SIZE = 24
+SLOT_ENVELOPE_HEADER_SIZE = 224
+
+
+def _fnv1a64(data):
+    value = 14695981039346656037
+    for byte in data:
+        value ^= byte
+        value = (value * 1099511628211) & 0xffffffffffffffff
+    return value
+
+
+def _read_v3_slot(path):
+    with open(path, "rb") as file:
+        data = bytearray(file.read())
+    total_size, checksum = struct.unpack_from("=QQ", data, 8)
+    assert total_size == len(data)
+    assert checksum == _fnv1a64(data[STATE_FILE_HEADER_SIZE:])
+    packed_count = struct.unpack_from("=I", data, STATE_FILE_HEADER_SIZE)[0]
+    packed_start = STATE_FILE_HEADER_SIZE + 4
+    packed_end = packed_start + packed_count * 4
+    return data[:8], bytearray(data[packed_start:packed_end]), bytearray(data[packed_end:])
+
+
+def _write_v3_slot(path, prefix, packed, state):
+    assert len(packed) % 4 == 0
+    payload = bytearray(struct.pack("=I", len(packed) // 4)) + packed + state
+    header = bytearray(prefix) + bytearray(struct.pack(
+        "=QQ", STATE_FILE_HEADER_SIZE + len(payload), _fnv1a64(payload)))
+    with open(path, "wb") as file:
+        file.write(header + payload)
+
+
+def _strip_frontier_logits(path):
+    prefix, packed, state = _read_v3_slot(path)
+    assert packed[:8] == b"BUUNSLOT"
+    token_bytes = struct.unpack_from("<Q", packed, 24)[0]
+    flags = struct.unpack_from("<I", packed, 16)[0] & ~1
+    struct.pack_into("<I", packed, 16, flags)
+    struct.pack_into("<I", packed, 48, 0)
+    packed[184:216] = bytes(32)
+    struct.pack_into("<Q", packed, 216, 0)
+    packed = packed[:SLOT_ENVELOPE_HEADER_SIZE + token_bytes]
+    _write_v3_slot(path, prefix, packed, state)
+
+
+def _server_tokens_from_slot(path):
+    prefix, packed, state = _read_v3_slot(path)
+    assert packed[:8] == b"BUUNSLOT"
+    token_bytes = struct.unpack_from("<Q", packed, 24)[0]
+    serialized = packed[SLOT_ENVELOPE_HEADER_SIZE:
+                        SLOT_ENVELOPE_HEADER_SIZE + token_bytes]
+    return prefix, serialized, state
+
+
+def _assert_completion_probabilities_close(actual, expected):
+    assert len(actual) == len(expected)
+    for actual_token, expected_token in zip(actual, expected):
+        for key in ("id", "token", "bytes"):
+            assert actual_token[key] == expected_token[key]
+        assert actual_token["logprob"] == pytest.approx(
+            expected_token["logprob"], abs=1e-5)
+        actual_top = actual_token["top_logprobs"]
+        expected_top = expected_token["top_logprobs"]
+        assert len(actual_top) == len(expected_top)
+        for actual_item, expected_item in zip(actual_top, expected_top):
+            for key in ("id", "token", "bytes"):
+                assert actual_item[key] == expected_item[key]
+            assert actual_item["logprob"] == pytest.approx(
+                expected_item["logprob"], abs=1e-5)
 
 server = ServerPreset.tinyllama2()
 
@@ -76,6 +146,115 @@ def test_slot_save_restore():
     assert res.body["timings"]["prompt_n"] == 1
 
 
+def test_slot_frontier_logits_hot_restore_and_cold_fallback():
+    global server
+    server.start()
+
+    prompt = "The capital of France is"
+    tokenized = server.make_request(
+        "POST", "/tokenize", data={
+            "content": prompt,
+            "add_special": True,
+        })
+    assert tokenized.status_code == 200
+
+    generated = server.make_request("POST", "/completion", data={
+        "prompt": prompt,
+        "id_slot": 1,
+        "cache_prompt": True,
+        "n_predict": 1,
+        "return_tokens": True,
+        "temperature": 0.0,
+    })
+    assert generated.status_code == 200
+    assert len(generated.body["tokens"]) == 1
+    # The sampled stop token was returned to the caller but was not decoded
+    # into the retained KV.  The persisted frontier is therefore the exact
+    # BOS-inclusive request prompt, and its logits must reproduce that sampled
+    # token without replaying a prompt token.
+    exact_tokens = tokenized.body["tokens"]
+
+    # Replace the context-wide output buffer before saving.  The terminal row
+    # belongs to slot 1 and must already have been copied into slot-owned
+    # storage; /slots/save must never recover it from whichever slot decoded
+    # most recently.
+    mutated_output = server.make_request("POST", "/completion", data={
+        "prompt": "A different slot replaces shared model output",
+        "id_slot": 0,
+        "cache_prompt": True,
+        "n_predict": 1,
+        "temperature": 0.0,
+    })
+    assert mutated_output.status_code == 200
+
+    saved = server.make_request("POST", "/slots/1?action=save", data={
+        "filename": "slot_frontier_logits.bin",
+    })
+    assert saved.status_code == 200
+    path = os.path.join("tmp", "slot_frontier_logits.bin")
+    _, packed, _ = _read_v3_slot(path)
+    assert packed[:8] == b"BUUNSLOT"
+    assert struct.unpack_from("<I", packed, 16)[0] & 1
+
+    # Restart before restoring: the persisted row must not depend on a
+    # process-random execution epoch, and restore must mint destination-local
+    # slot/sequence authority.
+    server.stop()
+    server.start()
+
+    # Make the destination genuinely occupied before the cross-slot restore.
+    occupied = server.make_request("POST", "/completion", data={
+        "prompt": "An unrelated occupied destination",
+        "id_slot": 0,
+        "cache_prompt": True,
+        "n_predict": 1,
+        "temperature": 0.0,
+    })
+    assert occupied.status_code == 200
+
+    restored = server.make_request("POST", "/slots/0?action=restore", data={
+        "filename": "slot_frontier_logits.bin",
+    })
+    assert restored.status_code == 200
+    hot = server.make_request("POST", "/completion", data={
+        "prompt": exact_tokens,
+        "id_slot": 0,
+        "cache_prompt": True,
+        "n_predict": 1,
+        "return_tokens": True,
+        "n_probs": 5,
+        "temperature": 0.0,
+    })
+    assert hot.status_code == 200
+    assert hot.body["timings"]["prompt_n"] == 0
+    hot_token = hot.body["tokens"]
+    hot_probs = hot.body["completion_probabilities"]
+    assert hot_token == generated.body["tokens"]
+
+    # The base slot file is still a complete semantic restore when its
+    # optional capability is absent.  The ordinary one-token replay must be
+    # visible rather than silently using a stale in-memory row.
+    _strip_frontier_logits(path)
+    restored = server.make_request("POST", "/slots/0?action=restore", data={
+        "filename": "slot_frontier_logits.bin",
+    })
+    assert restored.status_code == 200
+    cold = server.make_request("POST", "/completion", data={
+        "prompt": exact_tokens,
+        "id_slot": 0,
+        "cache_prompt": True,
+        "n_predict": 1,
+        "return_tokens": True,
+        "n_probs": 5,
+        "temperature": 0.0,
+    })
+    assert cold.status_code == 200
+    assert cold.body["timings"]["prompt_n"] == 1
+    assert cold.body["tokens"] == hot_token
+    _assert_completion_probabilities_close(
+        cold.body["completion_probabilities"], hot_probs)
+
+
 def test_slot_restore_legacy_token_list():
     global server
     server.start()
@@ -95,23 +274,13 @@ def test_slot_restore_legacy_token_list():
 
     # rewrite the token payload into a plain token list, as written by servers that predate the packed server_tokens format
     path = os.path.join("tmp", "slot_legacy.bin")
-    with open(path, "rb") as f:
-        data = bytearray(f.read())
-
-    # the payload written by this server starts with a packed header: LLAMA_TOKEN_NULL(4) version(4) n_tokens(4)
+    prefix, serialized, state = _server_tokens_from_slot(path)
+    # The embedded server_tokens payload starts with marker/version/count.
     packed_header_size = 12
-
-    payload_size = struct.unpack_from("=I", data, STATE_FILE_HEADER_SIZE - 4)[0]
-    payload_end = STATE_FILE_HEADER_SIZE + payload_size * 4
-    n_tokens = struct.unpack_from("=I", data, STATE_FILE_HEADER_SIZE + 8)[0]
+    n_tokens = struct.unpack_from("=I", serialized, 8)[0]
     assert n_tokens == 84
-
-    tokens_start = STATE_FILE_HEADER_SIZE + packed_header_size
-    data = data[:STATE_FILE_HEADER_SIZE] + data[tokens_start:tokens_start + n_tokens * 4] + data[payload_end:]
-    struct.pack_into("=I", data, STATE_FILE_HEADER_SIZE - 4, n_tokens)
-
-    with open(path, "wb") as f:
-        f.write(data)
+    plain = serialized[packed_header_size:packed_header_size + n_tokens * 4]
+    _write_v3_slot(path, prefix, plain, state)
 
     # the plain token list must restore, and the restored KV must be reusable
     res = server.make_request("POST", "/slots/0?action=restore", data={

@@ -1896,8 +1896,10 @@ bool llama_vbr_artifact_catalog::configure_accounting(
                     llama_cache_acct_measure::logical_payload,
                     llama_cache_acct_measure::resident_allocated,
                     llama_cache_acct_measure::reserved }) {
-                impl_->ledger.gauge_set(
-                    cell.category, cell.domain, measure, 0);
+                if (!impl_->ledger.gauge_initialize_zero(
+                        cell.category, cell.domain, measure)) {
+                    return false;
+                }
             }
             added.push_back(cell);
         }

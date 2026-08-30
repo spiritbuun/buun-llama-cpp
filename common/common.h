@@ -17,6 +17,7 @@
 #include <vector>
 #include <map>
 #include <algorithm>
+#include <array>
 #include <fstream>
 #include <memory>
 #include <stdexcept>
@@ -649,6 +650,8 @@ struct common_params {
     int32_t verbosity                  = 3;  // LOG_LEVEL_INFO
     int32_t control_vector_layer_start = -1; // layer range for control vector
     int32_t control_vector_layer_end   = -1; // layer range for control vector
+    std::array<uint8_t, 32> control_vector_applied_digest = {};
+    bool control_vector_applied_digest_valid = false;
     bool    offline                    = false;
 
     int32_t ppl_stride      = 0;     // stride for perplexity calculations. If left at 0, the pre-existing approach will be used.
@@ -1336,6 +1339,8 @@ struct common_control_vector_data {
 
     // stores data for layers [1, n_layer] where n_layer = data.size() / n_embd
     std::vector<float> data;
+    std::array<uint8_t, 32> applied_digest = {};
+    bool applied_digest_valid = false;
 };
 
 struct common_control_vector_load_info {
@@ -1563,6 +1568,10 @@ struct common_prompt_checkpoint {
 
     common_shared_byte_buffer data_tgt;
     common_shared_byte_buffer data_dft;
+    // Fixed-F16 Qwen4 QSA index image at the same logical frontier. It is
+    // excluded from PARTIAL_ONLY target state and therefore travels as its
+    // own authenticated VBR companion.
+    common_shared_byte_buffer data_qsa;
     // Draft checkpoints used as VBR companions contain the complete sequence
     // image so they can populate an empty draft context. Legacy speculative
     // checkpoints may contain only PARTIAL_ONLY state. Retain the wire mode

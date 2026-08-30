@@ -1,6 +1,7 @@
 #include "common.h"
 #include "log.h"
 #include "ggml-backend.h"
+#include "ggml-vbr.h"
 #include "ggml.h"
 #include "gguf.h"
 #include "ggml-cpp.h"
@@ -12,12 +13,21 @@
 #include "../src/llama-cparams.h"
 #include "../src/llama-ext.h"
 #include "../src/llama-memory.h"
+#include "../src/llama-memory-hybrid-idx.h"
+#include "../src/llama-memory-tree.h"
 #include "../src/llama-model.h"
 #include "../src/llama-model-loader.h"
 #include "../src/llama-model-saver.h"
+#include "../src/llama-io.h"
+#include "../src/llama-vbr-artifact-adopt.h"
+#include "../src/llama-vbr-artifact-capture.h"
+#include "../src/llama-vbr-explicit-capture.h"
+#include "../src/llama-vbr-qsa-index.h"
 #include "../src/models/dflash-selector-family.h"
 
+#include <algorithm>
 #include <cinttypes>
+#include <cmath>
 #include <cstddef>
 #include <cstdlib>
 #include <cstdio>
@@ -25,15 +35,84 @@
 #include <cstdint>
 #include <initializer_list>
 #include <memory>
+#include <map>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
 #if !defined(_WIN32)
 #include <unistd.h>
 #endif
+
+// Narrow production-path instrumentation for the Qwen4 live CUDA contract.
+// The same friend name is already owned by the representation-epoch test in a
+// separate executable; no hook or counter is compiled into production.
+struct llama_kv_cache_vbr_epoch_test {
+    static bool active(const llama_kv_cache * kv) {
+        return kv != nullptr && kv->vbr_vmm_active() && kv->vbr_budget_bytes_ > 0;
+    }
+
+    static bool map_seed_watermark(llama_kv_cache * kv) {
+        const uint32_t wm = kv->vbr_watermark_cells(1);
+        return wm > 0 && kv->vbr_vmm_try_map(wm);
+    }
+
+    static bool force_degrade(llama_kv_cache * kv) {
+        std::vector<ggml_type> sim;
+        kv->vbr_sim_seed(
+            sim, /* pooled_only = */ true,
+            GGML_TYPE_COUNT, GGML_TYPE_COUNT,
+            nullptr, nullptr, nullptr);
+        bool has_mapped_step = false;
+        for (size_t i = kv->vbr_degrade_cursor_;
+             i < kv->vbr_degrade_order_.size(); ++i) {
+            size_t slot = 0;
+            const ggml_tensor * tensor = nullptr;
+            ggml_type target = GGML_TYPE_COUNT;
+            if (!kv->vbr_sim_step(sim, i, slot, tensor, target)) {
+                continue;
+            }
+            const auto & units = kv->vbr_units_of(
+                slot / 2, kv->vbr_degrade_order_[i].is_v != 0);
+            has_mapped_step = !units.empty();
+            for (const auto & [pool, extent] : units) {
+                has_mapped_step = has_mapped_step && pool->vmm != nullptr &&
+                    pool->wm_cells > 0 && extent->t != nullptr;
+            }
+            if (has_mapped_step) {
+                break;
+            }
+        }
+        if (!has_mapped_step) {
+            return false;
+        }
+        const size_t saved_limit = kv->vbr_degrade_limit_;
+        kv->vbr_degrade_limit_ = kv->vbr_degrade_order_.size();
+        const bool changed =
+            kv->vbr_degrade_next(kv->vbr_watermark_cells(0)) ==
+            llama_kv_cache::vbr_degrade_result::applied;
+        kv->vbr_degrade_limit_ = saved_limit;
+        return changed;
+    }
+
+    static std::vector<ggml_type> storage_types(const llama_kv_cache * kv) {
+        std::vector<ggml_type> result;
+        result.reserve(kv->layers.size() * 2);
+        for (const auto & layer : kv->layers) {
+            GGML_ASSERT(layer.k != nullptr && layer.v != nullptr);
+            result.push_back(layer.k->type);
+            result.push_back(layer.v->type);
+        }
+        return result;
+    }
+
+    static uint32_t n_stream(const llama_kv_cache * kv) {
+        return kv->n_stream;
+    }
+};
 
 // normalized mean squared error = mse(a, b) / mse(a, 0)
 static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
@@ -226,6 +305,10 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
             }
             ms.add_kv(LLM_KV_ATTENTION_INDEXER_TYPES, indexer_types);
         }
+    } else if (arch == LLM_ARCH_QWEN4EXP) {
+        // Match the shipped Qwen3.8-Flash-Next geometry: partial 64-dim
+        // interleaved M-RoPE in 128-dim attention heads.
+        ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(64));
     } else if (arch == LLM_ARCH_MINIMAX_M3) {
         // partial rotary: n_rot must not exceed the indexer key length (64)
         ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(64));
@@ -278,7 +361,10 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,        uint32_t(8));
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_BLOCK_SIZE,   uint32_t(4));
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_LOCAL_BLOCKS, uint32_t(1));
-    ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS, std::vector<uint32_t>({n_embd_head/4, n_embd_head/4, n_embd_head/4, n_embd_head/4}));
+    ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS,
+            arch == LLM_ARCH_QWEN4EXP
+                ? std::vector<uint32_t>({11, 11, 10, 0})
+                : std::vector<uint32_t>({n_embd_head/4, n_embd_head/4, n_embd_head/4, n_embd_head/4}));
 
     if (arch == LLM_ARCH_DEEPSEEK4) {
         ms.add_kv(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,         uint32_t(8));
@@ -360,7 +446,8 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
 
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
-        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false) {
+        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
+        ggml_backend_sched_eval_callback cb_eval = nullptr, void * cb_eval_user_data = nullptr) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -373,6 +460,8 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     ctx_params.n_ctx = 0;
     ctx_params.n_threads = 4;
     ctx_params.n_threads_batch = 4;
+    ctx_params.cb_eval = cb_eval;
+    ctx_params.cb_eval_user_data = cb_eval_user_data;
     if (!encode) {
         ctx_params.n_ubatch = 64;
     }
@@ -391,6 +480,9 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     return std::make_pair(std::move(model), std::move(lctx));
 }
 
+static std::vector<float> get_logits(
+        llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false);
+
 static void test_dflash_selector_family_contract() {
     using family = llm_dflash_selector_family;
 
@@ -405,10 +497,195 @@ static void test_dflash_selector_family_contract() {
 }
 
 static void test_qwen4_indexed_cache_admission(const size_t seed) {
+    struct qsa_trace {
+        size_t raw_key_nodes = 0;
+        size_t score_nodes = 0;
+        size_t top_k_nodes = 0;
+    };
+
+    const auto trace_qsa = [](ggml_tensor * tensor, bool ask, void * user_data) {
+        if (!ask) {
+            return true;
+        }
+        auto & trace = *static_cast<qsa_trace *>(user_data);
+        const std::string name = ggml_get_name(tensor);
+        trace.raw_key_nodes += name.find("indexer_k_raw") != std::string::npos;
+        trace.score_nodes   += name.find("indexer_score") != std::string::npos;
+        trace.top_k_nodes   += name.find("indexer_top_k") != std::string::npos;
+        return false;
+    };
+
+    // The index cache must still be populated when every cache cell fits within
+    // the QSA budget, but selection-only graph work must disappear.  Pin the exact
+    // ratio-4 boundary: top_k 253 selects at most 256 cells, while 252 selects 255.
+    {
+        gguf_context_ptr dense_gguf = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+        gguf_set_val_u32(dense_gguf.get(), "qwen4exp.attention.indexer.top_k", 253);
+        qsa_trace dense_trace;
+        auto dense = get_model_and_ctx(
+                dense_gguf.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, false,
+                trace_qsa, &dense_trace);
+        const auto dense_logits = get_logits(dense.first.get(), dense.second.get(), { 1, 2, 3, 4 });
+        GGML_ASSERT(dense_trace.raw_key_nodes > 0);
+        GGML_ASSERT(dense_trace.score_nodes == 0);
+        GGML_ASSERT(dense_trace.top_k_nodes == 0);
+
+        // Compare against the same loaded weights with QSA disabled.  This keeps
+        // the random tensor realization fixed while proving the all-cell shortcut
+        // is the ordinary dense-attention path, not merely a smaller graph.
+        dense.second.reset();
+        const auto compress_ratios = dense.first->hparams.dsv4_compress_ratios;
+        std::fill(dense.first->hparams.dsv4_compress_ratios.begin(),
+                  dense.first->hparams.dsv4_compress_ratios.end(), 0);
+        llama_context_params dense_ref_params = llama_context_default_params();
+        dense_ref_params.n_ctx = 0;
+        dense_ref_params.n_threads = 4;
+        dense_ref_params.n_threads_batch = 4;
+        dense_ref_params.n_ubatch = 64;
+        llama_context_ptr dense_ref(llama_init_from_model(dense.first.get(), dense_ref_params));
+        GGML_ASSERT(dense_ref != nullptr);
+        const auto dense_ref_logits = get_logits(dense.first.get(), dense_ref.get(), { 1, 2, 3, 4 });
+        GGML_ASSERT(dense_logits.size() == dense_ref_logits.size());
+        for (size_t i = 0; i < dense_logits.size(); ++i) {
+            GGML_ASSERT(std::abs(dense_logits[i] - dense_ref_logits[i]) <= 1.0e-5f);
+        }
+        dense_ref.reset();
+        dense.first->hparams.dsv4_compress_ratios = compress_ratios;
+
+        gguf_context_ptr sparse_gguf = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+        gguf_set_val_u32(sparse_gguf.get(), "qwen4exp.attention.indexer.top_k", 252);
+        qsa_trace sparse_trace;
+        auto sparse = get_model_and_ctx(
+                sparse_gguf.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, false,
+                trace_qsa, &sparse_trace);
+        (void) get_logits(sparse.first.get(), sparse.second.get(), { 1, 2, 3, 4 });
+        GGML_ASSERT(sparse_trace.raw_key_nodes > 0);
+        GGML_ASSERT(sparse_trace.score_nodes > 0);
+        GGML_ASSERT(sparse_trace.top_k_nodes > 0);
+    }
+
+    // A graph built for the dense 256-cell watermark must be rejected and rebuilt
+    // when the active cache pads to 512.  Also prove that the dense phase writes
+    // real raw index keys into the mirrored cells needed by that later sparse graph.
+    {
+        gguf_context_ptr transition_gguf = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+        gguf_set_val_u32(transition_gguf.get(), "qwen4exp.context_length", 512);
+        gguf_set_val_u32(transition_gguf.get(), "qwen4exp.attention.indexer.top_k", 253);
+        qsa_trace transition_trace;
+        auto transition = get_model_and_ctx(
+                transition_gguf.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, false,
+                trace_qsa, &transition_trace);
+
+        auto * transition_memory = dynamic_cast<llama_memory_hybrid_idx *>(
+                llama_get_memory(transition.second.get()));
+        GGML_ASSERT(transition_memory != nullptr);
+        auto * transition_idx = transition_memory->get_mem_idx();
+        GGML_ASSERT(transition_idx != nullptr);
+        const auto idx_layers = transition_idx->get_layer_ids();
+        GGML_ASSERT(!idx_layers.empty());
+        ggml_tensor * idx_storage = transition_idx->get_k_storage(idx_layers.front());
+        GGML_ASSERT(idx_storage != nullptr);
+        std::vector<uint8_t> idx_before(ggml_nbytes(idx_storage));
+        ggml_backend_tensor_get(idx_storage, idx_before.data(), 0, idx_before.size());
+
+        std::vector<llama_token> first_watermark(256, 1);
+        (void) get_logits(transition.first.get(), transition.second.get(), first_watermark);
+        GGML_ASSERT(transition_trace.raw_key_nodes > 0);
+        GGML_ASSERT(transition_trace.score_nodes == 0);
+        GGML_ASSERT(transition_trace.top_k_nodes == 0);
+        GGML_ASSERT(transition_idx->seq_pos_max(0) == 255);
+
+        std::vector<uint8_t> idx_after_dense(idx_before.size());
+        ggml_backend_tensor_get(idx_storage, idx_after_dense.data(), 0, idx_after_dense.size());
+        GGML_ASSERT(idx_after_dense != idx_before);
+
+        const auto & dense_cells = transition_idx->get_cells(0);
+        uint32_t late_cell = dense_cells.size();
+        for (uint32_t i = 0; i < dense_cells.size(); ++i) {
+            if (!dense_cells.is_empty(i) && dense_cells.seq_has(i, 0) && dense_cells.pos_get(i) == 255) {
+                late_cell = i;
+                break;
+            }
+        }
+        GGML_ASSERT(late_cell < dense_cells.size());
+        const size_t idx_row_size = ggml_row_size(idx_storage->type, idx_storage->ne[0]);
+        const size_t late_offset = (size_t) late_cell * idx_row_size;
+        GGML_ASSERT(late_offset + idx_row_size <= idx_before.size());
+        GGML_ASSERT(!std::equal(
+                idx_before.begin() + late_offset,
+                idx_before.begin() + late_offset + idx_row_size,
+                idx_after_dense.begin() + late_offset));
+
+        transition_trace = {};
+        // Keep the same 64-token ubatch geometry used at the dense watermark;
+        // selection mode is then the only graph-reuse discriminator that changes.
+        llama_batch next = llama_batch_init(64, 0, 1);
+        for (llama_pos pos = 256; pos < 320; ++pos) {
+            common_batch_add(next, 2, pos, { 0 }, true);
+        }
+        GGML_ASSERT(llama_decode(transition.second.get(), next) == 0);
+        GGML_ASSERT(llama_get_logits_ith(transition.second.get(), 63) != nullptr);
+        llama_batch_free(next);
+        GGML_ASSERT(transition_trace.raw_key_nodes > 0);
+        GGML_ASSERT(transition_trace.score_nodes > 0);
+        GGML_ASSERT(transition_trace.top_k_nodes > 0);
+        GGML_ASSERT(transition_idx->seq_pos_max(0) == 319);
+    }
+
     gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
     auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {});
 
-    const auto expect_refused = [&](ggml_type type_k, ggml_type type_v, const auto & configure) {
+    // Phase-0 VBR ownership/accounting contract. Qwen4's attention KV is the only storage whose
+    // representation may be selected by Turbo/VBR; recurrent state is fixed and the QSA indexer
+    // is a separate context-linear F16 cache. Pin both the production tree and the reference
+    // full-model arithmetic before enabling the currently-refused controller.
+    {
+        constexpr uint64_t n_ctx_train       = 262144;
+        constexpr uint64_t n_attn_layers     = 12;
+        constexpr uint64_t n_kv_values_side  = 2 * 256;
+        constexpr uint64_t n_index_values    = 128;
+        constexpr uint64_t bytes_f16         = 2;
+        constexpr uint64_t ref_attn_f16      = n_attn_layers * 2 * n_kv_values_side * bytes_f16 * n_ctx_train;
+        constexpr uint64_t ref_index_generic = n_attn_layers * 2 * n_index_values * bytes_f16 * n_ctx_train;
+        GGML_ASSERT(ref_attn_f16 == 6ULL * 1024 * 1024 * 1024);
+        GGML_ASSERT(ref_index_generic == 1536ULL * 1024 * 1024);
+
+        auto * memory = dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(model_and_ctx.second.get()));
+        GGML_ASSERT(memory != nullptr);
+        GGML_ASSERT(memory->get_mem_attn() != nullptr);
+        GGML_ASSERT(memory->get_mem_recr() != nullptr);
+        GGML_ASSERT(memory->get_mem_idx()  != nullptr);
+        GGML_ASSERT(memory->get_mem_idx()->type_k() == GGML_TYPE_F16);
+        GGML_ASSERT(memory->get_mem_idx()->type_v() == GGML_TYPE_F16);
+
+        const auto merge = [](auto dst, const auto & src) {
+            for (const auto & [buft, size] : src) {
+                dst[buft] += size;
+            }
+            return dst;
+        };
+
+        const auto attn    = memory->get_mem_attn()->memory_breakdown();
+        const auto recurrent = memory->get_mem_recr()->memory_breakdown();
+        const auto index   = memory->get_mem_idx()->memory_breakdown();
+        const auto managed = memory->memory_breakdown_vbr_managed();
+        const auto fixed   = memory->memory_breakdown_fixed();
+        const auto total   = memory->memory_breakdown();
+
+        GGML_ASSERT(managed == memory->get_mem_attn()->memory_breakdown_vbr_managed());
+        GGML_ASSERT(managed == attn);
+        GGML_ASSERT(fixed == memory->get_mem_recr()->memory_breakdown_fixed());
+        GGML_ASSERT(total == merge(merge(attn, recurrent), index));
+
+        const llama_memory_breakdown public_breakdown = llama_get_memory_breakdown(model_and_ctx.second.get());
+        for (const auto & [buft, mb] : public_breakdown) {
+            const auto it = managed.find(buft);
+            GGML_ASSERT(mb.context_vbr_managed == (it == managed.end() ? 0 : it->second));
+            GGML_ASSERT(mb.context_vbr_managed <= mb.context);
+        }
+    }
+
+    const auto make_indexed_memory = [&](ggml_type type_k, ggml_type type_v, const auto & configure) {
         llama_memory_params params = {};
         params.type_k = type_k;
         params.type_v = type_v;
@@ -416,31 +693,1008 @@ static void test_qwen4_indexed_cache_admission(const size_t seed) {
         params.ctx_type = LLAMA_CONTEXT_TYPE_DEFAULT;
 
         llama_cparams cparams = {};
+        cparams.n_ctx = 128;
+        cparams.n_ctx_seq = 128;
+        cparams.n_seq_max = 1;
         configure(cparams);
 
-        bool refused_by_indexed_owner = false;
-        try {
-            std::unique_ptr<llama_memory_i> memory(model_and_ctx.first->create_memory(params, cparams));
-        } catch (const std::runtime_error & err) {
-            refused_by_indexed_owner = std::string(err.what()).find(
-                    "indexed hybrid memory does not support Turbo/VBR representation or controllers") !=
-                std::string::npos;
-        }
-        GGML_ASSERT(refused_by_indexed_owner);
+        std::unique_ptr<llama_memory_i> memory(model_and_ctx.first->create_memory(params, cparams));
+        auto * indexed_memory = dynamic_cast<llama_memory_hybrid_idx *>(memory.get());
+        GGML_ASSERT(indexed_memory != nullptr);
+        GGML_ASSERT(indexed_memory->get_mem_idx() != nullptr);
+        GGML_ASSERT(indexed_memory->get_mem_idx()->type_k() == GGML_TYPE_F16);
+        GGML_ASSERT(indexed_memory->get_mem_idx()->type_v() == GGML_TYPE_F16);
+        return memory;
     };
 
-    const auto no_controller = [](llama_cparams &) {};
-    expect_refused(GGML_TYPE_TURBO3_TCQ, GGML_TYPE_F16, no_controller);
-    expect_refused(GGML_TYPE_F16, GGML_TYPE_TURBO3_TCQ, no_controller);
-    expect_refused(GGML_TYPE_F16, GGML_TYPE_F16, [](llama_cparams & cparams) {
+    // Qwen4-family checkpoints without indexer tensors still use the indexed
+    // hybrid wrapper, but they must not advertise an impossible QSA artifact
+    // companion. Model the loader's absent-indexer state by clearing the
+    // index width before constructing memory and pin the canonical tree.
+    {
+        const uint32_t saved_indexer_head_size =
+            model_and_ctx.first->hparams.indexer_head_size;
+        model_and_ctx.first->hparams.indexer_head_size = 0;
+        llama_memory_params params = {};
+        params.type_k = GGML_TYPE_F16;
+        params.type_v = GGML_TYPE_F16;
+        params.swa_full = true;
+        params.ctx_type = LLAMA_CONTEXT_TYPE_DEFAULT;
+        llama_cparams cparams = {};
+        cparams.n_ctx = 128;
+        cparams.n_ctx_seq = 128;
+        cparams.n_seq_max = 1;
+        std::unique_ptr<llama_memory_i> without_qsa(
+            model_and_ctx.first->create_memory(params, cparams));
+        model_and_ctx.first->hparams.indexer_head_size =
+            saved_indexer_head_size;
+        auto * wrapper = dynamic_cast<llama_memory_hybrid_idx *>(without_qsa.get());
+        GGML_ASSERT(wrapper != nullptr && wrapper->get_mem_idx() == nullptr);
+        std::vector<llama_memory_tree_child> tree;
+        GGML_ASSERT(llama_memory_tree_collect(wrapper, tree));
+        GGML_ASSERT(tree.size() == 2);
+        GGML_ASSERT(std::none_of(tree.begin(), tree.end(), [](const auto & child) {
+            return child.qsa_index_owner != nullptr;
+        }));
+    }
+
+    // CPU-bound movable Turbo sides follow the generic partial-offload policy and
+    // pin to Q8_0. This is a safe backend fallback, not an architecture refusal;
+    // the fixed QSA child remains F16 in both asymmetric cases.
+    const auto expect_cpu_turbo_fallback = [&](ggml_type type_k, ggml_type type_v) {
+        auto memory = make_indexed_memory(type_k, type_v, [](llama_cparams &) {});
+        auto * indexed_memory = dynamic_cast<llama_memory_hybrid_idx *>(memory.get());
+        GGML_ASSERT(indexed_memory != nullptr);
+        GGML_ASSERT(indexed_memory->get_mem_attn()->type_k() ==
+                    (ggml_is_turbo_kv_type(type_k) ? GGML_TYPE_Q8_0 : type_k));
+        GGML_ASSERT(indexed_memory->get_mem_attn()->type_v() ==
+                    (ggml_is_turbo_kv_type(type_v) ? GGML_TYPE_Q8_0 : type_v));
+    };
+    expect_cpu_turbo_fallback(GGML_TYPE_TURBO3_TCQ, GGML_TYPE_F16);
+    expect_cpu_turbo_fallback(GGML_TYPE_F16, GGML_TYPE_TURBO3_TCQ);
+
+    // Controller requests are admitted and remain scoped to mem_attn. These CPU
+    // construction cases deliberately do not claim that a CUDA VMM controller armed;
+    // the focused CUDA gate below owns that runtime contract.
+    (void) make_indexed_memory(GGML_TYPE_F16, GGML_TYPE_F16, [](llama_cparams & cparams) {
         cparams.vbr_dynamic = true;
     });
-    expect_refused(GGML_TYPE_F16, GGML_TYPE_F16, [](llama_cparams & cparams) {
+    (void) make_indexed_memory(GGML_TYPE_F16, GGML_TYPE_F16, [](llama_cparams & cparams) {
         cparams.vbr_vram_budget_bytes = 1;
     });
-    expect_refused(GGML_TYPE_F16, GGML_TYPE_F16, [](llama_cparams & cparams) {
+    (void) make_indexed_memory(GGML_TYPE_F16, GGML_TYPE_F16, [](llama_cparams & cparams) {
         cparams.vbr_min_bits = 1.0;
     });
+
+    // The internal indexed owner is now representation-ready even though public Turbo/VBR
+    // admission remains refused: an ordinary non-F16 attention type must never leak into the
+    // fixed QSA index child.
+    {
+        llama_memory_params params = {};
+        params.type_k = GGML_TYPE_Q8_0;
+        params.type_v = GGML_TYPE_Q8_0;
+        params.swa_full = true;
+        params.ctx_type = LLAMA_CONTEXT_TYPE_DEFAULT;
+        llama_cparams cparams = {};
+        cparams.n_ctx = 128;
+        cparams.n_ctx_seq = 128;
+        cparams.n_seq_max = 1;
+        std::unique_ptr<llama_memory_i> memory(model_and_ctx.first->create_memory(params, cparams));
+        auto * q8_indexed = dynamic_cast<llama_memory_hybrid_idx *>(memory.get());
+        GGML_ASSERT(q8_indexed != nullptr);
+        GGML_ASSERT(q8_indexed->get_mem_attn()->type_k() == GGML_TYPE_Q8_0);
+        GGML_ASSERT(q8_indexed->get_mem_attn()->type_v() == GGML_TYPE_Q8_0);
+        GGML_ASSERT(q8_indexed->get_mem_idx()->type_k() == GGML_TYPE_F16);
+        GGML_ASSERT(q8_indexed->get_mem_idx()->type_v() == GGML_TYPE_F16);
+        GGML_ASSERT(q8_indexed->memory_breakdown_vbr_managed() ==
+                    q8_indexed->get_mem_attn()->memory_breakdown_vbr_managed());
+    }
+
+    auto * indexed = dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(model_and_ctx.second.get()));
+    GGML_ASSERT(indexed != nullptr);
+    GGML_ASSERT(llama_memory_can_shift(indexed));
+
+    // All attention-only/transient/copy APIs must treat the QSA indexer as auxiliary attention
+    // state. Fill both recurrent slots so the first copy deterministically fails after the base
+    // attention mutation; the indexed wrapper must invalidate the destination in all children.
+    {
+        llama_context_params mutation_params = llama_context_default_params();
+        mutation_params.n_ctx = 128;
+        mutation_params.n_batch = 64;
+        mutation_params.n_ubatch = 64;
+        mutation_params.n_seq_max = 2;
+        mutation_params.kv_unified = true;
+        mutation_params.n_threads = 4;
+        mutation_params.n_threads_batch = 4;
+        llama_context_ptr mutation_ctx(llama_init_from_model(model_and_ctx.first.get(), mutation_params));
+        GGML_ASSERT(mutation_ctx != nullptr);
+
+        auto * mutation_memory = dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(mutation_ctx.get()));
+        GGML_ASSERT(mutation_memory != nullptr);
+        auto * mutation_attn = mutation_memory->get_mem_attn();
+        auto * mutation_idx  = mutation_memory->get_mem_idx();
+        auto * mutation_recr = mutation_memory->get_mem_recr();
+        GGML_ASSERT(mutation_idx != nullptr);
+
+        const auto decode_seq = [&](llama_seq_id seq_id, llama_token token) {
+            llama_batch batch = llama_batch_init(4, 0, 1);
+            for (llama_pos pos = 0; pos < 4; ++pos) {
+                common_batch_add(batch, token, pos, { seq_id }, pos == 3);
+            }
+            GGML_ASSERT(llama_decode(mutation_ctx.get(), batch) == 0);
+            llama_batch_free(batch);
+        };
+
+        const auto assert_mirrored = [&](llama_seq_id seq_id) {
+            const auto & attn_cells = mutation_attn->get_cells(0);
+            const auto & idx_cells  = mutation_idx ->get_cells(0);
+            GGML_ASSERT(attn_cells.size() == idx_cells.size());
+            for (uint32_t i = 0; i < attn_cells.size(); ++i) {
+                const bool in_attn = !attn_cells.is_empty(i) && attn_cells.seq_has(i, seq_id);
+                const bool in_idx  = !idx_cells.is_empty(i)  && idx_cells.seq_has(i, seq_id);
+                GGML_ASSERT(in_attn == in_idx);
+                if (!in_attn) {
+                    continue;
+                }
+                GGML_ASSERT(attn_cells.pos_get(i) == idx_cells.pos_get(i));
+                GGML_ASSERT(attn_cells.ext_get(i).tok == idx_cells.ext_get(i).tok);
+            }
+            GGML_ASSERT(mutation_attn->seq_pos_max(seq_id) == mutation_idx->seq_pos_max(seq_id));
+        };
+
+        decode_seq(0, 1);
+        decode_seq(1, 2);
+        assert_mirrored(0);
+        assert_mirrored(1);
+
+        GGML_ASSERT(!mutation_memory->try_seq_cp(0, 1, 0, -1));
+        assert_mirrored(1);
+        GGML_ASSERT(mutation_attn->seq_pos_max(1) == -1);
+        GGML_ASSERT(mutation_idx ->seq_pos_max(1) == -1);
+        GGML_ASSERT(mutation_recr->seq_pos_max(1) == -1);
+
+        decode_seq(1, 2);
+        GGML_ASSERT(!mutation_memory->try_seq_cp_transient(0, 1, 0, -1));
+        assert_mirrored(1);
+        GGML_ASSERT(mutation_attn->seq_pos_max(1) == -1);
+        GGML_ASSERT(mutation_idx ->seq_pos_max(1) == -1);
+        GGML_ASSERT(mutation_recr->seq_pos_max(1) == -1);
+
+        GGML_ASSERT(mutation_memory->try_seq_cp(0, 1, 0, -1));
+        assert_mirrored(1);
+        GGML_ASSERT(mutation_attn->seq_pos_max(1) == 3);
+        GGML_ASSERT(mutation_recr->seq_pos_max(1) == 3);
+
+        GGML_ASSERT(mutation_memory->seq_rm_attn(1, 2, -1));
+        assert_mirrored(1);
+        GGML_ASSERT(mutation_attn->seq_pos_max(1) == 1);
+        GGML_ASSERT(mutation_recr->seq_pos_max(1) == 3);
+
+        GGML_ASSERT(mutation_memory->seq_rm_transient(1, -1, -1));
+        assert_mirrored(1);
+        GGML_ASSERT(mutation_attn->seq_pos_max(1) == -1);
+        GGML_ASSERT(mutation_idx ->seq_pos_max(1) == -1);
+        GGML_ASSERT(mutation_recr->seq_pos_max(1) == -1);
+
+        GGML_ASSERT(mutation_memory->try_seq_cp_transient(0, 1, 0, -1));
+        assert_mirrored(1);
+        GGML_ASSERT(mutation_memory->seq_rm_attn_transient(1, 3, -1));
+        assert_mirrored(1);
+        GGML_ASSERT(mutation_attn->seq_pos_max(1) == 2);
+        GGML_ASSERT(mutation_recr->seq_pos_max(1) == 3);
+
+        GGML_ASSERT(mutation_memory->seq_rm_transient(1, -1, -1));
+        assert_mirrored(1);
+        GGML_ASSERT(mutation_attn->seq_pos_max(1) == -1);
+        GGML_ASSERT(mutation_idx ->seq_pos_max(1) == -1);
+        GGML_ASSERT(mutation_recr->seq_pos_max(1) == -1);
+
+        mutation_memory->seq_cp(0, 1, 0, -1);
+        assert_mirrored(1);
+        GGML_ASSERT(mutation_attn->seq_pos_max(1) == 3);
+        mutation_memory->seq_keep(0);
+        assert_mirrored(0);
+        assert_mirrored(1);
+        GGML_ASSERT(mutation_attn->seq_pos_max(1) == -1);
+        GGML_ASSERT(mutation_idx ->seq_pos_max(1) == -1);
+        GGML_ASSERT(mutation_recr->seq_pos_max(1) == -1);
+
+        mutation_memory->seq_cp(0, 1, 0, -1);
+        GGML_ASSERT(mutation_memory->seq_rm(1, -1, -1));
+        assert_mirrored(1);
+        GGML_ASSERT(mutation_attn->seq_pos_max(1) == -1);
+        GGML_ASSERT(mutation_idx ->seq_pos_max(1) == -1);
+        GGML_ASSERT(mutation_recr->seq_pos_max(1) == -1);
+    }
+
+    // Mutation-resistant structural gate: architecture alone is insufficient,
+    // and every component of the admitted layout is mandatory.
+    const auto arch = model_and_ctx.first->arch;
+    model_and_ctx.first->arch = LLM_ARCH_QWEN35;
+    GGML_ASSERT(!llama_memory_can_shift(indexed));
+    model_and_ctx.first->arch = arch;
+
+    const auto rope_type = model_and_ctx.first->hparams.rope_type;
+    model_and_ctx.first->hparams.rope_type = LLAMA_ROPE_TYPE_MROPE;
+    GGML_ASSERT(!llama_memory_can_shift(indexed));
+    model_and_ctx.first->hparams.rope_type = rope_type;
+
+    const auto n_rot_full = model_and_ctx.first->hparams.n_rot_full;
+    model_and_ctx.first->hparams.n_rot_full = 62;
+    GGML_ASSERT(!llama_memory_can_shift(indexed));
+    model_and_ctx.first->hparams.n_rot_full = n_rot_full;
+
+    const auto sections = model_and_ctx.first->hparams.rope_sections;
+    model_and_ctx.first->hparams.rope_sections[3] = 1;
+    GGML_ASSERT(!llama_memory_can_shift(indexed));
+    model_and_ctx.first->hparams.rope_sections = sections;
+    GGML_ASSERT(llama_memory_can_shift(indexed));
+
+    // Populate both mirrored caches through the real graph, then prove that a
+    // text shift rotates only attention K while preserving raw QSA keys.
+    (void) get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), { 1, 2, 3, 4 });
+
+    auto * attn = indexed->get_mem_attn();
+    auto * idx  = indexed->get_mem_idx();
+    GGML_ASSERT(idx != nullptr);
+    GGML_ASSERT(attn->can_shift_qwen4_text_range(0, 2, 4));
+    GGML_ASSERT(idx ->can_shift_qwen4_text_range(0, 2, 4));
+
+    const auto snapshot_k = [](const llama_kv_cache * cache) {
+        const auto layer_ids = cache->get_layer_ids();
+        GGML_ASSERT(!layer_ids.empty());
+        ggml_tensor * tensor = cache->get_k_storage(layer_ids.front());
+        GGML_ASSERT(tensor != nullptr);
+        std::vector<uint8_t> bytes(ggml_nbytes(tensor));
+        ggml_backend_tensor_get(tensor, bytes.data(), 0, bytes.size());
+        return bytes;
+    };
+    const auto attn_k_before = snapshot_k(attn);
+    const auto idx_k_before  = snapshot_k(idx);
+
+    indexed->seq_add(0, 2, 4, -1);
+
+    const auto check_shifted_token = [](const llama_kv_cache * cache, llama_token tok, bool rotates) {
+        const auto & cells = cache->get_cells(0);
+        bool found = false;
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (cells.is_empty(i) || !cells.seq_has(i, 0) || cells.ext_get(i).tok != tok) {
+                continue;
+            }
+            found = true;
+            GGML_ASSERT(cells.pos_get(i) == 1);
+            GGML_ASSERT(cells.ext_get(i).x == 1);
+            GGML_ASSERT(cells.ext_get(i).y == 1);
+            GGML_ASSERT(cells.get_shift(i) == (rotates ? -1 : 0));
+        }
+        GGML_ASSERT(found);
+    };
+
+    check_shifted_token(attn, 3, true);
+    check_shifted_token(idx,  3, false);
+    GGML_ASSERT(attn->get_has_shift());
+    GGML_ASSERT(!idx->get_has_shift());
+
+    auto update = indexed->init_update(model_and_ctx.second.get(), false);
+    GGML_ASSERT(update && update->apply());
+    llama_synchronize(model_and_ctx.second.get());
+    GGML_ASSERT(!attn->get_has_shift());
+    GGML_ASSERT(!idx->get_has_shift());
+    GGML_ASSERT(snapshot_k(attn) != attn_k_before);
+    GGML_ASSERT(snapshot_k(idx)  == idx_k_before);
+
+    // Exercise the first real QSA decode after the edit.  This traverses the
+    // shifted attention cache, raw index cache, block-position construction,
+    // and recurrent frontier together; metadata-only assertions cannot catch
+    // a graph that consumes the three timelines differently.
+    llama_batch continuation = llama_batch_init(1, 0, 1);
+    common_batch_add(continuation, 5, 3, { 0 }, true);
+    GGML_ASSERT(llama_decode(model_and_ctx.second.get(), continuation) == 0);
+
+    const float * continuation_logits = llama_get_logits_ith(model_and_ctx.second.get(), 0);
+    GGML_ASSERT(continuation_logits != nullptr);
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_and_ctx.first.get()));
+    for (uint32_t i = 0; i < n_vocab; ++i) {
+        GGML_ASSERT(std::isfinite(continuation_logits[i]));
+    }
+    llama_batch_free(continuation);
+
+    const auto & attn_cells = attn->get_cells(0);
+    const auto & idx_cells  = idx ->get_cells(0);
+    GGML_ASSERT(attn_cells.size() == idx_cells.size());
+    for (uint32_t i = 0; i < attn_cells.size(); ++i) {
+        GGML_ASSERT(attn_cells.is_empty(i) == idx_cells.is_empty(i));
+        if (attn_cells.is_empty(i)) {
+            continue;
+        }
+        GGML_ASSERT(attn_cells.seq_has(i, 0) == idx_cells.seq_has(i, 0));
+        GGML_ASSERT(attn_cells.pos_get(i) == idx_cells.pos_get(i));
+        GGML_ASSERT(attn_cells.ext_get(i).x == idx_cells.ext_get(i).x);
+        GGML_ASSERT(attn_cells.ext_get(i).y == idx_cells.ext_get(i).y);
+        GGML_ASSERT(attn_cells.ext_get(i).tok == idx_cells.ext_get(i).tok);
+    }
+    GGML_ASSERT(attn->seq_pos_max(0) == 3);
+    GGML_ASSERT(idx ->seq_pos_max(0) == 3);
+    GGML_ASSERT(indexed->get_mem_recr()->seq_pos_max(0) == 3);
+    GGML_ASSERT(!attn->get_has_shift() && !idx->get_has_shift());
+
+    // A real four-plane embedding position is not the broadcast text type.
+    // Pin the preflight itself so a future broad "all IMRoPE" gate cannot
+    // mutate one child before discovering the unsupported layout in another.
+    indexed->clear(false);
+    float embd_sentinel = 0.0f;
+    llama_pos pos_2d[4] = { 5, 6, 7, 0 };
+    int32_t n_seq_id[1] = { 1 };
+    llama_seq_id seq_id = 0;
+    llama_seq_id * seq_ids[1] = { &seq_id };
+    int8_t output[1] = { 0 };
+    llama_ubatch ubatch_2d {
+        /*.b_equal_seqs =*/ true,
+        /*.n_tokens     =*/ 1,
+        /*.n_seq_tokens =*/ 1,
+        /*.n_seqs       =*/ 1,
+        /*.n_seqs_unq   =*/ 1,
+        /*.n_pos        =*/ 4,
+        /*.token        =*/ nullptr,
+        /*.embd         =*/ &embd_sentinel,
+        /*.pos          =*/ pos_2d,
+        /*.n_seq_id     =*/ n_seq_id,
+        /*.seq_id       =*/ seq_ids,
+        /*.seq_id_unq   =*/ &seq_id,
+        /*.seq_idx      =*/ nullptr,
+        /*.output       =*/ output,
+        /*.data         =*/ {},
+    };
+    const auto attn_slot = attn->find_slot(ubatch_2d, false);
+    const auto idx_slot  = idx ->find_slot(ubatch_2d, false);
+    GGML_ASSERT(!attn_slot.empty() && !idx_slot.empty());
+    attn->apply_ubatch(attn_slot, ubatch_2d);
+    idx ->apply_ubatch(idx_slot,  ubatch_2d);
+    GGML_ASSERT(!attn->can_shift_qwen4_text_range(0, 0, 8));
+    GGML_ASSERT(!idx ->can_shift_qwen4_text_range(0, 0, 8));
+}
+
+static void test_qwen4_vbr_cuda(const size_t seed) {
+    ggml_backend_load_all();
+
+    ggml_backend_dev_t vbr_device = nullptr;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        auto * dev = ggml_backend_dev_get(i);
+        auto * reg = ggml_backend_dev_backend_reg(dev);
+        if (!reg) {
+            continue;
+        }
+        const auto get = reinterpret_cast<ggml_backend_vbr_iface_fn_t>(
+            ggml_backend_reg_get_proc_address(reg, GGML_VBR_BACKEND_IFACE_PROC));
+        if (get != nullptr && get() != nullptr) {
+            vbr_device = dev;
+            break;
+        }
+    }
+    if (!vbr_device) {
+        std::printf("Qwen4 VBR CUDA contract test SKIP: no VBR-capable device\n");
+        return;
+    }
+
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    std::array<ggml_backend_dev_t, 2> devices = { vbr_device, nullptr };
+    model_params.devices = devices.data();
+    size_t model_seed = seed;
+    llama_model_ptr model(llama_model_init_from_user(
+        gguf_ctx.get(), set_tensor_data, &model_seed, model_params));
+    GGML_ASSERT(model != nullptr);
+
+    // The 256-cell padded dense frontier becomes sparse when the continuation
+    // grows to 512. This is the same boundary used by the CPU QSA mutation test.
+    model->hparams.indexer_top_k = 253;
+
+    const auto assert_finite = [&](llama_context * ctx, int32_t i) {
+        const float * logits = llama_get_logits_ith(ctx, i);
+        GGML_ASSERT(logits != nullptr);
+        const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+        for (uint32_t j = 0; j < n_vocab; ++j) {
+            GGML_ASSERT(std::isfinite(logits[j]));
+        }
+    };
+
+    const auto decode_range = [&](llama_context * ctx, llama_pos p0, uint32_t n_tokens) {
+        llama_batch batch = llama_batch_init(n_tokens, 0, 1);
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            common_batch_add(batch, 1 + llama_token(i % 7), p0 + llama_pos(i), { 0 }, true);
+        }
+        GGML_ASSERT(llama_decode(ctx, batch) == 0);
+        assert_finite(ctx, int32_t(n_tokens - 1));
+        llama_batch_free(batch);
+    };
+
+    const auto last_logits = [&](llama_context * ctx) {
+        const float * logits = llama_get_logits_ith(ctx, -1);
+        GGML_ASSERT(logits != nullptr);
+        const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+        return std::vector<float>(logits, logits + n_vocab);
+    };
+
+    llama_context_params static_ref_params = llama_context_default_params();
+    static_ref_params.n_ctx = 512;
+    static_ref_params.n_batch = 64;
+    static_ref_params.n_ubatch = 64;
+    static_ref_params.n_seq_max = 1;
+    static_ref_params.kv_unified = true;
+    static_ref_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    static_ref_params.type_k = GGML_TYPE_F16;
+    static_ref_params.type_v = GGML_TYPE_F16;
+    llama_context_ptr static_ref(llama_init_from_model(model.get(), static_ref_params));
+    GGML_ASSERT(static_ref != nullptr);
+    decode_range(static_ref.get(), 0, 4);
+    const auto static_ref_logits = last_logits(static_ref.get());
+
+    // Every static tier must be owned by mem_attn and execute through the real
+    // CUDA attention graph. mem_idx stays F16 for every asymmetric layout.
+    for (const ggml_type tier : {
+             GGML_TYPE_TURBO8_0,
+             GGML_TYPE_TURBO4_0,
+             GGML_TYPE_TURBO3_TCQ,
+             GGML_TYPE_TURBO2_TCQ,
+             GGML_TYPE_TURBO1_TCQ,
+         }) {
+        llama_context_params params = llama_context_default_params();
+        params.n_ctx = 512;
+        params.n_batch = 64;
+        params.n_ubatch = 64;
+        params.n_seq_max = 1;
+        params.kv_unified = true;
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        params.type_k = tier;
+        params.type_v = tier;
+        llama_context_ptr ctx(llama_init_from_model(model.get(), params));
+        GGML_ASSERT(ctx != nullptr);
+        auto * memory = dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(ctx.get()));
+        GGML_ASSERT(memory != nullptr);
+        GGML_ASSERT(memory->get_mem_attn()->type_k() == tier);
+        GGML_ASSERT(memory->get_mem_attn()->type_v() == tier);
+        GGML_ASSERT(memory->get_mem_idx()->type_k() == GGML_TYPE_F16);
+        GGML_ASSERT(memory->get_mem_idx()->type_v() == GGML_TYPE_F16);
+        decode_range(ctx.get(), 0, 4);
+        const double tier_nmse = nmse(static_ref_logits, last_logits(ctx.get()));
+        GGML_ASSERT(std::isfinite(tier_nmse));
+        GGML_ASSERT(tier_nmse <= 1.0e-6);
+        printf("Qwen4 static %s vs F16 NMSE %.9g\n", ggml_type_name(tier), tier_nmse);
+    }
+
+    // Dynamic device VBR needs a non-transposed FA cache, so an explicit FA-off
+    // request is promoted before memory construction and must really arm. With
+    // KV offload disabled, the host fallback instead stays static Q8 and usable;
+    // it must never advertise a controller that cannot retier.
+    {
+        llama_context_params fallback = static_ref_params;
+        fallback.vbr_dynamic = true;
+        fallback.vbr_budget_explicit = true;
+        fallback.vbr_vram_budget_bytes = 64ull * 1024 * 1024;
+        fallback.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        llama_context_ptr non_fa(llama_init_from_model(model.get(), fallback));
+        GGML_ASSERT(non_fa != nullptr);
+        auto * memory = dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(non_fa.get()));
+        GGML_ASSERT(memory != nullptr);
+        GGML_ASSERT(llama_kv_cache_vbr_epoch_test::active(memory->get_mem_attn()));
+        GGML_ASSERT(memory->get_mem_idx()->type_k() == GGML_TYPE_F16);
+        decode_range(non_fa.get(), 0, 4);
+
+        fallback.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        fallback.offload_kqv = false;
+        llama_context_ptr cpu_kv(llama_init_from_model(model.get(), fallback));
+        GGML_ASSERT(cpu_kv != nullptr);
+        memory = dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(cpu_kv.get()));
+        GGML_ASSERT(memory != nullptr);
+        GGML_ASSERT(!llama_kv_cache_vbr_epoch_test::active(memory->get_mem_attn()));
+        GGML_ASSERT(memory->get_mem_attn()->type_k() == GGML_TYPE_Q8_0);
+        GGML_ASSERT(memory->get_mem_attn()->type_v() == GGML_TYPE_Q8_0);
+        GGML_ASSERT(memory->get_mem_idx()->type_k() == GGML_TYPE_F16);
+        decode_range(cpu_kv.get(), 0, 4);
+    }
+
+    struct qsa_trace {
+        size_t raw_key_nodes = 0;
+        size_t score_nodes = 0;
+        size_t top_k_nodes = 0;
+    } trace;
+    const auto trace_qsa = [](ggml_tensor * tensor, bool ask, void * user_data) {
+        if (!ask) {
+            return true;
+        }
+        auto & value = *static_cast<qsa_trace *>(user_data);
+        const std::string name = ggml_get_name(tensor);
+        value.raw_key_nodes += name.find("indexer_k_raw") != std::string::npos;
+        value.score_nodes   += name.find("indexer_score") != std::string::npos;
+        value.top_k_nodes   += name.find("indexer_top_k") != std::string::npos;
+        return false;
+    };
+
+    llama_context_params params = llama_context_default_params();
+    params.n_ctx = 512;
+    params.n_batch = 256;
+    params.n_ubatch = 64;
+    params.n_seq_max = 2;
+    params.kv_unified = false; // dynamic VBR must force the three children to unified storage
+    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    params.type_k = GGML_TYPE_F16;
+    params.type_v = GGML_TYPE_F16;
+    params.vbr_dynamic = true;
+    params.vbr_budget_explicit = true;
+    params.vbr_vram_budget_bytes = 64ull * 1024 * 1024;
+    params.cb_eval = trace_qsa;
+    params.cb_eval_user_data = &trace;
+    llama_context_ptr ctx(llama_init_from_model(model.get(), params));
+    GGML_ASSERT(ctx != nullptr);
+    auto * memory = dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(ctx.get()));
+    GGML_ASSERT(memory != nullptr);
+    auto * attn = memory->get_mem_attn();
+    auto * idx = memory->get_mem_idx();
+    GGML_ASSERT(llama_kv_cache_vbr_epoch_test::active(attn));
+    GGML_ASSERT(llama_kv_cache_vbr_epoch_test::n_stream(attn) == 1);
+    GGML_ASSERT(llama_kv_cache_vbr_epoch_test::n_stream(idx) == 1);
+    GGML_ASSERT(llama_kv_cache_vbr_epoch_test::map_seed_watermark(attn));
+    GGML_ASSERT(idx->type_k() == GGML_TYPE_F16 && idx->type_v() == GGML_TYPE_F16);
+
+    decode_range(ctx.get(), 0, 256);
+    GGML_ASSERT(trace.raw_key_nodes > 0);
+    GGML_ASSERT(trace.score_nodes == 0 && trace.top_k_nodes == 0);
+
+    const auto snapshot_index = [&]() {
+        std::vector<std::vector<uint8_t>> result;
+        for (const uint32_t il : idx->get_layer_ids()) {
+            ggml_tensor * tensor = idx->get_k_storage(il);
+            result.emplace_back(ggml_nbytes(tensor));
+            ggml_backend_tensor_get(
+                tensor, result.back().data(), 0, result.back().size());
+        }
+        return result;
+    };
+    const auto assert_index_snapshot = [&](const std::vector<std::vector<uint8_t>> & before) {
+        size_t index_layer = 0;
+        for (const uint32_t il : idx->get_layer_ids()) {
+            ggml_tensor * tensor = idx->get_k_storage(il);
+            std::vector<uint8_t> after(ggml_nbytes(tensor));
+            ggml_backend_tensor_get(tensor, after.data(), 0, after.size());
+            GGML_ASSERT(after == before.at(index_layer++));
+        }
+        GGML_ASSERT(index_layer == before.size());
+    };
+    const auto tier_ordinal = [](ggml_type type) -> int {
+        switch (type) {
+            case GGML_TYPE_TURBO8_0:   return 0;
+            case GGML_TYPE_TURBO4_0:   return 1;
+            case GGML_TYPE_TURBO3_TCQ: return 2;
+            case GGML_TYPE_TURBO2_TCQ: return 3;
+            case GGML_TYPE_TURBO1_TCQ: return 4;
+            default:                   return -1;
+        }
+    };
+
+    // Drive the real production order through every rung. Each applied step
+    // must advance only the attention epoch, leave the fixed QSA index bytes
+    // untouched, and remain executable before the next step is attempted.
+    std::array<bool, 5> seen_tier = {};
+    llama_pos next_pos = 256;
+    trace = {};
+    for (size_t step = 0; step < 64 && !std::all_of(
+             seen_tier.begin(), seen_tier.end(), [](bool seen) { return seen; }); ++step) {
+        const auto index_before = snapshot_index();
+        const auto types_before = llama_kv_cache_vbr_epoch_test::storage_types(attn);
+        const auto epoch_before = memory->vbr_representation_identity();
+        GGML_ASSERT(llama_kv_cache_vbr_epoch_test::force_degrade(attn));
+        const auto epoch_after = memory->vbr_representation_identity();
+        const auto types_after = llama_kv_cache_vbr_epoch_test::storage_types(attn);
+        GGML_ASSERT(types_after != types_before);
+        GGML_ASSERT(epoch_after.tier_epoch > epoch_before.tier_epoch);
+        GGML_ASSERT(epoch_after.tier_epoch_swa == epoch_before.tier_epoch_swa);
+        assert_index_snapshot(index_before);
+        for (const ggml_type type : types_after) {
+            const int ordinal = tier_ordinal(type);
+            if (ordinal >= 0) {
+                seen_tier.at(size_t(ordinal)) = true;
+            }
+        }
+        decode_range(ctx.get(), next_pos++, 1);
+        GGML_ASSERT(idx->type_k() == GGML_TYPE_F16 && idx->type_v() == GGML_TYPE_F16);
+    }
+    GGML_ASSERT(std::all_of(
+        seen_tier.begin(), seen_tier.end(), [](bool seen) { return seen; }));
+
+    GGML_ASSERT(next_pos <= 320);
+    if (next_pos < 320) {
+        decode_range(ctx.get(), next_pos, uint32_t(320 - next_pos));
+    }
+    GGML_ASSERT(trace.raw_key_nodes > 0);
+    GGML_ASSERT(trace.score_nodes > 0 && trace.top_k_nodes > 0);
+    GGML_ASSERT(attn->seq_pos_max(0) == 319);
+    GGML_ASSERT(idx ->seq_pos_max(0) == 319);
+    GGML_ASSERT(idx->type_k() == GGML_TYPE_F16 && idx->type_v() == GGML_TYPE_F16);
+
+    llama_batch two_seq = llama_batch_init(2, 0, 2);
+    common_batch_add(two_seq, 3, 320, { 0 }, true);
+    common_batch_add(two_seq, 4,   0, { 1 }, true);
+    GGML_ASSERT(llama_decode(ctx.get(), two_seq) == 0);
+    assert_finite(ctx.get(), 0);
+    assert_finite(ctx.get(), 1);
+    llama_batch_free(two_seq);
+    GGML_ASSERT(attn->seq_pos_max(0) == 320 && idx->seq_pos_max(0) == 320);
+    GGML_ASSERT(attn->seq_pos_max(1) ==   0 && idx->seq_pos_max(1) ==   0);
+
+    // The indexed hybrid tree is now artifact-capable only as a complete
+    // attention+QSA/recurrent unit. Prove that discovery binds the QSA owner
+    // to the attention child and that its typed bytes seal this exact frontier.
+    std::vector<llama_memory_tree_child> artifact_tree;
+    GGML_ASSERT(llama_memory_tree_collect(memory, artifact_tree));
+    GGML_ASSERT(artifact_tree.size() == 2);
+    const auto qsa_child = std::find_if(
+        artifact_tree.begin(), artifact_tree.end(), [](const auto & child) {
+            return child.attention != nullptr && child.qsa_index_owner != nullptr;
+        });
+    const auto recurrent_child = std::find_if(
+        artifact_tree.begin(), artifact_tree.end(), [](const auto & child) {
+            return child.recurrent != nullptr;
+        });
+    GGML_ASSERT(qsa_child != artifact_tree.end());
+    GGML_ASSERT(recurrent_child != artifact_tree.end());
+    GGML_ASSERT(qsa_child->attention == attn);
+    GGML_ASSERT(qsa_child->qsa_index_owner == memory);
+    GGML_ASSERT(recurrent_child->qsa_index_owner == nullptr);
+
+    const auto qsa_provider = vbr_qsa_index_capture_provider(*memory);
+    uint64_t qsa_size = 0;
+    std::vector<uint8_t> qsa_bytes;
+    llama_pos qsa_terminal = -1;
+    llama_pos serialized_terminal = -1;
+    GGML_ASSERT(qsa_provider.kind ==
+        vbr_artifact_companion_kind::qsa_index);
+    GGML_ASSERT(qsa_provider.size && qsa_provider.capture &&
+        qsa_provider.terminal_position);
+    GGML_ASSERT(qsa_provider.size(qsa_provider.context, 0, qsa_size));
+    GGML_ASSERT(qsa_provider.capture(
+        qsa_provider.context, 0, qsa_bytes));
+    GGML_ASSERT(qsa_size == qsa_bytes.size() && qsa_size != 0);
+    GGML_ASSERT(qsa_provider.terminal_position(
+        qsa_provider.context, 0, qsa_terminal));
+    GGML_ASSERT(vbr_qsa_index_companion_terminal(
+        qsa_bytes.data(), qsa_bytes.size(), serialized_terminal));
+    GGML_ASSERT(qsa_terminal == 320 && serialized_terminal == qsa_terminal);
+
+    // The attention artifact layout intentionally carries no token, whereas
+    // the mirrored QSA index does.  Exercise the production relocation key:
+    // position/x/y select the target cell and the authenticated native QSA
+    // payload restores the token itself.
+    artifact_segment_chain qsa_chain(qsa_bytes.size());
+    GGML_ASSERT(qsa_chain.append(qsa_bytes.data(), qsa_bytes.size()));
+    vbr_artifact_companion_payload qsa_descriptor;
+    qsa_descriptor.kind = vbr_artifact_companion_kind::qsa_index;
+    qsa_descriptor.format_version =
+        vbr_qsa_index_companion_format_version();
+    qsa_descriptor.build_identity_digest =
+        vbr_qsa_index_companion_build_identity();
+    qsa_descriptor.payload_bytes = qsa_chain.size();
+    vbr_target_companion_snapshot qsa_target;
+    qsa_target.kind = qsa_descriptor.kind;
+    qsa_target.format_version = qsa_descriptor.format_version;
+    qsa_target.build_identity_digest = qsa_descriptor.build_identity_digest;
+    qsa_target.available = true;
+    qsa_target.target_cookie = memory;
+    const auto parse_qsa = [&](const artifact_segment_chain & source) {
+        std::unique_ptr<vbr_parsed_companion_image> parsed;
+        GGML_ASSERT(vbr_parse_qsa_index_companion(
+            nullptr, qsa_descriptor, source, qsa_target, parsed));
+        return parsed;
+    };
+
+    // The descriptor and the native header independently pin the codec. A
+    // version drift must be refused before it can mutate the destination.
+    {
+        auto wrong_version = qsa_descriptor;
+        ++wrong_version.format_version;
+        std::unique_ptr<vbr_parsed_companion_image> refused;
+        GGML_ASSERT(!vbr_parse_qsa_index_companion(
+            nullptr, wrong_version, qsa_chain, qsa_target, refused));
+        GGML_ASSERT(!refused);
+    }
+
+    using qsa_test_key = std::tuple<llama_pos, int32_t, int32_t>;
+    std::map<qsa_test_key, llama_token> qsa_tokens;
+    std::map<qsa_test_key, std::vector<uint8_t>> qsa_rows;
+    const auto & qsa_cells_before = idx->get_cells(0);
+    for (uint32_t physical = 0; physical < qsa_cells_before.size(); ++physical) {
+        if (!qsa_cells_before.seq_has(physical, 0)) {
+            continue;
+        }
+        const auto ext = qsa_cells_before.ext_get(physical);
+        const qsa_test_key key {
+            qsa_cells_before.pos_get(physical), ext.x, ext.y,
+        };
+        GGML_ASSERT(qsa_tokens.emplace(key, ext.tok).second);
+        auto & rows = qsa_rows[key];
+        for (const uint32_t il : idx->get_layer_ids()) {
+            ggml_tensor * tensor = idx->get_k_storage(il);
+            const size_t row_size = ggml_row_size(tensor->type, tensor->ne[0]);
+            const size_t start = rows.size();
+            rows.resize(start + row_size);
+            ggml_backend_tensor_get(
+                tensor, rows.data() + start, physical*tensor->nb[1], row_size);
+        }
+    }
+    vbr_companion_attention_layout qsa_layout;
+    qsa_layout.child_id = qsa_child->child_id;
+    const auto & attention_cells = attn->get_cells(0);
+    const uint32_t attention_stream = attn->get_stream_for_seq(0);
+    for (uint32_t physical = 0; physical < attention_cells.size(); ++physical) {
+        if (!attention_cells.seq_has(physical, 0)) {
+            continue;
+        }
+        const auto ext = attention_cells.ext_get(physical);
+        qsa_layout.cells.push_back({
+            attention_stream, physical, attention_cells.pos_get(physical),
+            ext.x, ext.y, LLAMA_TOKEN_NULL,
+        });
+    }
+    GGML_ASSERT(!qsa_tokens.empty() && !qsa_layout.cells.empty());
+
+    // Record the exact continuation before removing the QSA state. The final
+    // relocated restore must reproduce it, proving the restored index bytes
+    // are not merely plausible metadata.
+    GGML_ASSERT(memory->seq_rm(1, -1, -1));
+    GGML_ASSERT(memory->try_seq_cp(0, 1, 0, 321));
+    llama_batch qsa_reference_batch = llama_batch_init(1, 0, 1);
+    common_batch_add(qsa_reference_batch, 1, 321, { 1 }, true);
+    GGML_ASSERT(llama_decode(ctx.get(), qsa_reference_batch) == 0);
+    const auto qsa_continuation_reference = last_logits(ctx.get());
+    llama_batch_free(qsa_reference_batch);
+    GGML_ASSERT(memory->seq_rm(1, -1, -1));
+    GGML_ASSERT(attn->seq_pos_max(0) == 320 && idx->seq_pos_max(0) == 320);
+
+    idx->seq_rm(0, -1, -1);
+    idx->seq_rm(1, -1, -1);
+    GGML_ASSERT(idx->state_empty());
+    const auto qsa_adoption =
+        vbr_qsa_index_adoption_provider(*memory, qsa_child->child_id);
+
+    const auto read_qsa_rows = [&](uint32_t physical) {
+        std::vector<uint8_t> restored;
+        for (const uint32_t il : idx->get_layer_ids()) {
+            ggml_tensor * tensor = idx->get_k_storage(il);
+            const size_t row_size = ggml_row_size(tensor->type, tensor->ne[0]);
+            const size_t start = restored.size();
+            restored.resize(start + row_size);
+            ggml_backend_tensor_get(
+                tensor, restored.data() + start,
+                physical*tensor->nb[1], row_size);
+        }
+        return restored;
+    };
+
+    const auto assert_qsa_image = [&](const vbr_companion_attention_layout & layout) {
+        const auto & cells = idx->get_cells(0);
+        size_t occupied = 0;
+        for (const auto & expected : layout.cells) {
+            GGML_ASSERT(expected.physical_cell < cells.size());
+            GGML_ASSERT(cells.seq_has(expected.physical_cell, 0));
+            const auto ext = cells.ext_get(expected.physical_cell);
+            const qsa_test_key key {
+                cells.pos_get(expected.physical_cell), ext.x, ext.y,
+            };
+            const auto token = qsa_tokens.find(key);
+            const auto rows = qsa_rows.find(key);
+            GGML_ASSERT(token != qsa_tokens.end() && token->second == ext.tok);
+            GGML_ASSERT(rows != qsa_rows.end());
+            GGML_ASSERT(read_qsa_rows(expected.physical_cell) == rows->second);
+            ++occupied;
+        }
+        GGML_ASSERT(occupied == qsa_tokens.size());
+    };
+
+    // Restore into deliberately different physical cells. This catches both
+    // ignored relocation maps and tensor readers that write the wrong rows.
+    auto relocated_layout = qsa_layout;
+    GGML_ASSERT(relocated_layout.cells.size() > 1);
+    const uint32_t first_physical = relocated_layout.cells.front().physical_cell;
+    for (size_t i = 0; i + 1 < relocated_layout.cells.size(); ++i) {
+        relocated_layout.cells[i].physical_cell =
+            relocated_layout.cells[i + 1].physical_cell;
+    }
+    relocated_layout.cells.back().physical_cell = first_physical;
+    std::unique_ptr<vbr_prepared_companion_image> qsa_prepared;
+    GGML_ASSERT(qsa_adoption.prepare_with_layout &&
+        qsa_adoption.prepare_with_layout(
+            qsa_adoption.context, parse_qsa(qsa_chain), 0,
+            relocated_layout, qsa_prepared));
+    GGML_ASSERT(qsa_prepared && qsa_adoption.recheck(
+        qsa_adoption.context, *qsa_prepared));
+    assert_qsa_image(relocated_layout);
+    GGML_ASSERT(qsa_adoption.rollback(
+        qsa_adoption.context, *qsa_prepared));
+    GGML_ASSERT(idx->state_empty());
+
+    // Install the production-aligned image and prove both exact tensor bytes
+    // and the next-token computation match the pre-capture frontier.
+    qsa_prepared.reset();
+    GGML_ASSERT(qsa_adoption.prepare_with_layout(
+        qsa_adoption.context, parse_qsa(qsa_chain), 0,
+        qsa_layout, qsa_prepared));
+    GGML_ASSERT(qsa_prepared && qsa_adoption.recheck(
+        qsa_adoption.context, *qsa_prepared));
+    assert_qsa_image(qsa_layout);
+    qsa_adoption.publish_swap(qsa_adoption.context, *qsa_prepared);
+
+    // Occupied adoption has a distinct destructive rollback contract. Make a
+    // valid incoming image observably different from the incumbent by changing
+    // one known native K-row byte while preserving its layout and metadata.
+    // This proves both the incoming install and the recovery reinstall execute.
+    const auto & changed_cell = qsa_layout.cells.front();
+    const qsa_test_key changed_key {
+        changed_cell.logical_position, changed_cell.ext_x, changed_cell.ext_y,
+    };
+    const auto changed_row = qsa_rows.find(changed_key);
+    GGML_ASSERT(changed_row != qsa_rows.end());
+    const auto index_layers = idx->get_layer_ids();
+    GGML_ASSERT(!index_layers.empty());
+    ggml_tensor * first_index_tensor = idx->get_k_storage(index_layers.front());
+    const size_t first_row_size =
+        ggml_row_size(first_index_tensor->type, first_index_tensor->ne[0]);
+    GGML_ASSERT(first_row_size > 0 && changed_row->second.size() >= first_row_size);
+
+    // Walk the exact v1 prefix and native KV metadata to the first layer's K
+    // rows. The native rows are serialized in ascending physical-cell order.
+    size_t native_offset = 0;
+    const auto read_native_scalar = [&](auto & value) {
+        GGML_ASSERT(native_offset + sizeof(value) <= qsa_bytes.size());
+        std::memcpy(&value, qsa_bytes.data() + native_offset, sizeof(value));
+        native_offset += sizeof(value);
+    };
+    uint32_t qsa_magic = 0, qsa_version = 0, qsa_cache_size = 0,
+             qsa_streams = 0, qsa_layer_count = 0;
+    ggml_type qsa_type_k = GGML_TYPE_COUNT, qsa_type_v = GGML_TYPE_COUNT;
+    read_native_scalar(qsa_magic);
+    read_native_scalar(qsa_version);
+    read_native_scalar(qsa_cache_size);
+    read_native_scalar(qsa_streams);
+    read_native_scalar(qsa_type_k);
+    read_native_scalar(qsa_type_v);
+    read_native_scalar(qsa_layer_count);
+    GGML_ASSERT(qsa_magic == 0x49534151 &&
+        qsa_version == vbr_qsa_index_companion_format_version() &&
+        qsa_cache_size == idx->get_size() && qsa_streams == idx->get_n_stream() &&
+        qsa_type_k == idx->type_k() && qsa_type_v == idx->type_v() &&
+        qsa_layer_count == index_layers.size());
+    for (uint32_t i = 0; i < qsa_layer_count; ++i) {
+        uint32_t layer = 0;
+        uint64_t width = 0;
+        read_native_scalar(layer);
+        read_native_scalar(width);
+        GGML_ASSERT(layer == index_layers[i] && width ==
+            uint64_t(idx->get_k_storage(layer)->ne[0]));
+    }
+    llama_pos encoded_terminal = -1;
+    uint32_t encoded_stream = 0, encoded_cells = 0;
+    read_native_scalar(encoded_terminal);
+    read_native_scalar(encoded_stream);
+    read_native_scalar(encoded_cells);
+    GGML_ASSERT(encoded_terminal == qsa_terminal && encoded_stream == 0 &&
+        encoded_cells == qsa_tokens.size());
+    for (uint32_t i = 0; i < encoded_cells; ++i) {
+        llama_pos position = -1;
+        llama_kv_cell_ext ext;
+        read_native_scalar(position);
+        read_native_scalar(ext);
+        GGML_ASSERT(position >= 0);
+    }
+    uint32_t native_streams = 0, native_cells = 0;
+    read_native_scalar(native_streams);
+    read_native_scalar(native_cells);
+    GGML_ASSERT(native_streams == 1 && native_cells == encoded_cells);
+    for (uint32_t i = 0; i < native_cells; ++i) {
+        llama_pos position = -1;
+        uint32_t sequence_count = 0;
+        llama_kv_cell_ext ext;
+        read_native_scalar(position);
+        read_native_scalar(sequence_count);
+        read_native_scalar(ext);
+        GGML_ASSERT(sequence_count == 1);
+        llama_seq_id sequence = -1;
+        read_native_scalar(sequence);
+        GGML_ASSERT(position >= 0 && sequence == 0);
+    }
+    uint32_t v_trans = 0, native_layers = 0;
+    int32_t native_k_type = -1;
+    uint64_t native_row_size = 0;
+    read_native_scalar(v_trans);
+    read_native_scalar(native_layers);
+    read_native_scalar(native_k_type);
+    read_native_scalar(native_row_size);
+    GGML_ASSERT(v_trans <= 1 && native_layers == index_layers.size() &&
+        native_k_type == int32_t(first_index_tensor->type) &&
+        native_row_size == first_row_size);
+    size_t physical_ordinal = 0;
+    for (uint32_t physical = 0; physical < changed_cell.physical_cell; ++physical) {
+        physical_ordinal += qsa_cells_before.seq_has(physical, 0);
+    }
+    GGML_ASSERT(physical_ordinal < native_cells);
+
+    std::vector<uint8_t> incoming_bytes = qsa_bytes;
+    const size_t changed_offset =
+        native_offset + physical_ordinal*size_t(native_row_size);
+    GGML_ASSERT(changed_offset < incoming_bytes.size());
+    incoming_bytes[changed_offset] ^= 1;
+    std::vector<uint8_t> expected_incoming_row = changed_row->second;
+    expected_incoming_row[0] ^= 1;
+    artifact_segment_chain incoming_chain(incoming_bytes.size());
+    GGML_ASSERT(incoming_chain.append(
+        incoming_bytes.data(), incoming_bytes.size()));
+
+    std::unique_ptr<vbr_prepared_companion_image> qsa_replacement;
+    GGML_ASSERT(qsa_adoption.prepare_replacement_with_layout &&
+        qsa_adoption.prepare_replacement_with_layout(
+            qsa_adoption.context, parse_qsa(incoming_chain),
+            parse_qsa(qsa_chain), 0,
+            qsa_layout, qsa_replacement));
+    GGML_ASSERT(qsa_replacement && qsa_adoption.recheck(
+        qsa_adoption.context, *qsa_replacement));
+    GGML_ASSERT(read_qsa_rows(changed_cell.physical_cell) ==
+        expected_incoming_row);
+    GGML_ASSERT(qsa_adoption.rollback(
+        qsa_adoption.context, *qsa_replacement));
+    assert_qsa_image(qsa_layout);
+
+    decode_range(ctx.get(), 321, 1);
+    GGML_ASSERT(nmse(qsa_continuation_reference, last_logits(ctx.get())) <= 1e-12);
+
+    // Qwen4 recurrent sequence images interleave the PLE convolution-history
+    // row immediately after each R row.  Prove the atomic recurrent companion
+    // parser consumes that native layout instead of accepting only R/S-only
+    // model state.
+    class recurrent_bytes_writer final : public llama_io_write_i {
+    public:
+        void write(const void * data, size_t size) override {
+            const auto * bytes = static_cast<const uint8_t *>(data);
+            output.insert(output.end(), bytes, bytes + size);
+        }
+        void write_tensor(
+                ggml_tensor * tensor, size_t offset, size_t size) override {
+            const size_t start = output.size();
+            output.resize(start + size);
+            ggml_backend_tensor_get(
+                tensor, output.data() + start, offset, size);
+        }
+        size_t n_bytes() override { return output.size(); }
+        std::vector<uint8_t> output;
+    } recurrent_writer;
+    static constexpr uint32_t recurrent_magic = 0xaf143cd8;
+    recurrent_writer.write(&recurrent_magic, sizeof(recurrent_magic));
+    const llama_seq_id recurrent_source_sequence = 0;
+    recurrent_writer.write(
+        &recurrent_source_sequence, sizeof(recurrent_source_sequence));
+    recurrent_child->recurrent->state_write(recurrent_writer, 0, 0);
+    artifact_segment_chain recurrent_chain(recurrent_writer.output.size());
+    GGML_ASSERT(recurrent_chain.append(
+        recurrent_writer.output.data(), recurrent_writer.output.size()));
+    vbr_artifact_companion_payload recurrent_descriptor;
+    recurrent_descriptor.kind = vbr_artifact_companion_kind::recurrent;
+    recurrent_descriptor.format_version = 1;
+    recurrent_descriptor.build_identity_digest =
+        vbr_explicit_recurrent_companion_build_identity();
+    recurrent_descriptor.payload_bytes = recurrent_chain.size();
+    vbr_target_companion_snapshot recurrent_target;
+    recurrent_target.kind = vbr_artifact_companion_kind::recurrent;
+    recurrent_target.format_version = 1;
+    recurrent_target.build_identity_digest =
+        recurrent_descriptor.build_identity_digest;
+    recurrent_target.available = true;
+    recurrent_target.target_cookie = recurrent_child->recurrent;
+    std::unique_ptr<vbr_parsed_companion_image> recurrent_parsed;
+    GGML_ASSERT(vbr_parse_recurrent_companion(
+        nullptr, recurrent_descriptor, recurrent_chain,
+        recurrent_target, recurrent_parsed));
+    GGML_ASSERT(recurrent_parsed &&
+        recurrent_parsed->kind() == vbr_artifact_companion_kind::recurrent);
+
+    printf("Qwen4 static Turbo and dynamic dense/sparse QSA VBR CUDA test PASSED\n");
 }
 
 struct file_deleter {
@@ -847,8 +2101,380 @@ static void test_qwen35_mtp_d2t_contract(const size_t seed) {
     printf("Qwen3.5 MTP d2t loader/graph contract test PASSED\n");
 }
 
+static gguf_context_ptr get_qwen4_mtp_gguf_ctx(uint32_t n_nextn = 1) {
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    llama_model_saver metadata(LLM_ARCH_QWEN4EXP, gguf_ctx.get());
+
+    // The ordinary fixture has two trunk blocks. Reinterpret the second as the
+    // single dense MTP block and pin its lack of QSA compression in metadata.
+    metadata.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, n_nextn);
+    metadata.add_kv(LLM_KV_FULL_ATTENTION_INTERVAL, uint32_t(1));
+    metadata.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>({ 4, 0 }));
+    return gguf_ctx;
+}
+
+static file_ptr make_qwen4_mtp_sidecar(
+        const size_t seed, std::vector<float> & target_h, const char * omit_tensor = nullptr) {
+    file_ptr file = make_test_tmpfile();
+    if (!file) {
+        return file;
+    }
+
+    gguf_context_ptr source_gguf = get_qwen4_mtp_gguf_ctx();
+    llama_model_params source_params = llama_model_default_params();
+    source_params.progress_callback = silent_model_load_progress;
+    source_params.load_mtp = true;
+    ggml_backend_dev_t cpu_devices[] = { nullptr };
+    source_params.devices = cpu_devices;
+
+    size_t tmp = seed;
+    llama_model_ptr source(llama_model_init_from_user(
+            source_gguf.get(), set_tensor_data, &tmp, source_params));
+    if (!source) {
+        throw std::runtime_error("failed to create synthetic Qwen4 MTP model");
+    }
+    GGML_ASSERT(source->hparams.n_layer() == 1);
+    GGML_ASSERT(source->hparams.n_layer_nextn == 1);
+    GGML_ASSERT(source->hparams.n_layer_all == 2);
+    GGML_ASSERT(!source->hparams.is_recr(1));
+
+    // Exercise the target half of the contract: it must publish the wide HC
+    // residual that the draft head consumes, rather than the collapsed output.
+    llama_context_params target_params = llama_context_default_params();
+    target_params.n_ctx = 8;
+    target_params.n_batch = 8;
+    target_params.n_ubatch = 8;
+    target_params.n_seq_max = 1;
+    target_params.n_outputs_max = 1;
+    target_params.n_threads = 1;
+    target_params.n_threads_batch = 1;
+    target_params.n_rs_seq = 3;
+    llama_context_ptr target(llama_init_from_model(source.get(), target_params));
+    if (!target) {
+        throw std::runtime_error("failed to create synthetic Qwen4 target context");
+    }
+    GGML_ASSERT(llama_n_rs_seq(target.get()) == 3);
+    llama_set_embeddings_nextn(target.get(), true, false);
+
+    ggml_cgraph * target_gf = llama_graph_reserve(target.get(), 3, 1, 1);
+    GGML_ASSERT(target_gf != nullptr);
+    ggml_tensor * target_h_graph = ggml_graph_get_tensor(target_gf, "h_nextn");
+    GGML_ASSERT(target_h_graph != nullptr);
+    GGML_ASSERT(target_h_graph->ne[0] == source->hparams.n_embd);
+    GGML_ASSERT(target_h_graph->ne[1] == source->hparams.dsv4_hc_mult);
+    GGML_ASSERT(target_h_graph->ne[2] == 3);
+
+    llama_token tokens[3] = { 5, 6, 7 };
+    llama_batch target_batch = llama_batch_get_one(tokens, 3);
+    GGML_ASSERT(llama_decode(target.get(), target_batch) == 0);
+    llama_synchronize(target.get());
+
+    const int64_t n_embd_out = source->hparams.n_embd_out();
+    for (int32_t row = 0; row < 3; ++row) {
+        const float * h = llama_get_embeddings_nextn_ith(target.get(), row);
+        GGML_ASSERT(h != nullptr);
+        GGML_ASSERT(std::all_of(h, h + n_embd_out, [](float value) {
+            return std::isfinite(value);
+        }));
+    }
+    const float * h_last = llama_get_embeddings_nextn_ith(target.get(), 2);
+    target_h.assign(h_last, h_last + n_embd_out);
+    GGML_ASSERT(std::all_of(target_h.begin(), target_h.end(), [](float value) {
+        return std::isfinite(value);
+    }));
+
+    // Serialize a genuine standalone sidecar: retain global embedding/head
+    // tensors and block 1, but omit every block-0 trunk tensor. The loader must
+    // recognize this shape and still build the draft graph.
+    gguf_context_ptr sidecar_gguf(gguf_init_empty());
+    gguf_set_kv(sidecar_gguf.get(), source_gguf.get());
+    llama_model_saver saver(LLM_ARCH_QWEN4EXP, sidecar_gguf.get());
+    for (const auto & entry : llama_internal_get_tensor_map(source.get())) {
+        if (entry.first.rfind("blk.0.", 0) == 0 ||
+                entry.first.rfind("output_hc_", 0) == 0 ||
+                (omit_tensor != nullptr && entry.first == omit_tensor)) {
+            continue;
+        }
+        saver.add_tensor(entry.second);
+    }
+    saver.save(file.get());
+    fflush(file.get());
+    rewind(file.get());
+    return file;
+}
+
+static file_ptr make_qwen4_mtp_combined(
+        const size_t seed, bool add_bogus_tensor = false, bool add_fused_qkv = false) {
+    file_ptr file = make_test_tmpfile();
+    if (!file) {
+        return file;
+    }
+
+    gguf_context_ptr source_gguf = get_qwen4_mtp_gguf_ctx();
+    llama_model_params source_params = llama_model_default_params();
+    source_params.progress_callback = silent_model_load_progress;
+    source_params.load_mtp = true;
+    ggml_backend_dev_t cpu_devices[] = { nullptr };
+    source_params.devices = cpu_devices;
+
+    size_t tmp = seed;
+    llama_model_ptr source(llama_model_init_from_user(
+            source_gguf.get(), set_tensor_data, &tmp, source_params));
+    GGML_ASSERT(source != nullptr);
+
+    gguf_context_ptr combined_gguf(gguf_init_empty());
+    gguf_set_kv(combined_gguf.get(), source_gguf.get());
+    llama_model_saver saver(LLM_ARCH_QWEN4EXP, combined_gguf.get());
+    for (const auto & entry : llama_internal_get_tensor_map(source.get())) {
+        saver.add_tensor(entry.second);
+    }
+
+    ggml_context_ptr extra_ctx;
+    if (add_bogus_tensor || add_fused_qkv) {
+        ggml_init_params params = {
+            /* .mem_size   = */ 4*1024*1024,
+            /* .mem_buffer = */ nullptr,
+            /* .no_alloc   = */ false,
+        };
+        extra_ctx.reset(ggml_init(params));
+        GGML_ASSERT(extra_ctx != nullptr);
+        if (add_bogus_tensor) {
+            ggml_tensor * bogus = ggml_new_tensor_1d(extra_ctx.get(), GGML_TYPE_F32, 1);
+            ggml_set_name(bogus, "qwen4exp.unrecognized_sibling.weight");
+            saver.add_tensor(bogus);
+        }
+        if (add_fused_qkv) {
+            const auto & mtp = source->layers[1];
+            const int64_t n_qkv = mtp.wq->ne[1] + mtp.wk->ne[1] + mtp.wv->ne[1];
+            ggml_tensor * qkv = ggml_new_tensor_2d(
+                    extra_ctx.get(), GGML_TYPE_F32, source->hparams.n_embd, n_qkv);
+            ggml_set_name(qkv, "blk.1.attn_qkv.weight");
+            saver.add_tensor(qkv);
+            for (const char * suffix : { "scale", "input_scale" }) {
+                ggml_tensor * scale = ggml_new_tensor_1d(extra_ctx.get(), GGML_TYPE_F32, 1);
+                ggml_set_name(scale, format("blk.1.attn_qkv.%s", suffix).c_str());
+                saver.add_tensor(scale);
+            }
+        }
+    }
+    saver.save(file.get());
+    fflush(file.get());
+    rewind(file.get());
+    return file;
+}
+
+static void test_qwen4_mtp_sidecar_contract(const size_t seed) {
+    // The target load must ignore the attached draft block entirely. This pins
+    // TENSOR_SKIP for both split and optional fused-expert representations.
+    {
+        file_ptr integrated_file = make_qwen4_mtp_combined(seed);
+        GGML_ASSERT(integrated_file != nullptr);
+        llama_model_params target_model_params = llama_model_default_params();
+        target_model_params.progress_callback = silent_model_load_progress;
+        target_model_params.load_mtp = false;
+        ggml_backend_dev_t cpu_devices[] = { nullptr };
+        target_model_params.devices = cpu_devices;
+        llama_model_ptr target_model(llama_model_load_from_file_ptr(
+                integrated_file.get(), target_model_params));
+        GGML_ASSERT(target_model != nullptr);
+        GGML_ASSERT(target_model->layers[1].nextn.eh_proj == nullptr);
+        GGML_ASSERT(target_model->layers[1].nextn.hc_head_norm == nullptr);
+        GGML_ASSERT(target_model->layers[1].ffn_gate_exps == nullptr);
+        GGML_ASSERT(target_model->layers[1].ffn_up_exps == nullptr);
+        GGML_ASSERT(target_model->layers[1].ffn_gate_up_exps == nullptr);
+
+        // Ordinary embedding extraction uses the model's advertised wide HC
+        // width. It must publish the wide residual rather than overread the
+        // collapsed output-head input.
+        llama_context_params embd_params = llama_context_default_params();
+        embd_params.n_ctx = 4;
+        embd_params.n_batch = 4;
+        embd_params.n_ubatch = 4;
+        embd_params.n_seq_max = 1;
+        embd_params.embeddings = true;
+        embd_params.n_threads = 1;
+        embd_params.n_threads_batch = 1;
+        llama_context_ptr embd_ctx(llama_init_from_model(target_model.get(), embd_params));
+        GGML_ASSERT(embd_ctx != nullptr);
+        llama_token embd_token = 5;
+        llama_batch embd_batch = llama_batch_get_one(&embd_token, 1);
+        GGML_ASSERT(llama_decode(embd_ctx.get(), embd_batch) == 0);
+        llama_synchronize(embd_ctx.get());
+        const float * embd = llama_get_embeddings_ith(embd_ctx.get(), 0);
+        GGML_ASSERT(embd != nullptr);
+        GGML_ASSERT(std::all_of(embd, embd + target_model->hparams.n_embd_out(), [](float value) {
+            return std::isfinite(value);
+        }));
+
+        file_ptr bogus_file = make_qwen4_mtp_combined(seed, true);
+        GGML_ASSERT(bogus_file != nullptr);
+        llama_model_ptr bogus_model(llama_model_load_from_file_ptr(
+                bogus_file.get(), target_model_params));
+        GGML_ASSERT(bogus_model == nullptr);
+
+        file_ptr fused_qkv_file = make_qwen4_mtp_combined(seed, false, true);
+        GGML_ASSERT(fused_qkv_file != nullptr);
+        llama_model_ptr fused_qkv_model(llama_model_load_from_file_ptr(
+                fused_qkv_file.get(), target_model_params));
+        GGML_ASSERT(fused_qkv_model != nullptr);
+        GGML_ASSERT(fused_qkv_model->layers[1].wqkv == nullptr);
+    }
+
+    // Reject unsupported multi-block artifacts during model load, before graph
+    // construction can hit an assertion after allocating the draft weights.
+    {
+        gguf_context_ptr multi_gguf = get_qwen4_mtp_gguf_ctx(2);
+        llama_model_params multi_params = llama_model_default_params();
+        multi_params.progress_callback = silent_model_load_progress;
+        multi_params.load_mtp = true;
+        ggml_backend_dev_t cpu_devices[] = { nullptr };
+        multi_params.devices = cpu_devices;
+        size_t multi_seed = seed;
+        llama_model_ptr multi_model(llama_model_init_from_user(
+                multi_gguf.get(), set_tensor_data, &multi_seed, multi_params));
+        GGML_ASSERT(multi_model == nullptr);
+    }
+
+    std::vector<float> target_h;
+    file_ptr file = make_qwen4_mtp_sidecar(seed, target_h);
+    if (!file) {
+        printf("Qwen4 MTP sidecar contract test SKIPPED (tmpfile unavailable)\n");
+        return;
+    }
+
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    model_params.load_mtp = true;
+    ggml_backend_dev_t cpu_devices[] = { nullptr };
+    model_params.devices = cpu_devices;
+
+    // A standalone sidecar is not a valid target model. Without load_mtp the
+    // absent trunk must fail model load rather than yielding null graph inputs.
+    llama_model_params wrong_role_params = model_params;
+    wrong_role_params.load_mtp = false;
+    llama_model_ptr wrong_role(llama_model_load_from_file_ptr(file.get(), wrong_role_params));
+    GGML_ASSERT(wrong_role == nullptr);
+    rewind(file.get());
+
+    llama_model_ptr model(llama_model_load_from_file_ptr(file.get(), model_params));
+    if (!model) {
+        throw std::runtime_error("failed to load synthetic Qwen4 MTP sidecar");
+    }
+    GGML_ASSERT(model->hparams.n_layer() == 1);
+    GGML_ASSERT(model->hparams.n_layer_nextn == 1);
+    GGML_ASSERT(model->hc_head_norm == nullptr);
+    GGML_ASSERT(model->layers[0].hc_attn_norm == nullptr);
+    GGML_ASSERT(model->layers[1].nextn.eh_proj != nullptr);
+    GGML_ASSERT(model->layers[1].nextn.enorm != nullptr);
+    GGML_ASSERT(model->layers[1].nextn.hnorm != nullptr);
+    GGML_ASSERT(model->layers[1].nextn.hc_head_norm != nullptr);
+    GGML_ASSERT(model->layers[1].nextn.hc_head_down != nullptr);
+    GGML_ASSERT(model->layers[1].nextn.hc_head_up != nullptr);
+    GGML_ASSERT(model->layers[1].index_q_proj == nullptr);
+    GGML_ASSERT(model->layers[1].index_k_proj == nullptr);
+
+    llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    ctx_params.n_ctx = 8;
+    ctx_params.n_batch = 8;
+    ctx_params.n_ubatch = 8;
+    ctx_params.n_seq_max = 1;
+    ctx_params.n_outputs_max = 1;
+    ctx_params.n_threads = 1;
+    ctx_params.n_threads_batch = 1;
+    llama_context_ptr ctx(llama_init_from_model(model.get(), ctx_params));
+    if (!ctx) {
+        throw std::runtime_error("failed to create synthetic Qwen4 MTP context");
+    }
+    GGML_ASSERT(dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(ctx.get())) == nullptr);
+
+    llama_set_embeddings_nextn(ctx.get(), true, true);
+    ggml_cgraph * gf = llama_graph_reserve(ctx.get(), 2, 1, 1);
+    GGML_ASSERT(gf != nullptr);
+    GGML_ASSERT(ggml_graph_get_tensor(gf, "mtp_h_input") != nullptr);
+    ggml_tensor * eh_proj = ggml_graph_get_tensor(gf, "mtp_eh_proj-1");
+    GGML_ASSERT(eh_proj != nullptr);
+    ggml_tensor * eh_concat = nullptr;
+    std::vector<ggml_tensor *> pending = { eh_proj };
+    while (!pending.empty() && eh_concat == nullptr) {
+        ggml_tensor * node = pending.back();
+        pending.pop_back();
+        if (node->op == GGML_OP_CONCAT) {
+            eh_concat = node;
+            break;
+        }
+        for (ggml_tensor * src : node->src) {
+            if (src != nullptr) {
+                pending.push_back(src);
+            }
+        }
+    }
+    GGML_ASSERT(eh_concat != nullptr);
+    GGML_ASSERT(strcmp(ggml_get_name(eh_concat->src[0]), "mtp_enorm-1") == 0);
+    GGML_ASSERT(strcmp(ggml_get_name(eh_concat->src[1]), "mtp_hnorm-1") == 0);
+    GGML_ASSERT(ggml_graph_get_tensor(gf, "mtp_hc_attn_pre-1") != nullptr);
+    GGML_ASSERT(ggml_graph_get_tensor(gf, "mtp_hc_head") != nullptr);
+    GGML_ASSERT(ggml_graph_get_tensor(gf, "indexer_k_raw-1") == nullptr);
+    GGML_ASSERT(ggml_graph_get_tensor(gf, "result_output") != nullptr);
+    ggml_tensor * draft_h_graph = ggml_graph_get_tensor(gf, "h_nextn");
+    GGML_ASSERT(draft_h_graph != nullptr);
+    GGML_ASSERT(draft_h_graph->ne[0] == model->hparams.n_embd_out());
+    GGML_ASSERT(draft_h_graph->ne[1] == 1);
+
+    // Feed the exact target-published HC state together with a proposed token.
+    // This exercises both token and hidden inputs, the dense draft KV cache,
+    // the one-layer graph, and chained t_h_nextn publication.
+    llama_batch batch = llama_batch_init(2, (int32_t) target_h.size(), 1);
+    batch.token = (llama_token *) malloc(2 * sizeof(llama_token));
+    GGML_ASSERT(batch.token != nullptr);
+    batch.n_tokens = 2;
+    batch.token[0] = 8;
+    batch.token[1] = 9;
+    memcpy(batch.embd, target_h.data(), target_h.size() * sizeof(float));
+    memcpy(batch.embd + target_h.size(), target_h.data(), target_h.size() * sizeof(float));
+    batch.pos[0] = 0;
+    batch.pos[1] = 1;
+    batch.n_seq_id[0] = 1;
+    batch.n_seq_id[1] = 1;
+    batch.seq_id[0][0] = 0;
+    batch.seq_id[1][0] = 0;
+    batch.logits[0] = 0;
+    batch.logits[1] = 1;
+    GGML_ASSERT(llama_decode(ctx.get(), batch) == 0);
+    llama_synchronize(ctx.get());
+
+    const float * logits = llama_get_logits_ith(ctx.get(), 1);
+    GGML_ASSERT(logits != nullptr);
+    for (int32_t i = 0; i < llama_vocab_n_tokens(llama_model_get_vocab(model.get())); ++i) {
+        GGML_ASSERT(std::isfinite(logits[i]));
+    }
+    const float * next_h = llama_get_embeddings_nextn_ith(ctx.get(), 1);
+    GGML_ASSERT(next_h != nullptr);
+    for (size_t i = 0; i < target_h.size(); ++i) {
+        GGML_ASSERT(std::isfinite(next_h[i]));
+    }
+    llama_batch_free(batch);
+
+    // The three NextN input tensors are mandatory. A missing hidden-state norm
+    // must fail load rather than silently build a graph with an absent operand.
+    std::vector<float> ignored_h;
+    file_ptr incomplete = make_qwen4_mtp_sidecar(seed, ignored_h, "blk.1.nextn.hnorm.weight");
+    GGML_ASSERT(incomplete != nullptr);
+    llama_model_ptr incomplete_model(llama_model_load_from_file_ptr(incomplete.get(), model_params));
+    GGML_ASSERT(incomplete_model == nullptr);
+
+    file_ptr incomplete_mixer = make_qwen4_mtp_sidecar(
+            seed, ignored_h, "blk.1.nextn.hc_head_norm.weight");
+    GGML_ASSERT(incomplete_mixer != nullptr);
+    llama_model_ptr incomplete_mixer_model(
+            llama_model_load_from_file_ptr(incomplete_mixer.get(), model_params));
+    GGML_ASSERT(incomplete_mixer_model == nullptr);
+
+    printf("Qwen4 MTP standalone sidecar/target handoff contract test PASSED\n");
+}
+
 static std::vector<float> get_logits(
-        llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false) {
+        llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode) {
     const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
     const uint32_t n_ctx    = llama_n_ctx(lctx);
     const uint32_t n_tokens = tokens.size();
@@ -1302,6 +2928,8 @@ int main(int argc, char ** argv) {
         }
         if (arch == LLM_ARCH_UNKNOWN || arch == LLM_ARCH_QWEN4EXP) {
             test_qwen4_indexed_cache_admission(seed);
+            test_qwen4_vbr_cuda(seed);
+            test_qwen4_mtp_sidecar_contract(seed);
         }
         return test_backends(arch, seed, log_level);
     } catch (const std::exception & err) {

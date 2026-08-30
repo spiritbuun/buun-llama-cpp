@@ -1888,6 +1888,7 @@ bool server_prompt_cache_measure_fixed_states(
                 shared_plane |=
                     checkpoint.data_tgt.storage_use_count() > 1 ||
                     checkpoint.data_dft.storage_use_count() > 1 ||
+                    checkpoint.data_qsa.storage_use_count() > 1 ||
                     checkpoint.accel.ring.storage_use_count() > 1 ||
                     checkpoint.accel.spec.storage_use_count() > 1;
             }
@@ -2218,6 +2219,7 @@ size_t server_prompt_cache::size() const {
                 has_shared_fixed_plane |=
                     checkpoint.data_tgt.storage_use_count() > 1 ||
                     checkpoint.data_dft.storage_use_count() > 1 ||
+                    checkpoint.data_qsa.storage_use_count() > 1 ||
                     checkpoint.accel.ring.storage_use_count() > 1 ||
                     checkpoint.accel.spec.storage_use_count() > 1;
             }
@@ -2384,6 +2386,7 @@ std::list<server_prompt_cache_state> server_prompt_cache::stage(const server_pro
             for (const auto & ckpt : prompt.checkpoints) {
                 if (!add_plane(ckpt.data_tgt) ||
                     !add_plane(ckpt.data_dft) ||
+                    !add_plane(ckpt.data_qsa) ||
                     !add_plane(ckpt.accel.ring) ||
                     !add_plane(ckpt.accel.spec)) {
                     return {};
@@ -3589,6 +3592,7 @@ bool server_prompt_cache::payload_bytes(
     for (const auto & ckpt : st.prompt.checkpoints) {
         if (!add_checked(checkpoint_bytes, ckpt.data_tgt.size()) ||
             !add_checked(checkpoint_bytes, ckpt.data_dft.size()) ||
+            !add_checked(accelerator_bytes, ckpt.data_qsa.size()) ||
             !add_checked(accelerator_bytes, ckpt.accel.size())) {
             snapshot_bytes = checkpoint_bytes = accelerator_bytes = 0;
             return false;
@@ -4906,6 +4910,7 @@ bool checkpoint_payload_equal(
            a.computation_frontier == b.computation_frontier &&
            a.data_tgt == b.data_tgt &&
            a.data_dft == b.data_dft &&
+           a.data_qsa == b.data_qsa &&
            a.data_dft_full_sequence == b.data_dft_full_sequence &&
            a.accel.ring == b.accel.ring &&
            a.accel.spec == b.accel.spec;
@@ -9611,6 +9616,7 @@ bool server_prompt_cache::update_impl(
                     has_shared_fixed_plane |=
                         checkpoint.data_tgt.storage_use_count() > 1 ||
                         checkpoint.data_dft.storage_use_count() > 1 ||
+                        checkpoint.data_qsa.storage_use_count() > 1 ||
                         checkpoint.accel.ring.storage_use_count() > 1 ||
                         checkpoint.accel.spec.storage_use_count() > 1;
                 }

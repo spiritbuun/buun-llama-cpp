@@ -6,6 +6,7 @@
 #include "llama-kv-cache.h"
 #include "llama-memory-recurrent.h"
 #include "llama-memory-tree.h"
+#include "llama-vbr-qsa-index.h"
 #include "llama-sha256.h"
 #include "llama-vbr-identity-digest.h"
 #include "llama-vbr-operation.h"
@@ -2610,7 +2611,9 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
         }
         std::vector<vbr_live_capture_adapter::child> children;
         std::vector<llama_memory_recurrent *> recurrent_children;
+        size_t qsa_index_children = 0;
         for (const auto & node : tree) {
+            qsa_index_children += node.qsa_index_owner != nullptr;
             if (node.recurrent != nullptr) {
                 recurrent_children.push_back(node.recurrent);
                 continue;
@@ -2630,6 +2633,10 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
         }
         if (children.empty()) {
             result.status = vbr_explicit_capture_status::not_armed;
+            return result;
+        }
+        if (qsa_index_children > 1) {
+            result.status = vbr_explicit_capture_status::unsupported_layout;
             return result;
         }
 
@@ -2926,8 +2933,18 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
                     return provider.kind ==
                         vbr_artifact_companion_kind::recurrent;
                 }));
+            const size_t supplied_qsa = size_t(std::count_if(
+                manifest_request.companions.begin(),
+                manifest_request.companions.end(),
+                [](const vbr_explicit_companion_provider & provider) {
+                    return provider.kind ==
+                        vbr_artifact_companion_kind::qsa_index;
+                }));
             if (supplied_recurrent != 0 &&
                 supplied_recurrent != recurrent_children.size()) {
+                dependencies_available = false;
+            }
+            if (supplied_qsa != qsa_index_children) {
                 dependencies_available = false;
             }
             for (auto * recurrent : recurrent_children) {
@@ -3944,6 +3961,7 @@ static bool import_target_snapshot_core(
             representation_cache;
         size_t n_attention = 0;
         size_t n_recurrent = 0;
+        size_t n_qsa = 0;
         for (const auto & child : tree) {
             if (child.recurrent) {
                 if (n_recurrent != 0 ||
@@ -3963,6 +3981,23 @@ static bool import_target_snapshot_core(
             if (!child.attention) {
                 output = {};
                 return false;
+            }
+            if (child.qsa_index_owner) {
+                const auto provider = vbr_qsa_index_adoption_provider(
+                    *child.qsa_index_owner, child.child_id);
+                if (!provider.target_empty ||
+                    (!previously_observed &&
+                     !provider.target_empty(provider.context))) {
+                    output = {};
+                    return false;
+                }
+                output.companions.push_back({
+                    vbr_artifact_companion_kind::qsa_index,
+                    vbr_qsa_index_companion_format_version(),
+                    vbr_qsa_index_companion_build_identity(), true,
+                    child.qsa_index_owner,
+                });
+                ++n_qsa;
             }
             vbr_target_child_snapshot snapshot;
             if (!vbr_live_capture_adapter::fill_import_child(
@@ -3991,6 +4026,12 @@ static bool import_target_snapshot_core(
                 [](const vbr_artifact_companion_view & companion) {
                     return companion.descriptor.kind ==
                         vbr_artifact_companion_kind::recurrent;
+                })) ||
+            n_qsa != size_t(std::count_if(
+                package.companions().begin(), package.companions().end(),
+                [](const vbr_artifact_companion_view & companion) {
+                    return companion.descriptor.kind ==
+                        vbr_artifact_companion_kind::qsa_index;
                 }))) {
             output = {};
             return false;
@@ -4463,7 +4504,9 @@ vbr_explicit_capture_result vbr_prepare_explicit_manifest(
 
         std::vector<vbr_live_capture_adapter::child> children;
         std::vector<llama_memory_recurrent *> recurrent;
+        size_t qsa_index_children = 0;
         for (const auto & node : tree) {
+            qsa_index_children += node.qsa_index_owner != nullptr;
             if (node.attention != nullptr) {
                 if (!node.attention->vbr_operation_armed()) {
                     result.status = vbr_explicit_capture_status::not_armed;
@@ -4481,6 +4524,17 @@ vbr_explicit_capture_result vbr_prepare_explicit_manifest(
         }
         if (children.empty()) {
             result.status = vbr_explicit_capture_status::not_armed;
+            return result;
+        }
+        const size_t supplied_qsa = size_t(std::count_if(
+            request.companions.begin(), request.companions.end(),
+            [](const vbr_explicit_companion_provider & provider) {
+                return provider.kind ==
+                    vbr_artifact_companion_kind::qsa_index;
+            }));
+        if (qsa_index_children > 1 || supplied_qsa != qsa_index_children) {
+            result.status = vbr_explicit_capture_status::
+                required_companion_unavailable;
             return result;
         }
 

@@ -7,6 +7,7 @@
 #include "log.h"
 #include "llama.h"
 #include "../src/llama-ext.h"
+#include "../src/llama-sha256.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "unicode.h"
@@ -1646,6 +1647,8 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         if (err) {
             return res;
         }
+        params.control_vector_applied_digest = cvec.applied_digest;
+        params.control_vector_applied_digest_valid = cvec.applied_digest_valid;
     }
 
     if (llama_pooling_type(lctx) == LLAMA_POOLING_TYPE_RANK) {
@@ -2294,6 +2297,16 @@ common_control_vector_data common_control_vector_load(const std::vector<common_c
     if (result.n_embd == -1) {
         COM_ERR("%s", "no valid control vector files passed\n");
         result.data.clear();
+    } else {
+        llama_sha256_writer writer;
+        static constexpr char domain[] =
+            "llama.control-vector.applied-data/v1";
+        writer.string(domain, sizeof(domain) - 1);
+        writer.u32(uint32_t(result.n_embd));
+        writer.u64(uint64_t(result.data.size()));
+        writer.bytes(result.data.data(), result.data.size()*sizeof(float));
+        result.applied_digest = writer.finish();
+        result.applied_digest_valid = true;
     }
 
     return result;
@@ -2580,7 +2593,7 @@ bool common_prompt_checkpoint::empty() const {
 }
 
 size_t common_prompt_checkpoint::size() const {
-    return data_tgt.size() + data_dft.size() + accel.size();
+    return data_tgt.size() + data_dft.size() + data_qsa.size() + accel.size();
 }
 
 void common_prompt_checkpoint::clear() {
@@ -2598,6 +2611,7 @@ void common_prompt_checkpoint::clear() {
 
     data_tgt.clear();
     data_dft.clear();
+    data_qsa.clear();
     data_dft_full_sequence = false;
     accel.clear();
 }
@@ -2700,6 +2714,7 @@ bool common_prompt_checkpoint::try_load_dft(
 
 void common_prompt_checkpoint::clear_tgt() {
     data_tgt.clear();
+    data_qsa.clear();
 }
 
 void common_prompt_checkpoint::clear_dft() {

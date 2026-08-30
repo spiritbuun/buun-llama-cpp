@@ -37,13 +37,14 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
                             /* layer filters */
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
-    const layer_filter_cb & filter_idx) :
+    const layer_filter_cb & filter_idx,
+    const llama_memory_vbr_params & vbr) :
     llama_memory_hybrid(
         model,
         type_k, type_v, v_trans, kv_size, n_pad, n_swa, swa_type,
         type_r, type_s, rs_size,
         n_seq_max, n_rs_seq, offload, unified,
-        filter_attn, filter_recr),
+        filter_attn, filter_recr, vbr),
     hparams_idx(model.hparams),
     mem_idx(filter_idx == nullptr ? nullptr : [&] {
         // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
@@ -52,8 +53,10 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
 
         LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
 
+        // QSA index keys come from a separate learned projection and are consumed by ordinary
+        // selection matmuls. They are fixed F16 state, never attention Turbo/VBR storage.
         return new llama_kv_cache(
-            model, hparams_idx, type_k, type_v, v_trans, offload, unified,
+            model, hparams_idx, GGML_TYPE_F16, GGML_TYPE_F16, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {}
@@ -146,18 +149,97 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
     }
 
     if (mem_idx) {
-        mem_idx->seq_rm(seq_id, p0, p1);
+        const bool removed_idx = mem_idx->seq_rm(seq_id, p0, p1);
+        GGML_ASSERT(removed_idx);
+        GGML_UNUSED(removed_idx);
     }
 
     return get_mem_attn()->seq_rm(seq_id, p0, p1);
 }
 
-void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
-    llama_memory_hybrid::seq_cp(seq_id_src, seq_id_dst, p0, p1);
-
+bool llama_memory_hybrid_idx::seq_rm_attn(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    // The indexer is auxiliary attention state. Every attention-only edit must retain the same
+    // cell membership in both children, while deliberately leaving recurrent state untouched.
     if (mem_idx) {
-        mem_idx->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+        const bool removed_idx = mem_idx->seq_rm(seq_id, p0, p1);
+        GGML_ASSERT(removed_idx);
+        GGML_UNUSED(removed_idx);
     }
+    return get_mem_attn()->seq_rm(seq_id, p0, p1);
+}
+
+bool llama_memory_hybrid_idx::seq_rm_transient(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    if (!get_mem_recr()->seq_rm(seq_id, p0, p1)) {
+        return false;
+    }
+    if (mem_idx) {
+        const bool removed_idx = mem_idx->seq_rm_transient(seq_id, p0, p1);
+        GGML_ASSERT(removed_idx);
+        GGML_UNUSED(removed_idx);
+    }
+    return get_mem_attn()->seq_rm_transient(seq_id, p0, p1);
+}
+
+bool llama_memory_hybrid_idx::seq_rm_attn_transient(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    if (mem_idx) {
+        const bool removed_idx = mem_idx->seq_rm_attn_transient(seq_id, p0, p1);
+        GGML_ASSERT(removed_idx);
+        GGML_UNUSED(removed_idx);
+    }
+    return get_mem_attn()->seq_rm_attn_transient(seq_id, p0, p1);
+}
+
+void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    (void) try_seq_cp(seq_id_src, seq_id_dst, p0, p1);
+}
+
+bool llama_memory_hybrid_idx::try_seq_cp(
+        llama_seq_id seq_id_src,
+        llama_seq_id seq_id_dst,
+        llama_pos p0,
+        llama_pos p1) {
+    if (!llama_memory_hybrid::try_seq_cp(seq_id_src, seq_id_dst, p0, p1)) {
+        // The base has already invalidated attention and recurrent state.
+        const bool removed_idx = !mem_idx || mem_idx->seq_rm(seq_id_dst, -1, -1);
+        GGML_ASSERT(removed_idx);
+        GGML_UNUSED(removed_idx);
+        return false;
+    }
+
+    if (!mem_idx || mem_idx->try_seq_cp(seq_id_src, seq_id_dst, p0, p1)) {
+        return true;
+    }
+
+    // A failed index copy after the base succeeded invalidates the destination rather than
+    // exposing children from different timelines.
+    state_drop(seq_id_dst);
+    return false;
+}
+
+bool llama_memory_hybrid_idx::try_seq_cp_transient(
+        llama_seq_id seq_id_src,
+        llama_seq_id seq_id_dst,
+        llama_pos p0,
+        llama_pos p1) {
+    if (!llama_memory_hybrid::try_seq_cp_transient(seq_id_src, seq_id_dst, p0, p1)) {
+        const bool removed_idx = !mem_idx || mem_idx->seq_rm_transient(seq_id_dst, -1, -1);
+        GGML_ASSERT(removed_idx);
+        GGML_UNUSED(removed_idx);
+        return false;
+    }
+
+    if (!mem_idx || mem_idx->try_seq_cp_transient(seq_id_src, seq_id_dst, p0, p1)) {
+        return true;
+    }
+
+    const bool removed_recr = get_mem_recr()->seq_rm(seq_id_dst, -1, -1);
+    const bool removed_attn = get_mem_attn()->seq_rm_transient(seq_id_dst, -1, -1);
+    const bool removed_idx = !mem_idx || mem_idx->seq_rm_transient(seq_id_dst, -1, -1);
+    GGML_ASSERT(removed_recr && removed_attn && removed_idx);
+    GGML_UNUSED(removed_recr);
+    GGML_UNUSED(removed_attn);
+    GGML_UNUSED(removed_idx);
+    return false;
 }
 
 void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
@@ -169,19 +251,40 @@ void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    if (shift == 0) {
+        return;
+    }
+
+    // Prove every affected active position is [t,t,t,0] before any child
+    // mutates.  The indexer mirrors the attention cells, but checking both
+    // also turns an already-drifted cache into a fail-closed error.
+    GGML_ASSERT(get_mem_attn()->can_shift_qwen4_text_range(seq_id, p0, p1));
+    GGML_ASSERT(!mem_idx || mem_idx->can_shift_qwen4_text_range(seq_id, p0, p1));
+
     llama_memory_hybrid::seq_add(seq_id, p0, p1, shift);
 
     if (mem_idx) {
-        mem_idx->seq_add(seq_id, p0, p1, shift);
+        // QSA caches the unnormalised, pre-RoPE index projection.  Only its
+        // block-position metadata follows the edit; rotating these raw keys
+        // would make the next QSA selection disagree with an unshifted decode.
+        mem_idx->seq_add_raw_mrope(seq_id, p0, p1, shift);
     }
 }
 
 void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
-    llama_memory_hybrid::seq_div(seq_id, p0, p1, d);
-
-    if (mem_idx) {
-        mem_idx->seq_div(seq_id, p0, p1, d);
+    if (d == 1) {
+        return;
     }
+
+    GGML_UNUSED(seq_id);
+    GGML_UNUSED(p0);
+    GGML_UNUSED(p1);
+    GGML_UNUSED(d);
+
+    // A division gives the active M-RoPE sections different, position-dependent
+    // deltas and cannot be represented by the single K-shift input.  Refuse
+    // before mutating any of the three children.
+    GGML_ABORT("Qwen4 indexed memory does not support seq_div / Self-Extend");
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_breakdown() const {
@@ -366,20 +469,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     int32_t * dst_blk_pos   = (int32_t *) blk_pos->data;
     float   * dst_bias      = (float   *) bias->data;
 
-    // block b covers [b*ratio, (b+1)*ratio), so its first token is at b*ratio
-    // all mrope sections carry it: exact for text, approximate for images
-    for (int64_t sec = 0; sec < 4; ++sec) {
-        for (int64_t s = 0; s < n_ns; ++s) {
-            for (int64_t b = 0; b < n_blocks; ++b) {
-                dst_blk_pos[sec*(n_blocks*n_ns) + s*n_blocks + b] = (int32_t) (b*r);
-            }
-        }
-    }
-
     // one pass per stream: cell j is a different token in each, so no mapping is shared
-    std::vector<int32_t> blk_of(n_kv);
-    std::vector<int32_t> filled(n_blocks);
-
     for (int64_t s = 0; s < n_ns; ++s) {
         // ubatch index s*n_tps belongs to this stream; ask which cells array it uses
         const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
@@ -387,11 +477,15 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
 
         int32_t * cur_cell_blk  = dst_cell_blk  + s*n_kv;
         int32_t * cur_blk_cells = dst_blk_cells + s*(r*n_blocks);
+        // blk_pos is an input-owned host buffer. Its first section is safe
+        // staging until every bias has consumed the per-block fill counts;
+        // all four position sections are materialized below before upload.
+        int32_t * cur_filled = dst_blk_pos + s*n_blocks;
 
         // an incomplete block cannot be pooled; the bias below forces those tail cells in
         // -1 means no usable block, and block 0 only keeps the gather in range
-        std::fill(blk_of.begin(),  blk_of.end(),  -1);
-        std::fill(filled.begin(),  filled.end(),   0);
+        std::fill(cur_cell_blk, cur_cell_blk + n_kv, -1);
+        std::fill(cur_filled, cur_filled + n_blocks, 0);
         std::fill(cur_blk_cells, cur_blk_cells + r*n_blocks, 0);
 
         // a cell no block covers needs its own -inf, which a per-block bias cannot carry
@@ -411,9 +505,9 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
                 continue;
             }
 
-            blk_of[j] = (int32_t) b;
+            cur_cell_blk[j] = (int32_t) b;
             cur_blk_cells[b*r + (p%r)] = (int32_t) j;
-            filled[b]++;
+            cur_filled[b]++;
         }
 
         GGML_ASSERT((!blk_bias || !oor) && "qsa: cell position runs past the cell window");
@@ -421,10 +515,10 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         // per-block mode keeps an unpooled cell's real block, so the block's own -inf reaches it
         // per-cell mode carries that -inf itself and only needs the gather in range
         for (int64_t j = 0; j < n_kv; ++j) {
-            if (blk_of[j] >= 0 && filled[blk_of[j]] < r && !blk_bias) {
-                blk_of[j] = -1;
+            if (cur_cell_blk[j] >= 0 &&
+                cur_filled[cur_cell_blk[j]] < r && !blk_bias) {
+                cur_cell_blk[j] = -1;
             }
-            cur_cell_blk[j] = blk_of[j] < 0 ? 0 : blk_of[j];
         }
 
         for (int64_t ii = 0; ii < n_tps; ++ii) {
@@ -442,7 +536,8 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
 
                 for (int64_t b = 0; b < n_blocks; ++b) {
                     // finite, so it can never meet a -inf and produce a nan
-                    cur_blk_bias[b] = b*r >= tail_start ? 1e9f : (filled[b] < r ? -INFINITY : 0.0f);
+                    cur_blk_bias[b] = b*r >= tail_start ? 1e9f :
+                        (cur_filled[b] < r ? -INFINITY : 0.0f);
                 }
 
                 continue;
@@ -455,10 +550,31 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
 
                 if (!cells.is_empty(j) && cells.seq_has(j, seq_id) && cells.pos_get(j) <= q) {
                     // finite, so it can never meet a -inf and produce a nan
-                    v = cells.pos_get(j) >= tail_start ? 1e9f : (blk_of[j] < 0 ? -INFINITY : 0.0f);
+                    v = cells.pos_get(j) >= tail_start ? 1e9f :
+                        (cur_cell_blk[j] < 0 ? -INFINITY : 0.0f);
                 }
 
                 cur_bias[j] = v;
+            }
+        }
+
+        // The gather requires an in-range index. Bias construction above has
+        // already consumed the -1 sentinel that distinguishes unpooled cells.
+        for (int64_t j = 0; j < n_kv; ++j) {
+            if (cur_cell_blk[j] < 0) {
+                cur_cell_blk[j] = 0;
+            }
+        }
+    }
+
+    // Block b covers [b*ratio, (b+1)*ratio), so its first token is at
+    // b*ratio. All M-RoPE sections carry it: exact for text, approximate for
+    // images. This overwrites the temporary fill-count section above.
+    for (int64_t sec = 0; sec < 4; ++sec) {
+        for (int64_t s = 0; s < n_ns; ++s) {
+            for (int64_t b = 0; b < n_blocks; ++b) {
+                dst_blk_pos[sec*(n_blocks*n_ns) + s*n_blocks + b] =
+                    int32_t(b*r);
             }
         }
     }

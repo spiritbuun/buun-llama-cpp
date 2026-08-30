@@ -8,6 +8,7 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
+#include "llama-sha256.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -2549,7 +2550,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 const bool mtp_on_hybrid_qwen =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
                     (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
-                     arch == LLM_ARCH_BAILINGMOE3);
+                     arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_BAILINGMOE3);
 
                 const bool mtp_on_hybrid_nemotron =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
@@ -2600,16 +2601,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     }
 
                     if (needs_mem_idx) {
-                        if (ggml_is_turbo_kv_type(params.type_k) ||
-                            ggml_is_turbo_kv_type(params.type_v) ||
-                            vbr.dynamic || vbr.budget_bytes > 0 || vbr.min_bits > 0.0) {
-                            throw std::runtime_error(
-                                    "indexed hybrid memory does not support Turbo/VBR representation or controllers");
-                        }
-
-                        // Sparse attention over a per-token indexer cache. This is initially
-                        // target-only fixed-KV substrate; representation/provider integration
-                        // must remain fail-closed until the indexed cache supports it directly.
+                        // Sparse attention owns a separate per-token indexer cache. The ordinary
+                        // attention child is the sole Turbo/VBR owner; the indexed child is fixed
+                        // F16 and the recurrent child remains fixed-layout. Artifact collection
+                        // still refuses this three-child topology until QSA index state has a
+                        // typed companion, so enabling live execution cannot publish an
+                        // attention-only artifact.
                         res = new llama_memory_hybrid_idx(
                             /* model             */ *this,
                             /* attn_type_k       */ params.type_k,
@@ -2628,7 +2625,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr),
-                            /* filter_idx        */ std::move(filter_idx));
+                            /* filter_idx        */ std::move(filter_idx),
+                            /* vbr               */ vbr);
                     } else if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         // Use hybrid-iswa for hybrid models with SWA
                         res = new llama_memory_hybrid_iswa(
@@ -2871,6 +2869,10 @@ void llama_model_free(llama_model * model) {
 
 int32_t llama_model_n_ctx_train(const llama_model * model) {
     return model->hparams.n_ctx_train;
+}
+
+int32_t llama_model_n_ctx_orig_yarn(const llama_model * model) {
+    return model->hparams.n_ctx_orig_yarn;
 }
 
 int32_t llama_model_n_embd(const llama_model * model) {
@@ -3349,6 +3351,286 @@ uint64_t llama_model_size(const llama_model * model) {
     return model->size();
 }
 
+bool llama_model_semantic_family_digest(
+        const llama_model * model,
+        uint8_t digest[32]) {
+    if (!model || !digest) {
+        return false;
+    }
+    llama_sha256_writer writer;
+    static constexpr char domain[] = "llama.model.semantic-family/v2";
+    writer.string(domain, sizeof(domain) - 1);
+    const auto & hp = model->hparams;
+    const auto write_f32 = [&](float value) {
+        uint32_t bits = 0;
+        static_assert(sizeof(bits) == sizeof(value));
+        memcpy(&bits, &value, sizeof(bits));
+        writer.u32(bits);
+    };
+    // `turbo_meansub_id` is intentionally absent: it is a build-local
+    // registry ordinal derived solely from arch/layer/embedding geometry,
+    // which is already bound below. The runtime identity separately binds
+    // the build revision, so hashing the ordinal would add instability rather
+    // than semantic-family authority.
+    writer.u32(uint32_t(model->arch));
+    writer.u32(hp.n_embd);
+    writer.u32(hp.n_embd_inp());
+    writer.u32(hp.n_embd_out());
+    writer.u32(hp.n_layer_all);
+    writer.u32(hp.n_layer_nextn);
+    writer.u32(uint32_t(hp.n_layer_kv_from_start));
+    writer.u32(uint32_t(hp.router_layer));
+    writer.u32(hp.n_expert);
+    writer.u32(hp.n_expert_used);
+    writer.u32(hp.n_rel_attn_bkts);
+    writer.u32(hp.n_embd_head_k_full);
+    writer.u32(hp.n_embd_head_v_full);
+    writer.u32(hp.n_embd_head_k_swa);
+    writer.u32(hp.n_embd_head_v_swa);
+    writer.u32(hp.n_embd_head_k_mla_impl);
+    writer.u32(hp.n_embd_head_v_mla_impl);
+    writer.u32(hp.posnet.n_embd);
+    writer.u32(hp.posnet.n_layer);
+    writer.u32(hp.convnext.n_embd);
+    writer.u32(hp.convnext.n_layer);
+    writer.u32(hp.use_par_res ? 1u : 0u);
+    writer.u32(hp.swin_norm ? 1u : 0u);
+    writer.u32(hp.norm_before_residual ? 1u : 0u);
+    writer.u32(hp.norm_before_fc ? 1u : 0u);
+    writer.u32(hp.n_layer_dense_lead);
+    writer.u32(hp.n_lora_q);
+    writer.u32(hp.n_lora_kv);
+    writer.u32(hp.n_ff_exp);
+    writer.u32(hp.n_ff_shexp);
+    writer.u32(hp.n_ff_chexp);
+    writer.u32(hp.n_expert_shared);
+    writer.u32(hp.n_norm_groups);
+    writer.u32(hp.n_expert_groups);
+    writer.u32(hp.n_group_used);
+    writer.u32(hp.n_group_experts);
+    writer.u32(hp.n_lora_kv_swa);
+    writer.u32(hp.n_embd_head_k_mla_swa);
+    writer.u32(hp.n_embd_head_v_mla_swa);
+    write_f32(hp.expert_group_scale);
+    write_f32(hp.expert_weights_scale);
+    writer.u32(hp.expert_weights_norm ? 1u : 0u);
+    writer.u32(hp.expert_gating_func);
+    writer.u32(hp.moe_every_n_layers);
+    writer.u32(hp.moe_latent_size);
+    write_f32(hp.f_norm_eps);
+    write_f32(hp.f_norm_rms_eps);
+    write_f32(hp.f_norm_group_eps);
+    write_f32(hp.f_attn_logit_softcapping);
+    write_f32(hp.f_router_logit_softcapping);
+    write_f32(hp.f_final_logit_softcapping);
+    writer.u32(hp.rope_finetuned ? 1u : 0u);
+    writer.u32(hp.n_rot_full);
+    writer.u32(hp.n_rot_swa);
+    writer.u32(uint32_t(hp.rope_type));
+    writer.u32(uint32_t(hp.rope_scaling_type_train));
+    write_f32(hp.rope_freq_base_train);
+    write_f32(hp.rope_freq_base_train_swa);
+    write_f32(hp.rope_freq_scale_train);
+    write_f32(hp.rope_freq_scale_train_swa);
+    write_f32(hp.rope_scaling_alpha);
+    write_f32(hp.rope_attn_factor);
+    // Context length and original YaRN context are runtime-resolved from an
+    // explicit override or model fallback. They are bound by the slot runtime
+    // identity so equal explicit overrides remain family-compatible across
+    // models with different training-context metadata.
+    write_f32(hp.rope_yarn_log_mul);
+    write_f32(hp.yarn_ext_factor);
+    write_f32(hp.yarn_attn_factor);
+    write_f32(hp.yarn_beta_fast);
+    write_f32(hp.yarn_beta_slow);
+    for (const int section : hp.rope_sections) {
+        writer.u32(uint32_t(section));
+    }
+    writer.u32(uint32_t(hp.swa_type));
+    writer.u32(hp.n_swa);
+    writer.u32(hp.n_embd_r());
+    writer.u32(hp.n_embd_s());
+    writer.u32(hp.n_shortconv_l_cache);
+    writer.u32(hp.ssm_d_conv);
+    writer.u32(hp.ssm_d_inner);
+    writer.u32(hp.ssm_d_state);
+    writer.u32(hp.ssm_dt_rank);
+    writer.u32(hp.ssm_n_group);
+    writer.u32(hp.ssm_dt_b_c_rms ? 1u : 0u);
+    writer.u32(hp.n_embd_head_la);
+    writer.u32(hp.n_embd_head_kda);
+    writer.u32(hp.kda_safe_gate ? 1u : 0u);
+    writer.u32(hp.n_expert_latent);
+    writer.u32(hp.attn_res_block_size);
+    write_f32(hp.kda_gate_lower_bound);
+    write_f32(hp.situ_beta);
+    write_f32(hp.situ_linear_beta);
+    writer.u32(hp.rescale_every_n_layers);
+    writer.u32(hp.time_mix_extra_dim);
+    writer.u32(hp.time_decay_extra_dim);
+    writer.u32(hp.wkv_head_size);
+    writer.u32(hp.token_shift_count);
+    writer.u32(hp.n_lora_decay);
+    writer.u32(hp.n_lora_iclr);
+    writer.u32(hp.n_lora_value_res_mix);
+    writer.u32(hp.n_lora_gate);
+    writer.u32(hp.dflash_conv_kernel_size);
+    writer.u32(hp.dflash_conv_group_size);
+    writer.u32(hp.dflash_selector_rank);
+    writer.u32(hp.dflash_selector_top_k);
+    writer.u32(hp.dflash2_conv_kernel_size);
+    writer.u32(hp.dflash2_conv_group_size);
+    writer.u32(hp.dflash2_selector_rank);
+    writer.u32(hp.dflash2_selector_top_k);
+    writer.u32(hp.dflash_block_size);
+    writer.u32(hp.dflash_mask_token_id);
+    writer.u32(hp.dflash_n_target_features);
+    writer.u32(hp.dflash_n_target_layers);
+    for (uint32_t i = 0;
+            i < std::min<uint32_t>(hp.dflash_n_target_layers, 8); ++i) {
+        writer.u32(hp.dflash_target_layer_ids[i]);
+    }
+    write_f32(hp.f_clamp_kqv);
+    write_f32(hp.f_max_alibi_bias);
+    write_f32(hp.f_logit_scale);
+    write_f32(hp.f_residual_scale);
+    write_f32(hp.f_embedding_scale);
+    write_f32(hp.f_attention_scale);
+    write_f32(hp.f_attn_out_scale);
+    writer.u32(hp.attn_temp_length);
+    write_f32(hp.f_attn_value_scale);
+    writer.u32(hp.causal_attn ? 1u : 0u);
+    writer.u32(hp.use_alibi ? 1u : 0u);
+    writer.u32(hp.attn_soft_cap ? 1u : 0u);
+    writer.u32(hp.use_kq_norm ? 1u : 0u);
+    writer.u32(hp.n_cls_out);
+    writer.u32(hp.n_embd_inp_enc());
+    writer.u32(hp.n_moe_layer_step);
+    writer.u32(hp.n_no_rope_layer_step);
+    writer.u32(hp.n_attn_temp_floor_scale);
+    write_f32(hp.f_attn_temp_scale);
+    write_f32(hp.f_attn_temp_offset);
+    writer.u32(hp.n_altup);
+    writer.u32(hp.i_altup_act);
+    writer.u32(hp.laurel_rank);
+    writer.u32(hp.n_embd_altup);
+    writer.u32(hp.dense_2_feat_in);
+    writer.u32(hp.dense_2_feat_out);
+    writer.u32(hp.dense_3_feat_in);
+    writer.u32(hp.dense_3_feat_out);
+    writer.u32(hp.indexer_n_head);
+    writer.u32(hp.indexer_head_size);
+    writer.u32(hp.indexer_top_k);
+    writer.u32(hp.indexer_block_size);
+    writer.u32(hp.indexer_local_blocks);
+    writer.u32(hp.dsv4_o_group_count);
+    writer.u32(hp.dsv4_o_lora_rank);
+    writer.u32(hp.dsv4_hc_mult);
+    writer.u32(hp.dsv4_hc_sinkhorn_iters);
+    writer.u32(hp.dsv4_hash_layer_count);
+    write_f32(hp.dsv4_compress_rope_base);
+    write_f32(hp.dsv4_hc_eps);
+    writer.u32(hp.hc_low_rank);
+    writer.u32(hp.ple_ngram_size);
+    writer.u32(hp.ple_heads_per_ngram);
+    writer.u32(hp.ple_conv_kernel);
+    writer.u32(hp.ple_n_heads);
+    writer.u32(hp.ple_head_dim);
+    writer.u32(hp.ple_eos_token_id);
+    writer.u32(hp.ple_image_token_id);
+    for (uint32_t i = 0;
+            i < std::min<uint32_t>(hp.ple_ngram_size, LLAMA_MAX_PLE_NGRAM); ++i) {
+        writer.u64(hp.ple_layer_multipliers[i]);
+    }
+    for (uint32_t i = 0;
+            i < std::min<uint32_t>(hp.ple_n_heads, LLAMA_MAX_PLE_HEADS); ++i) {
+        writer.u32(hp.ple_head_offsets[i]);
+        writer.u32(hp.ple_head_vocab_sizes[i]);
+    }
+    writer.u32(hp.n_deepstack_layers);
+    writer.u32(hp.n_embd_per_layer);
+    writer.u32(uint32_t(hp.dec_start_token_id));
+    writer.u32(hp.dec_n_layer);
+    writer.u32(uint32_t(hp.pooling_type));
+    writer.u32(uint32_t(hp.llm_ffn_op));
+    for (uint32_t il = 0; il < hp.n_layer_all; ++il) {
+        writer.u32(hp.is_recr(il) ? 1u : 0u);
+        writer.u32(hp.is_swa(il) ? 1u : 0u);
+        writer.u32(hp.is_indexer_full(il) ? 1u : 0u);
+        writer.u32(hp.rope_pattern[il]);
+        writer.u32(hp.n_head(il));
+        writer.u32(hp.n_head_kv(il));
+        writer.u32(hp.n_ff(il));
+        writer.u32(hp.n_embd_head_k(il));
+        writer.u32(hp.n_embd_head_v(il));
+        writer.u32(hp.n_embd_k_gqa(il));
+        writer.u32(hp.n_embd_v_gqa(il));
+        write_f32(hp.xielu_alpha_n[il]);
+        write_f32(hp.xielu_alpha_p[il]);
+        write_f32(hp.xielu_beta[il]);
+        write_f32(hp.xielu_eps[il]);
+        write_f32(hp.swiglu_clamp_exp[il]);
+        write_f32(hp.swiglu_clamp_shexp[il]);
+        writer.u32(hp.dsv4_compress_ratios[il]);
+        writer.u32(uint32_t(hp.deepstack_mapping_arr[il]));
+        writer.u32(hp.is_ple(il) ? 1u : 0u);
+    }
+    const auto & vocab = model->vocab;
+    if (vocab.get_type() == LLAMA_VOCAB_TYPE_NONE) {
+        return false;
+    }
+    writer.u32(uint32_t(vocab.get_type()));
+    writer.u32(uint32_t(vocab.get_pre_type()));
+    writer.u32(vocab.n_tokens());
+    writer.u32(vocab.n_token_types());
+    const auto tokenizer_model = vocab.get_tokenizer_model();
+    const auto tokenizer_pre = vocab.get_tokenizer_pre();
+    writer.string(tokenizer_model.data(), tokenizer_model.size());
+    writer.string(tokenizer_pre.data(), tokenizer_pre.size());
+    for (uint32_t id = 0; id < vocab.n_tokens(); ++id) {
+        const auto & token = vocab.get_token_data(llama_token(id));
+        writer.string(token.text.data(), token.text.size());
+        uint32_t score_bits = 0;
+        static_assert(sizeof(score_bits) == sizeof(token.score));
+        memcpy(&score_bits, &token.score, sizeof(score_bits));
+        writer.u32(score_bits);
+        writer.u32(uint32_t(token.attr));
+    }
+    for (const llama_token token : {
+            vocab.token_bos(), vocab.token_eos(), vocab.token_eot(),
+            vocab.token_eom(), vocab.token_unk(), vocab.token_sep(),
+            vocab.token_nl(), vocab.token_pad(), vocab.token_mask() }) {
+        writer.u32(uint32_t(token));
+    }
+    writer.u32(vocab.get_add_space_prefix() ? 1u : 0u);
+    writer.u32(vocab.get_add_bos() ? 1u : 0u);
+    writer.u32(vocab.get_add_eos() ? 1u : 0u);
+    writer.u32(vocab.get_ignore_merges() ? 1u : 0u);
+    writer.u32(vocab.get_clean_spaces() ? 1u : 0u);
+    writer.u32(vocab.get_remove_extra_whitespaces() ? 1u : 0u);
+    writer.u32(vocab.get_escape_whitespaces() ? 1u : 0u);
+    writer.u32(vocab.get_treat_whitespace_as_suffix() ? 1u : 0u);
+    const auto & normalizer = vocab.get_normalizer_opts();
+    writer.u32(normalizer.lowercase ? 1u : 0u);
+    writer.u32(normalizer.strip_accents ? 1u : 0u);
+    const auto & suppressed = vocab.get_suppress_tokens();
+    writer.u64(suppressed.size());
+    for (const llama_token token : suppressed) {
+        writer.u32(uint32_t(token));
+    }
+    const auto merges = vocab.get_bpe_merges();
+    writer.u64(merges.size());
+    for (const auto & merge : merges) {
+        writer.string(merge.data(), merge.size());
+    }
+    const auto charsmap = vocab.get_precompiled_charsmap();
+    writer.string(charsmap.data(), charsmap.size());
+    writer.u32(uint32_t(vocab.max_token_len()));
+    const auto value = writer.finish();
+    memcpy(digest, value.data(), value.size());
+    return true;
+}
+
 const char * llama_model_chat_template(const llama_model * model, const char * name) {
     const auto key = name ? LLM_KV(model->arch, name)(LLM_KV_TOKENIZER_CHAT_TEMPLATE)
         : LLM_KV(model->arch)(LLM_KV_TOKENIZER_CHAT_TEMPLATE);
@@ -3503,7 +3785,16 @@ ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std:
 }
 
 void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_, int64_t n_ff_, int64_t n_expert_, int flags) {
-    layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", bid), {n_embd_, n_ff_ * 2, n_expert_}, TENSOR_NOT_REQUIRED);
+    if (flags & TENSOR_SKIP) {
+        const int skip = flags | TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL;
+        create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", bid), {n_embd_, n_ff_ * 2, n_expert_}, skip);
+        create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS,    "weight", bid), {n_embd_, n_ff_,     n_expert_}, skip);
+        create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,      "weight", bid), {n_embd_, n_ff_,     n_expert_}, skip);
+        return;
+    }
+
+    layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", bid),
+            {n_embd_, n_ff_ * 2, n_expert_}, TENSOR_NOT_REQUIRED);
     if (layer.ffn_gate_up_exps == nullptr) {
         layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
         layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);

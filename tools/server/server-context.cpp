@@ -27,7 +27,9 @@
 #include "../../src/llama-ext.h" // llama_vram_mark_serviced (fork ext API; fit.cpp precedent)
 #include "../../src/llama-context.h"
 #include "../../src/llama-io.h"
+#include "../../src/llama-memory-hybrid-idx.h"
 #include "../../src/llama-sha256.h"
+#include "../../src/llama-vbr-qsa-index.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -39,11 +41,13 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <cinttypes>
 #include <cstdint>
+#include <cstdio>
 #include <exception>
 #include <functional>
 #include <iterator>
@@ -77,6 +81,691 @@ static json server_json_from_ordered(nlohmann::ordered_json value) {
 static nlohmann::ordered_json server_ordered_from_json(const json & value) {
     return nlohmann::ordered_json::parse(value.dump());
 }
+
+namespace {
+
+class server_fixed_io_writer final : public llama_io_write_i {
+  public:
+    server_fixed_io_writer(uint8_t * data, size_t capacity) noexcept
+        : data_(data), capacity_(capacity) {}
+
+    void write(const void * source, size_t size) override {
+        if (!source || !reserve(size)) {
+            valid_ = false;
+            return;
+        }
+        std::memcpy(data_ + offset_, source, size);
+        offset_ += size;
+    }
+
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        if (!tensor || !reserve(size)) {
+            valid_ = false;
+            return;
+        }
+        ggml_backend_tensor_get(tensor, data_ + offset_, offset, size);
+        offset_ += size;
+    }
+
+    size_t n_bytes() override { return offset_; }
+    bool complete() const noexcept { return valid_ && offset_ == capacity_; }
+
+  private:
+    bool reserve(size_t size) const noexcept {
+        return valid_ && size <= capacity_ - offset_;
+    }
+
+    uint8_t * data_ = nullptr;
+    size_t capacity_ = 0;
+    size_t offset_ = 0;
+    bool valid_ = true;
+};
+
+enum class server_context_shift_capability_status {
+    enabled,
+    request_disabled,
+    target_unsupported,
+    draft_unsupported,
+};
+
+struct server_context_shift_capability {
+    server_context_shift_capability_status status =
+        server_context_shift_capability_status::request_disabled;
+    bool enabled = false;
+    bool shift_draft = false;
+};
+
+server_context_shift_capability server_context_shift_capability_resolve(
+        bool requested,
+        bool target_can_shift,
+        bool draft_present,
+        bool draft_can_shift) noexcept {
+    if (!requested) {
+        return {};
+    }
+    if (!target_can_shift) {
+        return { server_context_shift_capability_status::target_unsupported, false, false };
+    }
+    if (draft_present && !draft_can_shift) {
+        return { server_context_shift_capability_status::draft_unsupported, false, false };
+    }
+    return { server_context_shift_capability_status::enabled, true, draft_present };
+}
+
+constexpr char SERVER_SLOT_ENVELOPE_MAGIC[8] = {
+    'B', 'U', 'U', 'N', 'S', 'L', 'O', 'T',
+};
+constexpr uint32_t SERVER_SLOT_ENVELOPE_VERSION = 2;
+constexpr size_t SERVER_SLOT_ENVELOPE_HEADER_SIZE = 224;
+constexpr uint32_t SERVER_SLOT_ENVELOPE_HAS_LOGITS = 1u << 0;
+constexpr uint32_t SERVER_SLOT_ENVELOPE_RUNTIME_FAMILY_BOUND = 1u << 1;
+
+enum class server_slot_frontier_logits_status {
+    loaded,
+    not_present,
+    legacy_cold,
+    io_error,
+    format_mismatch,
+    model_family_mismatch,
+    adapter_mismatch,
+    token_count_mismatch,
+    next_position_mismatch,
+    token_digest_mismatch,
+    vocabulary_mismatch,
+    serialized_payload_mismatch,
+    payload_mismatch,
+    logits_digest_mismatch,
+};
+
+const char * server_slot_frontier_logits_status_name(
+        server_slot_frontier_logits_status status) noexcept {
+    switch (status) {
+        case server_slot_frontier_logits_status::loaded:
+            return "loaded";
+        case server_slot_frontier_logits_status::not_present:
+            return "not_present";
+        case server_slot_frontier_logits_status::legacy_cold:
+            return "legacy_cold";
+        case server_slot_frontier_logits_status::io_error:
+            return "io_error";
+        case server_slot_frontier_logits_status::format_mismatch:
+            return "format_mismatch";
+        case server_slot_frontier_logits_status::model_family_mismatch:
+            return "model_family_mismatch";
+        case server_slot_frontier_logits_status::adapter_mismatch:
+            return "adapter_mismatch";
+        case server_slot_frontier_logits_status::token_count_mismatch:
+            return "token_count_mismatch";
+        case server_slot_frontier_logits_status::next_position_mismatch:
+            return "next_position_mismatch";
+        case server_slot_frontier_logits_status::token_digest_mismatch:
+            return "token_digest_mismatch";
+        case server_slot_frontier_logits_status::vocabulary_mismatch:
+            return "vocabulary_mismatch";
+        case server_slot_frontier_logits_status::serialized_payload_mismatch:
+            return "serialized_payload_mismatch";
+        case server_slot_frontier_logits_status::payload_mismatch:
+            return "payload_mismatch";
+        case server_slot_frontier_logits_status::logits_digest_mismatch:
+            return "logits_digest_mismatch";
+    }
+    return "unknown";
+}
+
+std::array<uint8_t, 32> server_slot_frontier_tagged_digest(
+        const char * domain,
+        const void * data,
+        size_t size) {
+    llama_sha256_writer writer;
+    writer.string(domain, std::strlen(domain));
+    writer.string(data, size);
+    return writer.finish();
+}
+
+std::array<uint8_t, 32> server_slot_frontier_string_digest(
+        const char * domain,
+        const std::string & value) {
+    return server_slot_frontier_tagged_digest(
+        domain, value.data(), value.size());
+}
+
+std::array<uint8_t, 32> server_slot_frontier_logits_digest(
+        const std::vector<float> & logits) {
+    return server_slot_frontier_tagged_digest(
+        "buun.server.slot-frontier-logits/v1",
+        logits.data(), logits.size()*sizeof(float));
+}
+
+struct server_slot_runtime_identity {
+    std::array<uint8_t, 32> digest = {};
+    // Capability policy, not weight identity: "exact" slot continuation is
+    // exact only within this semantic-family + runtime configuration contract.
+    bool family_compatible = false;
+};
+
+struct server_slot_runtime_geometry {
+    uint32_t n_ctx = 0;
+    uint32_t n_ctx_seq = 0;
+    uint32_t n_ctx_orig_yarn = 0;
+};
+
+server_slot_runtime_geometry server_slot_runtime_geometry_from_owner(
+        uint32_t actual_n_ctx,
+        uint32_t actual_n_ctx_seq,
+        const common_params & params,
+        uint32_t model_n_ctx_train,
+        uint32_t model_n_ctx_orig_yarn) noexcept {
+    return {
+        actual_n_ctx,
+        actual_n_ctx_seq,
+        params.yarn_orig_ctx != 0 ? uint32_t(params.yarn_orig_ctx) :
+            model_n_ctx_orig_yarn != 0 ? model_n_ctx_orig_yarn :
+                                         model_n_ctx_train,
+    };
+}
+
+server_slot_runtime_identity server_slot_runtime_identity_from_owner_receipts(
+        const std::array<uint8_t, 32> & model_digest,
+        bool model_digest_valid,
+        const llama_model * model,
+        const common_params & params,
+        server_slot_runtime_geometry runtime_geometry) {
+    llama_sha256_writer writer;
+    static constexpr char domain[] =
+        "buun.server.slot-file-runtime-identity/v2";
+    writer.string(domain, sizeof(domain) - 1);
+    const char * commit = llama_commit();
+    writer.string(commit, std::strlen(commit));
+    bool family_compatible = model_digest_valid;
+    writer.u32(family_compatible ? 1u : 0u);
+    writer.bytes(model_digest.data(), model_digest.size());
+    const bool has_mmproj = !params.no_mmproj && !params.mmproj.path.empty();
+    writer.u32(has_mmproj ? 1u : 0u);
+    // The multimodal projector has no semantic-family receipt yet.
+    // Media slot files retain their existing cold semantic restore, but can
+    // never acquire the exact frontier-logits capability from a path hash.
+    if (has_mmproj) {
+        family_compatible = false;
+    }
+    writer.u32(uint32_t(params.control_vectors.size()));
+    if (!params.control_vectors.empty()) {
+        family_compatible = family_compatible &&
+            params.control_vector_applied_digest_valid;
+        writer.bytes(params.control_vector_applied_digest.data(),
+                     params.control_vector_applied_digest.size());
+    }
+    writer.u32(uint32_t(params.control_vector_layer_start));
+    writer.u32(uint32_t(params.control_vector_layer_end));
+    // LoRA authority is intentionally not duplicated here.  The loaded
+    // adapter registry can change through POST /lora-adapters; each envelope
+    // binds the canonical per-slot lora_config_identity(), which already owns
+    // loaded adapter content identity and scale at save/restore time.
+    writer.u32(model ? uint32_t(llama_vocab_n_tokens(
+        llama_model_get_vocab(model))) : 0);
+    const auto write_f32 = [&](float value) {
+        uint32_t bits = 0;
+        static_assert(sizeof(bits) == sizeof(value));
+        std::memcpy(&bits, &value, sizeof(bits));
+        writer.u32(bits);
+    };
+    writer.u32(runtime_geometry.n_ctx);
+    writer.u32(runtime_geometry.n_ctx_seq);
+    writer.u32(uint32_t(params.grp_attn_n));
+    writer.u32(uint32_t(params.grp_attn_w));
+    writer.u32(uint32_t(params.rope_scaling_type));
+    write_f32(params.rope_freq_base);
+    write_f32(params.rope_freq_scale);
+    write_f32(params.yarn_ext_factor);
+    write_f32(params.yarn_attn_factor);
+    write_f32(params.yarn_beta_fast);
+    write_f32(params.yarn_beta_slow);
+    writer.u32(runtime_geometry.n_ctx_orig_yarn);
+    writer.u32(uint32_t(params.cache_type_k));
+    writer.u32(uint32_t(params.cache_type_v));
+    writer.u32(uint32_t(params.flash_attn_type));
+    writer.u32(params.no_fused_gdn ? 1u : 0u);
+    writer.u32(params.swa_full ? 1u : 0u);
+    writer.u32(params.kv_unified ? 1u : 0u);
+    writer.u32(params.logits_all ? 1u : 0u);
+    return { writer.finish(), family_compatible };
+}
+
+server_slot_runtime_identity server_slot_file_runtime_identity_build(
+        const llama_model * model,
+        const llama_context * ctx,
+        const common_params & params) {
+    std::array<uint8_t, 32> model_digest = {};
+    const bool valid = model && llama_model_semantic_family_digest(
+        model, model_digest.data());
+    const uint32_t n_ctx_train = model
+        ? uint32_t(llama_model_n_ctx_train(model)) : 0;
+    const uint32_t n_ctx_orig_yarn = model
+        ? uint32_t(llama_model_n_ctx_orig_yarn(model)) : 0;
+    return server_slot_runtime_identity_from_owner_receipts(
+        model_digest, valid, model, params,
+        server_slot_runtime_geometry_from_owner(
+            ctx ? llama_n_ctx(ctx) : 0,
+            ctx ? llama_n_ctx_seq(ctx) : 0,
+            params, n_ctx_train, n_ctx_orig_yarn));
+}
+
+void server_slot_store_le_u32(std::vector<char> & out, uint32_t value) {
+    for (size_t i = 0; i < 4; ++i) {
+        out.push_back(char(uint8_t(value >> (8*i))));
+    }
+}
+
+void server_slot_store_le_u64(std::vector<char> & out, uint64_t value) {
+    for (size_t i = 0; i < 8; ++i) {
+        out.push_back(char(uint8_t(value >> (8*i))));
+    }
+}
+
+bool server_slot_load_le_u32(
+        const char * data, size_t size, size_t & offset,
+        uint32_t & value) noexcept {
+    if (offset + 4 > size) {
+        return false;
+    }
+    value = 0;
+    for (size_t i = 0; i < 4; ++i) {
+        value |= uint32_t(uint8_t(data[offset++])) << (8*i);
+    }
+    return true;
+}
+
+bool server_slot_load_le_u64(
+        const char * data, size_t size, size_t & offset,
+        uint64_t & value) noexcept {
+    if (offset + 8 > size) {
+        return false;
+    }
+    value = 0;
+    for (size_t i = 0; i < 8; ++i) {
+        value |= uint64_t(uint8_t(data[offset++])) << (8*i);
+    }
+    return true;
+}
+
+void server_slot_state_payload_checksum_update(
+        uint64_t & hash, const uint8_t * data, size_t size) noexcept {
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= data[i];
+        hash *= UINT64_C(1099511628211);
+    }
+}
+
+uint64_t server_slot_state_payload_checksum(
+        const uint8_t * data, size_t size) noexcept {
+    uint64_t hash = UINT64_C(14695981039346656037);
+    server_slot_state_payload_checksum_update(hash, data, size);
+    return hash;
+}
+
+struct server_slot_envelope {
+    server_slot_frontier_logits_status status =
+        server_slot_frontier_logits_status::format_mismatch;
+    std::vector<char> serialized_tokens;
+    std::vector<float> logits;
+    std::array<uint8_t, 32> token_digest = {};
+    uint64_t token_count = 0;
+    int64_t next_position = 0;
+};
+
+bool server_slot_envelope_build(
+        const std::vector<char> & serialized_tokens,
+        const server_slot_runtime_identity & runtime_identity,
+        const std::string & adapter_identity,
+        uint64_t token_count,
+        int64_t next_position,
+        const std::array<uint8_t, 32> & token_digest,
+        const std::vector<float> * logits,
+        std::vector<char> & output) noexcept {
+    output.clear();
+    try {
+        if (serialized_tokens.empty() || serialized_tokens.size() % 4 != 0 ||
+            serialized_tokens.size() > UINT64_MAX ||
+            (logits && (logits->empty() || logits->size() > UINT32_MAX ||
+                !std::all_of(logits->begin(), logits->end(),
+                    [](float value) { return std::isfinite(value); })))) {
+            return false;
+        }
+        const bool include_logits = logits && runtime_identity.family_compatible;
+        const uint64_t logits_bytes = include_logits
+            ? uint64_t(logits->size())*sizeof(float) : 0;
+        if (serialized_tokens.size() > SIZE_MAX - SERVER_SLOT_ENVELOPE_HEADER_SIZE ||
+            logits_bytes > SIZE_MAX - SERVER_SLOT_ENVELOPE_HEADER_SIZE -
+                serialized_tokens.size()) {
+            return false;
+        }
+        output.reserve(SERVER_SLOT_ENVELOPE_HEADER_SIZE +
+                       serialized_tokens.size() + size_t(logits_bytes));
+        output.insert(output.end(), std::begin(SERVER_SLOT_ENVELOPE_MAGIC),
+                      std::end(SERVER_SLOT_ENVELOPE_MAGIC));
+        server_slot_store_le_u32(output, SERVER_SLOT_ENVELOPE_VERSION);
+        server_slot_store_le_u32(output,
+                                 uint32_t(SERVER_SLOT_ENVELOPE_HEADER_SIZE));
+        uint32_t flags = runtime_identity.family_compatible
+            ? SERVER_SLOT_ENVELOPE_RUNTIME_FAMILY_BOUND : 0;
+        if (include_logits) {
+            flags |= SERVER_SLOT_ENVELOPE_HAS_LOGITS;
+        }
+        server_slot_store_le_u32(output, flags);
+        server_slot_store_le_u32(output, 0);
+        server_slot_store_le_u64(output, serialized_tokens.size());
+        server_slot_store_le_u64(output, token_count);
+        server_slot_store_le_u64(output, uint64_t(next_position));
+        server_slot_store_le_u32(output,
+            include_logits ? uint32_t(logits->size()) : 0);
+        server_slot_store_le_u32(output, 0);
+        const auto adapter_digest = server_slot_frontier_string_digest(
+            "buun.server.slot-frontier-adapter/v1", adapter_identity);
+        const auto serialized_digest = server_slot_frontier_tagged_digest(
+            "buun.server.slot-token-envelope/v2", serialized_tokens.data(),
+            serialized_tokens.size());
+        const auto logits_digest = include_logits
+            ? server_slot_frontier_logits_digest(*logits)
+            : std::array<uint8_t, 32> {};
+        for (const auto & digest : { runtime_identity.digest, adapter_digest,
+                token_digest, serialized_digest, logits_digest }) {
+            output.insert(output.end(),
+                          reinterpret_cast<const char *>(digest.data()),
+                          reinterpret_cast<const char *>(digest.data() + digest.size()));
+        }
+        server_slot_store_le_u64(output, logits_bytes);
+        GGML_ASSERT(output.size() == SERVER_SLOT_ENVELOPE_HEADER_SIZE);
+        output.insert(output.end(), serialized_tokens.begin(), serialized_tokens.end());
+        if (include_logits) {
+            const char * begin = reinterpret_cast<const char *>(logits->data());
+            output.insert(output.end(), begin, begin + logits_bytes);
+        }
+        return output.size() % sizeof(llama_token) == 0;
+    } catch (...) {
+        output.clear();
+        return false;
+    }
+}
+
+server_slot_envelope server_slot_envelope_parse_bytes(
+        const void * packed_data,
+        size_t packed_size,
+        const server_slot_runtime_identity & runtime_identity,
+        const std::string & adapter_identity,
+        uint32_t vocabulary_size) noexcept {
+    server_slot_envelope result;
+    try {
+        const char * data = reinterpret_cast<const char *>(packed_data);
+        const size_t size = packed_size;
+        if (size < sizeof(SERVER_SLOT_ENVELOPE_MAGIC) ||
+            std::memcmp(data, SERVER_SLOT_ENVELOPE_MAGIC,
+                        sizeof(SERVER_SLOT_ENVELOPE_MAGIC)) != 0) {
+            result.status = server_slot_frontier_logits_status::legacy_cold;
+            return result;
+        }
+        size_t offset = sizeof(SERVER_SLOT_ENVELOPE_MAGIC);
+        uint32_t version = 0;
+        uint32_t header_size = 0;
+        uint32_t flags = 0;
+        uint32_t reserved = 0;
+        uint64_t token_bytes = 0;
+        uint64_t next_position = 0;
+        uint32_t saved_vocab = 0;
+        uint32_t reserved2 = 0;
+        if (!server_slot_load_le_u32(data, size, offset, version) ||
+            !server_slot_load_le_u32(data, size, offset, header_size) ||
+            !server_slot_load_le_u32(data, size, offset, flags) ||
+            !server_slot_load_le_u32(data, size, offset, reserved) ||
+            !server_slot_load_le_u64(data, size, offset, token_bytes) ||
+            !server_slot_load_le_u64(data, size, offset, result.token_count) ||
+            !server_slot_load_le_u64(data, size, offset, next_position) ||
+            !server_slot_load_le_u32(data, size, offset, saved_vocab) ||
+            !server_slot_load_le_u32(data, size, offset, reserved2) ||
+            version != SERVER_SLOT_ENVELOPE_VERSION ||
+            header_size != SERVER_SLOT_ENVELOPE_HEADER_SIZE ||
+            reserved != 0 || reserved2 != 0 ||
+            (flags & ~(SERVER_SLOT_ENVELOPE_HAS_LOGITS |
+                       SERVER_SLOT_ENVELOPE_RUNTIME_FAMILY_BOUND)) != 0) {
+            return result;
+        }
+        std::array<uint8_t, 32> saved_runtime = {};
+        std::array<uint8_t, 32> saved_adapter = {};
+        std::array<uint8_t, 32> saved_serialized = {};
+        std::array<uint8_t, 32> saved_logits = {};
+        for (auto * digest : { &saved_runtime, &saved_adapter,
+                &result.token_digest, &saved_serialized, &saved_logits }) {
+            if (offset + digest->size() > size) {
+                return result;
+            }
+            std::memcpy(digest->data(), data + offset, digest->size());
+            offset += digest->size();
+        }
+        uint64_t logits_bytes = 0;
+        if (!server_slot_load_le_u64(data, size, offset, logits_bytes) ||
+            offset != SERVER_SLOT_ENVELOPE_HEADER_SIZE ||
+            token_bytes == 0 || token_bytes % 4 != 0 ||
+            token_bytes > size - offset || logits_bytes > size - offset - token_bytes ||
+            offset + token_bytes + logits_bytes != size) {
+            return result;
+        }
+        if (saved_runtime != runtime_identity.digest) {
+            result.status = server_slot_frontier_logits_status::model_family_mismatch;
+            return result;
+        }
+        if (saved_adapter != server_slot_frontier_string_digest(
+                "buun.server.slot-frontier-adapter/v1", adapter_identity)) {
+            result.status = server_slot_frontier_logits_status::adapter_mismatch;
+            return result;
+        }
+        result.next_position = int64_t(next_position);
+        result.serialized_tokens.assign(data + offset, data + offset + token_bytes);
+        if (saved_serialized != server_slot_frontier_tagged_digest(
+                "buun.server.slot-token-envelope/v2",
+                result.serialized_tokens.data(), result.serialized_tokens.size())) {
+            result.status =
+                server_slot_frontier_logits_status::serialized_payload_mismatch;
+            return result;
+        }
+        offset += token_bytes;
+        const bool has_logits = (flags & SERVER_SLOT_ENVELOPE_HAS_LOGITS) != 0;
+        if (!has_logits) {
+            if (logits_bytes != 0 || saved_vocab != 0 ||
+                saved_logits != std::array<uint8_t, 32> {}) {
+                result.status = server_slot_frontier_logits_status::payload_mismatch;
+                return result;
+            }
+            result.status = server_slot_frontier_logits_status::not_present;
+            return result;
+        }
+        if ((flags & SERVER_SLOT_ENVELOPE_RUNTIME_FAMILY_BOUND) == 0 ||
+            !runtime_identity.family_compatible || saved_vocab != vocabulary_size) {
+            result.status = saved_vocab != vocabulary_size
+                ? server_slot_frontier_logits_status::vocabulary_mismatch
+                : server_slot_frontier_logits_status::not_present;
+            return result;
+        }
+        if (logits_bytes != uint64_t(saved_vocab)*sizeof(float)) {
+            result.status = server_slot_frontier_logits_status::payload_mismatch;
+            return result;
+        }
+        result.logits.resize(saved_vocab);
+        std::memcpy(result.logits.data(), data + offset, size_t(logits_bytes));
+        if (saved_logits != server_slot_frontier_logits_digest(result.logits)) {
+            result.status = server_slot_frontier_logits_status::logits_digest_mismatch;
+            return result;
+        }
+        if (!std::all_of(result.logits.begin(), result.logits.end(),
+                [](float value) { return std::isfinite(value); })) {
+            result.status = server_slot_frontier_logits_status::payload_mismatch;
+            return result;
+        }
+        result.status = server_slot_frontier_logits_status::loaded;
+        return result;
+    } catch (...) {
+        result = {};
+        result.status = server_slot_frontier_logits_status::io_error;
+        return result;
+    }
+}
+
+server_slot_envelope server_slot_envelope_parse(
+        const llama_tokens & packed,
+        const server_slot_runtime_identity & runtime_identity,
+        const std::string & adapter_identity,
+        uint32_t vocabulary_size) noexcept {
+    return server_slot_envelope_parse_bytes(
+        packed.data(), packed.size()*sizeof(llama_token), runtime_identity,
+        adapter_identity, vocabulary_size);
+}
+
+server_slot_frontier_logits_status server_slot_envelope_token_binding_status(
+        const server_slot_envelope & envelope,
+        uint64_t token_count,
+        int64_t next_position,
+        const std::array<uint8_t, 32> & token_digest) noexcept {
+    if (envelope.status != server_slot_frontier_logits_status::loaded) {
+        return envelope.status;
+    }
+    if (envelope.token_count != token_count) {
+        return server_slot_frontier_logits_status::token_count_mismatch;
+    }
+    if (envelope.next_position != next_position) {
+        return server_slot_frontier_logits_status::next_position_mismatch;
+    }
+    if (envelope.token_digest != token_digest) {
+        return server_slot_frontier_logits_status::token_digest_mismatch;
+    }
+    return server_slot_frontier_logits_status::loaded;
+}
+
+struct server_slot_exact_prompt_action {
+    bool use_frontier_logits = false;
+    size_t reusable_tokens = 0;
+};
+
+struct server_frontier_logits_state {
+    std::vector<float> values;
+    std::array<uint8_t, 32> token_digest = {};
+    uint64_t sequence_epoch = 0;
+    bool pending = false;
+
+    server_frontier_logits_state() noexcept : values() {}
+
+    void clear() noexcept {
+        std::vector<float>().swap(values);
+        token_digest = {};
+        sequence_epoch = 0;
+        pending = false;
+    }
+
+    void install(
+            std::vector<float> && source,
+            const std::array<uint8_t, 32> & digest,
+            uint64_t epoch) noexcept {
+        values = std::move(source);
+        token_digest = digest;
+        sequence_epoch = epoch;
+        pending = false;
+    }
+
+    bool matches(
+            const server_tokens & tokens,
+            uint64_t epoch,
+            size_t vocabulary_size) const noexcept {
+        if (tokens.empty() || tokens.has_media() || values.size() != vocabulary_size ||
+            sequence_epoch != epoch) {
+            return false;
+        }
+        std::array<uint8_t, 32> digest = {};
+        return tokens.retention_token_digest(digest) && digest == token_digest;
+    }
+};
+
+enum class server_slot_frontier_prepare_status {
+    captured_existing,
+    aligned_without_logits,
+    completed_tail,
+    media_unsupported,
+    frontier_gap,
+    decode_rolled_back,
+    decode_partially_committed,
+    capture_failed,
+};
+
+const char * server_slot_frontier_prepare_status_name(
+        server_slot_frontier_prepare_status status) noexcept {
+    switch (status) {
+        case server_slot_frontier_prepare_status::captured_existing:
+            return "captured_existing";
+        case server_slot_frontier_prepare_status::aligned_without_logits:
+            return "aligned_without_logits";
+        case server_slot_frontier_prepare_status::completed_tail:
+            return "completed_tail";
+        case server_slot_frontier_prepare_status::media_unsupported:
+            return "media_unsupported";
+        case server_slot_frontier_prepare_status::frontier_gap:
+            return "frontier_gap";
+        case server_slot_frontier_prepare_status::decode_rolled_back:
+            return "decode_rolled_back";
+        case server_slot_frontier_prepare_status::decode_partially_committed:
+            return "decode_partially_committed";
+        case server_slot_frontier_prepare_status::capture_failed:
+            return "capture_failed";
+    }
+    return "unknown";
+}
+
+bool server_slot_frontier_prepare_requires_reset(
+        server_slot_frontier_prepare_status status,
+        bool physically_aligned) noexcept {
+    return status == server_slot_frontier_prepare_status::decode_partially_committed ||
+        status == server_slot_frontier_prepare_status::frontier_gap ||
+        (status == server_slot_frontier_prepare_status::capture_failed &&
+         !physically_aligned);
+}
+
+enum class server_slot_frontier_geometry {
+    aligned_with_logits,
+    aligned_without_logits,
+    one_behind,
+    unsafe_gap,
+};
+
+server_slot_frontier_geometry server_slot_frontier_geometry_classify(
+        bool memory_available,
+        bool prompt_nonempty,
+        llama_pos live_pos_max,
+        llama_pos last_position,
+        llama_pos next_position,
+        bool logits_match) noexcept {
+    if (!memory_available || !prompt_nonempty) {
+        return server_slot_frontier_geometry::unsafe_gap;
+    }
+    if (live_pos_max + 1 == next_position) {
+        return logits_match
+            ? server_slot_frontier_geometry::aligned_with_logits
+            : server_slot_frontier_geometry::aligned_without_logits;
+    }
+    if (live_pos_max >= 0 && last_position == live_pos_max + 1 &&
+            next_position == last_position + 1) {
+        return server_slot_frontier_geometry::one_behind;
+    }
+    return server_slot_frontier_geometry::unsafe_gap;
+}
+
+server_slot_exact_prompt_action server_slot_exact_prompt_action_resolve(
+        size_t prompt_tokens,
+        bool need_sampling,
+        bool diffusion_self_speculation,
+        bool frontier_logits_match) noexcept {
+    server_slot_exact_prompt_action result;
+    result.use_frontier_logits = prompt_tokens > 0 && need_sampling &&
+        !diffusion_self_speculation && frontier_logits_match;
+    result.reusable_tokens = prompt_tokens -
+        ((prompt_tokens > 0 && !result.use_frontier_logits) ? 1u : 0u);
+    return result;
+}
+
+} // namespace
 
 // A projector swap is a destructive two-phase transition: once armed, every
 // exit from the media interval must restore (or fail-closed disable) the draft
@@ -886,10 +1575,7 @@ struct server_slot {
     // Full raw vocabulary logits produced at the exact retained prompt
     // frontier. They are captured only at a successful generation stop and
     // travel as an authenticated VBR companion with the same token/KV image.
-    std::vector<float> vbr_frontier_logits;
-    std::array<uint8_t, 32> vbr_frontier_logits_token_digest = {};
-    uint64_t vbr_frontier_logits_sequence_epoch = 0;
-    bool vbr_frontier_logits_pending = false;
+    server_frontier_logits_state frontier_logits;
     std::string vbr_adapter_config_identity;
     bool vbr_adapter_config_identity_valid = false;
 
@@ -1236,38 +1922,47 @@ struct server_slot {
         vbr_reuse_capture_frontier = 0;
         vbr_idle_capture_source_reset();
         vbr_imported_complete_frontier = 0;
-        vbr_frontier_logits.clear();
-        vbr_frontier_logits_token_digest = {};
-        vbr_frontier_logits_sequence_epoch = 0;
-        vbr_frontier_logits_pending = false;
+        frontier_logits.clear();
     }
 
-    bool vbr_frontier_logits_matches() const noexcept {
+    bool frontier_logits_matches() const noexcept {
         try {
-            if (!ctx_tgt || prompt.n_tokens() <= 0 ||
-                prompt.tokens.has_media() ||
-                vbr_frontier_logits.size() != size_t(llama_vocab_n_tokens(
-                    llama_model_get_vocab(llama_get_model(ctx_tgt)))) ||
-                vbr_frontier_logits_sequence_epoch != prompt.sequence_epoch) {
-                return false;
-            }
-            std::array<uint8_t, 32> digest = {};
-            return prompt.tokens.retention_token_prefix_digest(
-                       size_t(prompt.n_tokens()), digest) &&
-                digest == vbr_frontier_logits_token_digest;
+            return ctx_tgt && frontier_logits.matches(
+                prompt.tokens, prompt.sequence_epoch,
+                size_t(llama_vocab_n_tokens(
+                    llama_model_get_vocab(llama_get_model(ctx_tgt)))));
         } catch (...) {
             return false;
         }
     }
 
-    bool vbr_capture_frontier_logits(int32_t output_index) noexcept {
+    bool capture_frontier_logits(
+            int32_t output_index, bool synchronize) noexcept {
         try {
-            llama_synchronize(ctx_tgt);
+            if (synchronize) {
+                llama_synchronize(ctx_tgt);
+            }
             const int32_t n_vocab = llama_vocab_n_tokens(
                 llama_model_get_vocab(llama_get_model(ctx_tgt)));
-            const float * logits = llama_get_logits_ith(ctx_tgt, output_index);
-            if (n_vocab <= 0 || !logits ||
-                prompt.n_tokens() <= 0 || prompt.tokens.has_media()) {
+            llama_memory_i * memory = llama_get_memory(ctx_tgt);
+            const llama_pos live_pos_max = memory
+                ? memory->seq_pos_max(id) : -1;
+            const llama_pos token_pos_next = prompt.tokens.pos_next();
+            if (n_vocab <= 0 || prompt.n_tokens() <= 0 ||
+                prompt.tokens.has_media() || live_pos_max < 0 ||
+                live_pos_max + 1 != token_pos_next) {
+                return false;
+            }
+            // The public getter may prefer a backend-sampled/top-k row whose
+            // valid prefix is smaller than n_vocab.  Persistent frontier
+            // authority must always copy the full raw pre-sampler row.
+            if (ctx_tgt->get_sampled_logits_ith(output_index) != nullptr) {
+                SLT_DBG(*this, "%s",
+                    "frontier logits unavailable: backend-sampled row is not raw authority\n");
+                return false;
+            }
+            const float * logits = ctx_tgt->get_logits_ith(output_index);
+            if (!logits) {
                 SLT_DBG(*this,
                         "frontier logits unavailable: vocab=%d raw=%d prompt=%d media=%d\n",
                         n_vocab, logits != nullptr,
@@ -1275,49 +1970,57 @@ struct server_slot {
                 return false;
             }
             std::array<uint8_t, 32> digest = {};
-            if (!prompt.tokens.retention_token_prefix_digest(
-                    size_t(prompt.n_tokens()), digest)) {
+            if (!prompt.tokens.retention_token_digest(digest)) {
                 return false;
             }
             std::vector<float> captured((size_t(n_vocab)));
             std::memcpy(captured.data(), logits,
                         captured.size()*sizeof(float));
-            vbr_frontier_logits.swap(captured);
-            vbr_frontier_logits_token_digest = digest;
-            vbr_frontier_logits_sequence_epoch = prompt.sequence_epoch;
+            if (!std::all_of(captured.begin(), captured.end(),
+                    [](float value) { return std::isfinite(value); })) {
+                return false;
+            }
+            frontier_logits.install(
+                std::move(captured), digest, prompt.sequence_epoch);
             return true;
         } catch (...) {
-            vbr_frontier_logits.clear();
-            vbr_frontier_logits_token_digest = {};
-            vbr_frontier_logits_sequence_epoch = 0;
+            frontier_logits.clear();
             return false;
         }
     }
 
-    void vbr_bind_frontier_logits_to_prompt() noexcept {
-        if (vbr_frontier_logits.empty()) {
+    bool capture_synchronized_frontier_logits(
+            int32_t output_index) noexcept {
+        return capture_frontier_logits(output_index, false);
+    }
+
+    void install_frontier_logits(
+            std::vector<float> && logits,
+            const std::array<uint8_t, 32> & token_digest,
+            uint64_t destination_sequence_epoch) noexcept {
+        GGML_ASSERT(destination_sequence_epoch != 0 && !logits.empty());
+        frontier_logits.install(
+            std::move(logits), token_digest, destination_sequence_epoch);
+    }
+
+    void bind_frontier_logits_to_prompt() noexcept {
+        if (frontier_logits.values.empty()) {
             return;
         }
         try {
             std::array<uint8_t, 32> digest = {};
-            if (prompt.tokens.retention_token_prefix_digest(
-                    size_t(prompt.n_tokens()), digest)) {
-                vbr_frontier_logits_token_digest = digest;
-                vbr_frontier_logits_sequence_epoch = prompt.sequence_epoch;
+            if (prompt.tokens.retention_token_digest(digest)) {
+                frontier_logits.token_digest = digest;
+                frontier_logits.sequence_epoch = prompt.sequence_epoch;
                 return;
             }
         } catch (...) {
         }
-        vbr_frontier_logits.clear();
-        vbr_frontier_logits_token_digest = {};
-        vbr_frontier_logits_sequence_epoch = 0;
+        frontier_logits.clear();
     }
 
-    void vbr_clear_frontier_logits() noexcept {
-        vbr_frontier_logits.clear();
-        vbr_frontier_logits_token_digest = {};
-        vbr_frontier_logits_sequence_epoch = 0;
-        vbr_frontier_logits_pending = false;
+    void clear_frontier_logits() noexcept {
+        frontier_logits.clear();
     }
 
     void prompt_clear_certified(
@@ -1525,6 +2228,7 @@ struct server_slot {
         }
         prompt.clear();
         cache_family = {};
+        frontier_logits.clear();
         if (clear_draft && ctx_dft) {
             ::server_cache_mandatory_recovery_reset_impl(ctx_dft, id, -1, -1);
         }
@@ -1782,7 +2486,7 @@ struct server_slot {
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
-        vbr_frontier_logits_pending = false;
+        frontier_logits.pending = false;
         if (retention_obs) {
             retention_obs->release_lineage_ticket(retention_reuse_source);
             retention_obs->release_lineage_ticket(retention_destination);
@@ -1998,9 +2702,7 @@ struct server_slot {
     void handle_last_sampled_token(server_batch & batch) {
         // Once the sampled token is decoded, the retained frontier advances
         // and the previous terminal-logit capability no longer names it.
-        vbr_frontier_logits.clear();
-        vbr_frontier_logits_token_digest = {};
-        vbr_frontier_logits_sequence_epoch = 0;
+        frontier_logits.clear();
         bool add_ok = true;
         if (spec_draft.empty()) {
             // no speculative decoding
@@ -2864,6 +3566,10 @@ private:
     // Checkpoints are never portable across this random model-instance key;
     // slot-file restore explicitly invalidates them below.
     std::string frontier_execution_identity;
+    // Stable across server restarts, unlike frontier_execution_identity.  It
+    // exists only when slot-file persistence is enabled and binds the optional
+    // logits companion to the exact model/execution configuration.
+    server_slot_runtime_identity slot_file_runtime_identity;
     uint64_t frontier_next_sequence_epoch = 1;
     uint64_t frontier_ratchet_threshold = 1024;
 
@@ -4424,6 +5130,104 @@ private:
         return prompt.sequence_epoch;
     }
 
+    bool slot_frontier_is_physically_aligned(
+            const server_slot & slot) const noexcept {
+        try {
+            llama_memory_i * memory = llama_get_memory(ctx_tgt);
+            return memory && !slot.prompt.tokens.empty() &&
+                memory->seq_pos_max(slot.id) + 1 ==
+                    slot.prompt.tokens.pos_next();
+        } catch (...) {
+            return false;
+        }
+    }
+
+    server_slot_frontier_prepare_status
+    prepare_slot_frontier_logits_for_save(server_slot & slot) noexcept {
+        bool target_decode_committed = false;
+        bool target_decode_started = false;
+        try {
+            if (slot.prompt.tokens.has_media()) {
+                return server_slot_frontier_prepare_status::media_unsupported;
+            }
+            llama_memory_i * memory = llama_get_memory(ctx_tgt);
+            if (!memory || slot.prompt.tokens.empty()) {
+                return server_slot_frontier_prepare_status::frontier_gap;
+            }
+            const llama_pos live_pos_max = memory->seq_pos_max(slot.id);
+            const llama_pos last_position = slot.prompt.tokens.pos_next(
+                int64_t(slot.prompt.tokens.size()) - 1);
+            const llama_pos next_position = slot.prompt.tokens.pos_next();
+            switch (server_slot_frontier_geometry_classify(
+                    true, true,
+                    live_pos_max, last_position, next_position,
+                    slot.frontier_logits_matches())) {
+                case server_slot_frontier_geometry::aligned_with_logits:
+                    return server_slot_frontier_prepare_status::captured_existing;
+                case server_slot_frontier_geometry::aligned_without_logits:
+                    return server_slot_frontier_prepare_status::aligned_without_logits;
+                case server_slot_frontier_geometry::unsafe_gap:
+                    return server_slot_frontier_prepare_status::frontier_gap;
+                case server_slot_frontier_geometry::one_behind:
+                    break;
+            }
+
+            // Any older row describes the pre-tail frontier.  Clear it before
+            // the fallible completion so a post-decode capture refusal can
+            // only produce a cold companion-free save.
+            slot.frontier_logits.clear();
+
+            // Slot actions run on the scheduler between decode cycles.  Finish
+            // exactly the already-published, one-token-behind ledger frontier
+            // in the target only; this is explicit slot-save work and never
+            // touches the ordinary request path or its timing counters.
+            struct batch_guard {
+                llama_batch value = llama_batch_init(1, 0, 1);
+                ~batch_guard() { llama_batch_free(value); }
+            } tail;
+            common_batch_add(
+                tail.value,
+                slot.prompt.tokens[slot.prompt.tokens.size() - 1],
+                last_position, { slot.id }, true);
+            if (params_base.speculative.type() ==
+                    COMMON_SPECULATIVE_TYPE_DFLASH) {
+                llama_dflash_set_active_slot(ctx_tgt, slot.id);
+            }
+            llama_set_tape_recording(ctx_tgt, false);
+            target_decode_started = true;
+            const int decode_result =
+                server_fault("slot_frontier_logits_decode_partial") ? 2 :
+                server_fault("slot_frontier_logits_decode_fail") ? -1 :
+                llama_decode(ctx_tgt, tail.value);
+            if (decode_result != 0) {
+                return decode_result == 1 || decode_result == -1
+                    ? server_slot_frontier_prepare_status::decode_rolled_back
+                    : server_slot_frontier_prepare_status::decode_partially_committed;
+            }
+            llama_synchronize(ctx_tgt);
+            target_decode_committed = true;
+
+            // The target is now one token newer than every speculative side
+            // carrier.  Reuse the canonical transition so MTP carry, DFlash
+            // rings, and draft KV cannot claim the completed frontier.
+            common_speculative_sequence_transition(
+                slot.get_spec(), slot.id,
+                common_speculative_sequence_event::
+                    target_restored_without_draft);
+            (void) ensure_frontier_sequence_epoch(slot.prompt);
+            if (!slot.capture_synchronized_frontier_logits(0)) {
+                return server_slot_frontier_prepare_status::capture_failed;
+            }
+            return server_slot_frontier_prepare_status::completed_tail;
+        } catch (...) {
+            return target_decode_committed
+                ? server_slot_frontier_prepare_status::capture_failed
+                : target_decode_started
+                    ? server_slot_frontier_prepare_status::decode_partially_committed
+                    : server_slot_frontier_prepare_status::decode_rolled_back;
+        }
+    }
+
     static bool computation_frontiers_equal(
             const common_computation_frontier & a,
             const common_computation_frontier & b) {
@@ -4611,6 +5415,29 @@ private:
         return llama_init_from_model(model_tgt, cparams);
     }
 
+    bool recheck_context_shift_capability(
+            llama_context * draft_context,
+            const char * phase) {
+        const auto capability = server_context_shift_capability_resolve(
+            params_base.ctx_shift,
+            llama_memory_can_shift(llama_get_memory(ctx_tgt)),
+            draft_context != nullptr,
+            draft_context == nullptr ||
+                llama_memory_can_shift(llama_get_memory(draft_context)));
+        if (capability.enabled ||
+            capability.status == server_context_shift_capability_status::request_disabled) {
+            return capability.enabled;
+        }
+
+        params_base.ctx_shift = false;
+        if (capability.status == server_context_shift_capability_status::draft_unsupported) {
+            SRV_WRN("ctx_shift is not supported by the draft context (%s); it will be disabled\n", phase);
+        } else {
+            SRV_WRN("ctx_shift is not supported by the target context (%s); it will be disabled\n", phase);
+        }
+        return false;
+    }
+
     bool restore_external_draft() {
         if (!external_draft_reload_configured) {
             return false;
@@ -4640,6 +5467,10 @@ private:
             params_base.speculative.model_dft = nullptr;
             return false;
         }
+
+        // A reloaded external draft is a new memory owner. Never inherit an
+        // earlier context-shift capability decision across that replacement.
+        (void) recheck_context_shift_capability(ctx_dft.get(), "draft recreation");
 
         ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
         params_base.speculative.draft.ctx_tgt = ctx_tgt;
@@ -4753,6 +5584,7 @@ private:
                 // and its speculative owner or remain coherently target-only.
                 ctx_dft.reset(create_mtp_context());
                 if (ctx_dft) {
+                    (void) recheck_context_shift_capability(ctx_dft.get(), "MTP recreation");
                     ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
                     params_base.speculative.draft.ctx_tgt = ctx_tgt;
                     params_base.speculative.draft.ctx_dft = ctx_dft.get();
@@ -6385,16 +7217,14 @@ private:
             // share buffers with the target context (upstream #24922 family)
             params_base.speculative.cparams_dft.ctx_other = ctx_tgt;
 
-            // The shared draft-dflash/draft-dspark graphs also read the target's
-            // tok_embd/output — through the ctx_other fallback, which references the
-            // target tensors directly. A -sm layer target puts output.weight on the
-            // last GPU, and a drafter pinned elsewhere (--spec-draft-device) then
-            // aborts at sched split ("pre-allocated tensor in a buffer that cannot
-            // run the operation"). Route them through the same share/gather helper
-            // the fork DFlash type uses: it shares by pointer when the drafter can
-            // schedule the tensor (identical graphs to the ctx_other fallback) and
-            // gathers a drafter-device copy (one INFO log) when it cannot.
-            if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH ||
+            // Shared MTP and block-diffusion graphs consume the target's token
+            // embedding/output tensors. This is also required for an external MTP
+            // conversion head: its duplicate embedding/output are conversion aids,
+            // while the documented grafted-model contract uses the target tensors.
+            // Share by pointer when schedulable and gather a drafter-device copy when
+            // layer placement leaves the target tensor on a foreign device.
+            if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) ||
+                params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH ||
                 params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) ||
                 params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)) {
                 llama_model_share_tensors(model_dft.get(), llama_get_model(ctx_tgt));
@@ -6675,6 +7505,13 @@ private:
             ctx_dft.reset();
         }
 
+        // Target and draft memories participate in the same logical context
+        // shift. In particular, a generic M-RoPE draft cache cannot use the
+        // target's narrower Qwen4 text-range permission and would assert in
+        // seq_add(). Admit the feature only after the final startup draft owner
+        // is known; replacement owners are checked again at recreation time.
+        (void) recheck_context_shift_capability(ctx_dft.get(), "startup");
+
         if (!spec && params_base.speculative.has_synth()) {
             SRV_ERR("%s", "synthetic acceptance requires an initialized speculative decoding context\n");
             return false;
@@ -6910,6 +7747,15 @@ private:
                 params_base.n_ctx_checkpoints = 0;
                 SRV_WRN("%s\n", "context checkpoints are not supported by dynamic VBR on SWA models (the SWA attention KV is part of the checkpoint), they will be disabled");
             }
+        }
+
+        // Dynamic VBR may have disabled slot files above.  Hash model shards,
+        // controls, and LoRA sources only for an actually reachable slot-file
+        // endpoint; ordinary servers and the disabled path do no file IO.
+        if (!params_base.slot_save_path.empty()) {
+            slot_file_runtime_identity =
+                server_slot_file_runtime_identity_build(
+                    model_tgt, ctx_tgt, params_base);
         }
 
         if (params_base.cache_ram_mib != 0) {
@@ -9678,7 +10524,7 @@ private:
                 request.previously_observed = true;
                 request.draft_context = ctx_dft.get();
                 request.accelerator = slot.get_spec();
-                request.frontier_logits = &slot.vbr_frontier_logits;
+                request.frontier_logits = &slot.frontier_logits.values;
                 request.frontier_logits_count = uint32_t(
                     llama_vocab_n_tokens(vocab));
                 request.publish_context = &state;
@@ -9770,14 +10616,14 @@ private:
                 common_speculative_sequence_transition(
                     slot.get_spec(), slot.id, restore_event);
                 if (incoming_frontier_logits) {
-                    slot.vbr_bind_frontier_logits_to_prompt();
+                    slot.bind_frontier_logits_to_prompt();
                 } else {
-                    slot.vbr_clear_frontier_logits();
+                    slot.clear_frontier_logits();
                 }
                 SLT_DBG(slot,
                         "restored frontier logits: count=%zu authenticated=%d\n",
-                        slot.vbr_frontier_logits.size(),
-                        slot.vbr_frontier_logits_matches());
+                        slot.frontier_logits.values.size(),
+                        slot.frontier_logits_matches());
                 vbr_automatic_restore_succeeded++;
                 vbr_automatic_restore_occupied_succeeded++;
                 const uint64_t delivered_payload_bytes =
@@ -9821,7 +10667,28 @@ private:
                 return false;
             }
             memory = llama_get_memory(ctx_tgt);
-            if (!memory || !cache_plan_observe_live_memory(false)) {
+            if (!memory) {
+                return false;
+            }
+            // An explicitly erased construction-empty slot has already
+            // abandoned its old prompt lineage, but the physical memory tree
+            // is normally cleared later by the cold prompt path.  Artifact
+            // validation runs before that path and must not see stale
+            // recurrent/QSA companion state.  Clear this destination across
+            // every child now; failure remains a soft cold-replay fallback.
+            // Other unified-KV sequences are untouched.
+            if (construction_empty &&
+                !memory->seq_rm(slot.id, -1, -1)) {
+                return false;
+            }
+            if (construction_empty) {
+                // seq_rm drops membership immediately; dynamic VBR releases
+                // its now-phantom pool watermark at the idle boundary.  Run
+                // that boundary before snapshotting so the target is truly an
+                // empty import destination rather than merely cell-empty.
+                memory->breathe();
+            }
+            if (!cache_plan_observe_live_memory(false)) {
                 return false;
             }
             const bool target_ready =
@@ -9848,7 +10715,7 @@ private:
                 request.previously_observed = false;
                 request.draft_context = ctx_dft.get();
                 request.accelerator = slot.get_spec();
-                request.frontier_logits = &slot.vbr_frontier_logits;
+                request.frontier_logits = &slot.frontier_logits.values;
                 request.frontier_logits_count = uint32_t(
                     llama_vocab_n_tokens(vocab));
                 request.publish_context = &state;
@@ -9906,12 +10773,17 @@ private:
                 SLT_DBG(
                     slot,
                     "automatic VBR host restore refused: status=%s "
-                    "validation=%s schedule=%s decision=%s\n",
+                    "validation=%s schedule=%s decision=%s adopt=%s "
+                    "phase=%s units=%u companions=%u rollback=%llu\n",
                     server_vbr_artifact_import_status_name(imported.status),
                     vbr_manifest_validation_status_name(
                         imported.validation_status),
                     vbr_import_schedule_status_name(imported.schedule_status),
-                    vbr_import_decision_name(imported.decision));
+                    vbr_import_decision_name(imported.decision),
+                    vbr_adopt_status_name(imported.adopt_status),
+                    vbr_adopt_phase_name(imported.phase), imported.units,
+                    imported.companions,
+                    static_cast<unsigned long long>(imported.rollback_count));
                 return false;
             }
             GGML_ASSERT(state.published);
@@ -9930,11 +10802,11 @@ private:
             }
             common_speculative_sequence_transition(
                 slot.get_spec(), slot.id, restore_event);
-            slot.vbr_bind_frontier_logits_to_prompt();
+            slot.bind_frontier_logits_to_prompt();
             SLT_DBG(slot,
                     "restored frontier logits: count=%zu authenticated=%d\n",
-                    slot.vbr_frontier_logits.size(),
-                    slot.vbr_frontier_logits_matches());
+                    slot.frontier_logits.values.size(),
+                    slot.frontier_logits_matches());
             if (used_compact_fallback) {
                 vbr_automatic_restore_quality_fallbacks++;
             }
@@ -10460,13 +11332,16 @@ private:
         }
     }
 
-    void sample_vbr_frontier_logits(server_slot & slot) {
+    void sample_frontier_logits(server_slot & slot) {
         GGML_ASSERT(slot.state == SLOT_STATE_DONE_PROMPT);
-        GGML_ASSERT(slot.vbr_frontier_logits_pending);
-        GGML_ASSERT(slot.vbr_frontier_logits_matches());
+        GGML_ASSERT(slot.frontier_logits.pending);
         GGML_ASSERT(slot.task && slot.task->need_sampling());
 
-        slot.vbr_frontier_logits_pending = false;
+        struct release_frontier_logits {
+            server_frontier_logits_state & state;
+            ~release_frontier_logits() { state.clear(); }
+        } release { slot.frontier_logits };
+        slot.frontier_logits.pending = false;
         slot.state = SLOT_STATE_GENERATING;
         if (slot.can_speculate()) {
             if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
@@ -10485,8 +11360,8 @@ private:
         {
             scoped_timer timer(t_sampl, n_sampl);
             id = common_sampler_sample_from_logits(
-                slot.smpl.get(), slot.vbr_frontier_logits.data(),
-                slot.vbr_frontier_logits.size());
+                slot.smpl.get(), slot.frontier_logits.values.data(),
+                slot.frontier_logits.values.size());
         }
         if (id == LLAMA_TOKEN_NULL) {
             throw std::runtime_error(
@@ -10512,11 +11387,15 @@ private:
         if (slot.task->params.sampling.n_probs > 0) {
             populate_token_probs_from_logits(
                 slot, result, slot.task->params.post_sampling_probs,
-                params_base.special, slot.vbr_frontier_logits);
+                params_base.special, slot.frontier_logits.values);
         }
 
-        vbr_frontier_logits_sampled_cycle = true;
-        if (!process_token(result, slot)) {
+        frontier_logits_sampled_cycle = true;
+        const bool continue_generation = process_token(result, slot);
+        // The row predicts the token just appended by process_token(). The
+        // scope guard releases its O(vocabulary) storage on every terminal,
+        // including sampler/process exceptions.
+        if (!continue_generation) {
             slot.print_timings();
             send_final_response(slot);
             metrics_on_prediction(slot);
@@ -11387,7 +12266,7 @@ private:
         // The first durable capture mints a nonzero sequence epoch. A raw
         // frontier row retained at generation stop may therefore still be
         // bound to epoch zero even though its token digest is exact.
-        slot.vbr_bind_frontier_logits_to_prompt();
+        slot.bind_frontier_logits_to_prompt();
         request.sequence = slot.id;
         request.frontier.execution_identity =
             request.identity.execution_identity.data();
@@ -11461,6 +12340,20 @@ private:
                     return vbr_explicit_recurrent_companion_terminal(
                         view.data(), view.size(), output);
                 };
+            } else if (codec.kind == vbr_artifact_companion_kind::qsa_index) {
+                provider.terminal_position = [](
+                        const void * context,
+                        llama_seq_id,
+                        llama_pos & output) noexcept {
+                    const auto * source = static_cast<
+                        const common_shared_byte_buffer *>(context);
+                    if (!source || source->empty()) {
+                        return false;
+                    }
+                    const auto view = source->view();
+                    return vbr_qsa_index_companion_terminal(
+                        view.data(), view.size(), output);
+                };
             } else if (codec.kind ==
                     vbr_artifact_companion_kind::typed_accelerator) {
                 provider.terminal_position = [](
@@ -11488,6 +12381,7 @@ private:
             };
             server_vbr_companion_codec draft_codec;
             server_vbr_companion_codec accelerator_codec;
+            server_vbr_companion_codec qsa_codec;
             const bool draft_codec_ready = !ctx_dft ||
                 server_vbr_companion_codec_for(
                     vbr_artifact_companion_kind::required_spec_payload,
@@ -11504,6 +12398,13 @@ private:
                 status = server_vbr_artifact_capture_status::unsupported;
                 return false;
             }
+            const bool needs_qsa = std::any_of(
+                tree.begin(), tree.end(), [](const auto & child) {
+                    return child.qsa_index_owner != nullptr;
+                });
+            const bool qsa_codec_ready = !needs_qsa ||
+                server_vbr_companion_codec_for(
+                    vbr_artifact_companion_kind::qsa_index, qsa_codec);
             for (const auto & child : tree) {
                 recurrent_children += child.recurrent != nullptr;
                 payload_complete_attention |= child.attention != nullptr &&
@@ -11515,11 +12416,14 @@ private:
             // artifact owner; treating it as a recurrent blob would duplicate
             // or mismatch the VBR attention tree.
             if (!draft_codec_ready || !accelerator_codec_ready ||
+                !qsa_codec_ready ||
                 payload_complete_attention || recurrent_children > 1 ||
                 (recurrent_children != 0 &&
                  !add_checkpoint_buffer(
                      recurrent_codec,
                      checkpoint->data_tgt)) ||
+                (needs_qsa && !add_checkpoint_buffer(
+                     qsa_codec, checkpoint->data_qsa)) ||
                 (ctx_dft && !add_checkpoint_buffer(
                      draft_codec,
                      checkpoint->data_dft)) ||
@@ -11533,6 +12437,18 @@ private:
             }
             status = server_vbr_artifact_capture_status::ok;
             return true;
+        }
+
+        std::vector<llama_memory_tree_child> live_tree;
+        if (!llama_memory_tree_collect(llama_get_memory(ctx_tgt), live_tree)) {
+            status = server_vbr_artifact_capture_status::unsupported;
+            return false;
+        }
+        for (const auto & child : live_tree) {
+            if (child.qsa_index_owner) {
+                request.companions.push_back(
+                    vbr_qsa_index_capture_provider(*child.qsa_index_owner));
+            }
         }
 
         if (ctx_dft) {
@@ -11707,13 +12623,13 @@ private:
                 llama_seq_id,
                 uint64_t & output) noexcept {
             const auto * owner = static_cast<const server_slot *>(context);
-            if (!owner || !owner->vbr_frontier_logits_matches() ||
-                owner->vbr_frontier_logits.size() >
+            if (!owner || !owner->frontier_logits_matches() ||
+                owner->frontier_logits.values.size() >
                     UINT64_MAX/sizeof(float)) {
                 output = 0;
                 return false;
             }
-            output = uint64_t(owner->vbr_frontier_logits.size())*sizeof(float);
+            output = uint64_t(owner->frontier_logits.values.size())*sizeof(float);
             return output != 0;
         };
         frontier_logits.capture = [](
@@ -11722,11 +12638,11 @@ private:
                 std::vector<uint8_t> & output) noexcept {
             try {
                 const auto * owner = static_cast<const server_slot *>(context);
-                if (!owner || !owner->vbr_frontier_logits_matches()) {
+                if (!owner || !owner->frontier_logits_matches()) {
                     return false;
                 }
-                output.resize(owner->vbr_frontier_logits.size()*sizeof(float));
-                std::memcpy(output.data(), owner->vbr_frontier_logits.data(),
+                output.resize(owner->frontier_logits.values.size()*sizeof(float));
+                std::memcpy(output.data(), owner->frontier_logits.values.data(),
                             output.size());
                 return !output.empty();
             } catch (...) {
@@ -11739,12 +12655,12 @@ private:
                 llama_seq_id,
                 llama_io_write_i & output) {
             const auto * owner = static_cast<const server_slot *>(context);
-            if (!owner || !owner->vbr_frontier_logits_matches()) {
+            if (!owner || !owner->frontier_logits_matches()) {
                 return false;
             }
             output.write(
-                owner->vbr_frontier_logits.data(),
-                owner->vbr_frontier_logits.size()*sizeof(float));
+                owner->frontier_logits.values.data(),
+                owner->frontier_logits.values.size()*sizeof(float));
             return true;
         };
         request.companions.push_back(frontier_logits);
@@ -14246,9 +15162,49 @@ private:
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
 
+                    const auto frontier_prepare =
+                        prepare_slot_frontier_logits_for_save(*slot);
+                    SLT_INF(*slot,
+                        "SLOT_FRONTIER_LOGITS event=prepare status=%s tokens=%d\n",
+                        server_slot_frontier_prepare_status_name(
+                            frontier_prepare),
+                        slot->prompt.n_tokens());
+                    if (server_slot_frontier_prepare_requires_reset(
+                            frontier_prepare,
+                            slot_frontier_is_physically_aligned(*slot))) {
+                        slot->mandatory_recovery_reset(
+                            server_cache_destruction_reason::restore_failure);
+                        send_error(task,
+                            "Unable to save slot: terminal frontier alignment failed",
+                            ERROR_TYPE_SERVER);
+                        break;
+                    }
+
+                    std::vector<char> serialized_tokens;
                     std::vector<char> packed;
+                    std::array<uint8_t, 32> token_digest = {};
+                    bool envelope_has_logits = false;
                     try {
-                        packed = slot->prompt.tokens.serialize();
+                        serialized_tokens = slot->prompt.tokens.serialize();
+                        if (!slot->prompt.tokens.retention_token_digest(
+                                token_digest)) {
+                            throw std::runtime_error(
+                                "Unable to bind slot token identity");
+                        }
+                        envelope_has_logits =
+                            slot->frontier_logits_matches() &&
+                            slot_file_runtime_identity.family_compatible;
+                        const std::vector<float> * logits = envelope_has_logits
+                            ? &slot->frontier_logits.values : nullptr;
+                        if (!server_slot_envelope_build(
+                                serialized_tokens, slot_file_runtime_identity,
+                                lora_config_identity(slot->lora),
+                                uint64_t(slot->prompt.n_tokens()),
+                                int64_t(slot->prompt.tokens.pos_next()),
+                                token_digest, logits, packed)) {
+                            throw std::runtime_error(
+                                "Unable to build authenticated slot envelope");
+                        }
                     } catch (const std::exception & err) {
                         send_error(task, err.what(), ERROR_TYPE_NOT_SUPPORTED);
                         break;
@@ -14263,17 +15219,22 @@ private:
                         break;
                     }
 
-                    // The server semantic envelope adds adapter identity: the library slot file carries the checksummed state
-                    // but no adapter identity, and a restore into a slot bound to a different adapter
-                    // is NOT caught by the launch-time check (that compares against slot.lora, not the
-                    // file). Record the adapter identity this state was computed under in a sidecar so
-                    // the restore can reject a cross-adapter mismatch.
-                    if (nwrite > 0) {
-                        std::ofstream f(filepath + ".lora", std::ios::binary | std::ios::trunc);
-                        if (f) {
-                            f << lora_config_identity(slot->lora);
-                        }
+                    const server_slot_frontier_logits_status logits_status =
+                        envelope_has_logits
+                        ? server_slot_frontier_logits_status::loaded
+                        : server_slot_frontier_logits_status::not_present;
+                    // New saves are one atomic authenticated file. Remove stale
+                    // optional sidecars from pre-envelope versions only after
+                    // the new primary has committed.
+                    for (const std::string suffix : { ".lora", ".frontier-logits" }) {
+                        std::error_code ignored;
+                        std::filesystem::remove(
+                            std::filesystem::u8path(filepath + suffix), ignored);
                     }
+                    SLT_INF(*slot,
+                        "SLOT_FRONTIER_LOGITS event=save status=%s tokens=%d\n",
+                        server_slot_frontier_logits_status_name(logits_status),
+                        slot->prompt.n_tokens());
 
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
@@ -14873,44 +15834,79 @@ private:
 
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
-
-                    // Reject a cross-adapter restore before mutating the target.
-                    {
-                        std::ifstream f(filepath + ".lora", std::ios::binary);
-                        if (f) {
-                            const std::string saved_identity(
-                                    (std::istreambuf_iterator<char>(f)),
-                                    std::istreambuf_iterator<char>());
-                            if (saved_identity != lora_config_identity(slot->lora)) {
-                                send_error(task,
-                                    "Slot file was saved under a different adapter configuration than the target slot",
-                                    ERROR_TYPE_INVALID_REQUEST);
-                                break;
-                            }
-                        }
-                    }
+                    server_slot_frontier_logits_status logits_status =
+                        server_slot_frontier_logits_status::not_present;
+                    std::array<uint8_t, 32> restored_token_digest = {};
 
                     size_t nread = 0;
+                    bool target_load_attempted = false;
                     try {
-                        size_t n_packed = 0;
-                        llama_tokens packed;
-                        nread = llama_state_seq_load_file(
-                                ctx_tgt, filepath.c_str(), slot->id,
-                                nullptr, 0, &n_packed);
-                        if (nread != 0) {
-                            packed.resize(std::max<size_t>(1, n_packed));
-                            nread = llama_state_seq_load_file(
-                                    ctx_tgt, filepath.c_str(), slot->id,
-                                    packed.data(), packed.size(), &n_packed);
-                        }
-                        if (nread == 0) {
+                        const std::string adapter_identity =
+                            lora_config_identity(slot->lora);
+                        llama_state_seq_file_snapshot prepared;
+                        if (!llama_state_seq_file_snapshot_prepare(
+                                filepath.c_str(), prepared)) {
                             throw std::runtime_error(
-                                "No available space in KV cache or invalid slot save file");
+                                "Invalid or unauthenticated slot save file");
                         }
-                        packed.resize(n_packed);
-
-                        server_tokens restored =
-                            server_tokens::deserialize(packed, mctx != nullptr);
+                        std::vector<uint8_t> prepared_packed;
+                        if (!prepared.copy_packed_token_bytes(prepared_packed)) {
+                            throw std::runtime_error(
+                                "Unable to copy authenticated slot envelope");
+                        }
+                        auto envelope = server_slot_envelope_parse_bytes(
+                            prepared_packed.data(), prepared_packed.size(),
+                            slot_file_runtime_identity,
+                            adapter_identity,
+                            uint32_t(llama_vocab_n_tokens(
+                                llama_model_get_vocab(model_tgt))));
+                        const bool legacy = envelope.status ==
+                            server_slot_frontier_logits_status::legacy_cold;
+                        if (envelope.status ==
+                                server_slot_frontier_logits_status::model_family_mismatch ||
+                            envelope.status ==
+                                server_slot_frontier_logits_status::adapter_mismatch ||
+                            envelope.status ==
+                                server_slot_frontier_logits_status::format_mismatch ||
+                            envelope.status ==
+                                server_slot_frontier_logits_status::serialized_payload_mismatch ||
+                            envelope.status ==
+                                server_slot_frontier_logits_status::io_error) {
+                            throw std::runtime_error(std::string(
+                                "Slot semantic envelope refused: ") +
+                                server_slot_frontier_logits_status_name(
+                                    envelope.status));
+                        }
+                        if (legacy) {
+                            std::ifstream identity_file(
+                                filepath + ".lora", std::ios::binary);
+                            if (identity_file) {
+                                const std::string saved_identity(
+                                    (std::istreambuf_iterator<char>(identity_file)),
+                                    std::istreambuf_iterator<char>());
+                                if (saved_identity != adapter_identity) {
+                                    throw std::runtime_error(
+                                        "Legacy slot file adapter identity mismatch");
+                                }
+                            } else if (adapter_identity != "0") {
+                                throw std::runtime_error(
+                                    "Legacy slot file has no adapter identity");
+                            }
+                        }
+                        llama_tokens serialized(prepared.token_count());
+                        if (!prepared_packed.empty()) {
+                            std::memcpy(serialized.data(),
+                                prepared_packed.data(), prepared_packed.size());
+                        }
+                        if (!legacy) {
+                            serialized.resize(
+                                envelope.serialized_tokens.size()/sizeof(llama_token));
+                            std::memcpy(serialized.data(),
+                                envelope.serialized_tokens.data(),
+                                envelope.serialized_tokens.size());
+                        }
+                        server_tokens restored = server_tokens::deserialize(
+                            serialized, mctx != nullptr);
                         if (restored.size() > (size_t) slot->n_ctx) {
                             throw std::runtime_error(
                                 "Restored prompt does not fit in the slot context");
@@ -14919,6 +15915,49 @@ private:
                             throw std::runtime_error(
                                 "Invalid tokens in slot save file");
                         }
+                        if (!restored.retention_token_digest(
+                                restored_token_digest)) {
+                            throw std::runtime_error(
+                                "Unable to authenticate restored token identity");
+                        }
+                        if (!legacy) {
+                            envelope.status =
+                                server_slot_envelope_token_binding_status(
+                                    envelope, restored.size(),
+                                    restored.pos_next(), restored_token_digest);
+                            if (envelope.status !=
+                                    server_slot_frontier_logits_status::loaded) {
+                                // The serialized server_tokens payload and
+                                // primary state remain independently
+                                // authenticated. A stale optional frontier
+                                // binding only removes the hot capability.
+                                std::vector<float>().swap(envelope.logits);
+                            }
+                        }
+
+                        size_t n_packed = prepared.token_count();
+                        llama_tokens loaded_packed(std::max<size_t>(1, n_packed));
+                        target_load_attempted = true;
+                        ctx_tgt->synchronize();
+                        nread = ctx_tgt->state_seq_apply_file_snapshot(
+                            slot->id, prepared,
+                            loaded_packed.data(), loaded_packed.size(),
+                            &n_packed);
+                        loaded_packed.resize(n_packed);
+                        if (nread == 0 ||
+                            loaded_packed.size()*sizeof(llama_token) !=
+                                prepared_packed.size() ||
+                            (!prepared_packed.empty() &&
+                             std::memcmp(loaded_packed.data(),
+                                prepared_packed.data(),
+                                prepared_packed.size()) != 0)) {
+                            slot->mandatory_recovery_reset(
+                                server_cache_destruction_reason::restore_failure);
+                            target_load_attempted = false;
+                            throw std::runtime_error(
+                                "Prepared slot state could not be applied");
+                        }
+                        logits_status = envelope.status;
 
                         if (slot->prompt.sequence_epoch != 0 ||
                             !slot->prompt.checkpoints.empty()) {
@@ -14937,6 +15976,23 @@ private:
                             server_cache_destruction_reason::slot_rebind);
                         slot->server_cache_mandatory_recovery_reset_impl(ctx_dft != nullptr);
                         slot->prompt.tokens = std::move(restored);
+
+                        if (logits_status ==
+                                server_slot_frontier_logits_status::loaded) {
+                            const uint64_t destination_epoch =
+                                ensure_frontier_sequence_epoch(slot->prompt);
+                            slot->install_frontier_logits(
+                                std::move(envelope.logits),
+                                restored_token_digest,
+                                destination_epoch);
+                        }
+
+                        SLT_INF(*slot,
+                            "SLOT_FRONTIER_LOGITS event=restore status=%s hot=%u tokens=%d\n",
+                            server_slot_frontier_logits_status_name(logits_status),
+                            logits_status ==
+                                server_slot_frontier_logits_status::loaded,
+                            slot->prompt.n_tokens());
 
                         if (slot->retention_obs) {
                             const common_chat_msg_spans unavailable_spans;
@@ -14958,9 +16014,16 @@ private:
                                     slot->prompt.n_tokens());
                             }
                         }
+                        target_load_attempted = false;
                     } catch (const std::exception & err) {
-                        slot->mandatory_recovery_reset(
-                            server_cache_destruction_reason::restore_failure);
+                        // Parsing and identity failures occur before the
+                        // mutating library load and preserve an occupied
+                        // destination.  Once load begins, any exception is
+                        // conservatively treated as a partial install.
+                        if (target_load_attempted) {
+                            slot->mandatory_recovery_reset(
+                                server_cache_destruction_reason::restore_failure);
+                        }
                         send_error(task,
                             std::string("Unable to restore slot: ") + err.what(),
                             ERROR_TYPE_INVALID_REQUEST);
@@ -15113,7 +16176,7 @@ private:
     // Target-side argmax for one pure-greedy DFlash verify batch.
     bool dflash_target_argmax_active = false;
     llama_seq_id dflash_target_argmax_slot = -1;
-    bool vbr_frontier_logits_sampled_cycle = false;
+    bool frontier_logits_sampled_cycle = false;
     // target can replay the tape losslessly on GPU after a partial accept; when false,
     // no tape is recorded and rollback re-decodes the accepted tokens instead
     bool dflash_tape_ok = false;
@@ -15207,7 +16270,7 @@ private:
         if (batch.size() == 0) {
             const bool has_diff_gen = std::any_of(slots.begin(), slots.end(),
                 [](const server_slot & s) { return s.diff_self_spec && s.state == SLOT_STATE_GENERATING; });
-            if (!has_diff_gen && !vbr_frontier_logits_sampled_cycle) {
+            if (!has_diff_gen && !frontier_logits_sampled_cycle) {
                 SRV_WRN("%s", "no tokens to decode\n");
                 if (++n_empty_consecutive > 3) {
                     GGML_ABORT("fatal error - please provide logs and repro in %s\n", "https://github.com/ggml-org/llama.cpp/pull/20277");
@@ -15219,7 +16282,7 @@ private:
 
         GGML_ASSERT(batch.slot_batched || batch.size() == 0);
 
-        // An exact VBR hit can consume authenticated frontier logits and
+        // An authenticated frontier hit can consume frontier logits and
         // finish (for example on EOS) without adding a decode token.  Sampling
         // releases that slot above, so an empty batch must not dereference the
         // stale assembly-time task pointer merely to configure a decode that
@@ -15298,7 +16361,7 @@ private:
     }
 
     void pre_decode() {
-        vbr_frontier_logits_sampled_cycle = false;
+        frontier_logits_sampled_cycle = false;
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
@@ -15306,6 +16369,15 @@ private:
                 if (!params_base.ctx_shift) {
                     // this check is redundant (for good)
                     // we should never get here, because generation should already stopped in process_token()
+                    send_error(slot, "context shift is disabled", ERROR_TYPE_SERVER);
+                    slot.release();
+                    return;
+                }
+
+                // The draft context can be destroyed and recreated by the
+                // mmproj lifecycle. Recheck its current memory owner at the
+                // destructive boundary as a final fail-closed guard.
+                if (!recheck_context_shift_capability(ctx_dft.get(), "shift boundary")) {
                     send_error(slot, "context shift is disabled", ERROR_TYPE_SERVER);
                     slot.release();
                     return;
@@ -15438,14 +16510,20 @@ private:
             }
         }
 
-        // The shared block-diffusion DFlash/DSpark implementation accepts one armed
-        // draft descriptor per sequence and deliberately builds all armed noise blocks
-        // into a single llama_decode(). Arm every generating slot before calling it;
-        // the old per-slot loop below threw that batching contract away and launched
-        // one drafter graph per slot per cycle.
-        if (!ctx_dft_shared && spec &&
-            (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) ||
-             params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK))) {
+        const bool shared_model_draft =
+            params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) ||
+            params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) ||
+            params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK);
+        const bool shared_block_diffusion =
+            params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) ||
+            params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK);
+
+        // Shared model drafters accept one armed descriptor per sequence. Arm every
+        // generating slot before invoking the shared implementation so both draft and
+        // acceptance use the same per-sequence owner (`impl_last`). The legacy single-
+        // sequence wrapper records only `curr_impl` and is therefore valid only for
+        // slot-owned implementations.
+        if (!ctx_dft_shared && spec && shared_model_draft) {
             std::vector<int> batch_slot_ids;
             for (auto & slot : slots) {
                 if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate()) {
@@ -15478,10 +16556,10 @@ private:
                 for (const int slot_id : batch_slot_ids) {
                     batched_draft_decode_succeeded[slot_id] = decode_succeeded;
 
-                    // Noise rows are proposals, not committed drafter state. The next
-                    // common_speculative_process() injection is the sole owner of cells
-                    // beyond the target frontier.
-                    if (ctx_dft) {
+                    // Block-diffusion noise rows are proposals, not committed drafter
+                    // state. MTP manages its draft frontier in process() and must retain
+                    // the normal MTP lifecycle here.
+                    if (shared_block_diffusion && ctx_dft) {
                         llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), slot_id,
                                 llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot_id) + 1, -1);
                     }
@@ -15513,12 +16591,10 @@ private:
                 llama_tokens draft;
                 if (batched_draft_attempted[slot.id] || !batched_drafts[slot.id].empty()) {
                     draft = std::move(batched_drafts[slot.id]);
-                } else if (!slot.spec && spec &&
-                           (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) ||
-                            params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK))) {
-                    // shared multi-seq state (block-diffusion DFlash / DSpark):
-                    // arm this slot's per-seq draft params — the fork single-seq wrapper
-                    // below always drives drafter seq 0, which only matches slot 0
+                } else if (!slot.spec && spec && shared_model_draft) {
+                    // Shared multi-sequence model state: arm this slot's exact sequence.
+                    // The fallback wrapper below always drives sequence 0 and records a
+                    // different acceptance owner, so it is reserved for slot-owned state.
                     const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
                     auto & dp   = common_speculative_get_draft_params(spec.get(), slot.id);
                     dp.drafting = true;
@@ -15529,12 +16605,9 @@ private:
                     dp.result   = &draft;
                     common_speculative_draft(spec.get());
 
-                    // the draft decode wrote its noise block into the drafter KV at the
-                    // frontier positions; trim back to the committed target frontier so
-                    // the verify-batch injection in common_speculative_process stays the
-                    // only source of drafter cells (the reference server does this same
-                    // post-draft seq_rm; it was dropped in the fork-owned merge)
-                    if (ctx_dft) {
+                    // Only block-diffusion proposals need this immediate trim. MTP's
+                    // process() owns truncation and carry refresh for its draft context.
+                    if (shared_block_diffusion && ctx_dft) {
                         llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), slot.id,
                                 llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) + 1, -1);
                     }
@@ -16694,18 +17767,20 @@ private:
 
                         // [TAG_PROMPT_LOGITS]
                         if (n_past == slot.task->n_tokens() && n_past > 0) {
-                            const bool cached_frontier_logits =
-                                slot.task->need_sampling() &&
-                                !slot.diff_self_spec &&
-                                slot.vbr_frontier_logits_matches();
-                            if (cached_frontier_logits) {
-                                slot.vbr_frontier_logits_pending = true;
+                            const auto exact_prompt_action =
+                                server_slot_exact_prompt_action_resolve(
+                                    size_t(slot.task->n_tokens()),
+                                    slot.task->need_sampling(),
+                                    slot.diff_self_spec,
+                                    slot.frontier_logits_matches());
+                            if (exact_prompt_action.use_frontier_logits) {
+                                slot.frontier_logits.pending = true;
                                 SLT_INF(slot,
                                     "using authenticated frontier logits for exact prompt hit (n_past = %d)\n",
                                     n_past);
                             } else {
                                 SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
-                                n_past--;
+                                n_past = int(exact_prompt_action.reusable_tokens);
                                 // The last token must really be re-evaluated for logits; preserving it
                                 // only in token bookkeeping would skip that decode.
                                 n_past_keep = std::min(n_past_keep, (size_t) n_past);
@@ -17061,7 +18136,7 @@ private:
                         slot.state = SLOT_STATE_DONE_PROMPT;
 
                         slot.stats.n_gen = 0;
-                        if (slot.vbr_frontier_logits_pending) {
+                        if (slot.frontier_logits.pending) {
                             slot.i_batch = -1;
                         } else {
                             GGML_ASSERT(batch.size() > 0);
@@ -17232,6 +18307,35 @@ private:
 
                             const size_t checkpoint_size =
                                 llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            llama_memory_hybrid_idx * qsa_owner = nullptr;
+                            bool qsa_topology_ready = true;
+                            if (params_base.vbr_prompt_cache) {
+                                std::vector<llama_memory_tree_child> tree;
+                                qsa_topology_ready = llama_memory_tree_collect(
+                                    llama_get_memory(ctx_tgt), tree);
+                                for (const auto & child : tree) {
+                                    if (!child.qsa_index_owner) {
+                                        continue;
+                                    }
+                                    if (qsa_owner &&
+                                        qsa_owner != child.qsa_index_owner) {
+                                        qsa_topology_ready = false;
+                                        break;
+                                    }
+                                    qsa_owner = child.qsa_index_owner;
+                                }
+                            }
+                            const auto qsa_provider = qsa_owner
+                                ? vbr_qsa_index_capture_provider(*qsa_owner)
+                                : vbr_explicit_companion_provider {};
+                            uint64_t qsa_size = 0;
+                            const bool qsa_required = qsa_owner != nullptr &&
+                                params_base.vbr_prompt_cache;
+                            const bool qsa_size_ready = qsa_topology_ready &&
+                                (!qsa_required ||
+                                (qsa_provider.size && qsa_provider.size(
+                                    qsa_provider.context, slot.id, qsa_size) &&
+                                 qsa_size != 0 && qsa_size <= SIZE_MAX));
                             const size_t draft_size = ctx_dft &&
                                     params_base.vbr_prompt_cache
                                 ? llama_state_seq_get_size_ext(
@@ -17244,18 +18348,26 @@ private:
                                 : 0;
                             const uint64_t exact_capture_limit =
                                 vbr_automatic_exact_capture_max_bytes();
-                            const bool draft_vbr_fits =
-                                draft_size != 0 &&
+                            const bool qsa_vbr_fits = qsa_size_ready &&
                                 uint64_t(checkpoint_size) <=
                                     exact_capture_limit &&
+                                qsa_size <= exact_capture_limit-
+                                    uint64_t(checkpoint_size);
+                            const bool draft_vbr_fits =
+                                draft_size != 0 && qsa_vbr_fits &&
                                 uint64_t(ring_size) <=
                                     exact_capture_limit-
-                                        uint64_t(checkpoint_size) &&
+                                        uint64_t(checkpoint_size)-qsa_size &&
                                 uint64_t(draft_size) <=
                                     exact_capture_limit-
                                         uint64_t(checkpoint_size)-
+                                        qsa_size-
                                         uint64_t(ring_size);
-                            if (checkpoint_size == 0) {
+                            if (!qsa_topology_ready) {
+                                SLT_ERR(slot, "%s",
+                                    "skipping context checkpoint: QSA topology is unavailable\n");
+                                staged.clear();
+                            } else if (checkpoint_size == 0) {
                                 SLT_ERR(slot, "%s", "skipping context checkpoint: target state size is zero\n");
                                 staged.clear();
                             } else {
@@ -17273,6 +18385,33 @@ private:
                                             checkpoint_size, n);
                                     staged.clear();
                                 }
+                            }
+
+                            if (!staged.empty() && qsa_required && qsa_vbr_fits) {
+                                bool qsa_captured = false;
+                                next.data_qsa.overwrite(
+                                    size_t(qsa_size),
+                                    [&](uint8_t * data, size_t size) {
+                                        server_fixed_io_writer writer(data, size);
+                                        qsa_captured =
+                                            qsa_provider.capture_stream &&
+                                            qsa_provider.capture_stream(
+                                                qsa_provider.context, slot.id,
+                                                writer) &&
+                                            writer.complete();
+                                    });
+                                if (!qsa_captured) {
+                                    SLT_ERR(slot, "%s",
+                                        "skipping context checkpoint: QSA index capture failed\n");
+                                    staged.clear();
+                                }
+                            } else if (!staged.empty() && qsa_required) {
+                                SLT_DBG(slot,
+                                    "VBR QSA checkpoint companion skipped: "
+                                    "target=%zu qsa=%" PRIu64 " exceeds "
+                                    "automatic capture runway=%" PRIu64 "\n",
+                                    checkpoint_size, qsa_size,
+                                    exact_capture_limit);
                             }
 
                             // A VBR frontier artifact restores target
@@ -17666,14 +18805,14 @@ private:
             });
         }
 
-        // An exact VBR hit can finish prompt processing without adding a token
+        // An authenticated frontier hit can finish prompt processing without adding a token
         // to the decode batch. Sample its authenticated terminal row through
         // the ordinary sampler/token pipeline before speculative post-cycle
         // work begins.
         for (auto & slot : slots) {
             if (slot.state == SLOT_STATE_DONE_PROMPT &&
-                slot.vbr_frontier_logits_pending) {
-                sample_vbr_frontier_logits(slot);
+                slot.frontier_logits.pending) {
+                sample_frontier_logits(slot);
             }
         }
 
@@ -18084,8 +19223,9 @@ private:
         // Bind the terminal row before the capture so an exact host hit can
         // sample immediately without re-running the final prompt token.  A
         // missing row only removes that shortcut; it must not invalidate an
-        // otherwise complete prompt-frontier artifact.
-        (void) slot.vbr_capture_frontier_logits(output_index);
+        // otherwise complete prompt-frontier artifact. Successful output
+        // decode synchronized the target immediately before this call.
+        (void) slot.capture_synchronized_frontier_logits(output_index);
 
         // Normal live-slot retention publication happens at release(), after
         // generation.  Prompt-boundary sealing deliberately precedes that
@@ -18336,11 +19476,15 @@ private:
                     (void) finish_idle_exact_vbr_capture(false);
                 }
                 // release slot because of stop condition
-                if (params_base.vbr_prompt_cache) {
+                if (params_base.vbr_prompt_cache ||
+                    !params_base.slot_save_path.empty()) {
+                    (void) ensure_frontier_sequence_epoch(slot.prompt);
+                    const bool frontier_logits_retained =
+                        slot.capture_synchronized_frontier_logits(tok_idx);
                     SLT_DBG(slot,
                             "frontier logits capture at output %d: %s\n",
                             tok_idx,
-                            slot.vbr_capture_frontier_logits(tok_idx)
+                            frontier_logits_retained
                                 ? "retained" : "unavailable");
                 }
                 slot.print_timings();
@@ -18662,9 +19806,11 @@ private:
                 slot.stats.n_gen += 1;
 
                 if (!process_token(result, slot)) {
-                    if (params_base.vbr_prompt_cache &&
+                    if ((params_base.vbr_prompt_cache ||
+                         !params_base.slot_save_path.empty()) &&
                         i < verified_output_rows.size()) {
-                        (void) slot.vbr_capture_frontier_logits(
+                        (void) ensure_frontier_sequence_epoch(slot.prompt);
+                        (void) slot.capture_synchronized_frontier_logits(
                             verified_output_rows[i]);
                     }
                     slot.print_timings();
@@ -19312,6 +20458,36 @@ server_mmproj_lifecycle_for_test() {
         restore_count(false, true, false) == 1;
     result.throwing_restore_not_retried =
         restore_count(false, false, true) == 1;
+
+    const auto simulate_shift = [](
+            const server_context_shift_capability & capability) {
+        std::pair<int, int> calls = { 0, 0 };
+        if (capability.enabled) {
+            ++calls.first;
+            if (capability.shift_draft) {
+                ++calls.second;
+            }
+        }
+        return calls;
+    };
+    const auto incompatible = server_context_shift_capability_resolve(
+        true,  // requested
+        true,  // target can shift
+        true,  // draft present
+        false  // draft cannot shift
+    );
+    const auto incompatible_calls = simulate_shift(incompatible);
+    result.incompatible_draft_disables_shift =
+        !incompatible.enabled &&
+        incompatible.status == server_context_shift_capability_status::draft_unsupported;
+    result.incompatible_draft_not_shifted = incompatible_calls.second == 0;
+
+    const auto compatible = server_context_shift_capability_resolve(
+        true, true, true, true);
+    const auto compatible_calls = simulate_shift(compatible);
+    result.compatible_draft_enables_shift = compatible.enabled;
+    result.compatible_draft_shifted =
+        compatible_calls.first == 1 && compatible_calls.second == 1;
     return result;
 }
 
@@ -19338,6 +20514,312 @@ server_committed_decode_reset_for_test() {
     result.processing_family_cleared = !processing.cache_family.declared();
     result.idle_prompt_preserved = idle.prompt.tokens.get_tokens() ==
         llama_tokens({ 4, 5 });
+    return result;
+}
+
+server_slot_frontier_logits_test_result
+server_slot_frontier_logits_for_test() {
+    server_slot_frontier_logits_test_result result;
+    std::filesystem::path directory;
+    try {
+        directory = std::filesystem::temp_directory_path() /
+            ("buun-slot-frontier-logits-" + random_string());
+        std::filesystem::create_directories(directory);
+        const std::string primary = (directory / "slot.bin").string();
+        common_params identity_params;
+        std::array<uint8_t, 32> model_receipt = {};
+        model_receipt[0] = 1;
+        const auto test_runtime_identity = [&identity_params](
+                const std::array<uint8_t, 32> & receipt,
+                bool valid,
+                server_slot_runtime_geometry geometry = {}) {
+            return server_slot_runtime_identity_from_owner_receipts(
+                receipt, valid, nullptr, identity_params, geometry);
+        };
+        const auto initial_identity =
+            test_runtime_identity(model_receipt, true);
+        identity_params.model.path = "renamed-and-requantized.gguf";
+        const auto nonsemantic_identity =
+            test_runtime_identity(model_receipt, true);
+        result.model_nonsemantic_variation_matches =
+            initial_identity.digest == nonsemantic_identity.digest;
+        const auto unresolved_2048 =
+            test_runtime_identity(model_receipt, true,
+                server_slot_runtime_geometry_from_owner(
+                    2048, 2048, identity_params, 2048, 0));
+        const auto unresolved_4096 =
+            test_runtime_identity(model_receipt, true,
+                server_slot_runtime_geometry_from_owner(
+                    4096, 4096, identity_params, 4096, 0));
+        result.unresolved_context_fallback_changes_identity =
+            unresolved_2048.digest != unresolved_4096.digest;
+        identity_params.n_ctx = 8192;
+        identity_params.yarn_orig_ctx = 4096;
+        const auto explicit_from_2048 =
+            test_runtime_identity(model_receipt, true,
+                server_slot_runtime_geometry_from_owner(
+                    8192, 8192, identity_params, 2048, 0));
+        const auto explicit_from_16384 =
+            test_runtime_identity(model_receipt, true,
+                server_slot_runtime_geometry_from_owner(
+                    8192, 8192, identity_params, 16384, 32768));
+        result.explicit_context_override_ignores_training_context =
+            explicit_from_2048.digest == explicit_from_16384.digest;
+        identity_params.n_ctx = 0;
+        identity_params.yarn_orig_ctx = 0;
+        identity_params.kv_unified = false;
+        identity_params.n_parallel = 1;
+        const auto one_sequence_geometry = test_runtime_identity(
+            model_receipt, true, { 8192, 8192, 4096 });
+        identity_params.n_parallel = 2;
+        const auto two_sequence_geometry = test_runtime_identity(
+            model_receipt, true, { 8192, 4096, 4096 });
+        result.sequence_geometry_changes_identity =
+            one_sequence_geometry.digest != two_sequence_geometry.digest;
+
+        identity_params.n_parallel = 1;
+        identity_params.n_ctx = 1000;
+        const auto padded_from_1000 = test_runtime_identity(
+            model_receipt, true, { 1024, 1024, 4096 });
+        identity_params.n_ctx = 1024;
+        const auto padded_from_1024 = test_runtime_identity(
+            model_receipt, true, { 1024, 1024, 4096 });
+        result.padding_equivalent_geometry_matches =
+            padded_from_1000.digest == padded_from_1024.digest;
+        identity_params.n_ctx = 0;
+        model_receipt[0] = 2;
+        const auto changed_model_identity =
+            test_runtime_identity(model_receipt, true);
+        result.model_family_mutation_refused =
+            initial_identity.family_compatible && changed_model_identity.family_compatible &&
+            initial_identity.digest != changed_model_identity.digest;
+
+        identity_params.control_vectors.push_back({ 0.5f, "ignored" });
+        identity_params.control_vector_applied_digest_valid = true;
+        identity_params.control_vector_applied_digest[0] = 3;
+        const auto changed_control_identity =
+            test_runtime_identity(model_receipt, true);
+        result.control_content_mutation_refused =
+            changed_model_identity.family_compatible &&
+            changed_control_identity.family_compatible &&
+            changed_model_identity.digest != changed_control_identity.digest;
+
+        identity_params.control_vector_applied_digest_valid = false;
+        const auto missing_family_identity =
+            test_runtime_identity(model_receipt, true);
+        result.missing_family_receipt_disables_hot =
+            !missing_family_identity.family_compatible;
+        server_slot_runtime_identity runtime;
+        runtime.digest[0] = 7;
+        runtime.family_compatible = true;
+        const std::string adapter = "adapter:test";
+        server_tokens tokens(llama_tokens { 1, 2, 3 }, false);
+        const std::vector<char> serialized = tokens.serialize();
+        std::array<uint8_t, 32> token_digest = {};
+        tokens.retention_token_digest(token_digest);
+        const uint64_t token_count = tokens.size();
+        const int64_t next_position = tokens.pos_next();
+        const std::vector<float> logits { -2.5f, 0.0f, 1.25f, 9.0f };
+        std::vector<char> envelope_bytes;
+        if (!server_slot_envelope_build(
+                serialized, runtime, adapter, token_count, next_position,
+                token_digest, &logits, envelope_bytes)) {
+            throw std::runtime_error("slot envelope fixture build failed");
+        }
+        llama_tokens packed(envelope_bytes.size()/sizeof(llama_token));
+        std::memcpy(packed.data(), envelope_bytes.data(), envelope_bytes.size());
+        const auto loaded = server_slot_envelope_parse(
+            packed, runtime, adapter, uint32_t(logits.size()));
+        result.round_trip = loaded.status ==
+                server_slot_frontier_logits_status::loaded &&
+            loaded.logits == logits && loaded.serialized_tokens == serialized;
+
+        auto changed_runtime = runtime;
+        changed_runtime.digest[0] ^= 1;
+        result.runtime_family_mutation_refused =
+            server_slot_envelope_parse(
+                packed, changed_runtime, adapter,
+                uint32_t(logits.size())).status ==
+            server_slot_frontier_logits_status::model_family_mismatch;
+        result.adapter_mutation_refused =
+            server_slot_envelope_parse(
+                packed, runtime, adapter + "-changed",
+                uint32_t(logits.size())).status ==
+            server_slot_frontier_logits_status::adapter_mismatch;
+        result.vocabulary_mutation_refused =
+            server_slot_envelope_parse(
+                packed, runtime, adapter,
+                uint32_t(logits.size() + 1)).status ==
+            server_slot_frontier_logits_status::vocabulary_mismatch;
+
+        result.token_count_mutation_refused =
+            server_slot_envelope_token_binding_status(
+                loaded, token_count + 1, next_position, token_digest) ==
+            server_slot_frontier_logits_status::token_count_mismatch;
+        result.next_position_mutation_refused =
+            server_slot_envelope_token_binding_status(
+                loaded, token_count, next_position + 1, token_digest) ==
+            server_slot_frontier_logits_status::next_position_mismatch;
+        auto changed_tokens = token_digest;
+        changed_tokens[0] ^= 1;
+        result.token_digest_mutation_refused =
+            server_slot_envelope_token_binding_status(
+                loaded, token_count, next_position, changed_tokens) ==
+            server_slot_frontier_logits_status::token_digest_mismatch;
+
+        llama_tokens mutated_logits = packed;
+        reinterpret_cast<uint8_t *>(mutated_logits.data())[
+            SERVER_SLOT_ENVELOPE_HEADER_SIZE + serialized.size()] ^= 1;
+        result.logits_mutation_refused =
+            server_slot_envelope_parse(
+                mutated_logits, runtime, adapter,
+                uint32_t(logits.size())).status ==
+            server_slot_frontier_logits_status::logits_digest_mismatch;
+
+        llama_tokens mutated_serialized = packed;
+        reinterpret_cast<uint8_t *>(mutated_serialized.data())[
+            SERVER_SLOT_ENVELOPE_HEADER_SIZE] ^= 1;
+        result.serialized_payload_mutation_refused =
+            server_slot_envelope_parse(
+                mutated_serialized, runtime, adapter,
+                uint32_t(logits.size())).status ==
+            server_slot_frontier_logits_status::serialized_payload_mismatch;
+
+        std::vector<float> nonfinite = logits;
+        nonfinite[0] = std::numeric_limits<float>::infinity();
+        std::vector<char> refused;
+        result.nonfinite_logits_refused = !server_slot_envelope_build(
+            serialized, runtime, adapter, token_count, next_position,
+            token_digest, &nonfinite, refused);
+
+        llama_tokens torn = packed;
+        torn.pop_back();
+        result.torn_companion_refused =
+            server_slot_envelope_parse(
+                torn, runtime, adapter, uint32_t(logits.size())).status ==
+            server_slot_frontier_logits_status::format_mismatch;
+
+        std::vector<char> cold_bytes;
+        server_slot_envelope_build(
+            serialized, runtime, adapter, token_count, next_position,
+            token_digest, nullptr, cold_bytes);
+        llama_tokens cold_packed(cold_bytes.size()/sizeof(llama_token));
+        std::memcpy(cold_packed.data(), cold_bytes.data(), cold_bytes.size());
+        result.missing_companion_is_cold =
+            server_slot_envelope_parse(
+                cold_packed, runtime, adapter, uint32_t(logits.size())).status ==
+            server_slot_frontier_logits_status::not_present;
+
+        // The outer v3 checksum authenticates the entire semantic envelope.
+        std::vector<uint8_t> primary_bytes(28 + envelope_bytes.size());
+        const uint32_t primary_magic = LLAMA_STATE_SEQ_MAGIC;
+        const uint32_t primary_version = LLAMA_STATE_SEQ_VERSION;
+        const uint64_t primary_size = primary_bytes.size();
+        const uint32_t primary_count = uint32_t(packed.size());
+        std::memcpy(primary_bytes.data(), &primary_magic, 4);
+        std::memcpy(primary_bytes.data() + 4, &primary_version, 4);
+        std::memcpy(primary_bytes.data() + 8, &primary_size, 8);
+        std::memcpy(primary_bytes.data() + 24, &primary_count, 4);
+        std::memcpy(primary_bytes.data() + 28, envelope_bytes.data(),
+                    envelope_bytes.size());
+        uint64_t primary_checksum = server_slot_state_payload_checksum(
+            primary_bytes.data() + 24, primary_bytes.size() - 24);
+        std::memcpy(primary_bytes.data() + 16, &primary_checksum, 8);
+        {
+            std::ofstream file(primary, std::ios::binary | std::ios::trunc);
+            file.write(reinterpret_cast<const char *>(primary_bytes.data()),
+                       primary_bytes.size());
+        }
+        primary_bytes.back() ^= 1;
+        {
+            std::ofstream file(primary, std::ios::binary | std::ios::trunc);
+            file.write(reinterpret_cast<const char *>(primary_bytes.data()),
+                       primary_bytes.size());
+        }
+        llama_state_seq_file_snapshot ignored_snapshot;
+        result.primary_binding_mutation_refused =
+            !llama_state_seq_file_snapshot_prepare(
+                primary.c_str(), ignored_snapshot);
+
+        server_slot destination;
+        destination.id = 9;
+        destination.prompt.tokens =
+            server_tokens(llama_tokens { 1, 2, 3 }, false);
+        destination.prompt.sequence_epoch = 991;
+        std::vector<float> rebound_logits = logits;
+        destination.install_frontier_logits(
+            std::move(rebound_logits), token_digest,
+            destination.prompt.sequence_epoch);
+        result.destination_epoch_rebound =
+            destination.frontier_logits.sequence_epoch == 991;
+        result.destination_slot_rebound = destination.id == 9;
+        constexpr uint64_t source_process_epoch = 77;
+        result.source_process_epoch_not_reused =
+            destination.frontier_logits.sequence_epoch !=
+                source_process_epoch;
+
+        const auto hot = server_slot_exact_prompt_action_resolve(
+            token_count, true, false, true);
+        result.exact_hit_skips_decode =
+            hot.use_frontier_logits && hot.reusable_tokens == token_count;
+        const auto cold = server_slot_exact_prompt_action_resolve(
+            token_count, true, false, false);
+        result.missing_capability_replays =
+            !cold.use_frontier_logits &&
+            cold.reusable_tokens + 1 == token_count;
+
+        server_slot failed_save;
+        failed_save.prompt.tokens =
+            server_tokens(llama_tokens { 1, 2, 3 }, false);
+        result.rollback_decode_allows_cold_save =
+            !server_slot_frontier_prepare_requires_reset(
+                server_slot_frontier_prepare_status::decode_rolled_back, false);
+        result.partial_decode_requires_reset =
+            server_slot_frontier_prepare_requires_reset(
+                server_slot_frontier_prepare_status::decode_partially_committed,
+                false);
+        result.aligned_without_logits_allows_cold_save =
+            server_slot_frontier_geometry_classify(
+                true, true, 2, 2, 3, false) ==
+                    server_slot_frontier_geometry::aligned_without_logits &&
+            !server_slot_frontier_prepare_requires_reset(
+                server_slot_frontier_prepare_status::aligned_without_logits,
+                true);
+        result.missing_memory_requires_reset =
+            server_slot_frontier_geometry_classify(
+                false, true, -1, 2, 3, false) ==
+                    server_slot_frontier_geometry::unsafe_gap &&
+            server_slot_frontier_prepare_requires_reset(
+                server_slot_frontier_prepare_status::frontier_gap, false);
+        result.multi_token_gap_requires_reset =
+            server_slot_frontier_geometry_classify(
+                true, true, 0, 3, 4, false) ==
+                    server_slot_frontier_geometry::unsafe_gap &&
+            server_slot_frontier_prepare_requires_reset(
+                server_slot_frontier_prepare_status::frontier_gap, false);
+        result.decode_failure_refuses_publication =
+            result.partial_decode_requires_reset;
+        if (result.decode_failure_refuses_publication) {
+            failed_save.mandatory_recovery_reset(
+                server_cache_destruction_reason::restore_failure);
+        }
+        result.decode_failure_clears_slot =
+            failed_save.prompt.tokens.empty() &&
+            failed_save.frontier_logits.values.empty();
+        server_frontier_logits_state consumed;
+        std::vector<float> large(4096, 1.0f);
+        consumed.install(std::move(large), token_digest, 1);
+        consumed.clear();
+        result.consumed_logits_release_capacity =
+            consumed.values.empty() && consumed.values.capacity() == 0;
+    } catch (...) {
+        // Leave individual booleans false; the focused test reports the exact
+        // missing contract rather than allowing an exception to escape.
+    }
+    if (!directory.empty()) {
+        std::error_code ignored;
+        std::filesystem::remove_all(directory, ignored);
+    }
     return result;
 }
 

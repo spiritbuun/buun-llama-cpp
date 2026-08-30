@@ -1630,6 +1630,19 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_dsv4::memory_breakdo
     return mb;
 }
 
+std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_dsv4::memory_breakdown_vbr_managed() const {
+    // Static Turbo selection applies to raw/CSA/HCA. The lightning index and compressor state
+    // are fixed-layout context consumers and must not be floor-scaled or charged to a VBR budget.
+    std::map<ggml_backend_buffer_type_t, size_t> mb = kv_raw->memory_breakdown_vbr_managed();
+    for (const auto & buft_size : kv_csa->memory_breakdown_vbr_managed()) {
+        mb[buft_size.first] += buft_size.second;
+    }
+    for (const auto & buft_size : kv_hca->memory_breakdown_vbr_managed()) {
+        mb[buft_size.first] += buft_size.second;
+    }
+    return mb;
+}
+
 void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     const bool partial_only = flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
 

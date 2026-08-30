@@ -2652,13 +2652,33 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    seq_add_impl(seq_id, p0, p1, shift, false);
+}
+
+void llama_kv_cache::seq_add_raw_mrope(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    GGML_ASSERT(supports_qwen4_text_mrope_shift());
+    seq_add_impl(seq_id, p0, p1, shift, true);
+}
+
+void llama_kv_cache::seq_add_impl(
+        llama_seq_id seq_id,
+           llama_pos p0,
+           llama_pos p1,
+           llama_pos shift,
+                bool raw_keys) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
     }
 
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
-    GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_add() is only supported for n_pos_per_embd() == 1");
+    const bool text_mrope = supports_qwen4_text_mrope_shift();
+    GGML_ASSERT((hparams.n_pos_per_embd() == 1 || text_mrope) &&
+            "seq_add() only supports one-dimensional or Qwen4 text-broadcast positions");
+    GGML_ASSERT((!raw_keys || text_mrope) &&
+            "metadata-only shifting is restricted to Qwen4 text M-RoPE raw-key caches");
+    GGML_ASSERT((!text_mrope || can_shift_qwen4_text_range(seq_id, p0, p1)) &&
+            "Qwen4 M-RoPE shifting is restricted to broadcast text positions");
 
     const uint32_t stream = seq_to_stream[seq_id];
     auto & cells = v_cells[stream];
@@ -2692,7 +2712,11 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
         if (cells.seq_has(i, seq_id)) {
             changed = true;
             const llama_pos old_pos = cells.pos_get(i);
-            const bool removed = cells.pos_add(i, shift);
+            const bool removed = text_mrope
+                ? (raw_keys
+                    ? cells.pos_add_mrope_text_raw(i, shift)
+                    : cells.pos_add_mrope_text(i, shift))
+                : cells.pos_add(i, shift);
             if (vbr_ownership_) {
                 if (removed) {
                     vbr_ownership_->remove_cell(stream, seq_id, i, old_pos);
@@ -2825,6 +2849,13 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() 
     }
 
     return ret;
+}
+
+std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown_vbr_managed() const {
+    // A plain KV cache has no auxiliary context-linear state: its entire allocation follows the
+    // selected K/V representation, even when the selection is a fixed Turbo tier rather than a
+    // live dynamic controller.
+    return memory_breakdown();
 }
 
 llama_memory_context_ptr llama_kv_cache::init_batch(
@@ -11605,8 +11636,60 @@ bool llama_kv_cache::get_can_shift() const {
         return false;
     }
     if (hparams.n_pos_per_embd() > 1) {
+        return supports_qwen4_text_mrope_shift();
+    }
+    return true;
+}
+
+bool llama_kv_cache::supports_qwen4_text_mrope_shift() const {
+    // This is deliberately a model/layout contract, not a generic M-RoPE
+    // allowance.  Qwen4 text tokens use [t,t,t,0]; with no dimensions in the
+    // fourth section a single temporal delta is exactly a NEOX K-shift over
+    // the full rotary span.  Multimodal/2-D layouts do not satisfy this type.
+    static constexpr std::array<int, 4> qwen4_text_sections = { 11, 11, 10, 0 };
+
+    if (model.arch != LLM_ARCH_QWEN4EXP ||
+        hparams.rope_type != LLAMA_ROPE_TYPE_IMROPE ||
+        hparams.rope_sections != qwen4_text_sections) {
         return false;
     }
+
+    for (const auto & layer : layers) {
+        if (hparams.has_rope(layer.il) && hparams.n_rot(layer.il) != 64) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool llama_kv_cache::can_shift_qwen4_text_range(
+        llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+    if (!supports_qwen4_text_mrope_shift() ||
+        seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return false;
+    }
+
+    if (p0 < 0) {
+        p0 = 0;
+    }
+    if (p1 < 0) {
+        p1 = std::numeric_limits<llama_pos>::max();
+    }
+
+    const auto & cells = v_cells[seq_to_stream[seq_id]];
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (!cells.pos_in(i, p0, p1) || !cells.seq_has(i, seq_id)) {
+            continue;
+        }
+
+        const llama_pos pos = cells.pos_get(i);
+        const auto & ext = cells.ext_get(i);
+        if (ext.x != pos || ext.y != pos) {
+            return false;
+        }
+    }
+
     return true;
 }
 
@@ -11618,6 +11701,16 @@ uint32_t llama_kv_cache::get_size() const {
 
 uint32_t llama_kv_cache::get_n_stream() const {
     return n_stream;
+}
+
+uint32_t llama_kv_cache::get_stream_for_seq(llama_seq_id seq_id) const {
+    GGML_ASSERT(seq_id >= 0 && size_t(seq_id) < seq_to_stream.size());
+    return seq_to_stream[size_t(seq_id)];
+}
+
+bool llama_kv_cache::state_empty() const {
+    return std::all_of(v_cells.begin(), v_cells.end(),
+        [](const llama_kv_cells & cells) { return cells.get_used() == 0; });
 }
 
 bool llama_kv_cache::get_has_shift() const {

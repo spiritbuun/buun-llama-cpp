@@ -2759,11 +2759,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
-        // truncate ctx_dft to the start of this batch — draft() may have advanced
-        // ctx_dft past these positions, and M-RoPE requires monotonic positions
-        for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
-            if (i_batch_beg[s] >= 0) {
-                llama_memory_seq_rm(llama_get_memory(ctx_dft), s, batch_in.pos[i_batch_beg[s]], -1);
+        // draft() may have advanced the MTP KV beyond this target batch. Rewind
+        // to the verified frontier before replaying target hidden rows; M-RoPE
+        // requires the stored position to be no greater than the incoming one.
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (i_batch_beg[seq_id] >= 0) {
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id,
+                    batch_in.pos[i_batch_beg[seq_id]], -1);
             }
         }
 

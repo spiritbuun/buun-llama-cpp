@@ -788,6 +788,14 @@ struct llama_cache_acct_ledger {
                    llama_cache_acct_measure measure,
                    uint64_t value);
 
+    // Initialize an unobserved gauge to known zero without overwriting a
+    // value already published by another authority sharing this ledger cell.
+    // Returns false for an unavailable or invalid cell.
+    bool gauge_initialize_zero(
+            llama_cache_acct_category category,
+            const llama_cache_acct_resource_domain & domain,
+            llama_cache_acct_measure measure);
+
     // A producer whose own observation failed (e.g. checked-sum overflow) latches the cell
     // unavailable instead of reporting a fabricated value.
     void mark_unavailable(llama_cache_acct_category category,

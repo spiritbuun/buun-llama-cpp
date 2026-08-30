@@ -275,6 +275,44 @@ void test_speculative_decode_terminals() {
     CHECK(reset.idle_prompt_preserved);
 }
 
+void test_slot_frontier_logits_companion() {
+    const auto result = server_slot_frontier_logits_for_test();
+    CHECK(result.round_trip);
+    CHECK(result.primary_binding_mutation_refused);
+    CHECK(result.runtime_family_mutation_refused);
+    CHECK(result.model_family_mutation_refused);
+    CHECK(result.model_nonsemantic_variation_matches);
+    CHECK(result.unresolved_context_fallback_changes_identity);
+    CHECK(result.explicit_context_override_ignores_training_context);
+    CHECK(result.sequence_geometry_changes_identity);
+    CHECK(result.padding_equivalent_geometry_matches);
+    CHECK(result.control_content_mutation_refused);
+    CHECK(result.missing_family_receipt_disables_hot);
+    CHECK(result.adapter_mutation_refused);
+    CHECK(result.token_count_mutation_refused);
+    CHECK(result.next_position_mutation_refused);
+    CHECK(result.token_digest_mutation_refused);
+    CHECK(result.vocabulary_mutation_refused);
+    CHECK(result.logits_mutation_refused);
+    CHECK(result.serialized_payload_mutation_refused);
+    CHECK(result.nonfinite_logits_refused);
+    CHECK(result.torn_companion_refused);
+    CHECK(result.missing_companion_is_cold);
+    CHECK(result.destination_slot_rebound);
+    CHECK(result.destination_epoch_rebound);
+    CHECK(result.source_process_epoch_not_reused);
+    CHECK(result.exact_hit_skips_decode);
+    CHECK(result.missing_capability_replays);
+    CHECK(result.decode_failure_refuses_publication);
+    CHECK(result.decode_failure_clears_slot);
+    CHECK(result.rollback_decode_allows_cold_save);
+    CHECK(result.partial_decode_requires_reset);
+    CHECK(result.aligned_without_logits_allows_cold_save);
+    CHECK(result.missing_memory_requires_reset);
+    CHECK(result.multi_token_gap_requires_reset);
+    CHECK(result.consumed_logits_release_capacity);
+}
+
 void fill_checkpoint_bytes(
         common_shared_byte_buffer & buffer,
         size_t size,
@@ -5111,16 +5149,17 @@ void test_shared_checkpoint_physical_accounting() {
         common_prompt_checkpoint source;
         fill_checkpoint_bytes(source.data_tgt, 64, 1);
         fill_checkpoint_bytes(source.data_dft, 32, 2);
+        fill_checkpoint_bytes(source.data_qsa, 24, 5);
         fill_checkpoint_bytes(source.accel.ring, 16, 3);
         fill_checkpoint_bytes(source.accel.spec, 8, 4);
         std::vector<llama_cache_acct_op_id> source_ops;
         CHECK(authority.admit_live_checkpoint({ 10001 }, source, source_ops));
-        CHECK(source_ops.size() == 4);
+        CHECK(source_ops.size() == 5);
 
         auto snapshot = authority.ledger.snapshot();
-        CHECK(snapshot.allocations.size() == 4);
-        CHECK(resident_bytes(snapshot) == 120);
-        CHECK(snapshot.live_ops == 4);
+        CHECK(snapshot.allocations.size() == 5);
+        CHECK(resident_bytes(snapshot) == 144);
+        CHECK(snapshot.live_ops == 5);
 
         server_prompt prompt;
         prompt.checkpoints.push_back(source);
@@ -5130,7 +5169,16 @@ void test_shared_checkpoint_physical_accounting() {
         bounded.limit_size = 32;
         auto staged = bounded.stage(prompt, 16, 0, "shared-physical");
         CHECK(staged.size() == 1);
-        CHECK(staged.front().size() == 136);
+        CHECK(staged.front().size() == 160);
+        uint64_t snapshot_payload = 0;
+        uint64_t checkpoint_payload = 0;
+        uint64_t accelerator_payload = 0;
+        CHECK(server_prompt_cache::payload_bytes(
+            staged.front(), snapshot_payload, checkpoint_payload,
+            accelerator_payload));
+        CHECK(snapshot_payload == 16);
+        CHECK(checkpoint_payload == 96);
+        CHECK(accelerator_payload == 48);
 
         server_prompt unbound_prompt;
         unbound_prompt.checkpoints.emplace_back();
@@ -5147,15 +5195,15 @@ void test_shared_checkpoint_physical_accounting() {
         }
         CHECK(authority.admit_live_checkpoints(batch));
         snapshot = authority.ledger.snapshot();
-        CHECK(snapshot.allocations.size() == 4);
-        CHECK(resident_bytes(snapshot) == 120);
-        CHECK(snapshot.live_ops == 36);
+        CHECK(snapshot.allocations.size() == 5);
+        CHECK(resident_bytes(snapshot) == 144);
+        CHECK(snapshot.live_ops == 45);
         for (const auto & allocation : snapshot.allocations) {
             CHECK(allocation.committed_refs == 9);
         }
 
         for (const auto & member : batch) {
-            CHECK(member.committed.size() == 4);
+            CHECK(member.committed.size() == 5);
             for (const auto op : member.committed) {
                 CHECK(authority.ledger.release(op));
             }
@@ -5173,6 +5221,7 @@ void test_shared_checkpoint_physical_accounting() {
         common_prompt_checkpoint source;
         fill_checkpoint_bytes(source.data_tgt, 64, 1);
         fill_checkpoint_bytes(source.data_dft, 32, 2);
+        fill_checkpoint_bytes(source.data_qsa, 24, 5);
         fill_checkpoint_bytes(source.accel.ring, 16, 3);
         fill_checkpoint_bytes(source.accel.spec, 8, 4);
         common_prompt_checkpoint detached = source;
@@ -5197,9 +5246,9 @@ void test_shared_checkpoint_physical_accounting() {
         CHECK(authority.admit_live_checkpoint(
             { 11002 }, detached, detached_ops));
         const auto snapshot = authority.ledger.snapshot();
-        CHECK(snapshot.allocations.size() == 5);
-        CHECK(resident_bytes(snapshot) == 184);
-        CHECK(snapshot.live_ops == 8);
+        CHECK(snapshot.allocations.size() == 6);
+        CHECK(resident_bytes(snapshot) == 208);
+        CHECK(snapshot.live_ops == 10);
         for (const auto op : detached_ops) {
             CHECK(authority.ledger.release(op));
         }
@@ -5335,6 +5384,7 @@ int main(int argc, char ** argv) {
     test_idle_capture_refuses_active_queue_yield();
     test_queue_yield_work_exception_precedes_callback_exception();
     test_speculative_decode_terminals();
+    test_slot_frontier_logits_companion();
     test_fixed_host_pressure_shadow_records_counterfactual();
     test_fixed_host_shadow_uses_exact_cross_lineage_prefix();
     test_typed_host_payload_boundary();

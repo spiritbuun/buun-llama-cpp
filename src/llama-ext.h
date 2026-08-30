@@ -105,6 +105,9 @@ struct llama_memory_breakdown_data {
     // n_seq_max). Included in `context`, never added separately. Budget formulas that exploit
     // the context term cancelling out of context-linear projections must still charge this part.
     size_t context_fixed = 0;
+    // Portion of `context` whose representation/footprint is selected by Turbo/VBR. Auxiliary
+    // fixed-layout caches can be context-linear without belonging to this subset.
+    size_t context_vbr_managed = 0;
 
     size_t total() const {
         return model + context + compute;

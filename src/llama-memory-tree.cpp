@@ -14,9 +14,9 @@ bool collect_impl(
         std::vector<llama_memory_tree_child> & output) {
     if (auto * iswa = dynamic_cast<llama_kv_cache_iswa *>(memory)) {
         output.push_back({ uint32_t(output.size()), iswa->get_base(), nullptr,
-            checkpoint_child_dependency_mode::live_guarded });
+            checkpoint_child_dependency_mode::live_guarded, nullptr });
         output.push_back({ uint32_t(output.size()), iswa->get_swa(), nullptr,
-            checkpoint_child_dependency_mode::payload_complete });
+            checkpoint_child_dependency_mode::payload_complete, nullptr });
         return true;
     }
     if (auto * hybrid_iswa =
@@ -26,22 +26,24 @@ bool collect_impl(
         }
         output.push_back({ uint32_t(output.size()), nullptr,
             hybrid_iswa->get_mem_recr(),
-            checkpoint_child_dependency_mode::absent });
+            checkpoint_child_dependency_mode::absent, nullptr });
         return true;
     }
-    // Indexed hybrid memory has a third, indexed attention component whose
-    // artifact semantics are not represented by the two-child hybrid shape.
-    // Refuse it explicitly until the indexed topology has its own collector;
-    // falling through to llama_memory_hybrid would silently omit that state.
-    if (dynamic_cast<llama_memory_hybrid_idx *>(memory)) {
-        return false;
+    if (auto * indexed = dynamic_cast<llama_memory_hybrid_idx *>(memory)) {
+        output.push_back({ uint32_t(output.size()), indexed->get_mem_attn(), nullptr,
+            checkpoint_child_dependency_mode::live_guarded,
+            indexed->get_mem_idx() ? indexed : nullptr });
+        output.push_back({ uint32_t(output.size()), nullptr,
+            indexed->get_mem_recr(),
+            checkpoint_child_dependency_mode::absent, nullptr });
+        return true;
     }
     if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory)) {
         output.push_back({ uint32_t(output.size()), hybrid->get_mem_attn(), nullptr,
-            checkpoint_child_dependency_mode::live_guarded });
+            checkpoint_child_dependency_mode::live_guarded, nullptr });
         output.push_back({ uint32_t(output.size()), nullptr,
             hybrid->get_mem_recr(),
-            checkpoint_child_dependency_mode::absent });
+            checkpoint_child_dependency_mode::absent, nullptr });
         return true;
     }
     if (auto * kv = dynamic_cast<llama_kv_cache *>(memory)) {
@@ -50,12 +52,12 @@ bool collect_impl(
         // state dependency, treating it as payload-complete discards that
         // placement and leaves the resulting artifact unusable for restore.
         output.push_back({ uint32_t(output.size()), kv, nullptr,
-            checkpoint_child_dependency_mode::live_guarded });
+            checkpoint_child_dependency_mode::live_guarded, nullptr });
         return true;
     }
     if (auto * recurrent = dynamic_cast<llama_memory_recurrent *>(memory)) {
         output.push_back({ uint32_t(output.size()), nullptr, recurrent,
-            checkpoint_child_dependency_mode::absent });
+            checkpoint_child_dependency_mode::absent, nullptr });
         return true;
     }
     return false;

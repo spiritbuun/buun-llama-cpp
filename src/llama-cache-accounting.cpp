@@ -1627,6 +1627,34 @@ void llama_cache_acct_ledger::gauge_set(
     }
 }
 
+bool llama_cache_acct_ledger::gauge_initialize_zero(
+        llama_cache_acct_category category,
+        const llama_cache_acct_resource_domain & domain,
+        llama_cache_acct_measure measure) {
+    std::lock_guard<std::mutex> lock(mtx);
+    if (measure >= llama_cache_acct_measure::_count ||
+        !domain_use_valid(category, domain)) {
+        state.faults_invalid_transition++;
+        bump_serial();
+        return false;
+    }
+    auto * row = find_cell(category, domain);
+    if (!row) {
+        state.faults_invalid_transition++;
+        bump_serial();
+        return false;
+    }
+    auto & cell = row->cell.measures[size_t(measure)];
+    if (cell.state == llama_cache_acct_known::unavailable) {
+        return false;
+    }
+    if (cell.state == llama_cache_acct_known::unknown) {
+        cell = { 0, llama_cache_acct_known::known };
+        bump_serial();
+    }
+    return true;
+}
+
 void llama_cache_acct_ledger::mark_unavailable(
         llama_cache_acct_category category,
         const llama_cache_acct_resource_domain & domain,

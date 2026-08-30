@@ -1,5 +1,18 @@
 cmake_minimum_required(VERSION 3.18)  # for CMAKE_CUDA_ARCHITECTURES
 
+option(GGML_CUDA_Q8_MMV_TEST_INSTRUMENTATION
+       "Enable test-only Q8_0 MMV dispatch counters" OFF)
+option(GGML_CUDA_HC_COMBINE_TEST_INSTRUMENTATION
+       "Enable test-only HC-combine fusion dispatch counters" OFF)
+option(GGML_CUDA_HC_STREAM_MEAN_TEST_INSTRUMENTATION
+       "Enable test-only HC stream-mean fusion dispatch counters" OFF)
+option(GGML_CUDA_Q8_POST_SILU_TEST_INSTRUMENTATION
+       "Enable test-only Q8 post-SiLU fusion dispatch counters" OFF)
+option(GGML_CUDA_HC_GROUPED_RMS_TEST_INSTRUMENTATION
+       "Enable test-only grouped HC RMS fusion dispatch counters" OFF)
+option(GGML_CUDA_MOE_CACHE_FLAT_HITS_TEST_INSTRUMENTATION
+       "Enable test-only MoE cache flattened-hit dispatch counters" OFF)
+
 find_package(CUDAToolkit)
 
 if (CUDAToolkit_FOUND)
@@ -138,6 +151,25 @@ if (CUDAToolkit_FOUND)
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}
                             )
+
+    if (GGML_CUDA_Q8_MMV_TEST_INSTRUMENTATION)
+        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_Q8_MMV_TEST_INSTRUMENTATION)
+    endif()
+    if (GGML_CUDA_HC_COMBINE_TEST_INSTRUMENTATION)
+        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_HC_COMBINE_TEST_INSTRUMENTATION)
+    endif()
+    if (GGML_CUDA_HC_STREAM_MEAN_TEST_INSTRUMENTATION)
+        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_HC_STREAM_MEAN_TEST_INSTRUMENTATION)
+    endif()
+    if (GGML_CUDA_Q8_POST_SILU_TEST_INSTRUMENTATION)
+        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_Q8_POST_SILU_TEST_INSTRUMENTATION)
+    endif()
+    if (GGML_CUDA_HC_GROUPED_RMS_TEST_INSTRUMENTATION)
+        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_HC_GROUPED_RMS_TEST_INSTRUMENTATION)
+    endif()
+    if (GGML_CUDA_MOE_CACHE_FLAT_HITS_TEST_INSTRUMENTATION)
+        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_MOE_CACHE_FLAT_HITS_TEST_INSTRUMENTATION)
+    endif()
 
     add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
 

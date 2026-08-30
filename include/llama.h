@@ -624,6 +624,7 @@ extern "C" {
     LLAMA_API enum llama_rope_type       llama_model_rope_type(const struct llama_model * model);
 
     LLAMA_API int32_t llama_model_n_ctx_train  (const struct llama_model * model);
+    LLAMA_API int32_t llama_model_n_ctx_orig_yarn(const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd       (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd_inp   (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd_out   (const struct llama_model * model);
@@ -681,6 +682,14 @@ extern "C" {
 
     // Returns the total size of all the tensors in the model in bytes
     LLAMA_API uint64_t llama_model_size(const struct llama_model * model);
+
+    // Stable semantic-family compatibility policy for portable sequence
+    // state. This is deliberately NOT a model-weight identity: it excludes
+    // tensor values, quantization, model names, paths, and timestamps while
+    // binding effective state-producing structure and tokenizer semantics.
+    LLAMA_API bool llama_model_semantic_family_digest(
+            const struct llama_model * model,
+            uint8_t digest[32]);
 
     // Get the default chat template. Returns nullptr if not available
     // If name is NULL, returns the default chat template
