@@ -169,7 +169,7 @@ On VRAM-constrained GPUs, a speculative context and the vision encoder (mmproj) 
 
 When combined with auto-fit (no `-c` flag), the server automatically sizes context to leave room for the swap. With a single slot, it also auto-enables `--kv-unified` to avoid splitting the KV cache into separate streams, which doubles usable per-slot context.
 
-## DeepSeek V4 Flash — MoE cache and DSpark
+## DeepSeek V4 Flash and Qwen3.8 Flash Next — MoE cache
 
 DeepSeek V4 Flash is much larger than a typical consumer-GPU model, but its routed experts can stay
 in system RAM while the hot expert tensors are cached in spare VRAM. On a multi-GPU machine, use
