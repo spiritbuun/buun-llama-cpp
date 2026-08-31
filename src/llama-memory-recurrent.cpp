@@ -1320,6 +1320,7 @@ bool llama_memory_recurrent::resize(uint32_t new_mem_size) {
         const uint32_t old_size = size;
         const uint32_t n_copy = std::min(old_size, new_mem_size);
         const size_t tensor_overhead = ggml_tensor_overhead();
+        const size_t tensors_per_layer = hparams.ple_conv_state() > 0 ? 3 : 2;
 
         if (new_mem_size < old_size) {
             // A logical sequence can live in any physical cell. Truncating a high
@@ -1354,7 +1355,7 @@ bool llama_memory_recurrent::resize(uint32_t new_mem_size) {
         }
 
         if (n_layer < 0 ||
-            (tensor_overhead != 0 && size_t(n_layer) > SIZE_MAX / tensor_overhead / 2)) {
+            (tensor_overhead != 0 && size_t(n_layer) > SIZE_MAX / tensor_overhead / tensors_per_layer)) {
             LLAMA_LOG_ERROR("%s: resized rs context metadata size overflows\n", __func__);
             return false;
         }
@@ -1377,7 +1378,7 @@ bool llama_memory_recurrent::resize(uint32_t new_mem_size) {
             LLAMA_LOG_ERROR("%s: resized rs row count exceeds ggml dimensions\n", __func__);
             return false;
         }
-        const size_t context_bytes = 2 * size_t(n_layer) * tensor_overhead;
+        const size_t context_bytes = tensors_per_layer * size_t(n_layer) * tensor_overhead;
 
         auto tensor_shape_fits = [&](ggml_type type, uint32_t n_embd) {
             if (n_embd != 0 && new_rows > uint64_t(INT64_MAX) / n_embd) {
@@ -1408,21 +1409,25 @@ bool llama_memory_recurrent::resize(uint32_t new_mem_size) {
 
         const std::vector<ggml_tensor *> old_r_l = r_l;
         const std::vector<ggml_tensor *> old_s_l = s_l;
+        const std::vector<ggml_tensor *> old_p_l = p_l;
         std::vector<ggml_tensor *> new_r_l(r_l.size(), nullptr);
         std::vector<ggml_tensor *> new_s_l(s_l.size(), nullptr);
+        std::vector<ggml_tensor *> new_p_l(p_l.size(), nullptr);
 
         for (int i = 0; i < n_layer; i++) {
-            if (!old_r_l[i] && !old_s_l[i]) {
+            if (!old_r_l[i] && !old_s_l[i] && !old_p_l[i]) {
                 continue;
             }
 
             if ((old_r_l[i] && !tensor_shape_fits(old_r_l[i]->type, hparams.n_embd_r())) ||
-                (old_s_l[i] && !tensor_shape_fits(old_s_l[i]->type, hparams.n_embd_s()))) {
+                (old_s_l[i] && !tensor_shape_fits(old_s_l[i]->type, hparams.n_embd_s())) ||
+                (old_p_l[i] && !tensor_shape_fits(old_p_l[i]->type, hparams.ple_conv_state()))) {
                 LLAMA_LOG_ERROR("%s: resized rs tensor shape overflows\n", __func__);
                 return false;
             }
 
-            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(old_r_l[i] ? old_r_l[i]->buffer : old_s_l[i]->buffer);
+            ggml_tensor * old_tensor = old_r_l[i] ? old_r_l[i] : (old_s_l[i] ? old_s_l[i] : old_p_l[i]);
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(old_tensor->buffer);
             ggml_context * ctx = ctx_for_buft(buft);
             if (!ctx) {
                 LLAMA_LOG_ERROR("%s: failed to create ggml context for resized rs cache\n", __func__);
@@ -1446,6 +1451,15 @@ bool llama_memory_recurrent::resize(uint32_t new_mem_size) {
                 }
                 ggml_format_name(s, "cache_s_l%d", i);
                 new_s_l[i] = s;
+            }
+            if (old_p_l[i]) {
+                ggml_tensor * p = ggml_new_tensor_2d(ctx, old_p_l[i]->type, hparams.ple_conv_state(), (int64_t) new_rows);
+                if (!p) {
+                    LLAMA_LOG_ERROR("%s: failed to create resized PLE tensor\n", __func__);
+                    return false;
+                }
+                ggml_format_name(p, "cache_ple_r_l%d", i);
+                new_p_l[i] = p;
             }
         }
 
@@ -1476,6 +1490,12 @@ bool llama_memory_recurrent::resize(uint32_t new_mem_size) {
                     tmp.resize(bytes);
                     ggml_backend_tensor_get(old_s_l[i], tmp.data(), 0, bytes);
                     ggml_backend_tensor_set(new_s_l[i], tmp.data(), 0, bytes);
+                }
+                if (old_p_l[i] && new_p_l[i]) {
+                    size_t bytes = ggml_row_size(old_p_l[i]->type, hparams.ple_conv_state()) * n_copy_rows;
+                    tmp.resize(bytes);
+                    ggml_backend_tensor_get(old_p_l[i], tmp.data(), 0, bytes);
+                    ggml_backend_tensor_set(new_p_l[i], tmp.data(), 0, bytes);
                 }
             }
         }
@@ -1540,6 +1560,7 @@ bool llama_memory_recurrent::resize(uint32_t new_mem_size) {
         // live tensor pointer has been rebound.
         r_l.swap(new_r_l);
         s_l.swap(new_s_l);
+        p_l.swap(new_p_l);
         ctxs_bufs.swap(new_ctxs_bufs);
         cells.swap(new_cells);
         rs_idx.swap(new_rs_idx);
@@ -1553,11 +1574,13 @@ bool llama_memory_recurrent::resize(uint32_t new_mem_size) {
 
         const size_t memory_size_r = size_r_bytes();
         const size_t memory_size_s = size_s_bytes();
-        LLAMA_LOG_INFO("%s: resized %u -> %u cells, used=%u, head=%u, n=%u, rs_z=%d, R: %7.2f MiB, S: %7.2f MiB\n", __func__,
+        const size_t memory_size_p = size_p_bytes();
+        LLAMA_LOG_INFO("%s: resized %u -> %u cells, used=%u, head=%u, n=%u, rs_z=%d, R: %7.2f MiB, S: %7.2f MiB, P: %7.2f MiB\n", __func__,
                 old_size, new_mem_size,
                 used, head, n, rs_z,
                 (float)memory_size_r / (1024.0f * 1024.0f),
-                (float)memory_size_s / (1024.0f * 1024.0f));
+                (float)memory_size_s / (1024.0f * 1024.0f),
+                (float)memory_size_p / (1024.0f * 1024.0f));
 
         return true;
     } catch (const std::length_error &) {

@@ -723,6 +723,7 @@ int main(int argc, char ** argv) {
     const auto high_state_before = save_seq(ctx_parallel.get(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
     const auto high_r_before = recurrent_parallel->r_l;
     const auto high_s_before = recurrent_parallel->s_l;
+    const auto high_p_before = recurrent_parallel->p_l;
     uint64_t high_epoch_before = 0;
     uint64_t high_epoch_after = 0;
     if (high_tail < 1 || high_state_before.empty() ||
@@ -732,6 +733,7 @@ int main(int argc, char ** argv) {
         recurrent_parallel->cells[0].tail != high_tail ||
         recurrent_parallel->r_l != high_r_before ||
         recurrent_parallel->s_l != high_s_before ||
+        recurrent_parallel->p_l != high_p_before ||
         save_seq(ctx_parallel.get(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != high_state_before ||
         !get_recurrent_epoch(recurrent_parallel, high_epoch_after) ||
         high_epoch_after != high_epoch_before ||
@@ -785,6 +787,7 @@ int main(int argc, char ** argv) {
     const auto resize_state_before = save_seq(ctx_parallel.get(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
     const auto resize_r_before = recurrent_parallel->r_l;
     const auto resize_s_before = recurrent_parallel->s_l;
+    const auto resize_p_before = recurrent_parallel->p_l;
     const auto resize_rs_idx_before = recurrent_parallel->rs_idx;
     const auto resize_depth_before = recurrent_parallel->rollback_valid_depth;
     const uint32_t resize_size_before = recurrent_parallel->size;
@@ -811,6 +814,7 @@ int main(int argc, char ** argv) {
         recurrent_parallel->rs_z != resize_rs_z_before ||
         recurrent_parallel->r_l != resize_r_before ||
         recurrent_parallel->s_l != resize_s_before ||
+        recurrent_parallel->p_l != resize_p_before ||
         recurrent_parallel->rs_idx != resize_rs_idx_before ||
         recurrent_parallel->rollback_valid_depth != resize_depth_before ||
         save_seq(ctx_parallel.get(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != resize_state_before ||
@@ -844,7 +848,8 @@ int main(int argc, char ** argv) {
     for (size_t i = 0; i < resize_r_before.size(); ++i) {
         tensors_rebound = tensors_rebound ||
             (resize_r_before[i] != nullptr && resize_r_before[i] != recurrent_parallel->r_l[i]) ||
-            (resize_s_before[i] != nullptr && resize_s_before[i] != recurrent_parallel->s_l[i]);
+            (resize_s_before[i] != nullptr && resize_s_before[i] != recurrent_parallel->s_l[i]) ||
+            (resize_p_before[i] != nullptr && resize_p_before[i] != recurrent_parallel->p_l[i]);
     }
     if (recurrent_parallel->size != 2 || !tensors_rebound ||
         !get_recurrent_epoch(recurrent_parallel, resize_epoch_after_success) ||

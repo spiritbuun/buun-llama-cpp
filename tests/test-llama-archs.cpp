@@ -14,6 +14,7 @@
 #include "../src/llama-ext.h"
 #include "../src/llama-memory.h"
 #include "../src/llama-memory-hybrid-idx.h"
+#include "../src/llama-memory-recurrent.h"
 #include "../src/llama-memory-tree.h"
 #include "../src/llama-model.h"
 #include "../src/llama-model-loader.h"
@@ -478,6 +479,137 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         throw std::runtime_error("failed to create llama context");
     }
     return std::make_pair(std::move(model), std::move(lctx));
+}
+
+static void test_qwen4_ple_recurrent_resize(const size_t seed) {
+    gguf_context_ptr gguf = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+    // These owners precede the model so its borrowed synthetic PLE weights stay
+    // alive until after the model/context are destroyed.
+    ggml_context_ptr ple_ctx;
+    ggml_backend_buffer_ptr ple_buf;
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    ggml_backend_dev_t cpu_devices[] = { nullptr };
+    model_params.devices = cpu_devices;
+    size_t tmp = seed;
+    llama_model_ptr model(llama_model_init_from_user(gguf.get(), set_tensor_data, &tmp, model_params));
+    GGML_ASSERT(model != nullptr);
+
+    // Install a small but structurally complete PLE layer on the generated Qwen4
+    // model. One 256-wide hash head keeps the embedding input compatible with the
+    // ordinary model width without requiring a large real PLE GGUF fixture.
+    auto & hp = model->hparams;
+    hp.is_ple_impl.set(0);
+    hp.ple_ngram_size = 2;
+    hp.ple_heads_per_ngram = 1;
+    hp.ple_conv_kernel = 2;
+    hp.ple_n_heads = 1;
+    hp.ple_head_dim = 256;
+    hp.n_embd_per_layer = 256;
+    hp.ple_eos_token_id = 0;
+    hp.ple_layer_multipliers[0] = 1;
+    hp.ple_layer_multipliers[1] = 3;
+    hp.ple_head_offsets[0] = 0;
+    hp.ple_head_vocab_sizes[0] = 128;
+    GGML_ASSERT(hp.ple_conv_state() > 0);
+
+    ggml_init_params tensor_params = {
+        /* .mem_size   = */ 8*ggml_tensor_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ple_ctx.reset(ggml_init(tensor_params));
+    GGML_ASSERT(ple_ctx != nullptr);
+    auto make_1d = [&](int64_t ne0, const char * name) {
+        ggml_tensor * tensor = ggml_new_tensor_1d(ple_ctx.get(), GGML_TYPE_F32, ne0);
+        ggml_set_name(tensor, name);
+        return tensor;
+    };
+    auto make_2d = [&](int64_t ne0, int64_t ne1, const char * name) {
+        ggml_tensor * tensor = ggml_new_tensor_2d(ple_ctx.get(), GGML_TYPE_F32, ne0, ne1);
+        ggml_set_name(tensor, name);
+        return tensor;
+    };
+    model->per_layer_tok_embd      = make_2d(256, 128, "per_layer_token_embd.weight");
+    model->layers[0].ple_key        = make_2d(256, 1024, "blk.0.ple_key.weight");
+    model->layers[0].ple_value      = make_2d(256, 256, "blk.0.ple_value.weight");
+    model->layers[0].ple_norm_key   = make_1d(1024, "blk.0.ple_norm_key.weight");
+    model->layers[0].ple_norm_query = make_1d(1024, "blk.0.ple_norm_query.weight");
+    model->layers[0].ple_norm_conv  = make_1d(1024, "blk.0.ple_norm_conv.weight");
+    model->layers[0].ple_conv1d     = make_2d(2, 1024, "blk.0.ple_conv1d.weight");
+    ple_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ple_ctx.get(), ggml_backend_cpu_buffer_type()));
+    GGML_ASSERT(ple_buf != nullptr);
+    for (ggml_tensor * tensor = ggml_get_first_tensor(ple_ctx.get()); tensor != nullptr;
+            tensor = ggml_get_next_tensor(ple_ctx.get(), tensor)) {
+        set_tensor_data(tensor, &tmp);
+    }
+
+    llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.n_ctx = 16;
+    ctx_params.n_batch = 16;
+    ctx_params.n_ubatch = 16;
+    ctx_params.n_seq_max = 4;
+    ctx_params.n_rs_seq = 3;
+    ctx_params.n_threads = 1;
+    ctx_params.n_threads_batch = 1;
+    llama_context_ptr ctx(llama_init_from_model(model.get(), ctx_params));
+    GGML_ASSERT(ctx != nullptr);
+
+    llama_memory_t memory = llama_get_memory(ctx.get());
+    auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory);
+    GGML_ASSERT(hybrid != nullptr);
+    llama_memory_recurrent * recurrent = hybrid->get_mem_recr();
+    GGML_ASSERT(recurrent != nullptr && recurrent->size == 4 && recurrent->n_rs_seq == 3);
+    GGML_ASSERT(recurrent->p_l[0] != nullptr);
+
+    const size_t row_bytes = ggml_row_size(recurrent->p_l[0]->type, model->hparams.ple_conv_state());
+    std::vector<uint8_t> initial(row_bytes);
+    for (size_t i = 0; i < initial.size(); ++i) {
+        initial[i] = uint8_t((17*i + 29) & 0xff);
+    }
+    ggml_backend_tensor_set(recurrent->p_l[0], initial.data(), 0, initial.size());
+
+    ggml_tensor * p_before_shrink = recurrent->p_l[0];
+    GGML_ASSERT(llama_memory_recurrent_shrink(memory, 1));
+    GGML_ASSERT(recurrent->size == 1 && recurrent->p_l[0] != p_before_shrink);
+    GGML_ASSERT(recurrent->p_l[0]->ne[1] == int64_t(1 + recurrent->n_rs_seq));
+    std::vector<uint8_t> copied(row_bytes);
+    ggml_backend_tensor_get(recurrent->p_l[0], copied.data(), 0, copied.size());
+    GGML_ASSERT(copied == initial);
+
+    // This is the production failure: graph construction must observe the resized
+    // PLE row rather than the stale four-cell allocation left by the old resize.
+    llama_token first = 1;
+    GGML_ASSERT(llama_decode(ctx.get(), llama_batch_get_one(&first, 1)) == 0);
+    llama_synchronize(ctx.get());
+
+    ggml_tensor * p_before_failure = recurrent->p_l[0];
+    std::vector<uint8_t> state_before_failure(ggml_nbytes(p_before_failure));
+    ggml_backend_tensor_get(p_before_failure, state_before_failure.data(), 0, state_before_failure.size());
+#ifdef _WIN32
+    _putenv_s("LLAMA_RECURRENT_RESIZE_TEST_FAIL", "before_publish");
+#else
+    setenv("LLAMA_RECURRENT_RESIZE_TEST_FAIL", "before_publish", 1);
+#endif
+    const bool failed_expand = llama_memory_recurrent_expand(memory, 2);
+#ifdef _WIN32
+    _putenv_s("LLAMA_RECURRENT_RESIZE_TEST_FAIL", "");
+#else
+    unsetenv("LLAMA_RECURRENT_RESIZE_TEST_FAIL");
+#endif
+    GGML_ASSERT(!failed_expand && recurrent->size == 1 && recurrent->p_l[0] == p_before_failure);
+    std::vector<uint8_t> state_after_failure(state_before_failure.size());
+    ggml_backend_tensor_get(recurrent->p_l[0], state_after_failure.data(), 0, state_after_failure.size());
+    GGML_ASSERT(state_after_failure == state_before_failure);
+
+    GGML_ASSERT(llama_memory_recurrent_expand(memory, 2));
+    GGML_ASSERT(recurrent->size == 2 && recurrent->p_l[0] != p_before_failure);
+    GGML_ASSERT(recurrent->p_l[0]->ne[1] == int64_t(2*(1 + recurrent->n_rs_seq)));
+    llama_token second = 2;
+    GGML_ASSERT(llama_decode(ctx.get(), llama_batch_get_one(&second, 1)) == 0);
+    llama_synchronize(ctx.get());
+
+    printf("Qwen4 PLE recurrent resize test PASSED\n");
 }
 
 static std::vector<float> get_logits(
@@ -3518,6 +3650,7 @@ int main(int argc, char ** argv) {
             test_qwen35_mtp_d2t_contract(seed);
         }
         if (arch == LLM_ARCH_UNKNOWN || arch == LLM_ARCH_QWEN4EXP) {
+            test_qwen4_ple_recurrent_resize(seed);
             test_qwen4_indexed_cache_admission(seed);
             test_qwen4_vbr_cuda(seed);
             test_qwen4_mtp_sidecar_contract(seed);

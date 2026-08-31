@@ -205,6 +205,48 @@ def test_multi_requests_parallel(n_slots: int, n_requests: int):
         assert match_regex("(wise|kind|owl|answer)+", res.body["content"])
 
 
+def test_shared_model_free_nonzero_slot():
+    # Shared model-free implementations must draft and accept through the same
+    # per-sequence owner. The legacy single-sequence wrapper always drives seq 0,
+    # which used to abort when a real draft was accepted for another server slot.
+    server.model_draft = None
+    server.spec_type = "ngram-mod"
+    server.spec_ngram_mod_n_min = 4
+    server.spec_ngram_mod_n_max = 8
+    server.spec_ngram_mod_n_match = 4
+    server.spec_synth_rates = [1.0] * 8
+    server.n_slots = 2
+    server.start()
+
+    prefix = "I believe the meaning of life is"
+    training = server.make_request("POST", "/completion", data={
+        "id_slot": 0,
+        "prompt": prefix,
+        "temperature": 0.0,
+        "top_k": 1,
+        "n_predict": 16,
+        "return_tokens": True,
+    })
+    assert training.status_code == 200, training.body
+
+    # Put the observed greedy continuation into the second prompt, followed by
+    # the same prefix. This guarantees a real proposal for the nonzero slot
+    # without depending on a model-specific hard-coded continuation.
+    res = server.make_request("POST", "/completion", data={
+        "id_slot": 1,
+        "prompt": prefix + training.body["content"] + " " + prefix,
+        "temperature": 0.0,
+        "top_k": 1,
+        "n_predict": 16,
+        "logit_bias": [[training.body["tokens"][0], 100.0]],
+    })
+    assert res.status_code == 200, res.body
+    assert res.body["id_slot"] == 1
+    assert res.body["timings"]["draft_n"] > 0
+    assert res.body["timings"]["draft_n_accepted"] > 0
+    assert res.body["tokens_predicted"] == 16
+
+
 def test_combined_external_draft_and_native_mtp_graceful():
     # The target fixture has no MTP layers. A combined list must keep the
     # external drafter normally typed, disable only native MTP, and serve the

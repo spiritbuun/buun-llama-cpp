@@ -16633,10 +16633,11 @@ private:
                 llama_tokens draft;
                 if (batched_draft_attempted[slot.id] || !batched_drafts[slot.id].empty()) {
                     draft = std::move(batched_drafts[slot.id]);
-                } else if (!slot.spec && spec && shared_model_draft) {
-                    // Shared multi-sequence model state: arm this slot's exact sequence.
-                    // The fallback wrapper below always drives sequence 0 and records a
-                    // different acceptance owner, so it is reserved for slot-owned state.
+                } else if (!slot.spec && spec) {
+                    // Shared multi-sequence state: arm this slot's exact sequence. This
+                    // applies to model-free implementations too: the single-sequence
+                    // wrapper below always drives sequence 0 and records curr_impl rather
+                    // than the per-sequence impl_last consumed by shared acceptance.
                     const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
                     auto & dp   = common_speculative_get_draft_params(spec.get(), slot.id);
                     dp.drafting = true;
