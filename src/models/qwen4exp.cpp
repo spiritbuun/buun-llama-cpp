@@ -982,10 +982,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, kq_scale, il);
     cb(cur, "kqv_out", il);
 
-    // the rotation is its own inverse, so undo it on the value side of the output
-    if (inp->self_v_rot) {
-        cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
-    }
+    // Use the same V-cache representation contract as ordinary attention. In particular,
+    // Turbo V is stored in the rotated domain and needs the Turbo inverse WHT here; the
+    // optional upstream Hadamard tensor is deliberately absent for Turbo cache types.
+    cur = build_attn_v_unrotate(cur, v, inp->self_v_rot, inp->self_vmean, il);
 
     return cur;
 }

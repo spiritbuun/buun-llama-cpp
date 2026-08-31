@@ -1292,6 +1292,16 @@ struct llm_graph_context {
             int   il,
             bool  sparse_mask = false) const;
 
+    // Restore an attention result from the representation used by the V cache.
+    // Turbo V is stored in the rotated domain and must use the Turbo inverse WHT;
+    // ordinary quantized V uses the optional upstream Hadamard rotation instead.
+    ggml_tensor * build_attn_v_unrotate(
+            ggml_tensor * cur,
+            ggml_tensor * v,
+            ggml_tensor * v_rot,
+            ggml_tensor * vmean,
+                    int   il) const;
+
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
     ggml_tensor * build_attn(

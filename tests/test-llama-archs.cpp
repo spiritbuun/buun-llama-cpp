@@ -1163,6 +1163,53 @@ static void test_qwen4_vbr_cuda(const size_t seed) {
         printf("Qwen4 static %s vs F16 NMSE %.9g\n", ggml_type_name(tier), tier_nmse);
     }
 
+    // Qwen4 switches from ordinary dense attention to its custom QSA graph once the padded
+    // frontier crosses the top-k budget. Keep K and V asymmetric so this specifically pins the
+    // value-side representation contract: Turbo K must not add an output inverse WHT, while
+    // Turbo V must add one after the sparse attention result.
+    struct turbo_wht_trace {
+        size_t nodes = 0;
+    };
+    const auto trace_turbo_wht = [](ggml_tensor * tensor, bool ask, void * user_data) {
+        if (ask && tensor->op == GGML_OP_TURBO_WHT) {
+            ++static_cast<turbo_wht_trace *>(user_data)->nodes;
+        }
+        return false;
+    };
+    const auto sparse_asymmetric_logits = [&](ggml_type type_k, ggml_type type_v, turbo_wht_trace & wht) {
+        llama_context_params sparse_params = static_ref_params;
+        sparse_params.n_batch = 256;
+        sparse_params.type_k = type_k;
+        sparse_params.type_v = type_v;
+        sparse_params.cb_eval = trace_turbo_wht;
+        sparse_params.cb_eval_user_data = &wht;
+        llama_context_ptr sparse(llama_init_from_model(model.get(), sparse_params));
+        GGML_ASSERT(sparse != nullptr);
+        decode_range(sparse.get(), 0, 256);
+        wht.nodes = 0;
+        decode_range(sparse.get(), 256, 64);
+        return last_logits(sparse.get());
+    };
+
+    turbo_wht_trace sparse_ref_wht;
+    turbo_wht_trace sparse_k_wht;
+    turbo_wht_trace sparse_v_wht;
+    const auto sparse_ref_logits = sparse_asymmetric_logits(
+        GGML_TYPE_F16, GGML_TYPE_F16, sparse_ref_wht);
+    const auto sparse_k_logits = sparse_asymmetric_logits(
+        GGML_TYPE_TURBO8_0, GGML_TYPE_F16, sparse_k_wht);
+    const auto sparse_v_logits = sparse_asymmetric_logits(
+        GGML_TYPE_F16, GGML_TYPE_TURBO8_0, sparse_v_wht);
+    const double sparse_k_nmse = nmse(sparse_ref_logits, sparse_k_logits);
+    const double sparse_v_nmse = nmse(sparse_ref_logits, sparse_v_logits);
+    GGML_ASSERT(sparse_ref_wht.nodes == 0);
+    GGML_ASSERT(sparse_k_wht.nodes == 0);
+    GGML_ASSERT(sparse_v_wht.nodes > 0);
+    GGML_ASSERT(std::isfinite(sparse_k_nmse) && sparse_k_nmse <= 1.0e-5);
+    GGML_ASSERT(std::isfinite(sparse_v_nmse) && sparse_v_nmse <= 1.0e-5);
+    printf("Qwen4 sparse asymmetric Turbo8 K/F16 V NMSE %.9g, F16 K/Turbo8 V NMSE %.9g\n",
+        sparse_k_nmse, sparse_v_nmse);
+
     // Dynamic device VBR needs a non-transposed FA cache, so an explicit FA-off
     // request is promoted before memory construction and must really arm. With
     // KV offload disabled, the host fallback instead stays static Q8 and usable;

@@ -3048,6 +3048,38 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     return cur;
 }
 
+ggml_tensor * llm_graph_context::build_attn_v_unrotate(
+        ggml_tensor * cur,
+        ggml_tensor * v,
+        ggml_tensor * v_rot,
+        ggml_tensor * vmean,
+                int   il) const {
+    // TurboQuant V un-rotation at graph level (CUDA graph compatible).
+    // Ragged V can opt into the same contract while using an F16 cache by writing rotated-domain V.
+    const bool turbo_v_rotated = ggml_is_turbo_kv_type(v->type);
+    const bool ragged_v_rotated = v->type == GGML_TYPE_F16 && turbo_ragged_v_rotated_enabled();
+    if (turbo_v_rotated || ragged_v_rotated) {
+        if (cur->ne[0] % 128 == 0) {
+            cur = ggml_cont(ctx0, cur);  // force copy to break potential aliasing
+            cur = ggml_turbo_wht(ctx0, cur, 1);  // 1 = inverse
+
+            // V-mean tap: restore mu_V once (weights sum to 1 -> mean re-enters as a constant).
+            // View this layer's prefix of the pdim-wide mu row: narrower layers must still restore
+            // or encode-side subtraction leaves V shifted by -mu. TURBO8_0 is tap-gated, so its
+            // encoder did not subtract the mean and there is nothing to restore.
+            if (v->type != GGML_TYPE_TURBO8_0 && vmean && vmean->ne[0] >= cur->ne[0]) {
+                ggml_tensor * mu = ggml_view_2d(ctx0, vmean, cur->ne[0], 1,
+                        vmean->nb[1], (size_t) il * vmean->nb[1]);
+                cur = ggml_add(ctx0, cur, mu);
+            }
+        }
+    } else if (v_rot) {
+        cur = llama_mul_mat_hadamard(ctx0, cur, v_rot);
+    }
+
+    return cur;
+}
+
 llm_graph_input_attn_no_cache * llm_graph_context::build_attn_inp_no_cache() const {
     auto inp = std::make_unique<llm_graph_input_attn_no_cache>(hparams, cparams);
 
@@ -3231,27 +3263,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
-    // TurboQuant V un-rotation at graph level (CUDA graph compatible).
-    // Ragged V can opt into the same contract while using an F16 cache by writing rotated-domain V.
-    const bool turbo_v_rotated = ggml_is_turbo_kv_type(v->type);
-    const bool ragged_v_rotated = v->type == GGML_TYPE_F16 && turbo_ragged_v_rotated_enabled();
-    if (turbo_v_rotated || ragged_v_rotated) {
-        if (cur->ne[0] % 128 == 0) {
-            cur = ggml_cont(ctx0, cur);  // force copy to break potential aliasing
-            cur = ggml_turbo_wht(ctx0, cur, 1);  // 1 = inverse
-            // V-mean tap: restore mu_V once (weights sum to 1 -> mean re-enters as a constant).
-            // View this layer's prefix of the pdim-wide mu row: narrower layers (gemma4 SWA vs
-            // global) must still restore or encode-side subtraction leaves V shifted by -mu.
-            // TURBO8_0 excluded: its encode is tap-gated (turbo_tap_mu), so nothing to restore.
-            if (v->type != GGML_TYPE_TURBO8_0 && inp->self_vmean && inp->self_vmean->ne[0] >= cur->ne[0]) {
-                ggml_tensor * mu = ggml_view_2d(ctx0, inp->self_vmean, cur->ne[0], 1,
-                        inp->self_vmean->nb[1], (size_t) il * inp->self_vmean->nb[1]);
-                cur = ggml_add(ctx0, cur, mu);
-            }
-        }
-    } else if (inp->self_v_rot) {
-        cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
-    }
+    cur = build_attn_v_unrotate(cur, v, inp->self_v_rot, inp->self_vmean, il);
 
     // Crop output back to original head_dim after turbo head padding
     // cur is 2D [padded_head * n_head_q, n_tokens] — unflatten, crop per-head, reflatten
@@ -3518,25 +3530,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
-    // TurboQuant V un-rotation at graph level (CUDA graph compatible).
-    const bool turbo_v_rotated = ggml_is_turbo_kv_type(v->type);
-    const bool ragged_v_rotated = v->type == GGML_TYPE_F16 && turbo_ragged_v_rotated_enabled();
-    if (turbo_v_rotated || ragged_v_rotated) {
-        if (cur->ne[0] % 128 == 0) {
-            cur = ggml_cont(ctx0, cur);
-            cur = ggml_turbo_wht(ctx0, cur, 1);  // 1 = inverse
-            // V-mean tap: restore mu_V once (weights sum to 1 -> mean re-enters as a constant).
-            // Prefix view per layer — see the primary attention site for why >= / cur->ne[0]
-            // and the turbo_tap_mu gate for why TURBO8_0 is excluded.
-            if (v->type != GGML_TYPE_TURBO8_0 && inp->self_vmean && inp->self_vmean->ne[0] >= cur->ne[0]) {
-                ggml_tensor * mu = ggml_view_2d(ctx0, inp->self_vmean, cur->ne[0], 1,
-                        inp->self_vmean->nb[1], (size_t) il * inp->self_vmean->nb[1]);
-                cur = ggml_add(ctx0, cur, mu);
-            }
-        }
-    } else if (v_rot) {
-        cur = llama_mul_mat_hadamard(ctx0, cur, v_rot);
-    }
+    cur = build_attn_v_unrotate(cur, v, v_rot, inp->self_vmean, il);
 
     if (wo) {
         cur = build_lora_mm(wo, cur, wo_s);
