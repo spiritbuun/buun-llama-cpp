@@ -3536,6 +3536,7 @@ private:
     // the fork creation path in load_model()/create_mtp_context() manages these.)
     llama_model_ptr   model_dft;
     llama_context_ptr ctx_dft;
+    llama_context_ptr ctx_mtp;
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
@@ -5353,7 +5354,10 @@ private:
         // initialization after slots have already been populated.
         unbind_slots_from_draft_context();
 
+        ctx_mtp.reset();
         ctx_dft.reset();
+        params_base.speculative.draft.ctx_mtp = nullptr;
+        params_base.speculative.draft.ctx_dft = nullptr;
         // Legacy DFlash's shared context is backed by model_dft and may refer
         // to target tensors. Release it before either owning model goes away.
         ctx_dft_shared.reset();
@@ -7217,13 +7221,16 @@ private:
             // share buffers with the target context (upstream #24922 family)
             params_base.speculative.cparams_dft.ctx_other = ctx_tgt;
 
+            const bool combined_external_and_mtp = spec_mtp &&
+                                                    params_base.speculative.has_non_mtp_model_drafter();
+
             // Shared MTP and block-diffusion graphs consume the target's token
             // embedding/output tensors. This is also required for an external MTP
             // conversion head: its duplicate embedding/output are conversion aids,
             // while the documented grafted-model contract uses the target tensors.
             // Share by pointer when schedulable and gather a drafter-device copy when
             // layer placement leaves the target tensor on a foreign device.
-            if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) ||
+            if ((spec_mtp && !combined_external_and_mtp) ||
                 params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH ||
                 params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) ||
                 params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)) {
@@ -7254,8 +7261,26 @@ private:
                 params_base.speculative.draft.ctx_dft = ctx_dft.get();
             }
 
-            // Upstream MTP: create draft context from target model's MTP heads
-            if (spec_mtp && params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH) {
+            if (ctx_dft == nullptr &&
+                    (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE) ||
+                     params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3))) {
+                auto cparams = common_context_params_to_llama(params_dft);
+                cparams.n_rs_seq  = 0;
+                cparams.ctx_other = ctx_tgt;
+                ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
+                if (ctx_dft == nullptr) {
+                    SRV_ERR("%s", "failed to create external draft context\n");
+                    return false;
+                }
+                ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
+                params_base.speculative.draft.ctx_tgt = ctx_tgt;
+                params_base.speculative.draft.ctx_dft = ctx_dft.get();
+            }
+
+            // A standalone MTP sidecar and native MTP have the same context
+            // contract (MTP type + target ctx_other). In a combined list, the
+            // external drafter keeps ctx_dft and native MTP gets ctx_mtp.
+            if (spec_mtp && !combined_external_and_mtp) {
                 auto cparams = common_context_params_to_llama(params_dft);
                 cparams.ctx_type  = LLAMA_CONTEXT_TYPE_MTP;
                 cparams.n_rs_seq  = 0;
@@ -7268,6 +7293,17 @@ private:
                 ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
                 params_base.speculative.draft.ctx_tgt = ctx_tgt;
                 params_base.speculative.draft.ctx_dft = ctx_dft.get();
+                params_base.speculative.draft.ctx_mtp = nullptr;
+            } else if (combined_external_and_mtp) {
+                ctx_mtp.reset(create_mtp_context());
+                if (ctx_mtp == nullptr) {
+                    SRV_WRN("%s", "target model has no native MTP layers, disabling draft-mtp\n");
+                    auto & types = params_base.speculative.types;
+                    types.erase(std::remove(types.begin(), types.end(),
+                                            COMMON_SPECULATIVE_TYPE_DRAFT_MTP), types.end());
+                } else {
+                    params_base.speculative.draft.ctx_mtp = ctx_mtp.get();
+                }
             }
         } else if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP)) {
             // no new model load, so we simply report 0.0 and 1.0 progress
@@ -7285,6 +7321,7 @@ private:
 
             params_base.speculative.draft.ctx_tgt = ctx_tgt;
             params_base.speculative.draft.ctx_dft = ctx_dft.get();
+            params_base.speculative.draft.ctx_mtp = nullptr;
 
             load_progress_callback(1.0f, &load_progress_spec);
         }
@@ -7502,7 +7539,10 @@ private:
             // model_dft — in pure-DFlash mode the shared `spec` never inits so this else
             // always runs, yet params_base.speculative.model_dft and every slot's drafter
             // state still point at model_dft (share_tensors). Freeing it = UAF on first draft.
+            ctx_mtp.reset();
             ctx_dft.reset();
+            params_base.speculative.draft.ctx_mtp = nullptr;
+            params_base.speculative.draft.ctx_dft = nullptr;
         }
 
         // Target and draft memories participate in the same logical context
@@ -16511,6 +16551,8 @@ private:
         }
 
         const bool shared_model_draft =
+            params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE) ||
+            params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) ||
             params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) ||
             params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) ||
             params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK);

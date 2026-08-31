@@ -2257,6 +2257,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("number of CPU threads to use during generation (default: %d)", params.cpuparams.n_threads),
         [](common_params & params, int value) {
             params.cpuparams.n_threads = value;
+            params.cpuparams.n_threads_explicit = true;
             if (params.cpuparams.n_threads <= 0) {
                 params.cpuparams.n_threads = std::thread::hardware_concurrency();
             }
@@ -2267,6 +2268,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "number of threads to use during batch and prompt processing (default: same as --threads)",
         [](common_params & params, int value) {
             params.cpuparams_batch.n_threads = value;
+            params.cpuparams_batch.n_threads_explicit = true;
             if (params.cpuparams_batch.n_threads <= 0) {
                 params.cpuparams_batch.n_threads = std::thread::hardware_concurrency();
             }
@@ -3604,6 +3606,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_TENSOR_READ_LAZY"));
     add_opt(common_arg(
+        {"--mmap-prefetch"}, "MODE",
+        "bulk mmap prefetch policy (default: auto)\n"
+        "- auto: prefetch only when the mapped model comfortably fits available system RAM\n"
+        "- on: preserve eager whole-model prefetch\n"
+        "- off: rely on normal sequential readahead and demand paging",
+        [](common_params & params, const std::string & value) {
+            /**/ if (value == "on")   { params.mmap_prefetch = LLAMA_MMAP_PREFETCH_MODE_ON;   }
+            else if (value == "auto") { params.mmap_prefetch = LLAMA_MMAP_PREFETCH_MODE_AUTO; }
+            else if (value == "off")  { params.mmap_prefetch = LLAMA_MMAP_PREFETCH_MODE_OFF;  }
+            else { throw std::invalid_argument("invalid value"); }
+        }
+    ).set_env("LLAMA_ARG_MMAP_PREFETCH"));
+    add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"
         "- distribute: spread execution evenly over all nodes\n"
@@ -3692,6 +3707,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_MOE_CACHE"));
+    add_opt(common_arg(
+        {"--moe-cache-profile"},
+        {"--no-moe-cache-profile"},
+        "persist a versioned per-model expert heatmap in the llama.cpp cache directory "
+        "and use it for bounded expert prewarming (default: enabled)",
+        [](common_params & params, bool value) {
+            params.moe_cache.profile = value;
+            if (!value) {
+                params.moe_cache.profile_path.clear();
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_PROFILE"));
     add_opt(common_arg(
         {"--moe-cache-expert-parallel"}, "N",
         "split cached MoE expert rows across devices "
@@ -4956,6 +4983,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "number of threads to use during generation (default: same as --threads)",
         [](common_params & params, int value) {
             params.speculative.draft.cpuparams.n_threads = value;
+            params.speculative.draft.cpuparams.n_threads_explicit = true;
             if (params.speculative.draft.cpuparams.n_threads <= 0) {
                 params.speculative.draft.cpuparams.n_threads = std::thread::hardware_concurrency();
             }
@@ -4966,6 +4994,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "number of threads to use during batch and prompt processing (default: same as --threads-draft)",
         [](common_params & params, int value) {
             params.speculative.draft.cpuparams_batch.n_threads = value;
+            params.speculative.draft.cpuparams_batch.n_threads_explicit = true;
             if (params.speculative.draft.cpuparams_batch.n_threads <= 0) {
                 params.speculative.draft.cpuparams_batch.n_threads = std::thread::hardware_concurrency();
             }

@@ -108,6 +108,45 @@ static void test(void) {
         assert(draft.n_outputs_max_per_seq == 1);
     }
 
+    {
+        common_params base;
+        base.cpuparams.n_threads = 6;
+        base.cpuparams.n_threads_explicit = false;
+        base.cpuparams_batch.n_threads = 6;
+        base.cpuparams_batch.n_threads_explicit = false;
+        base.speculative.draft.mparams.path = "draft.gguf";
+        base.speculative.draft.cpuparams.n_threads = 8;
+        base.speculative.draft.cpuparams.n_threads_explicit = true;
+        base.speculative.draft.cpuparams_batch.n_threads = 7;
+        base.speculative.draft.cpuparams_batch.n_threads_explicit = true;
+
+        const auto draft = common_base_params_to_speculative(base);
+        assert(draft.cpuparams.n_threads == 8);
+        assert(draft.cpuparams.n_threads_explicit);
+        assert(draft.cpuparams_batch.n_threads == 7);
+        assert(draft.cpuparams_batch.n_threads_explicit);
+    }
+
+    {
+        common_params_speculative spec;
+        spec.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+        assert(!spec.has_non_mtp_model_drafter());
+
+        // Model-free helpers do not change an external MTP sidecar's role.
+        spec.types.push_back(COMMON_SPECULATIVE_TYPE_NGRAM_MOD);
+        assert(!spec.has_non_mtp_model_drafter());
+
+        for (const auto type : {
+                COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,
+                COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,
+                COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,
+                COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,
+                COMMON_SPECULATIVE_TYPE_DFLASH }) {
+            spec.types = { type, COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+            assert(spec.has_non_mtp_model_drafter());
+        }
+    }
+
     printf("test-arg-parser: make sure there is no duplicated arguments in any examples\n\n");
     for (int ex = 0; ex < LLAMA_EXAMPLE_COUNT; ex++) {
         try {

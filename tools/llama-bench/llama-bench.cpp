@@ -27,6 +27,7 @@
 #include "fit.h"
 #include "ggml.h"
 #include "llama.h"
+#include "../../src/llama-ext.h"
 #include "log.h"
 
 #ifdef _WIN32
@@ -285,6 +286,15 @@ static const char * lazy_mode_str(llama_lazy_mode mode) {
     }
 }
 
+static const char * mmap_prefetch_mode_str(llama_mmap_prefetch_mode mode) {
+    switch (mode) {
+        case LLAMA_MMAP_PREFETCH_MODE_OFF:  return "off";
+        case LLAMA_MMAP_PREFETCH_MODE_AUTO: return "auto";
+        case LLAMA_MMAP_PREFETCH_MODE_ON:   return "on";
+    }
+    return "unknown";
+}
+
 static std::string pair_str(const std::pair<int, int> & p) {
     static char buf[32];
     snprintf(buf, sizeof(buf), "%d,%d", p.first, p.second);
@@ -439,6 +449,7 @@ struct cmd_params {
     std::vector<llama_split_mode>    split_mode;
     std::vector<llama_load_mode>     load_mode;
     std::vector<llama_lazy_mode>     lazy_mode;
+    std::vector<llama_mmap_prefetch_mode> mmap_prefetch;
     std::vector<int>                 main_gpu;
     std::vector<bool>                no_kv_offload;
     std::vector<llama_flash_attn_type> flash_attn;
@@ -463,6 +474,8 @@ struct cmd_params {
     bool                             moe_cache_explicit;
     bool                             n_gen_warmup_explicit;
     bool                             repack_explicit;
+    bool                             n_threads_explicit;
+    bool                             moe_cache_profile;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
 };
@@ -493,6 +506,7 @@ static const cmd_params cmd_params_defaults = {
     /* split_mode           */ { LLAMA_SPLIT_MODE_LAYER },
     /* load_mode            */ { LLAMA_LOAD_MODE_AUTO },
     /* lazy_mode            */ { LLAMA_LAZY_MODE_AUTO },
+    /* mmap_prefetch        */ { LLAMA_MMAP_PREFETCH_MODE_AUTO },
     /* main_gpu             */ { 0 },
     /* no_kv_offload        */ { false },
     /* flash_attn           */ { LLAMA_FLASH_ATTN_TYPE_AUTO },
@@ -517,6 +531,8 @@ static const cmd_params cmd_params_defaults = {
     /* moe_cache_explicit   */ false,
     /* n_gen_warmup_explicit*/ false,
     /* repack_explicit      */ false,
+    /* n_threads_explicit   */ false,
+    /* moe_cache_profile    */ true,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
 };
@@ -576,6 +592,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("                                                    on and fixed budgets disable weight repacking\n");
     printf("  --repack <auto|on|off>                            weight repacking policy (default: %s)\n", cmd_params_defaults.repack.c_str());
     printf("  -nr, --no-repack                                  equivalent to --repack off\n");
+    printf("  --[no-]moe-cache-profile                         persist expert heatmap (default: on)\n");
     printf("  -sm, --split-mode <none|layer|row|tensor>         (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
     printf("  -mg, --main-gpu <i>                               (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>                      (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
@@ -583,6 +600,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -dev, --device <dev0/dev1/...>                    (default: auto)\n");
     printf("  -lm, --load-mode <auto|none|mmap|mlock|mmap+mlock|dio> (default: %s)\n", join(transform_to_str(cmd_params_defaults.load_mode, llama_load_mode_name), ",").c_str());
     printf("  --tensor-read-lazy <on|auto|off>                  (default: %s)\n", join(transform_to_str(cmd_params_defaults.lazy_mode, lazy_mode_str), ",").c_str());
+    printf("  --mmap-prefetch <on|auto|off>                     (default: %s)\n", join(transform_to_str(cmd_params_defaults.mmap_prefetch, mmap_prefetch_mode_str), ",").c_str());
     printf("  -mmp, --mmap <0|1>                                (DEPRECATED IN FAVOUR OF --load-mode)\n");
     printf("  -dio, --direct-io <0|1>                           (DEPRECATED IN FAVOUR OF --load-mode)\n");
     printf("  -embd, --embeddings <0|1>                         (default: %s)\n", join(cmd_params_defaults.embeddings, ",").c_str());
@@ -673,6 +691,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.moe_cache_explicit    = cmd_params_defaults.moe_cache_explicit;
     params.n_gen_warmup_explicit = cmd_params_defaults.n_gen_warmup_explicit;
     params.repack_explicit       = cmd_params_defaults.repack_explicit;
+    params.n_threads_explicit    = cmd_params_defaults.n_threads_explicit;
+    params.moe_cache_profile     = cmd_params_defaults.moe_cache_profile;
 
     if (const char * env = getenv("HF_TOKEN")) {
         params.hf_token = env;
@@ -871,6 +891,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = parse_int_range(argv[i]);
                 params.n_threads.insert(params.n_threads.end(), p.begin(), p.end());
+                params.n_threads_explicit = true;
             } else if (arg == "-C" || arg == "--cpu-mask") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -926,6 +947,10 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
             } else if (arg == "-nr" || arg == "--no-repack") {
                 params.repack = "off";
                 params.repack_explicit = true;
+            } else if (arg == "--moe-cache-profile") {
+                params.moe_cache_profile = true;
+            } else if (arg == "--no-moe-cache-profile") {
+                params.moe_cache_profile = false;
             } else if (llama_supports_rpc() && (arg == "-rpc" || arg == "--rpc")) {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1024,6 +1049,27 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 params.lazy_mode.insert(params.lazy_mode.end(), modes.begin(), modes.end());
+            } else if (arg == "--mmap-prefetch") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+                std::vector<llama_mmap_prefetch_mode> modes;
+                for (const auto & m : p) {
+                    if (m == "on") {
+                        modes.push_back(LLAMA_MMAP_PREFETCH_MODE_ON);
+                    } else if (m == "auto") {
+                        modes.push_back(LLAMA_MMAP_PREFETCH_MODE_AUTO);
+                    } else if (m == "off") {
+                        modes.push_back(LLAMA_MMAP_PREFETCH_MODE_OFF);
+                    } else {
+                        invalid_param = true;
+                        break;
+                    }
+                }
+                params.mmap_prefetch.insert(
+                        params.mmap_prefetch.end(), modes.begin(), modes.end());
             } else if (arg == "-mg" || arg == "--main-gpu") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1386,6 +1432,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.lazy_mode.empty()) {
         params.lazy_mode = cmd_params_defaults.lazy_mode;
     }
+    if (params.mmap_prefetch.empty()) {
+        params.mmap_prefetch = cmd_params_defaults.mmap_prefetch;
+    }
     if (params.main_gpu.empty()) {
         params.main_gpu = cmd_params_defaults.main_gpu;
     }
@@ -1467,6 +1516,7 @@ struct cmd_params_instance {
     llama_split_mode   split_mode;
     llama_load_mode    load_mode;
     llama_lazy_mode    lazy_mode;
+    llama_mmap_prefetch_mode mmap_prefetch;
     int                main_gpu;
     bool               no_kv_offload;
     llama_flash_attn_type flash_attn;
@@ -1494,6 +1544,7 @@ struct cmd_params_instance {
         mparams.split_mode    = split_mode;
         mparams.load_mode     = load_mode;
         mparams.lazy_mode     = lazy_mode;
+        mparams.mmap_prefetch = mmap_prefetch;
         mparams.main_gpu      = main_gpu;
         mparams.tensor_split  = tensor_split.data();
         mparams.use_extra_bufts = repack;
@@ -1544,6 +1595,7 @@ struct cmd_params_instance {
                split_mode == other.split_mode &&
                main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
                load_mode == other.load_mode && lazy_mode == other.lazy_mode &&
+               mmap_prefetch == other.mmap_prefetch &&
                devices == other.devices && no_host == other.no_host &&
                vec_tensor_buft_override_equal(tensor_buft_overrides, other.tensor_buft_overrides);
     }
@@ -1601,6 +1653,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & sm : params.split_mode)
     for (const auto & lm : params.load_mode)
     for (const auto & lzm : params.lazy_mode)
+    for (const auto & pfm : params.mmap_prefetch)
     for (const auto & mg : params.main_gpu)
     for (const auto & devs : params.devices)
     for (const auto & ts : params.tensor_split)
@@ -1644,6 +1697,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
+                /* .mmap_prefetch         = */ pfm,
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
                 /* .flash_attn            = */ fa,
@@ -1689,6 +1743,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
+                /* .mmap_prefetch         = */ pfm,
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
                 /* .flash_attn            = */ fa,
@@ -1734,6 +1789,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
+                /* .mmap_prefetch         = */ pfm,
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
                 /* .flash_attn            = */ fa,
@@ -1785,6 +1841,8 @@ struct test {
     llama_split_mode         split_mode;
     llama_load_mode          load_mode;
     llama_lazy_mode          lazy_mode;
+    llama_mmap_prefetch_mode mmap_prefetch;
+    bool                     moe_cache_profile;
     int                      main_gpu;
     bool                     no_kv_offload;
     llama_flash_attn_type    flash_attn;
@@ -1804,7 +1862,8 @@ struct test {
     std::vector<uint64_t>    samples_ns;
 
     test(const cmd_params_instance & inst, const llama_model_params & mparams,
-            bool cache_fit_selected, const llama_model * lmodel, const llama_context * ctx) :
+            bool cache_fit_selected, bool profile_enabled,
+            const llama_model * lmodel, const llama_context * ctx) :
         cpu_info(get_cpu_info()),
         gpu_info(get_gpu_info()) {
 
@@ -1831,6 +1890,8 @@ struct test {
         split_mode     = mparams.split_mode;
         load_mode      = mparams.load_mode;
         lazy_mode      = mparams.lazy_mode;
+        mmap_prefetch  = mparams.mmap_prefetch;
+        moe_cache_profile = profile_enabled;
         main_gpu       = mparams.main_gpu;
         no_kv_offload  = inst.no_kv_offload;
         flash_attn     = inst.flash_attn;
@@ -1914,6 +1975,7 @@ struct test {
             "moe_cache_fit",  "repack",         "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "load_mode",     "lazy_mode",
+            "mmap_prefetch",  "moe_cache_profile",
             "embeddings",
             "no_op_offload",  "no_host",        "fit_target",    "fit_min_ctx",
             "n_prompt",       "n_gen",          "n_gen_warmup",  "n_depth",
@@ -1934,13 +1996,14 @@ struct test {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" ||
-            field == "embeddings" || field == "no_host" || field == "moe_cache_fit" || field == "repack") {
+            field == "embeddings" || field == "no_host" || field == "moe_cache_fit" || field == "repack" ||
+            field == "moe_cache_profile") {
             return BOOL;
         }
         if (field == "avg_ts" || field == "stddev_ts") {
             return FLOAT;
         }
-        if (field == "load_mode" || field == "lazy_mode") {
+        if (field == "load_mode" || field == "lazy_mode" || field == "mmap_prefetch") {
             return STRING;
         }
         return STRING;
@@ -2014,6 +2077,8 @@ struct test {
                                             tensor_buft_overrides_str,
                                             llama_load_mode_name(load_mode),
                                             lazy_mode_str(lazy_mode),
+                                            mmap_prefetch_mode_str(mmap_prefetch),
+                                            std::to_string(moe_cache_profile),
                                             std::to_string(embeddings),
                                             std::to_string(no_op_offload),
                                             std::to_string(no_host),
@@ -2374,6 +2439,12 @@ struct markdown_printer : public printer {
         }
         if (params.lazy_mode.size() > 1 || params.lazy_mode != cmd_params_defaults.lazy_mode) {
             fields.emplace_back("lazy_mode");
+        }
+        if (params.mmap_prefetch.size() > 1 || params.mmap_prefetch != cmd_params_defaults.mmap_prefetch) {
+            fields.emplace_back("mmap_prefetch");
+        }
+        if (params.moe_cache_profile != cmd_params_defaults.moe_cache_profile) {
+            fields.emplace_back("moe_cache_profile");
         }
         if (params.embeddings.size() > 1 || params.embeddings != cmd_params_defaults.embeddings) {
             fields.emplace_back("embeddings");
@@ -2747,6 +2818,33 @@ int llama_bench(int argc, char ** argv) {
             prev_inst = &inst;
         }
 
+        int resolved_threads = inst.n_threads;
+        if (!params.n_threads_explicit && inst.cpu_mask == "0x0" &&
+                llama_model_has_host_moe_weights(lmodel)) {
+            resolved_threads = common_cpu_get_num_moe_threads();
+            if (resolved_threads != inst.n_threads) {
+                fprintf(stderr, "llama-bench: host-resident routed experts; auto-resolved threads %d -> %d\n",
+                        inst.n_threads, resolved_threads);
+            }
+            cparams.n_threads = resolved_threads;
+            cparams.n_threads_batch = resolved_threads;
+        }
+        std::string moe_profile_path;
+        if (params.moe_cache_profile &&
+                inst.moe_cache != "off" && inst.moe_cache != "0") {
+            uint8_t digest[32];
+            if (llama_model_semantic_family_digest(lmodel, digest)) {
+                try {
+                    moe_profile_path = common_moe_cache_profile_file(digest);
+                    cparams.moe_cache_profile_path = moe_profile_path.c_str();
+                } catch (const std::exception & e) {
+                    fprintf(stderr, "llama-bench: MoE cache profile disabled: %s\n", e.what());
+                }
+            } else {
+                fprintf(stderr, "llama-bench: MoE cache profile disabled: model has no semantic identity\n");
+            }
+        }
+
         llama_context * ctx = llama_init_from_model(lmodel, cparams);
         if (ctx == NULL) {
             fprintf(stderr, "%s: error: failed to create context with model '%s'\n", __func__, inst.model.c_str());
@@ -2754,7 +2852,8 @@ int llama_bench(int argc, char ** argv) {
             return 1;
         }
 
-        test t(inst, mparams, cache_fit_selected, lmodel, ctx);
+        test t(inst, mparams, cache_fit_selected, !moe_profile_path.empty(), lmodel, ctx);
+        t.n_threads = resolved_threads;
 
         llama_memory_clear(llama_get_memory(ctx), false);
 

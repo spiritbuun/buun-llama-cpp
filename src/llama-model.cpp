@@ -1748,7 +1748,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    ml.init_mappings(params.mmap_prefetch, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -2839,6 +2839,7 @@ llama_model_params llama_model_default_params() {
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
+        /*.mmap_prefetch               =*/ LLAMA_MMAP_PREFETCH_MODE_AUTO,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
@@ -3695,6 +3696,26 @@ int32_t llama_model_n_expert(const struct llama_model * model) {
     return model->hparams.n_expert;
 }
 
+static bool llama_model_is_routed_expert_weight(
+        const std::string & name, const ggml_tensor * tensor) {
+    if (!tensor) {
+        return false;
+    }
+    bool has_suffix = false;
+    {
+        if (name.size() >= strlen("_exps.weight") &&
+            name.compare(name.size() - strlen("_exps.weight"), strlen("_exps.weight"), "_exps.weight") == 0) {
+            has_suffix = true;
+        } else if (name.size() >= strlen("_chexps.weight") &&
+                   name.compare(name.size() - strlen("_chexps.weight"), strlen("_chexps.weight"), "_chexps.weight") == 0) {
+            has_suffix = true;
+        }
+    }
+    return has_suffix && name.find(".ffn_") != std::string::npos &&
+        ggml_n_dims(tensor) == 3 && tensor->ne[0] > 0 &&
+        tensor->ne[1] > 0 && tensor->ne[2] > 0 && tensor->nb[2] != 0;
+}
+
 size_t llama_model_get_moe_tensor_info(
         const llama_model * model,
         llama_moe_tensor_info * info,
@@ -3703,17 +3724,7 @@ size_t llama_model_get_moe_tensor_info(
     for (const auto & entry : model->tensors_by_name) {
         const std::string & name = entry.first;
         const ggml_tensor * tensor = entry.second;
-        const char * suffix = nullptr;
-        if (name.size() >= strlen("_exps.weight") &&
-            name.compare(name.size() - strlen("_exps.weight"), strlen("_exps.weight"), "_exps.weight") == 0) {
-            suffix = "_exps.weight";
-        } else if (name.size() >= strlen("_chexps.weight") &&
-                   name.compare(name.size() - strlen("_chexps.weight"), strlen("_chexps.weight"), "_chexps.weight") == 0) {
-            suffix = "_chexps.weight";
-        }
-        if (!suffix || name.find(".ffn_") == std::string::npos ||
-            ggml_n_dims(tensor) != 3 || tensor->ne[0] <= 0 ||
-            tensor->ne[1] <= 0 || tensor->ne[2] <= 0 || tensor->nb[2] == 0) {
+        if (!llama_model_is_routed_expert_weight(name, tensor)) {
             continue;
         }
 
@@ -3739,6 +3750,24 @@ size_t llama_model_get_moe_tensor_info(
         count++;
     }
     return count;
+}
+
+bool llama_model_has_host_moe_weights(const llama_model * model) {
+    if (!model) {
+        return false;
+    }
+    for (const auto & entry : model->tensors_by_name) {
+        const std::string & name = entry.first;
+        const ggml_tensor * tensor = entry.second;
+        if (!llama_model_is_routed_expert_weight(name, tensor)) {
+            continue;
+        }
+        const ggml_tensor * storage = tensor->view_src ? tensor->view_src : tensor;
+        if (storage->buffer && ggml_backend_buffer_is_host(storage->buffer)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 int32_t llama_model_n_devices(const struct llama_model * model) {

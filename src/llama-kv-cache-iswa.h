@@ -86,6 +86,7 @@ public:
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
+    bool get_has_shared_cells() const override;
     // A bounded SWA cache does not retain enough history for arbitrary partial removal.
     bool can_seq_rm_partial() const override { return swa_full; }
 

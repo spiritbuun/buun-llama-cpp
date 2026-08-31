@@ -141,6 +141,10 @@ public:
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
     uint32_t get_n_stream() const;
 
+    // A unified physical stream can expose one block layout only. Sparse selection is safe when
+    // the current ubatch has one logical sequence; separate physical streams are independent.
+    bool qsa_selection_safe(const llama_ubatch * ubatch) const;
+
     // block-compressed sparse attention (qwen4exp QSA) over the cells of the indexer cache.
     // Blocks cut the position line, not the cell array, so no caller assumes a contiguous layout:
     //   cell_blk  I32 [n_kv, ns]           block each cell belongs to

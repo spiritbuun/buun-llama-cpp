@@ -203,3 +203,29 @@ def test_multi_requests_parallel(n_slots: int, n_requests: int):
     for res in results:
         assert res.status_code == 200
         assert match_regex("(wise|kind|owl|answer)+", res.body["content"])
+
+
+def test_combined_external_draft_and_native_mtp_graceful():
+    # The target fixture has no MTP layers. A combined list must keep the
+    # external drafter normally typed, disable only native MTP, and serve the
+    # same greedy tokens as the external-draft-only configuration.
+    server.spec_type = "draft-simple,draft-mtp"
+    server.start()
+    request = {
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.0,
+        "top_k": 1,
+        "n_predict": 16,
+        "return_tokens": True,
+    }
+    res = server.make_request("POST", "/completion", data=request)
+    assert res.status_code == 200, res.body
+    assert len(res.body["content"]) > 0
+    tokens_combined = res.body["tokens"]
+    server.stop()
+
+    create_server()
+    server.start()
+    res = server.make_request("POST", "/completion", data=request)
+    assert res.status_code == 200, res.body
+    assert tokens_combined == res.body["tokens"]

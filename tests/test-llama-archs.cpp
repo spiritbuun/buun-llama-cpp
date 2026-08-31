@@ -496,11 +496,282 @@ static void test_dflash_selector_family_contract() {
     GGML_ASSERT(llm_dflash_selector_family_from_identity(true,  true,  true)  == family::mixed);
 }
 
+static void test_qwen4_qsa_layout_cpu(llama_model * model, size_t seed) {
+    const auto load_with_ratios = [&](const std::array<uint32_t, 2> & ratios) {
+        gguf_context_ptr gguf = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+        gguf_set_arr_data(gguf.get(), "qwen4exp.attention.compress_ratios", GGUF_TYPE_UINT32,
+                          ratios.data(), ratios.size());
+        llama_model_params model_params = llama_model_default_params();
+        model_params.progress_callback = silent_model_load_progress;
+        ggml_backend_dev_t cpu_devices[] = { nullptr };
+        model_params.devices = cpu_devices;
+        size_t tmp = seed;
+        return llama_model_ptr(llama_model_init_from_user(
+                gguf.get(), set_tensor_data, &tmp, model_params));
+    };
+    GGML_ASSERT(load_with_ratios({ 4, 8 }) != nullptr);
+    GGML_ASSERT(load_with_ratios({ 4, 0 }) == nullptr);
+    GGML_ASSERT(load_with_ratios({ 4, 65 }) == nullptr);
+    {
+        gguf_context_ptr gguf = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+        const std::array<int32_t, 2> ratios = { 4, -1 };
+        gguf_set_arr_data(gguf.get(), "qwen4exp.attention.compress_ratios", GGUF_TYPE_INT32,
+                          ratios.data(), ratios.size());
+        llama_model_params model_params = llama_model_default_params();
+        model_params.progress_callback = silent_model_load_progress;
+        ggml_backend_dev_t cpu_devices[] = { nullptr };
+        model_params.devices = cpu_devices;
+        size_t tmp = seed;
+        llama_model_ptr invalid(llama_model_init_from_user(
+                gguf.get(), set_tensor_data, &tmp, model_params));
+        GGML_ASSERT(invalid == nullptr);
+    }
+
+    llama_context_params params = llama_context_default_params();
+    params.n_ctx = 128;
+    params.n_batch = 64;
+    params.n_ubatch = 64;
+    params.n_seq_max = 2;
+    params.kv_unified = true;
+    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    llama_context_ptr ctx(llama_init_from_model(model, params));
+    GGML_ASSERT(ctx != nullptr);
+
+    auto * memory = dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(ctx.get()));
+    GGML_ASSERT(memory != nullptr && memory->get_mem_idx() != nullptr);
+    auto * idx = memory->get_mem_idx();
+
+    const auto apply_text = [&](llama_seq_id seq, const std::vector<llama_pos> & positions) {
+        std::vector<llama_pos> mutable_positions = positions;
+        std::vector<llama_token> tokens(positions.size(), 1);
+        std::vector<int32_t> n_seq_id(positions.size(), 1);
+        std::vector<llama_seq_id> seq_values(positions.size(), seq);
+        std::vector<llama_seq_id *> seq_ids(positions.size());
+        std::vector<int8_t> output(positions.size(), 0);
+        for (size_t i = 0; i < positions.size(); ++i) {
+            seq_ids[i] = &seq_values[i];
+        }
+        llama_ubatch ubatch {
+            true, (uint32_t) positions.size(), (uint32_t) positions.size(), 1, 1, 1,
+            tokens.data(), nullptr, mutable_positions.data(), n_seq_id.data(), seq_ids.data(),
+            seq_values.data(), nullptr, output.data(), {},
+        };
+        const auto slot = idx->find_slot(ubatch, false);
+        GGML_ASSERT(!slot.empty());
+        idx->apply_ubatch(slot, ubatch);
+    };
+
+    const auto apply_shared_text = [&](const std::vector<llama_pos> & positions) {
+        std::vector<llama_pos> mutable_positions = positions;
+        std::vector<llama_token> tokens(positions.size(), 1);
+        std::vector<int32_t> n_seq_id(positions.size(), 2);
+        std::vector<llama_seq_id> seq_values(2*positions.size());
+        std::vector<llama_seq_id *> seq_ids(positions.size());
+        std::vector<int8_t> output(positions.size(), 0);
+        for (size_t i = 0; i < positions.size(); ++i) {
+            seq_values[2*i + 0] = 0;
+            seq_values[2*i + 1] = 1;
+            seq_ids[i] = &seq_values[2*i];
+        }
+        llama_seq_id seq_id_unq[2] = { 0, 1 };
+        llama_ubatch ubatch {
+            true, (uint32_t) positions.size(), (uint32_t) positions.size(), 1, 2, 1,
+            tokens.data(), nullptr, mutable_positions.data(), n_seq_id.data(), seq_ids.data(),
+            seq_id_unq, nullptr, output.data(), {},
+        };
+        const auto slot = idx->find_slot(ubatch, false);
+        GGML_ASSERT(!slot.empty());
+        idx->apply_ubatch(slot, ubatch);
+    };
+
+    const auto apply_image = [&](llama_seq_id seq, const std::vector<llama_pos> & positions) {
+        GGML_ASSERT(positions.size() % 4 == 0);
+        std::vector<llama_pos> mutable_positions = positions;
+        const size_t n = positions.size()/4;
+        std::vector<float> embd(n, 0.0f);
+        std::vector<int32_t> n_seq_id(n, 1);
+        std::vector<llama_seq_id> seq_values(n, seq);
+        std::vector<llama_seq_id *> seq_ids(n);
+        std::vector<int8_t> output(n, 0);
+        for (size_t i = 0; i < n; ++i) {
+            seq_ids[i] = &seq_values[i];
+        }
+        llama_ubatch ubatch {
+            true, (uint32_t) n, (uint32_t) n, 1, 1, 4,
+            nullptr, embd.data(), mutable_positions.data(), n_seq_id.data(), seq_ids.data(),
+            seq_values.data(), nullptr, output.data(), {},
+        };
+        const auto slot = idx->find_slot(ubatch, false);
+        GGML_ASSERT(!slot.empty());
+        idx->apply_ubatch(slot, ubatch);
+    };
+
+    struct layout_result {
+        int64_t n_kv;
+        int64_t n_blocks;
+        std::vector<int32_t> cell_blk;
+        std::vector<int32_t> blk_cells;
+        std::vector<int32_t> blk_pos;
+        std::vector<float> bias;
+    };
+
+    llama_memory_hybrid_idx_context qsa(memory);
+    const auto run = [&](uint32_t ratio, bool blk_bias, llama_seq_id seq,
+                         const std::vector<llama_pos> & query_pos) {
+        GGML_ASSERT(query_pos.size() == 1 || query_pos.size() == 4);
+        const int64_t n_kv = qsa.get_idx()->get_n_kv();
+        const int64_t n_blocks = (n_kv + ratio - 1)/ratio;
+        ggml_init_params tensor_params = { 128*1024, nullptr, true };
+        ggml_context_ptr tensor_ctx(ggml_init(tensor_params));
+        GGML_ASSERT(tensor_ctx != nullptr);
+        ggml_tensor * cell_blk = ggml_new_tensor_2d(tensor_ctx.get(), GGML_TYPE_I32, n_kv, 1);
+        ggml_tensor * blk_cells = ggml_new_tensor_2d(tensor_ctx.get(), GGML_TYPE_I32, ratio*n_blocks, 1);
+        ggml_tensor * blk_pos = ggml_new_tensor_1d(tensor_ctx.get(), GGML_TYPE_I32, 4*n_blocks);
+        ggml_tensor * bias = ggml_new_tensor_3d(
+                tensor_ctx.get(), GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, 1, 1);
+        ggml_backend_ptr cpu(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
+        GGML_ASSERT(cpu != nullptr);
+        ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(tensor_ctx.get(), cpu.get()));
+        GGML_ASSERT(buffer != nullptr);
+
+        llama_token token = 1;
+        std::vector<llama_pos> mutable_query_pos = query_pos;
+        int32_t n_seq_id = 1;
+        llama_seq_id * seq_ids = &seq;
+        int8_t output = 1;
+        llama_ubatch query {
+            true, 1, 1, 1, 1, (uint32_t) query_pos.size(), &token, nullptr, mutable_query_pos.data(),
+            &n_seq_id, &seq_ids, &seq, nullptr, &output, {},
+        };
+        qsa.set_input_qsa(cell_blk, blk_cells, blk_pos, bias, &query, ratio, blk_bias);
+
+        layout_result result {
+            n_kv, n_blocks,
+            std::vector<int32_t>((int32_t *) cell_blk->data, (int32_t *) cell_blk->data + n_kv),
+            std::vector<int32_t>((int32_t *) blk_cells->data, (int32_t *) blk_cells->data + ratio*n_blocks),
+            std::vector<int32_t>((int32_t *) blk_pos->data, (int32_t *) blk_pos->data + 4*n_blocks),
+            std::vector<float>((float *) bias->data,
+                               (float *) bias->data + (blk_bias ? n_blocks : n_kv)),
+        };
+        return result;
+    };
+
+    // An old incomplete block must remain hidden while the actual incomplete causal tail is
+    // forced visible. Pin both the compact per-block and general per-cell bias contracts.
+    idx->clear(false);
+    apply_text(0, { 0, 1, 2, 3, 8, 9, 12, 13 });
+    const auto block_layout = run(4, true, 0, { 13 });
+    const auto cell_layout  = run(4, false, 0, { 13 });
+    const auto & gap_cells = idx->get_cells(0);
+    int32_t old_cell = -1;
+    int32_t tail_cell = -1;
+    for (uint32_t physical = 0; physical < gap_cells.size(); ++physical) {
+        if (!gap_cells.is_empty(physical) && gap_cells.seq_has(physical, 0)) {
+            old_cell  = gap_cells.pos_get(physical) == 8  ? (int32_t) physical : old_cell;
+            tail_cell = gap_cells.pos_get(physical) == 12 ? (int32_t) physical : tail_cell;
+        }
+    }
+    GGML_ASSERT(old_cell >= 0 && tail_cell >= 0);
+    GGML_ASSERT(std::isinf(block_layout.bias[block_layout.cell_blk[old_cell]]));
+    GGML_ASSERT(block_layout.bias[block_layout.cell_blk[tail_cell]] == 1e9f);
+    GGML_ASSERT(std::isinf(cell_layout.bias[old_cell]));
+    GGML_ASSERT(cell_layout.bias[tail_cell] == 1e9f);
+
+    // A unified shared-prefix/private-suffix history cannot use one sparse block layout for both
+    // queries. It must take the dense-attention fallback instead of dropping the boundary block.
+    idx->clear(false);
+    apply_shared_text({ 0, 1 });
+    apply_text(0, { 2, 3 });
+    apply_text(1, { 2, 3 });
+    llama_token fork_token[2] = { 1, 1 };
+    llama_pos fork_pos[2] = { 7, 7 };
+    int32_t fork_n_seq_id[2] = { 1, 1 };
+    llama_seq_id fork_seq[2] = { 0, 1 };
+    llama_seq_id * fork_seq_ids[2] = { &fork_seq[0], &fork_seq[1] };
+    int8_t fork_output[2] = { 1, 1 };
+    llama_ubatch fork_query {
+        true, 2, 1, 2, 2, 1, fork_token, nullptr, fork_pos,
+        fork_n_seq_id, fork_seq_ids, fork_seq, nullptr, fork_output, {},
+    };
+    GGML_ASSERT(!qsa.qsa_selection_safe(&fork_query));
+    llama_ubatch dormant_query {
+        true, 1, 1, 1, 1, 1, fork_token, nullptr, fork_pos,
+        fork_n_seq_id, fork_seq_ids, fork_seq, nullptr, fork_output, {},
+    };
+    GGML_ASSERT(qsa.qsa_selection_safe(&dormant_query));
+
+    // A single image sequence ranks repeated temporal positions by spatial coordinates.
+    idx->clear(false);
+    apply_image(0, {
+        10, 10, 10, 10,
+         0,  0,  1,  1,
+         0,  1,  0,  1,
+        10, 10, 10, 10,
+    });
+    const auto mixed = run(4, false, 0, { 10, 1, 1, 10 });
+    const auto mixed_block = run(4, true, 0, { 10, 1, 1, 10 });
+    const auto & mixed_cells = idx->get_cells(0);
+    int32_t image_bid = -1;
+    std::vector<int32_t> image_cells;
+    for (uint32_t physical = 0; physical < mixed_cells.size(); ++physical) {
+        if (mixed_cells.is_empty(physical)) {
+            continue;
+        }
+        if (mixed_cells.seq_has(physical, 0)) {
+            image_cells.push_back((int32_t) physical);
+            image_bid = image_bid < 0 ? mixed.cell_blk[physical] : image_bid;
+            GGML_ASSERT(mixed.cell_blk[physical] == image_bid);
+            GGML_ASSERT(std::isfinite(mixed.bias[physical]));
+        }
+    }
+    GGML_ASSERT(image_bid >= 0 && image_cells.size() == 4);
+    std::vector<int32_t> gathered_image(
+            mixed.blk_cells.begin() + image_bid*4, mixed.blk_cells.begin() + image_bid*4 + 4);
+    std::sort(image_cells.begin(), image_cells.end());
+    std::sort(gathered_image.begin(), gathered_image.end());
+    GGML_ASSERT(image_cells == gathered_image);
+    GGML_ASSERT(mixed.blk_pos[image_bid] == 10);
+    GGML_ASSERT(mixed.blk_pos[mixed.n_blocks + image_bid] == 0);
+    GGML_ASSERT(mixed.blk_pos[2*mixed.n_blocks + image_bid] == 0);
+    GGML_ASSERT(mixed.blk_pos[3*mixed.n_blocks + image_bid] == 10);
+    GGML_ASSERT(mixed_block.cell_blk == mixed.cell_blk);
+    GGML_ASSERT(mixed_block.blk_cells == mixed.blk_cells);
+    GGML_ASSERT(mixed_block.bias[image_bid] == 0.0f);
+
+    // The four-plane position tensor is output only, not rank scratch: ratio 8 M-RoPE must work.
+    idx->clear(false);
+    apply_image(0, {
+        20, 20, 20, 20, 20, 20, 20, 20,
+         0,  0,  0,  0,  1,  1,  1,  1,
+         0,  1,  2,  3,  0,  1,  2,  3,
+        20, 20, 20, 20, 20, 20, 20, 20,
+    });
+    const auto ratio8 = run(8, false, 0, { 20, 1, 3, 20 });
+    const auto & ratio8_cells = idx->get_cells(0);
+    int32_t ratio8_bid = -1;
+    std::vector<int32_t> expected_ratio8;
+    for (uint32_t physical = 0; physical < ratio8_cells.size(); ++physical) {
+        if (!ratio8_cells.is_empty(physical)) {
+            expected_ratio8.push_back((int32_t) physical);
+            ratio8_bid = ratio8_bid < 0 ? ratio8.cell_blk[physical] : ratio8_bid;
+            GGML_ASSERT(ratio8.cell_blk[physical] == ratio8_bid);
+        }
+    }
+    GGML_ASSERT(ratio8_bid >= 0 && expected_ratio8.size() == 8);
+    std::vector<int32_t> gathered_ratio8(
+            ratio8.blk_cells.begin() + ratio8_bid*8, ratio8.blk_cells.begin() + ratio8_bid*8 + 8);
+    std::sort(expected_ratio8.begin(), expected_ratio8.end());
+    std::sort(gathered_ratio8.begin(), gathered_ratio8.end());
+    GGML_ASSERT(expected_ratio8 == gathered_ratio8);
+}
+
 static void test_qwen4_indexed_cache_admission(const size_t seed) {
     struct qsa_trace {
         size_t raw_key_nodes = 0;
         size_t score_nodes = 0;
         size_t top_k_nodes = 0;
+        bool score_q_reshape_seen = false;
+        bool score_q_has_redundant_cont = false;
     };
 
     const auto trace_qsa = [](ggml_tensor * tensor, bool ask, void * user_data) {
@@ -512,6 +783,24 @@ static void test_qwen4_indexed_cache_admission(const size_t seed) {
         trace.raw_key_nodes += name.find("indexer_k_raw") != std::string::npos;
         trace.score_nodes   += name.find("indexer_score") != std::string::npos;
         trace.top_k_nodes   += name.find("indexer_top_k") != std::string::npos;
+        if (name.find("indexer_score-") != std::string::npos) {
+            std::vector<ggml_tensor *> pending = { tensor };
+            while (!pending.empty()) {
+                ggml_tensor * node = pending.back();
+                pending.pop_back();
+                if (node->op == GGML_OP_MUL_MAT && node->src[1] != nullptr) {
+                    trace.score_q_reshape_seen |= node->src[1]->op == GGML_OP_RESHAPE;
+                    trace.score_q_has_redundant_cont |= node->src[1]->op == GGML_OP_RESHAPE &&
+                            node->src[1]->src[0] != nullptr && node->src[1]->src[0]->op == GGML_OP_CONT;
+                    continue;
+                }
+                for (ggml_tensor * src : node->src) {
+                    if (src != nullptr) {
+                        pending.push_back(src);
+                    }
+                }
+            }
+        }
         return false;
     };
 
@@ -562,6 +851,8 @@ static void test_qwen4_indexed_cache_admission(const size_t seed) {
         GGML_ASSERT(sparse_trace.raw_key_nodes > 0);
         GGML_ASSERT(sparse_trace.score_nodes > 0);
         GGML_ASSERT(sparse_trace.top_k_nodes > 0);
+        GGML_ASSERT(sparse_trace.score_q_reshape_seen);
+        GGML_ASSERT(!sparse_trace.score_q_has_redundant_cont);
     }
 
     // A graph built for the dense 256-cell watermark must be rejected and rebuilt
@@ -634,6 +925,7 @@ static void test_qwen4_indexed_cache_admission(const size_t seed) {
 
     gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
     auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {});
+    test_qwen4_qsa_layout_cpu(model_and_ctx.first.get(), seed);
 
     // Phase-0 VBR ownership/accounting contract. Qwen4's attention KV is the only storage whose
     // representation may be selected by Turbo/VBR; recurrent state is fixed and the QSA indexer
@@ -1209,6 +1501,236 @@ static void test_qwen4_vbr_cuda(const size_t seed) {
     GGML_ASSERT(std::isfinite(sparse_v_nmse) && sparse_v_nmse <= 1.0e-5);
     printf("Qwen4 sparse asymmetric Turbo8 K/F16 V NMSE %.9g, F16 K/Turbo8 V NMSE %.9g\n",
         sparse_k_nmse, sparse_v_nmse);
+
+    // Force the long-context gather decision at a small synthetic budget. The ordinary sparse
+    // tests above intentionally use the shipped-width boundary and therefore exercise the scan
+    // path at this tiny fixture size. This contract pins the selected-cell production branch and
+    // its V-cache restoration rather than merely testing graph construction helpers.
+    struct qsa_gather_trace {
+        size_t selected_k = 0;
+        size_t selected_v = 0;
+        size_t top_k = 0;
+        size_t inverse_wht = 0;
+    };
+    const auto trace_qsa_gather = [](ggml_tensor * tensor, bool ask, void * user_data) {
+        if (!ask) {
+            return true;
+        }
+        auto & value = *static_cast<qsa_gather_trace *>(user_data);
+        const std::string name = ggml_get_name(tensor);
+        value.selected_k += name.find("qsa_k_sel") != std::string::npos;
+        value.selected_v += name.find("qsa_v_sel") != std::string::npos;
+        value.top_k += name.find("indexer_top_k") != std::string::npos;
+        value.inverse_wht += tensor->op == GGML_OP_TURBO_WHT;
+        return false;
+    };
+    const uint32_t saved_top_k = model->hparams.indexer_top_k;
+    model->hparams.indexer_top_k = 8;
+    const auto gathered_logits = [&](ggml_type type_v, qsa_gather_trace & gather_trace) {
+        llama_context_params gather_params = static_ref_params;
+        gather_params.n_ctx = 128;
+        gather_params.n_batch = 64;
+        gather_params.n_ubatch = 64;
+        gather_params.type_v = type_v;
+        gather_params.cb_eval = trace_qsa_gather;
+        gather_params.cb_eval_user_data = &gather_trace;
+        llama_context_ptr gather_ctx(llama_init_from_model(model.get(), gather_params));
+        GGML_ASSERT(gather_ctx != nullptr);
+        decode_range(gather_ctx.get(), 0, 64);
+        gather_trace = {};
+        decode_range(gather_ctx.get(), 64, 1);
+        GGML_ASSERT(gather_trace.selected_k > 0 && gather_trace.selected_v > 0);
+        return last_logits(gather_ctx.get());
+    };
+    qsa_gather_trace gather_f16_trace;
+    qsa_gather_trace gather_turbo_v_trace;
+    const auto gather_f16_logits = gathered_logits(GGML_TYPE_F16, gather_f16_trace);
+    const auto gather_turbo_v_logits = gathered_logits(GGML_TYPE_TURBO8_0, gather_turbo_v_trace);
+    const double gather_v_nmse = nmse(gather_f16_logits, gather_turbo_v_logits);
+    GGML_ASSERT(gather_f16_trace.inverse_wht == 0);
+    GGML_ASSERT(gather_turbo_v_trace.inverse_wht > 0);
+    GGML_ASSERT(std::isfinite(gather_v_nmse) && gather_v_nmse <= 1.0e-5);
+
+    // The same eight-token continuation runs through gather when decoded token by token and scan
+    // when decoded as one ubatch. Compare the established F16 results and pin the negative branch.
+    qsa_gather_trace sequential_trace;
+    llama_context_params sequential_params = static_ref_params;
+    sequential_params.n_ctx = 128;
+    sequential_params.n_batch = 64;
+    sequential_params.n_ubatch = 64;
+    sequential_params.cb_eval = trace_qsa_gather;
+    sequential_params.cb_eval_user_data = &sequential_trace;
+    llama_context_ptr sequential_ctx(llama_init_from_model(model.get(), sequential_params));
+    GGML_ASSERT(sequential_ctx != nullptr);
+    decode_range(sequential_ctx.get(), 0, 64);
+    sequential_trace = {};
+    for (llama_pos pos = 64; pos < 72; ++pos) {
+        llama_batch one = llama_batch_init(1, 0, 1);
+        common_batch_add(one, 1 + llama_token((pos - 64) % 7), pos, { 0 }, true);
+        GGML_ASSERT(llama_decode(sequential_ctx.get(), one) == 0);
+        llama_batch_free(one);
+    }
+    const auto sequential_logits = last_logits(sequential_ctx.get());
+    GGML_ASSERT(sequential_trace.selected_k > 0 && sequential_trace.selected_v > 0);
+
+    qsa_gather_trace scan_trace;
+    llama_context_params scan_params = sequential_params;
+    scan_params.cb_eval_user_data = &scan_trace;
+    llama_context_ptr scan_ctx(llama_init_from_model(model.get(), scan_params));
+    GGML_ASSERT(scan_ctx != nullptr);
+    decode_range(scan_ctx.get(), 0, 64);
+    scan_trace = {};
+    decode_range(scan_ctx.get(), 64, 8);
+    const auto scan_logits = last_logits(scan_ctx.get());
+    GGML_ASSERT(scan_trace.selected_k == 0 && scan_trace.selected_v == 0);
+    const double gather_scan_nmse = nmse(scan_logits, sequential_logits);
+    GGML_ASSERT(std::isfinite(gather_scan_nmse) && gather_scan_nmse <= 1.0e-5);
+
+    qsa_gather_trace non_fa_trace;
+    llama_context_params non_fa_params = sequential_params;
+    non_fa_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    non_fa_params.cb_eval_user_data = &non_fa_trace;
+    llama_context_ptr non_fa_qsa(llama_init_from_model(model.get(), non_fa_params));
+    GGML_ASSERT(non_fa_qsa != nullptr);
+    decode_range(non_fa_qsa.get(), 0, 64);
+    non_fa_trace = {};
+    decode_range(non_fa_qsa.get(), 64, 1);
+    GGML_ASSERT(non_fa_trace.selected_k == 0 && non_fa_trace.selected_v == 0);
+
+    // Two non-unified streams exercise the gather's stream dimension. Compare each output against
+    // an isolated context so stream/index association cannot be swapped without failing.
+    const auto decode_prefix = [&](llama_context * ctx, llama_seq_id seq, llama_token base) {
+        llama_batch batch = llama_batch_init(64, 0, 1);
+        for (llama_pos pos = 0; pos < 64; ++pos) {
+            common_batch_add(batch, base + llama_token(pos % 7), pos, { seq }, true);
+        }
+        GGML_ASSERT(llama_decode(ctx, batch) == 0);
+        llama_batch_free(batch);
+    };
+    const auto logits_ith = [&](llama_context * ctx, int32_t i) {
+        const float * logits = llama_get_logits_ith(ctx, i);
+        GGML_ASSERT(logits != nullptr);
+        const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+        return std::vector<float>(logits, logits + n_vocab);
+    };
+    const auto isolated_stream = [&](llama_token base, llama_token query_token) {
+        llama_context_ptr isolated(llama_init_from_model(model.get(), sequential_params));
+        GGML_ASSERT(isolated != nullptr);
+        decode_prefix(isolated.get(), 0, base);
+        llama_batch query = llama_batch_init(1, 0, 1);
+        common_batch_add(query, query_token, 64, { 0 }, true);
+        GGML_ASSERT(llama_decode(isolated.get(), query) == 0);
+        llama_batch_free(query);
+        return last_logits(isolated.get());
+    };
+    const auto isolated0 = isolated_stream(1, 17);
+    const auto isolated1 = isolated_stream(9, 23);
+
+    qsa_gather_trace streams_trace;
+    llama_context_params streams_params = sequential_params;
+    streams_params.n_ctx = 256;
+    streams_params.n_batch = 128;
+    streams_params.n_seq_max = 2;
+    streams_params.kv_unified = false;
+    streams_params.cb_eval_user_data = &streams_trace;
+    llama_context_ptr streams_ctx(llama_init_from_model(model.get(), streams_params));
+    GGML_ASSERT(streams_ctx != nullptr);
+    decode_prefix(streams_ctx.get(), 0, 1);
+    decode_prefix(streams_ctx.get(), 1, 9);
+    streams_trace = {};
+    llama_batch stream_query = llama_batch_init(2, 0, 1);
+    common_batch_add(stream_query, 17, 64, { 0 }, true);
+    common_batch_add(stream_query, 23, 64, { 1 }, true);
+    GGML_ASSERT(llama_decode(streams_ctx.get(), stream_query) == 0);
+    llama_batch_free(stream_query);
+    GGML_ASSERT(streams_trace.selected_k > 0 && streams_trace.selected_v > 0);
+    const double stream0_nmse = nmse(isolated0, logits_ith(streams_ctx.get(), 0));
+    const double stream1_nmse = nmse(isolated1, logits_ith(streams_ctx.get(), 1));
+    GGML_ASSERT(std::isfinite(stream0_nmse) && stream0_nmse <= 1.0e-10);
+    GGML_ASSERT(std::isfinite(stream1_nmse) && stream1_nmse <= 1.0e-10);
+
+    // Unified KV has one physical QSA layout. A shared prefix followed by private continuations
+    // therefore falls back to dense attention; compare each query with its isolated history.
+    const auto isolated_fork = [&](llama_token private_base, llama_token query_token) {
+        llama_context_ptr isolated(llama_init_from_model(model.get(), sequential_params));
+        GGML_ASSERT(isolated != nullptr);
+        llama_batch prefix = llama_batch_init(64, 0, 1);
+        for (llama_pos pos = 0; pos < 2; ++pos) {
+            common_batch_add(prefix, 1 + llama_token(pos % 7), pos, { 0 }, true);
+        }
+        for (llama_pos pos = 2; pos < 64; ++pos) {
+            common_batch_add(prefix, private_base + llama_token(pos % 7), pos, { 0 }, true);
+        }
+        GGML_ASSERT(llama_decode(isolated.get(), prefix) == 0);
+        llama_batch_free(prefix);
+        llama_batch query = llama_batch_init(1, 0, 1);
+        common_batch_add(query, query_token, 64, { 0 }, true);
+        GGML_ASSERT(llama_decode(isolated.get(), query) == 0);
+        llama_batch_free(query);
+        return last_logits(isolated.get());
+    };
+    const auto saved_ratios = model->hparams.dsv4_compress_ratios;
+    std::fill(model->hparams.dsv4_compress_ratios.begin(),
+              model->hparams.dsv4_compress_ratios.end(), 0);
+    const auto fork_ref0 = isolated_fork(1, 17);
+    const auto fork_ref1 = isolated_fork(9, 23);
+    model->hparams.dsv4_compress_ratios = saved_ratios;
+
+    qsa_gather_trace fork_trace;
+    llama_context_params fork_params = streams_params;
+    fork_params.kv_unified = true;
+    fork_params.cb_eval_user_data = &fork_trace;
+    const auto populate_fork = [&](llama_context * ctx) {
+        llama_batch shared = llama_batch_init(2, 0, 2);
+        for (llama_pos pos = 0; pos < 2; ++pos) {
+            common_batch_add(shared, 1 + llama_token(pos % 7), pos, { 0, 1 }, true);
+        }
+        GGML_ASSERT(llama_decode(ctx, shared) == 0);
+        llama_batch_free(shared);
+        llama_batch private_suffix = llama_batch_init(124, 0, 1);
+        for (llama_seq_id seq = 0; seq < 2; ++seq) {
+            const llama_token base = seq == 0 ? 1 : 9;
+            for (llama_pos pos = 2; pos < 64; ++pos) {
+                common_batch_add(private_suffix, base + llama_token(pos % 7), pos, { seq }, true);
+            }
+        }
+        GGML_ASSERT(llama_decode(ctx, private_suffix) == 0);
+        llama_batch_free(private_suffix);
+    };
+
+    // A dormant second sequence is harmless: a one-sequence ubatch gets its own filtered layout.
+    llama_context_ptr dormant_ctx(llama_init_from_model(model.get(), fork_params));
+    GGML_ASSERT(dormant_ctx != nullptr);
+    populate_fork(dormant_ctx.get());
+    fork_trace = {};
+    llama_batch dormant_query = llama_batch_init(1, 0, 1);
+    common_batch_add(dormant_query, 17, 64, { 0 }, true);
+    GGML_ASSERT(llama_decode(dormant_ctx.get(), dormant_query) == 0);
+    llama_batch_free(dormant_query);
+    GGML_ASSERT(fork_trace.top_k > 0 && fork_trace.selected_k > 0 && fork_trace.selected_v > 0);
+    const double dormant_nmse = nmse(isolated0, last_logits(dormant_ctx.get()));
+    GGML_ASSERT(std::isfinite(dormant_nmse) && dormant_nmse <= 1.0e-10);
+
+    llama_context_ptr fork_ctx(llama_init_from_model(model.get(), fork_params));
+    GGML_ASSERT(fork_ctx != nullptr);
+    populate_fork(fork_ctx.get());
+    fork_trace = {};
+    llama_batch fork_queries = llama_batch_init(2, 0, 1);
+    common_batch_add(fork_queries, 17, 64, { 0 }, true);
+    common_batch_add(fork_queries, 23, 64, { 1 }, true);
+    GGML_ASSERT(llama_decode(fork_ctx.get(), fork_queries) == 0);
+    llama_batch_free(fork_queries);
+    GGML_ASSERT(fork_trace.top_k == 0 && fork_trace.selected_k == 0 && fork_trace.selected_v == 0);
+    const double fork0_nmse = nmse(fork_ref0, logits_ith(fork_ctx.get(), 0));
+    const double fork1_nmse = nmse(fork_ref1, logits_ith(fork_ctx.get(), 1));
+    GGML_ASSERT(std::isfinite(fork0_nmse) && fork0_nmse <= 1.0e-10);
+    GGML_ASSERT(std::isfinite(fork1_nmse) && fork1_nmse <= 1.0e-10);
+
+    model->hparams.indexer_top_k = saved_top_k;
+    printf("Qwen4 selected-cell gather F16/Turbo8 V NMSE %.9g, scan parity %.9g, "
+           "streams %.9g/%.9g, dormant %.9g, unified fork %.9g/%.9g\n",
+           gather_v_nmse, gather_scan_nmse, stream0_nmse, stream1_nmse,
+           dormant_nmse, fork0_nmse, fork1_nmse);
 
     // Dynamic device VBR needs a non-transposed FA cache, so an explicit FA-off
     // request is promoted before memory construction and must really arm. With
@@ -2429,11 +2951,33 @@ static void test_qwen4_mtp_sidecar_contract(const size_t seed) {
     ctx_params.n_outputs_max = 1;
     ctx_params.n_threads = 1;
     ctx_params.n_threads_batch = 1;
+
+    // A sidecar MTP context has the same linkage contract as native MTP: it
+    // points at a target context through ctx_other. Qwen4 nevertheless owns a
+    // separate filtered draft cache, so context linkage must not imply shared
+    // physical KV cells.
+    file_ptr target_file = make_qwen4_mtp_combined(seed);
+    GGML_ASSERT(target_file != nullptr);
+    llama_model_params target_model_params = llama_model_default_params();
+    target_model_params.progress_callback = silent_model_load_progress;
+    target_model_params.load_mtp = false;
+    target_model_params.devices = cpu_devices;
+    llama_model_ptr target_model(llama_model_load_from_file_ptr(
+            target_file.get(), target_model_params));
+    GGML_ASSERT(target_model != nullptr);
+    llama_context_params target_ctx_params = ctx_params;
+    target_ctx_params.ctx_type = LLAMA_CONTEXT_TYPE_DEFAULT;
+    llama_context_ptr target_ctx(llama_init_from_model(target_model.get(), target_ctx_params));
+    GGML_ASSERT(target_ctx != nullptr);
+    ctx_params.ctx_other = target_ctx.get();
+
     llama_context_ptr ctx(llama_init_from_model(model.get(), ctx_params));
     if (!ctx) {
         throw std::runtime_error("failed to create synthetic Qwen4 MTP context");
     }
     GGML_ASSERT(dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(ctx.get())) == nullptr);
+    GGML_ASSERT(llama_get_ctx_other(ctx.get()) == target_ctx.get());
+    GGML_ASSERT(!llama_memory_has_shared_cells(llama_get_memory(ctx.get())));
 
     llama_set_embeddings_nextn(ctx.get(), true, true);
     ggml_cgraph * gf = llama_graph_reserve(ctx.get(), 2, 1, 1);

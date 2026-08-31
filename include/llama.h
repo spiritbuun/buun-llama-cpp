@@ -220,6 +220,12 @@ extern "C" {
         LLAMA_LAZY_MODE_ON   = 2, // read the rows of tensors marked by the arch on demand (requires mmap)
     };
 
+    enum llama_mmap_prefetch_mode {
+        LLAMA_MMAP_PREFETCH_MODE_OFF  = 0,
+        LLAMA_MMAP_PREFETCH_MODE_AUTO = 1,
+        LLAMA_MMAP_PREFETCH_MODE_ON   = 2,
+    };
+
     enum llama_context_type {
         LLAMA_CONTEXT_TYPE_DEFAULT = 0,
         LLAMA_CONTEXT_TYPE_MTP     = 1,
@@ -329,6 +335,7 @@ extern "C" {
         enum llama_load_mode  load_mode;  // how to load the model
 
         enum llama_lazy_mode lazy_mode; // on-demand reading of tensors marked by the arch
+        enum llama_mmap_prefetch_mode mmap_prefetch; // bulk mmap prefetch policy
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
@@ -404,6 +411,7 @@ extern "C" {
         enum llama_moe_cache_mode moe_cache_mode; // runtime MoE expert cache mode
         size_t moe_cache_budget_mib;               // 0 uses the provider's available-memory budget
         int32_t moe_cache_expert_parallel;          // -1 = provider policy, 0 = disabled, N = device fanout
+        const char * moe_cache_profile_path;        // optional versioned expert heatmap
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
@@ -618,6 +626,8 @@ extern "C" {
 
     LLAMA_API const struct llama_model * llama_get_model   (const struct llama_context * ctx);
     LLAMA_API           llama_memory_t   llama_get_memory  (const struct llama_context * ctx);
+    // true when this memory directly reuses KV cells owned by another context
+    LLAMA_API bool llama_memory_has_shared_cells(llama_memory_t mem);
     LLAMA_API  enum llama_pooling_type   llama_pooling_type(const struct llama_context * ctx); // TODO: rename to llama_get_pooling_type
 
     LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);

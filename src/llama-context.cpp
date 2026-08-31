@@ -154,6 +154,8 @@ llama_context::llama_context(
     cparams.moe_cache_mode          = params.moe_cache_mode;
     cparams.moe_cache_budget_mib    = params.moe_cache_budget_mib;
     cparams.moe_cache_expert_parallel = params.moe_cache_expert_parallel;
+    cparams.moe_cache_profile_path = params.moe_cache_profile_path
+        ? params.moe_cache_profile_path : "";
     cparams.yarn_ext_factor         = params.yarn_ext_factor  >= 0.0f ? params.yarn_ext_factor  : hparams.yarn_ext_factor;
     cparams.yarn_attn_factor        = params.yarn_attn_factor >= 0.0f ? params.yarn_attn_factor : hparams.yarn_attn_factor;
     cparams.yarn_beta_fast          = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
@@ -184,6 +186,13 @@ llama_context::llama_context(
     cparams.cb_eval_user_data = params.cb_eval_user_data;
 
     cparams.ctx_other = nullptr;
+
+    // Every MTP context may use ctx_other to identify its target, regardless of
+    // whether its memory physically shares target cells. Storage sharing is a
+    // separate memory capability (llama_memory_has_shared_cells()).
+    if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        cparams.ctx_other = params.ctx_other;
+    }
 
     // TODO: more generic
     if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
@@ -958,7 +967,9 @@ void llama_context::sched_reserve() {
     ggml_backend_sched_set_moe_cache(
             sched.get(), moe_cache_mode,
             cparams.moe_cache_budget_mib,
-            cparams.moe_cache_expert_parallel);
+            cparams.moe_cache_expert_parallel,
+            cparams.moe_cache_profile_path.empty() ? nullptr :
+                cparams.moe_cache_profile_path.c_str());
 
     // avoid reserving graphs with zero outputs - assume one output per sequence
     const int n_outputs = n_seqs;
@@ -1021,7 +1032,9 @@ void llama_context::sched_reserve() {
                 ggml_backend_sched_set_moe_cache(
                         sched.get(), moe_cache_mode,
                         cparams.moe_cache_budget_mib,
-                        cparams.moe_cache_expert_parallel);
+                        cparams.moe_cache_expert_parallel,
+                        cparams.moe_cache_profile_path.empty() ? nullptr :
+                            cparams.moe_cache_profile_path.c_str());
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -7096,6 +7109,7 @@ llama_context_params llama_context_default_params() {
         /*.moe_cache_mode              =*/ LLAMA_MOE_CACHE_MODE_UNSPECIFIED,
         /*.moe_cache_budget_mib        =*/ 0,
         /*.moe_cache_expert_parallel   =*/ 0,
+        /*.moe_cache_profile_path      =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
@@ -7431,6 +7445,10 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
     }
 
     return ctx->get_memory();
+}
+
+bool llama_memory_has_shared_cells(llama_memory_t mem) {
+    return mem != nullptr && mem->get_has_shared_cells();
 }
 
 float * llama_get_embeddings_nextn(llama_context * ctx) {

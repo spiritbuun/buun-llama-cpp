@@ -66,6 +66,7 @@ test parameters:
   -ngl, --n-gpu-layers <n>                  (default: -1)
   -ncmoe, --n-cpu-moe <n>                   (default: 0)
   --moe-cache <auto|on|off|0|MiB>           (default: auto)
+  --[no-]moe-cache-profile                  (default: enabled)
   --repack <auto|on|off>                    weight repacking policy (default: auto)
   -nr, --no-repack                          equivalent to --repack off
   -sm, --split-mode <none|layer|row|tensor> (default: layer)
@@ -76,6 +77,7 @@ test parameters:
   -lm, --load-mode <none|mmap|mlock|mmap+mlock|dio>
                                             (default: mmap)
   --tensor-read-lazy <on|auto|off>          (default: auto)
+  --mmap-prefetch <on|auto|off>             (default: auto)
   -mmp, --mmap <0|1>                        (DEPRECATED IN FAVOUR OF --load-mode)
   -dio, --direct-io <0|1>                   (DEPRECATED IN FAVOUR OF --load-mode)
   -embd, --embeddings <0|1>                 (default: 0)
@@ -102,7 +104,9 @@ Each test is repeated the number of times given by `-r`, and the results are ave
 
 Using the `-d <n>` option, each test can be run at a specified context depth, prefilling the KV cache with `<n>` tokens.
 
-`--n-gen-warmup <n>` controls how many generation tokens run before timing. This is useful when a benchmark needs to populate persistent runtime state such as the MoE expert cache. `--moe-cache off` provides a hard-disabled baseline. `auto` preserves repacking and may remain dormant, while `on` and a positive per-device MiB budget use canonical CPU weights and disable repacking. `--repack on` is rejected for those modes. Use `--repack off` for a matched canonical-weight baseline, for example `--moe-cache off,4096 --repack off`.
+`--n-gen-warmup <n>` controls how many generation tokens run before timing. This is useful when a benchmark needs to populate persistent runtime state such as the MoE expert cache. `--moe-cache off` provides a hard-disabled baseline. `auto` preserves repacking and may remain dormant, while `on` and a positive per-device MiB budget use canonical CPU weights and disable repacking. `--repack on` is rejected for those modes. Use `--repack off` for a matched canonical-weight baseline, for example `--moe-cache off,4096 --repack off`. When enabled, the cache also stores a versioned per-model expert heatmap under `LLAMA_CACHE` (or the platform cache default) for bounded prewarming in later processes.
+
+`--mmap-prefetch auto` is the default. It preserves eager whole-model prefetch when the mapping fits comfortably in currently available RAM, but avoids bulk `WILLNEED` when it would evict a larger lazy model's working set. Explicit `on` and `off` modes are available for controlled comparisons.
 
 Prompt and generation inputs use deterministic synthetic token traces. Every cache or repack arm receives the same trace for a given repetition, so matched A/B tests do not measure different expert-routing inputs. The generation warmup uses a separate fixed trace and is excluded from the timed region.
 

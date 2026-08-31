@@ -635,6 +635,8 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
 endif()
 
 llama_build_and_test(test-moe-cache-fit.cpp)
+llama_build_and_test(test-auto-memory-policy.cpp)
+llama_build_and_test(test-kv-cell-position-index.cpp)
 
 if (TARGET ggml-cuda AND NOT GGML_BACKEND_DL)
     llama_build(test-vbr-vmm.cpp)

@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <memory>
 #include <mutex>
 
@@ -1182,6 +1183,12 @@ const ggml_cuda_device_info & ggml_cuda_info();
 void ggml_cuda_set_device(int device);
 int ggml_cuda_get_device();
 
+struct ggml_cuda_pool_alloc_failure : std::exception {
+    const char * what() const noexcept override {
+        return "ggml-cuda pool allocation failed: out of VRAM";
+    }
+};
+
 struct ggml_cuda_pool {
     virtual ~ggml_cuda_pool() = default;
 
@@ -1215,6 +1222,9 @@ struct ggml_cuda_pool_alloc {
         GGML_ASSERT(pool != nullptr);
         GGML_ASSERT(ptr == nullptr);
         ptr = (T *) pool->alloc(size * sizeof(T), &this->actual_size);
+        if (ptr == nullptr) {
+            throw ggml_cuda_pool_alloc_failure();
+        }
         return ptr;
     }
 

@@ -30,10 +30,12 @@ void ggml_moe_cache_register(const void * owner) {
 #include <climits>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <fstream>
 #include <iterator>
 #include <limits>
 #include <memory>
@@ -46,6 +48,25 @@ void ggml_moe_cache_register(const void * owner) {
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+#if defined(_WIN32)
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#  include <process.h>
+#elif defined(__linux__)
+#  include <fcntl.h>
+#  include <sys/file.h>
+#  include <sys/mman.h>
+#  include <unistd.h>
+#elif defined(__APPLE__)
+#  include <fcntl.h>
+#  include <sys/file.h>
+#  include <unistd.h>
+#elif defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__)
+#  include <fcntl.h>
+#  include <sys/file.h>
+#  include <unistd.h>
+#endif
 
 #define MOE_CACHE_LOG(...) GGML_LOG_INFO(__VA_ARGS__)
 
@@ -144,6 +165,7 @@ struct moe_cache_config {
     bool automatic = true;
     size_t budget_mb = 0;
     size_t reserve_mb = 3072;
+    bool reserve_explicit = false;
     size_t minimum_slab_bytes = moe_cache_slab_bytes_auto_min;
     size_t min_expert_bytes = moe_cache_expert_bytes_pre_ampere_min;
     bool min_expert_explicit = false;
@@ -168,6 +190,27 @@ struct moe_cache_config {
     bool overlap_cpu_rows_explicit = false;
     int expert_parallel = 0;
     std::string fail_stage;
+    std::string profile_path;
+};
+
+struct moe_cache_profile_key {
+    uint64_t tensor = 0;
+    int32_t expert = -1;
+
+    bool operator==(const moe_cache_profile_key & other) const {
+        return tensor == other.tensor && expert == other.expert;
+    }
+};
+
+struct moe_cache_profile_key_hash {
+    size_t operator()(const moe_cache_profile_key & key) const {
+        uint64_t value = key.tensor ^
+            ((uint64_t)(uint32_t)key.expert * UINT64_C(0x9e3779b97f4a7c15));
+        value ^= value >> 30;
+        value *= UINT64_C(0xbf58476d1ce4e5b9);
+        value ^= value >> 27;
+        return (size_t)(value ^ (value >> 31));
+    }
 };
 
 struct moe_cache_session;
@@ -194,6 +237,7 @@ struct moe_cache_device {
     bool budget_ready = false;
     bool budget_registered = false;
     bool budget_claimed = false;
+    size_t automatic_reserve_bytes = 0;
     size_t budget_reserve_bytes = 0;
     size_t budget_limit = 0;
     size_t coordinator_allocated_bytes = 0;
@@ -258,6 +302,13 @@ struct moe_cache_session {
     std::vector<std::unique_ptr<moe_cache_device>> devices;
     std::unordered_map<int, int> layer_devices;
     std::unordered_map<const void *, int> tensor_devices;
+    std::unordered_map<moe_cache_profile_key, uint32_t,
+        moe_cache_profile_key_hash> profile_heat;
+    uint64_t profile_generation = 0;
+    std::unordered_map<uint64_t, std::vector<int32_t>> profile_hot;
+    std::unordered_map<uint64_t, std::vector<uint32_t>> observed_heat;
+    std::unordered_set<moe_cache_key, moe_cache_key_hash> profile_seeded;
+    std::unordered_set<const void *> profile_advised;
 
     std::mutex mu;
     std::mutex fill_mu;
@@ -299,6 +350,7 @@ struct moe_cache_node {
     int64_t n_expert = 0;
     int64_t n_tokens = 0;
     int wtype = -1;
+    uint64_t profile_keys[3] = {};
     std::unique_lock<std::mutex> dispatch_lock;
     moe_cache_pin pins[3 * moe_cache_node_rows_max];
     int n_pins = 0;
@@ -348,7 +400,10 @@ static bool moe_cache_budget_register(moe_cache_session & session) {
         for (const auto & device_ptr : session.devices) {
             moe_cache_device & device = *device_ptr;
             moe_cache_physical_budget & state = g_physical_budgets[device.physical];
-            const size_t reserve_bytes = session.config.reserve_mb << 20;
+            const size_t reserve_bytes = ggml_moe_cache_effective_reserve_bytes(
+                    session.config.reserve_explicit,
+                    session.config.reserve_mb << 20,
+                    device.automatic_reserve_bytes);
             state.reserves.insert(reserve_bytes);
             state.participants++;
             device.budget_registered = true;
@@ -579,6 +634,7 @@ static moe_cache_config moe_cache_read_config() {
     }
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_RESERVE_MB", 0, 1024 * 1024, value)) {
         config.reserve_mb = (size_t)value;
+        config.reserve_explicit = true;
     }
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB", 1, 1024 * 1024, value)) {
         config.min_expert_bytes = (size_t)value << 10;
@@ -641,6 +697,16 @@ static moe_cache_config moe_cache_read_config() {
     return config;
 }
 
+static size_t moe_cache_recommended_reserve_bytes(size_t total_vram) {
+    constexpr size_t MiB = 1024 * 1024;
+    constexpr size_t step = 128 * MiB;
+    size_t reserve = total_vram / 100 * 6;
+    reserve = reserve / step * step;
+    reserve = std::max<size_t>(1024 * MiB, reserve);
+    reserve = std::min<size_t>(3072 * MiB, reserve);
+    return std::min(reserve, total_vram / 4);
+}
+
 static bool moe_cache_fail(const moe_cache_session & session, const char * stage) {
     const std::string & value = session.config.fail_stage;
     if (value.empty()) {
@@ -681,6 +747,351 @@ static uint64_t moe_cache_name_hash(const char * text) {
         hash *= 0x100000001b3ULL;
     }
     return hash;
+}
+
+static uint64_t moe_cache_profile_tensor_hash(
+        const char * name, size_t expert_size, int wtype, int64_t n_expert) {
+    uint64_t hash = moe_cache_name_hash(name);
+    const uint64_t fields[] = {
+        (uint64_t)expert_size, (uint64_t)(uint32_t)wtype, (uint64_t)n_expert,
+    };
+    for (uint64_t field : fields) {
+        hash ^= field;
+        hash *= UINT64_C(0x100000001b3);
+    }
+    return hash;
+}
+
+static uint32_t moe_cache_profile_u32(const unsigned char * data) {
+    return uint32_t(data[0]) | uint32_t(data[1]) << 8 |
+        uint32_t(data[2]) << 16 | uint32_t(data[3]) << 24;
+}
+
+static uint64_t moe_cache_profile_u64(const unsigned char * data) {
+    return uint64_t(moe_cache_profile_u32(data)) |
+        uint64_t(moe_cache_profile_u32(data + 4)) << 32;
+}
+
+static void moe_cache_profile_put_u32(std::vector<unsigned char> & out, uint32_t value) {
+    for (int shift = 0; shift < 32; shift += 8) {
+        out.push_back((unsigned char)(value >> shift));
+    }
+}
+
+static void moe_cache_profile_put_u64(std::vector<unsigned char> & out, uint64_t value) {
+    moe_cache_profile_put_u32(out, (uint32_t)value);
+    moe_cache_profile_put_u32(out, (uint32_t)(value >> 32));
+}
+
+static uint64_t moe_cache_profile_checksum(const unsigned char * data, size_t size) {
+    uint64_t hash = UINT64_C(0xcbf29ce484222325);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= data[i];
+        hash *= UINT64_C(0x100000001b3);
+    }
+    return hash;
+}
+
+static void moe_cache_profile_load(moe_cache_session & session, bool announce = true) {
+    if (session.config.profile_path.empty()) {
+        return;
+    }
+    std::ifstream input(session.config.profile_path, std::ios::binary | std::ios::ate);
+    if (!input) {
+        return;
+    }
+    const std::streamoff end = input.tellg();
+    constexpr size_t header_v1_size = 24;
+    constexpr size_t header_v2_size = 32;
+    constexpr size_t record_size = 16;
+    constexpr uint32_t max_records = 1u << 20;
+    if (end < (std::streamoff)header_v1_size || end > (std::streamoff)(header_v2_size +
+            (size_t)max_records * record_size)) {
+        if (announce) {
+            MOE_CACHE_LOG("[moe-cache] ignoring invalid expert profile size: %s\n",
+                    session.config.profile_path.c_str());
+        }
+        return;
+    }
+    std::vector<unsigned char> bytes((size_t)end);
+    input.seekg(0);
+    if (!input.read((char *)bytes.data(), bytes.size())) {
+        return;
+    }
+    static constexpr unsigned char magic[8] = {'G','G','M','L','M','H','C','1'};
+    const uint32_t version = moe_cache_profile_u32(bytes.data() + 8);
+    const uint32_t count = moe_cache_profile_u32(bytes.data() + 12);
+    const size_t header_size = version == 1 ? header_v1_size :
+        version == 2 ? header_v2_size : 0;
+    const uint64_t generation = version == 2 && bytes.size() >= header_v2_size
+        ? moe_cache_profile_u64(bytes.data() + 16) : 0;
+    const uint64_t checksum = header_size != 0 && bytes.size() >= header_size
+        ? moe_cache_profile_u64(bytes.data() + (version == 2 ? 24 : 16)) : 0;
+    if (memcmp(bytes.data(), magic, sizeof(magic)) != 0 || header_size == 0 ||
+            count > max_records || bytes.size() != header_size + (size_t)count * record_size ||
+            checksum != moe_cache_profile_checksum(bytes.data() + header_size,
+                bytes.size() - header_size)) {
+        if (announce) {
+            MOE_CACHE_LOG("[moe-cache] ignoring corrupt or incompatible expert profile: %s\n",
+                    session.config.profile_path.c_str());
+        }
+        return;
+    }
+    try {
+        session.profile_generation = generation;
+        session.profile_heat.reserve(count);
+        const unsigned char * record = bytes.data() + header_size;
+        for (uint32_t i = 0; i < count; ++i, record += record_size) {
+            const moe_cache_profile_key key{
+                moe_cache_profile_u64(record),
+                (int32_t)moe_cache_profile_u32(record + 8),
+            };
+            const uint32_t heat = moe_cache_profile_u32(record + 12);
+            if (key.tensor != 0 && key.expert >= 0 && heat > 0) {
+                session.profile_heat[key] = heat;
+            }
+        }
+        std::unordered_map<uint64_t, std::vector<std::pair<uint32_t, int32_t>>> ranked;
+        for (const auto & item : session.profile_heat) {
+            ranked[item.first.tensor].push_back({item.second, item.first.expert});
+        }
+        session.profile_hot.reserve(ranked.size());
+        for (auto & tensor : ranked) {
+            std::sort(tensor.second.begin(), tensor.second.end(), [](const auto & a, const auto & b) {
+                return a.first > b.first || (a.first == b.first && a.second < b.second);
+            });
+            if (tensor.second.size() > 32) {
+                tensor.second.resize(32);
+            }
+            std::vector<int32_t> & hot = session.profile_hot[tensor.first];
+            hot.reserve(tensor.second.size());
+            for (const auto & item : tensor.second) {
+                hot.push_back(item.second);
+            }
+        }
+        if (announce) {
+            MOE_CACHE_LOG("[moe-cache] loaded %zu expert heat entries from %s\n",
+                    session.profile_heat.size(), session.config.profile_path.c_str());
+        }
+    } catch (...) {
+        session.profile_heat.clear();
+        session.profile_hot.clear();
+        session.profile_generation = 0;
+    }
+}
+
+static std::mutex g_profile_io_mu;
+
+struct moe_cache_profile_file_lock {
+    bool locked = false;
+#if defined(_WIN32)
+    HANDLE handle = INVALID_HANDLE_VALUE;
+#elif defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__)
+    int fd = -1;
+#endif
+
+    explicit moe_cache_profile_file_lock(const std::string & path) {
+        const std::string lock_path = path + ".lock";
+#if defined(_WIN32)
+        handle = CreateFileA(lock_path.c_str(), GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle != INVALID_HANDLE_VALUE) {
+            OVERLAPPED overlap = {};
+            locked = LockFileEx(handle, LOCKFILE_EXCLUSIVE_LOCK, 0,
+                    MAXDWORD, MAXDWORD, &overlap) != 0;
+        }
+#elif defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__)
+        fd = open(lock_path.c_str(), O_CREAT | O_RDWR, 0600);
+        locked = fd >= 0 && flock(fd, LOCK_EX) == 0;
+#else
+        locked = true;
+#endif
+    }
+
+    ~moe_cache_profile_file_lock() {
+#if defined(_WIN32)
+        if (handle != INVALID_HANDLE_VALUE) {
+            if (locked) {
+                OVERLAPPED overlap = {};
+                UnlockFileEx(handle, 0, MAXDWORD, MAXDWORD, &overlap);
+            }
+            CloseHandle(handle);
+        }
+#elif defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__)
+        if (fd >= 0) {
+            if (locked) {
+                flock(fd, LOCK_UN);
+            }
+            close(fd);
+        }
+#endif
+    }
+};
+
+static void moe_cache_profile_save(moe_cache_session & session) {
+    if (session.config.profile_path.empty() || session.observed_heat.empty()) {
+        return;
+    }
+    try {
+        std::lock_guard<std::mutex> process_lock(g_profile_io_mu);
+        moe_cache_profile_file_lock file_lock(session.config.profile_path);
+        if (!file_lock.locked) {
+            return;
+        }
+        moe_cache_session latest;
+        latest.config.profile_path = session.config.profile_path;
+        moe_cache_profile_load(latest, false);
+        auto & merged_heat = latest.profile_heat;
+        if (latest.profile_generation == session.profile_generation) {
+            for (auto it = merged_heat.begin(); it != merged_heat.end();) {
+                it->second /= 2;
+                if (it->second == 0) {
+                    it = merged_heat.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        for (const auto & tensor : session.observed_heat) {
+            for (size_t expert = 0; expert < tensor.second.size(); ++expert) {
+                const uint32_t observed = tensor.second[expert];
+                if (observed == 0 || expert > INT32_MAX) {
+                    continue;
+                }
+                uint32_t & heat = merged_heat[
+                    {tensor.first, (int32_t)expert}];
+                const uint64_t merged = uint64_t(heat) + observed;
+                heat = (uint32_t)std::min<uint64_t>(merged, UINT32_MAX);
+            }
+        }
+        std::vector<std::pair<moe_cache_profile_key, uint32_t>> records(
+                merged_heat.begin(), merged_heat.end());
+        std::sort(records.begin(), records.end(), [](const auto & a, const auto & b) {
+            return a.first.tensor < b.first.tensor ||
+                (a.first.tensor == b.first.tensor && a.first.expert < b.first.expert);
+        });
+        if (records.size() > (1u << 20)) {
+            records.resize(1u << 20);
+        }
+        std::vector<unsigned char> payload;
+        payload.reserve(records.size() * 16);
+        for (const auto & record : records) {
+            moe_cache_profile_put_u64(payload, record.first.tensor);
+            moe_cache_profile_put_u32(payload, (uint32_t)record.first.expert);
+            moe_cache_profile_put_u32(payload, record.second);
+        }
+        std::vector<unsigned char> bytes;
+        bytes.insert(bytes.end(), {'G','G','M','L','M','H','C','1'});
+        moe_cache_profile_put_u32(bytes, 2);
+        moe_cache_profile_put_u32(bytes, (uint32_t)records.size());
+        moe_cache_profile_put_u64(bytes, latest.profile_generation + 1);
+        moe_cache_profile_put_u64(bytes,
+                moe_cache_profile_checksum(payload.data(), payload.size()));
+        bytes.insert(bytes.end(), payload.begin(), payload.end());
+
+        char suffix[80];
+#if defined(_WIN32)
+        const long process_id = _getpid();
+#elif defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__)
+        const long process_id = (long)getpid();
+#else
+        const long process_id = 0;
+#endif
+        snprintf(suffix, sizeof(suffix), ".tmp-%ld-%p", process_id, (void *)&session);
+        const std::string temporary = session.config.profile_path + suffix;
+        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+        if (!output.write((const char *)bytes.data(), bytes.size())) {
+            output.close();
+            std::remove(temporary.c_str());
+            return;
+        }
+        output.close();
+#ifdef _WIN32
+        const bool replaced = MoveFileExA(temporary.c_str(),
+                session.config.profile_path.c_str(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+        const bool replaced = std::rename(
+                temporary.c_str(), session.config.profile_path.c_str()) == 0;
+#endif
+        if (replaced) {
+            MOE_CACHE_LOG("[moe-cache] saved %zu expert heat entries to %s\n",
+                    records.size(), session.config.profile_path.c_str());
+        } else {
+            std::remove(temporary.c_str());
+        }
+    } catch (...) {
+        MOE_CACHE_LOG("[moe-cache] could not update expert profile: %s\n",
+                session.config.profile_path.c_str());
+    }
+}
+
+static void moe_cache_profile_observe_locked(
+        moe_cache_session & session, uint64_t tensor,
+        const int32_t * experts, int n_experts, int64_t expert_count) {
+    if (tensor == 0 || !experts || n_experts <= 0 || expert_count <= 0 ||
+            expert_count > INT32_MAX || session.config.profile_path.empty()) {
+        return;
+    }
+    try {
+        std::vector<uint32_t> & heat = session.observed_heat[tensor];
+        if (heat.empty()) {
+            heat.resize((size_t)expert_count, 0);
+        } else if (heat.size() != (size_t)expert_count) {
+            return;
+        }
+        for (int i = 0; i < n_experts; ++i) {
+            const int32_t expert = experts[i];
+            if (expert >= 0 && expert < expert_count && heat[expert] < UINT32_MAX) {
+                heat[expert]++;
+            }
+        }
+    } catch (...) {
+        // Profiling must never disable or perturb inference.
+    }
+}
+
+static const std::vector<int32_t> & moe_cache_profile_hot_experts(
+        const moe_cache_session & session, uint64_t tensor) {
+    static const std::vector<int32_t> empty;
+    const auto found = session.profile_hot.find(tensor);
+    return found == session.profile_hot.end() ? empty : found->second;
+}
+
+static void moe_cache_profile_advise(
+        const void * host_base, size_t expert_size,
+        const std::vector<int32_t> & experts, int64_t n_expert) {
+#if defined(__linux__)
+    const long page_long = sysconf(_SC_PAGESIZE);
+    if (!host_base || expert_size == 0 || page_long <= 0) {
+        return;
+    }
+    const uintptr_t page = (uintptr_t)page_long;
+    for (int32_t expert : experts) {
+        if (expert < 0 || expert >= n_expert) {
+            continue;
+        }
+        const uintptr_t first = (uintptr_t)host_base + (size_t)expert * expert_size;
+        if (first < (uintptr_t)host_base || expert_size > UINTPTR_MAX - first) {
+            continue;
+        }
+        const uintptr_t begin = first - first % page;
+        const uintptr_t end_raw = first + expert_size;
+        if (end_raw > UINTPTR_MAX - (page - 1)) {
+            continue;
+        }
+        const uintptr_t end = (end_raw + page - 1) / page * page;
+        if (end > begin) {
+            (void)madvise((void *)begin, end - begin, MADV_WILLNEED);
+        }
+    }
+#else
+    (void)host_base;
+    (void)expert_size;
+    (void)experts;
+    (void)n_expert;
+#endif
 }
 
 static bool moe_cache_layer_number(const char * name, int & layer) {
@@ -939,6 +1350,7 @@ static int moe_cache_query_config(
 
     result->budget_bytes = config.budget_mb << 20;
     result->reserve_bytes = config.reserve_mb << 20;
+    result->reserve_explicit = config.reserve_explicit;
     result->minimum_slab_bytes = config.minimum_slab_bytes;
     result->min_expert_bytes = config.min_expert_bytes;
     result->min_expert_explicit = config.min_expert_explicit;
@@ -947,6 +1359,7 @@ static int moe_cache_query_config(
     result->min_devices = config.automatic ? 2 : 1;
     result->overlap_cpu_rows = config.overlap_cpu_rows;
     result->expert_parallel = config.expert_parallel;
+    result->profile_path = nullptr;
     return 1;
 }
 
@@ -986,6 +1399,10 @@ static int moe_cache_query_device(
     result->min_expert_bytes = config->min_expert_explicit
         ? config->min_expert_bytes
         : moe_cache_default_min_expert_bytes(cuda_device.cc);
+    result->recommended_reserve_bytes = ggml_moe_cache_effective_reserve_bytes(
+            config->reserve_explicit,
+            config->reserve_bytes,
+            moe_cache_recommended_reserve_bytes(cuda_device.total_vram));
     return 1;
 }
 
@@ -1547,6 +1964,8 @@ static void * moe_cache_session_create(
                 supplied_config->min_expert_bytes == 0 ||
                 supplied_config->min_expert_explicit < 0 ||
                 supplied_config->min_expert_explicit > 1 ||
+                supplied_config->reserve_explicit < 0 ||
+                supplied_config->reserve_explicit > 1 ||
                 supplied_config->max_batch < 1 ||
                 supplied_config->max_batch > moe_cache_batch_max ||
                 supplied_config->min_devices < 1 ||
@@ -1562,6 +1981,7 @@ static void * moe_cache_session_create(
             config.automatic = supplied_config->min_devices > 1;
             config.budget_mb = supplied_config->budget_bytes / MiB;
             config.reserve_mb = supplied_config->reserve_bytes / MiB;
+            config.reserve_explicit = supplied_config->reserve_explicit;
             config.minimum_slab_bytes = supplied_config->minimum_slab_bytes;
             config.min_expert_bytes = supplied_config->min_expert_bytes;
             config.min_expert_explicit = supplied_config->min_expert_explicit;
@@ -1569,6 +1989,8 @@ static void * moe_cache_session_create(
             config.min_compute_capability = supplied_config->min_compute_capability;
             config.overlap_cpu_rows = supplied_config->overlap_cpu_rows;
             config.expert_parallel = supplied_config->expert_parallel;
+            config.profile_path = supplied_config->profile_path
+                ? supplied_config->profile_path : "";
         }
         if (!config.enabled) {
             return nullptr;
@@ -1615,11 +2037,23 @@ static void * moe_cache_session_create(
                     moe_cache_default_min_expert_bytes(capability));
             minimum_capability = std::min(minimum_capability, capability);
             session->devices.emplace_back(new moe_cache_device(logical, physical));
+            session->devices.back()->automatic_reserve_bytes =
+                moe_cache_recommended_reserve_bytes(info.devices[logical].total_vram);
         }
 
         if (session->devices.empty() ||
             (session->config.automatic && session->devices.size() < 2)) {
             return nullptr;
+        }
+        if (!session->config.reserve_explicit) {
+            size_t reserve_bytes = 0;
+            for (const auto & device_ptr : session->devices) {
+                reserve_bytes = std::max(reserve_bytes,
+                        device_ptr->automatic_reserve_bytes);
+            }
+            // Configuration logging reports the largest automatic reserve;
+            // budget registration retains each device's own value.
+            session->config.reserve_mb = reserve_bytes >> 20;
         }
         if (!session->config.min_expert_explicit) {
             session->config.min_expert_bytes = default_min_expert_bytes;
@@ -1647,6 +2081,7 @@ static void * moe_cache_session_create(
         if (!moe_cache_budget_register(*session)) {
             return nullptr;
         }
+        moe_cache_profile_load(*session);
 
         moe_cache_session * result = session.get();
         try {
@@ -1775,6 +2210,7 @@ static void moe_cache_session_destroy(void * opaque) {
             moe_cache_log_stats(*device_ptr);
         }
     }
+    moe_cache_profile_save(*session);
 
     for (auto & device_ptr : session->devices) {
         std::unique_lock<std::mutex> dispatch_lock(device_ptr->dispatch_mu);
@@ -1921,6 +2357,8 @@ static void * moe_cache_begin(
     }
     int layer = -1;
     const bool has_layer = moe_cache_layer_number(name, layer);
+    const uint64_t profile_key = session->config.profile_path.empty() ? 0 :
+        moe_cache_profile_tensor_hash(name, expert_size, wtype, n_expert);
 
     moe_cache_device * selected = nullptr;
     int pool_index = -1;
@@ -2194,6 +2632,7 @@ static void * moe_cache_begin(
     node->n_expert = n_expert;
     node->n_tokens = n_tokens;
     node->wtype = wtype;
+    node->profile_keys[0] = profile_key;
     node->dispatch_lock = std::move(dispatch_lock);
     return node.release();
 }
@@ -2220,6 +2659,69 @@ static int moe_cache_overlap_rows(const moe_cache_node & node, int n_ids) {
     rows = std::min(rows, std::max(1, n_ids / 4));
     rows = std::min(rows, std::max(2, n_tokens));
     return std::min(rows, n_ids - 1);
+}
+
+static bool moe_cache_enqueue_locked(
+        moe_cache_session & session, moe_cache_device & device,
+        moe_cache_pool & pool, int pool_index, const void * host_base,
+        int32_t expert, size_t expert_size, int & inserts_left,
+        bool & wake_worker, bool allow_eviction) {
+    const moe_cache_key key{host_base, expert};
+    const size_t queue_limit = session.config.queue_mb << 20;
+    if (inserts_left <= 0 || (int)device.queue.size() >= session.config.queue_max ||
+        expert_size > queue_limit - std::min(queue_limit, device.queued_bytes)) {
+        device.insert_skips++;
+        return false;
+    }
+
+    int slot_index = -1;
+    if (!pool.free_slots.empty()) {
+        slot_index = pool.free_slots.back();
+        pool.free_slots.pop_back();
+    } else if (allow_eviction) {
+        int candidate = pool.lru_head;
+        while (candidate >= 0 && pool.slots[candidate].readers > 0) {
+            candidate = pool.slots[candidate].next;
+        }
+        if (candidate < 0) {
+            device.insert_skips++;
+            return false;
+        }
+        slot_index = candidate;
+        moe_cache_slot_reset(pool, slot_index, false);
+        device.evictions++;
+    } else {
+        return false;
+    }
+
+    moe_cache_slot & slot = pool.slots[slot_index];
+    slot.key = key;
+    slot.generation++;
+    slot.readers = 0;
+    slot.state = moe_cache_slot_state::copying;
+    try {
+        const auto inserted = pool.map.emplace(key, slot_index);
+        if (!inserted.second) {
+            moe_cache_slot_reset(pool, slot_index, true);
+            device.insert_skips++;
+            return false;
+        }
+
+        const void * source =
+            (const char *)host_base + (size_t)expert * expert_size;
+        device.queue.push_back({
+                pool_index, slot_index, slot.generation,
+                key, source, expert_size});
+        device.queued_bytes += expert_size;
+    } catch (...) {
+        moe_cache_slot_reset(pool, slot_index, true);
+        device.insert_skips++;
+        return false;
+    }
+    device.inserts++;
+    inserts_left--;
+    wake_worker = true;
+    return true;
 }
 
 static int moe_cache_lookup_or_queue_locked(
@@ -2255,59 +2757,44 @@ static int moe_cache_lookup_or_queue_locked(
         device.admission_skips++;
         return -1;
     }
-    const size_t queue_limit = session.config.queue_mb << 20;
-    if (inserts_left <= 0 || (int)device.queue.size() >= session.config.queue_max ||
-        expert_size > queue_limit - std::min(queue_limit, device.queued_bytes)) {
-        device.insert_skips++;
-        return -1;
-    }
-
-    int slot_index = -1;
-    if (!pool.free_slots.empty()) {
-        slot_index = pool.free_slots.back();
-        pool.free_slots.pop_back();
-    } else {
-        int candidate = pool.lru_head;
-        while (candidate >= 0 && pool.slots[candidate].readers > 0) {
-            candidate = pool.slots[candidate].next;
-        }
-        if (candidate < 0) {
-            device.insert_skips++;
-            return -1;
-        }
-        slot_index = candidate;
-        moe_cache_slot_reset(pool, slot_index, false);
-        device.evictions++;
-    }
-
-    moe_cache_slot & slot = pool.slots[slot_index];
-    slot.key = key;
-    slot.generation++;
-    slot.readers = 0;
-    slot.state = moe_cache_slot_state::copying;
-    try {
-        const auto inserted = pool.map.emplace(key, slot_index);
-        if (!inserted.second) {
-            moe_cache_slot_reset(pool, slot_index, true);
-            device.insert_skips++;
-            return -1;
-        }
-
-        const void * source =
-            (const char *)host_base + (size_t)expert * expert_size;
-        device.queue.push_back({
-                pool_index, slot_index, slot.generation,
-                key, source, expert_size});
-        device.queued_bytes += expert_size;
-    } catch (...) {
-        moe_cache_slot_reset(pool, slot_index, true);
-        device.insert_skips++;
-        return -1;
-    }
-    device.inserts++;
-    inserts_left--;
-    wake_worker = true;
+    (void) moe_cache_enqueue_locked(
+            session, device, pool, pool_index, host_base, expert,
+            expert_size, inserts_left, wake_worker, true);
     return -1;
+}
+
+static void moe_cache_profile_seed_locked(
+        moe_cache_session & session, moe_cache_device & device,
+        moe_cache_pool & pool, int pool_index, const void * host_base,
+        uint64_t tensor_profile, size_t expert_size, int64_t n_expert,
+        bool & wake_worker) {
+    if (tensor_profile == 0 || session.profile_heat.empty()) {
+        return;
+    }
+    try {
+        if (!session.profile_seeded.insert({host_base, device.physical}).second) {
+            return;
+        }
+    } catch (...) {
+        return;
+    }
+    const std::vector<int32_t> & hot = moe_cache_profile_hot_experts(
+            session, tensor_profile);
+    moe_cache_profile_advise(host_base, expert_size, hot, n_expert);
+    int inserts_left = std::min(session.config.inserts_per_plan, 8);
+    for (int32_t expert : hot) {
+        if (expert < 0 || expert >= n_expert) {
+            continue;
+        }
+        if (inserts_left <= 0) {
+            break;
+        }
+        if (pool.map.find({host_base, expert}) == pool.map.end()) {
+            (void) moe_cache_enqueue_locked(
+                    session, device, pool, pool_index, host_base, expert,
+                    expert_size, inserts_left, wake_worker, false);
+        }
+    }
 }
 
 static int moe_cache_plan(
@@ -2333,12 +2820,17 @@ static int moe_cache_plan(
     if (session.stopping) {
         return 0;
     }
+    moe_cache_profile_seed_locked(
+            session, device, pool, node->pool_index, node->host_base,
+            node->profile_keys[0], node->expert_size, node->n_expert,
+            wake_worker);
+    moe_cache_profile_observe_locked(
+            session, node->profile_keys[0], ids, n_ids, node->n_expert);
     for (int index = 0; index < n_ids; index++) {
         const int32_t expert = ids[index];
         if (expert < 0 || expert >= node->n_expert || device.dead.load()) {
             continue;
         }
-
         const int slot_index = moe_cache_lookup_or_queue_locked(
                 session, device, pool, node->pool_index,
                 node->host_base, expert, node->expert_size,
@@ -2878,6 +3370,38 @@ static void * moe_cache_fused_begin_expert_parallel(
     const size_t down_tensor_size = (size_t)down->n_expert * down->expert_size;
     moe_cache_scratch up_scratch;
     moe_cache_scratch down_scratch;
+    const bool profile_enabled = !session.config.profile_path.empty();
+    const uint64_t profile_keys[3] = {
+        profile_enabled ? moe_cache_profile_tensor_hash(
+            up->name, up->expert_size, up->type, up->n_expert) : 0,
+        profile_enabled ? moe_cache_profile_tensor_hash(
+            gate->name, gate->expert_size, gate->type, gate->n_expert) : 0,
+        profile_enabled ? moe_cache_profile_tensor_hash(
+            down->name, down->expert_size, down->type, down->n_expert) : 0,
+    };
+    bool advise[3] = {};
+    if (!session.profile_heat.empty()) {
+        try {
+            std::lock_guard<std::mutex> lock(session.mu);
+            advise[0] = session.profile_advised.insert(up->data).second;
+            advise[1] = session.profile_advised.insert(gate->data).second;
+            advise[2] = session.profile_advised.insert(down->data).second;
+        } catch (...) {
+            advise[0] = advise[1] = advise[2] = false;
+        }
+    }
+    if (advise[0]) {
+        moe_cache_profile_advise(up->data, up->expert_size,
+                moe_cache_profile_hot_experts(session, profile_keys[0]), up->n_expert);
+    }
+    if (advise[1]) {
+        moe_cache_profile_advise(gate->data, gate->expert_size,
+                moe_cache_profile_hot_experts(session, profile_keys[1]), gate->n_expert);
+    }
+    if (advise[2]) {
+        moe_cache_profile_advise(down->data, down->expert_size,
+                moe_cache_profile_hot_experts(session, profile_keys[2]), down->n_expert);
+    }
     if (!moe_cache_scratch_requirements(up->n_in, up->n_out, up_scratch) ||
         !moe_cache_scratch_requirements(down->n_in, down->n_out, down_scratch)) {
         return nullptr;
@@ -3065,6 +3589,10 @@ static void * moe_cache_fused_begin_expert_parallel(
     uint64_t mask = 0;
     {
         std::lock_guard<std::mutex> lock(session.mu);
+        for (uint64_t profile_key : profile_keys) {
+            moe_cache_profile_observe_locked(
+                    session, profile_key, ids, n_ids, up->n_expert);
+        }
         for (route & current : routes) {
             int inserts_left = session.config.inserts_per_plan;
             for (int local = 0; local < current.n_rows; local++) {
@@ -3146,6 +3674,7 @@ static void * moe_cache_fused_begin_expert_parallel(
     root->n_result_rows = total_hits;
     root->composite = true;
     root->planned = true;
+    std::copy(std::begin(profile_keys), std::end(profile_keys), root->profile_keys);
     active_node = false;
 
     size_t n_children = 0;
@@ -3189,6 +3718,7 @@ static void * moe_cache_fused_begin_expert_parallel(
         child->n_expert = up->n_expert;
         child->n_tokens = n_tokens;
         child->wtype = up->type;
+        std::copy(std::begin(profile_keys), std::end(profile_keys), child->profile_keys);
         child->planned = true;
         child->owns_active = false;
         child->n_result_rows = current.n_hits;
@@ -3348,6 +3878,16 @@ static void * moe_cache_fused_begin(
                 ids, n_ids, n_tokens, act_rows, hit_mask);
     }
 
+    const bool profile_enabled = !session->config.profile_path.empty();
+    const uint64_t profile_keys[3] = {
+        profile_enabled ? moe_cache_profile_tensor_hash(
+            up->name, up->expert_size, up->type, up->n_expert) : 0,
+        profile_enabled ? moe_cache_profile_tensor_hash(
+            gate->name, gate->expert_size, gate->type, gate->n_expert) : 0,
+        profile_enabled && down ? moe_cache_profile_tensor_hash(
+            down->name, down->expert_size, down->type, down->n_expert) : 0,
+    };
+
     std::unique_ptr<moe_cache_node> node(new (std::nothrow) moe_cache_node());
     if (!node) {
         return nullptr;
@@ -3357,6 +3897,7 @@ static void * moe_cache_fused_begin(
     moe_cache_pool * pool = nullptr;
     moe_cache_pool * down_pool = nullptr;
     int pool_index = -1;
+    int down_pool_index = -1;
     {
         std::lock_guard<std::mutex> lock(session->mu);
         if (session->stopping || session->dormant) {
@@ -3398,7 +3939,7 @@ static void * moe_cache_fused_begin(
             return nullptr;
         }
         if (down) {
-            const int down_pool_index = moe_cache_find_pool(
+            down_pool_index = moe_cache_find_pool(
                     *selected, down->expert_size, down->type);
             if (down_pool_index < 0 ||
                 down_pool_index >= (int)selected->pools.size()) {
@@ -3494,6 +4035,7 @@ static void * moe_cache_fused_begin(
     node->n_expert = up->n_expert;
     node->n_tokens = n_tokens;
     node->wtype = up->type;
+    std::copy(std::begin(profile_keys), std::end(profile_keys), node->profile_keys);
     node->dispatch_lock = std::move(dispatch_lock);
     node->planned = true;
 
@@ -3512,6 +4054,28 @@ static void * moe_cache_fused_begin(
     {
         std::unique_lock<std::mutex> lock(session->mu);
         if (!session->stopping && !selected->dead.load()) {
+            moe_cache_profile_seed_locked(
+                    *session, *selected, *pool, pool_index, up->data,
+                    node->profile_keys[0], up->expert_size, up->n_expert,
+                    wake_worker);
+            moe_cache_profile_seed_locked(
+                    *session, *selected, *pool, pool_index, gate->data,
+                    node->profile_keys[1], gate->expert_size, gate->n_expert,
+                    wake_worker);
+            if (down) {
+                moe_cache_profile_seed_locked(
+                        *session, *selected, *down_pool, down_pool_index, down->data,
+                        node->profile_keys[2], down->expert_size, down->n_expert,
+                        wake_worker);
+            }
+            moe_cache_profile_observe_locked(
+                    *session, node->profile_keys[0], ids, n_ids, up->n_expert);
+            moe_cache_profile_observe_locked(
+                    *session, node->profile_keys[1], ids, n_ids, up->n_expert);
+            if (down) {
+                moe_cache_profile_observe_locked(
+                        *session, node->profile_keys[2], ids, n_ids, up->n_expert);
+            }
             for (int index = 0; index < n_ids; index++) {
                 resident_up[index] = -1;
                 resident_gate[index] = -1;

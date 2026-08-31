@@ -188,6 +188,7 @@ public:
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
+    bool get_has_shared_cells() const override { return other != nullptr; }
     bool can_seq_rm_partial() const override { return true; }
 
     llama_memory_vbr_representation_identity

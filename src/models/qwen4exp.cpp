@@ -6,6 +6,22 @@
 #include <algorithm>
 #include <cinttypes>
 
+// Malformed model metadata must fail as a recoverable load error, not abort the process.
+static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
+    if (value == 0) {
+        throw std::runtime_error(format("%s must be greater than zero, got %u", ml.llm_kv(kid).c_str(), value));
+    }
+}
+
+static void qwen4exp_require_arr_len(llama_model_loader & ml, llm_kv kid, uint32_t n_min) {
+    uint32_t n_arr = 0;
+    ml.get_arr_n(kid, n_arr, true);
+    if (n_arr < n_min) {
+        throw std::runtime_error(format("%s has %u entries, but at least %u are required",
+                                        ml.llm_kv(kid).c_str(), n_arr, n_min));
+    }
+}
+
 void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
@@ -18,13 +34,20 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_SSM_STATE_SIZE,     hparams.ssm_d_state);
     ml.get_key(LLM_KV_SSM_TIME_STEP_RANK, hparams.ssm_dt_rank);
     ml.get_key(LLM_KV_SSM_GROUP_COUNT,    hparams.ssm_n_group);
-    GGML_ASSERT(hparams.ssm_d_conv  > 0 && hparams.ssm_d_inner > 0 && hparams.ssm_d_state > 0 &&
-                hparams.ssm_dt_rank > 0 && hparams.ssm_n_group > 0);
+    qwen4exp_require_nonzero(ml, LLM_KV_SSM_CONV_KERNEL,    hparams.ssm_d_conv);
+    qwen4exp_require_nonzero(ml, LLM_KV_SSM_INNER_SIZE,     hparams.ssm_d_inner);
+    qwen4exp_require_nonzero(ml, LLM_KV_SSM_STATE_SIZE,     hparams.ssm_d_state);
+    qwen4exp_require_nonzero(ml, LLM_KV_SSM_TIME_STEP_RANK, hparams.ssm_dt_rank);
+    qwen4exp_require_nonzero(ml, LLM_KV_SSM_GROUP_COUNT,    hparams.ssm_n_group);
 
     // HC; low_rank is qwen4exp-specific, DeepSeek-V4 leaves it absent (full rank)
     ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT,    hparams.dsv4_hc_mult);
     ml.get_key(LLM_KV_HYPER_CONNECTION_LOW_RANK, hparams.hc_low_rank);
-    GGML_ASSERT(hparams.dsv4_hc_mult > 0 && hparams.hc_low_rank > 0);
+    if (hparams.dsv4_hc_mult <= 1) {
+        throw std::runtime_error(format("%s must be greater than one, got %u",
+                                        ml.llm_kv(LLM_KV_HYPER_CONNECTION_COUNT).c_str(), hparams.dsv4_hc_mult));
+    }
+    qwen4exp_require_nonzero(ml, LLM_KV_HYPER_CONNECTION_LOW_RANK, hparams.hc_low_rank);
     hparams.n_embd_out_impl = hparams.dsv4_hc_mult * hparams.n_embd;
 
     ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
@@ -36,9 +59,9 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
-    GGML_ASSERT(hparams.indexer_n_head > 0
-             && hparams.indexer_head_size > 0
-             && hparams.indexer_top_k > 0);
+    qwen4exp_require_nonzero(ml, LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head);
+    qwen4exp_require_nonzero(ml, LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
+    qwen4exp_require_nonzero(ml, LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
     ml.get_key_or_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, hparams.dsv4_compress_ratios, hparams.n_layer_all, false);
 
     // PLE n-gram hash embeddings; if the key group is absent every field stays zero
@@ -50,7 +73,10 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     if (n_ple > 0) {
         std::vector<uint32_t> ple_layers;
         ml.get_arr(LLM_KV_PLE_LAYERS, ple_layers);
-        GGML_ASSERT(n_ple == 1 && "qwen4exp supports only one PLE layer");
+        if (n_ple != 1) {
+            throw std::runtime_error(format("%s lists %u layers, but only one PLE layer is supported",
+                                            ml.llm_kv(LLM_KV_PLE_LAYERS).c_str(), n_ple));
+        }
         for (uint32_t il : ple_layers) {
             if (il >= hparams.n_layer_all) {
                 throw std::runtime_error(format("PLE layer %u is out of range", il));
@@ -65,7 +91,8 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
         // optional: files written before this key fall back to the EOS token
         ml.get_key(LLM_KV_PLE_IMAGE_TOKEN_ID,  hparams.ple_image_token_id, false);
         ml.get_key(LLM_KV_EMBEDDING_LENGTH_PER_LAYER, hparams.n_embd_per_layer);
-        GGML_ASSERT(hparams.ple_conv_kernel > 0 && hparams.n_embd_per_layer > 0);
+        qwen4exp_require_nonzero(ml, LLM_KV_PLE_CONV_KERNEL,            hparams.ple_conv_kernel);
+        qwen4exp_require_nonzero(ml, LLM_KV_EMBEDDING_LENGTH_PER_LAYER, hparams.n_embd_per_layer);
 
         hparams.ple_n_heads  = (hparams.ple_ngram_size - 1) * hparams.ple_heads_per_ngram;
         hparams.ple_head_dim = hparams.n_embd_per_layer;
@@ -75,6 +102,10 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
         if (hparams.ple_n_heads == 0 || hparams.ple_n_heads > LLAMA_MAX_PLE_HEADS) {
             throw std::runtime_error(format("PLE head count %u is out of range", hparams.ple_n_heads));
         }
+
+        qwen4exp_require_arr_len(ml, LLM_KV_PLE_LAYER_MULTIPLIERS, hparams.ple_ngram_size);
+        qwen4exp_require_arr_len(ml, LLM_KV_PLE_HEAD_OFFSETS,      hparams.ple_n_heads);
+        qwen4exp_require_arr_len(ml, LLM_KV_PLE_HEAD_VOCAB_SIZES, hparams.ple_n_heads);
 
         ml.get_arr(LLM_KV_PLE_LAYER_MULTIPLIERS, hparams.ple_layer_multipliers);
 
@@ -99,9 +130,17 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     if (!ml.get_key_or_arr(LLM_KV_ATTENTION_RECURRENT_LAYERS, hparams.is_recr_impl, hparams.n_layer_all, false)) {
         uint32_t full_attn_interval = 4;
         ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval, false);
-        GGML_ASSERT(full_attn_interval > 0);
+        qwen4exp_require_nonzero(ml, LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval);
         for (uint32_t i = 0; i < hparams.n_layer_all; ++i) {
             hparams.is_recr_impl[i] = (i < hparams.n_layer()) && ((i + 1) % full_attn_interval != 0);
+        }
+    }
+    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+        const uint32_t ratio = hparams.dsv4_compress_ratios[il];
+        if (!hparams.is_recr(il) && (ratio == 0 || ratio > 64)) {
+            throw std::runtime_error(format(
+                    "%s[%u] must be in [1, 64] for attention layers, got %u",
+                    ml.llm_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS).c_str(), il, ratio));
         }
     }
 
@@ -713,7 +752,9 @@ public:
         const int64_t n_kv     = idx->get_n_kv();
         const int64_t n_stream = mctx->get_n_stream();
         const int64_t n_blocks = (n_kv + ratio - 1)/ratio;
-        const bool current_selection_required = qwen4_qsa_selected_width(n_kv, top_k, ratio) < n_kv;
+        const bool current_selection_required =
+            qwen4_qsa_selected_width(n_kv, top_k, ratio) < n_kv &&
+            mctx->qsa_selection_safe(&params.ubatch);
 
         bool res = true;
 
@@ -767,8 +808,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     GGML_ASSERT(r > 0);
 
     const int64_t n_blocks = (n_kv + r - 1)/r;
-    const bool selection_required = qwen4_qsa_selected_width(
-            n_kv, hparams.indexer_top_k, (uint32_t) r) < n_kv;
+    const bool selection_safe = mctx_hyb->qsa_selection_safe(&ubatch);
+    const bool selection_required =
+        qwen4_qsa_selected_width(n_kv, hparams.indexer_top_k, (uint32_t) r) < n_kv &&
+        selection_safe;
 
     // build_attn_qsa and the KQ mask need the tokens to divide evenly across the streams
     const int64_t n_stream = mctx_hyb->get_n_stream();
@@ -779,7 +822,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // the rest is the visible/not test the attention mask already carries, so upload the per-block half only: 1/ratio of the cells
     // alibi writes distances instead of a mask and non-causal keeps future cells, so both opt out
     // the mask also holds an mrope rule for the query's own position, but only 2d image positions can differ there
-    const bool blk_bias = kq_mask != nullptr &&
+    const bool blk_bias = selection_safe && kq_mask != nullptr &&
         kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream &&
         cparams.causal_attn && !hparams.use_alibi;
 
@@ -849,9 +892,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     pooled = ggml_scale(ctx0, pooled, 1.0f/(float) r);
     cb(pooled, "indexer_k_pooled", il);
 
+    // Keep the block count on ne[1]. The CUDA RMS-norm grid uses ne[2], whose 65535 limit is
+    // exceeded by 262144/4 blocks when that dimension carries the flattened block surface.
+    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks*n_stream, 1);
+    pooled = build_norm(pooled, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
+
     // rope wants [n_dims, n_head, n_tokens]: lay every stream's blocks flat, split after.
     pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_blocks*n_stream);
-    pooled = build_norm(pooled, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
     pooled = ggml_rope_multi(ctx0, pooled, inp->blk_pos, nullptr,
             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
             ext_factor, attn_factor, beta_fast, beta_slow);
@@ -869,12 +916,20 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
     // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
     ggml_tensor * score = ggml_mul_mat(ctx0, pooled,
-            ggml_reshape_3d(ctx0, ggml_cont(ctx0, q), idx_dim, n_idx_h*n_tps, n_stream));
+            ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h*n_tps, n_stream));
     score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
     score = ggml_relu(ctx0, score);
-    score = ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3));
-    score = ggml_sum_rows(ctx0, score);
-    score = ggml_reshape_3d(ctx0, score, n_blocks, n_tps, n_stream);
+
+    // The heads sit side by side on ne[1] and there are few of them, so summing slices avoids
+    // transposing the entire block-by-token surface twice.
+    ggml_tensor * summed = nullptr;
+    for (int64_t h = 0; h < n_idx_h; ++h) {
+        ggml_tensor * slice = ggml_view_3d(ctx0, score, n_blocks, n_tps, n_stream,
+                score->nb[2], score->nb[3], h*score->nb[1]);
+        summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
+    }
+
+    score = summed;
     cb(score, "indexer_score", il);
 
     // one value per block, so it is cheaper to bias here than after the cells are expanded
@@ -947,6 +1002,34 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
+    const int64_t width = top_k->ne[0];
+    const int64_t n_tps = top_k->ne[1];
+    const int64_t n_kv  = mctx_cur->get_n_kv();
+
+    // A scan reads the cache once for all queries in a stream, while a gather moves each selected
+    // K and V window per query. Keep a clear margin and use gather only with flash attention.
+    ggml_tensor * cur = cparams.flash_attn && 4*n_tps*width < n_kv
+        ? build_qsa_gather(inp, q_cur, top_k, kq_scale, il)
+        : build_qsa_scan  (inp, q_cur, top_k, kq_scale, il);
+    cb(cur, "kqv_out", il);
+
+    // Preserve the exact ordinary-attention V-cache representation contract. In particular,
+    // Turbo/VBR values use the graph-level inverse WHT and mean restoration, not the optional
+    // upstream Hadamard tensor.
+    cur = build_attn_v_unrotate(cur, mctx_cur->get_v(ctx0, il), inp->self_v_rot, inp->self_vmean, il);
+
+    return cur;
+}
+
+// Keep the full cache window and mask out cells not named by the selection.
+ggml_tensor * llama_model_qwen4exp::graph::build_qsa_scan(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor *             q_cur,
+        ggml_tensor *             top_k,
+        float                     kq_scale,
+        int                       il) {
+    const auto * mctx_cur = inp->mctx;
+
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
     // prepare new kq mask - starts filled with -INFINITY
@@ -979,15 +1062,56 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, kq_scale, il);
-    cb(cur, "kqv_out", il);
+    return build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, kq_scale, il);
+}
 
-    // Use the same V-cache representation contract as ordinary attention. In particular,
-    // Turbo V is stored in the rotated domain and needs the Turbo inverse WHT here; the
-    // optional upstream Hadamard tensor is deliberately absent for Turbo cache types.
-    cur = build_attn_v_unrotate(cur, v, inp->self_v_rot, inp->self_vmean, il);
+// Gather one selected K/V window per query. At long context this makes attention traffic follow
+// the fixed QSA budget instead of the complete cache length.
+ggml_tensor * llama_model_qwen4exp::graph::build_qsa_gather(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor *             q_cur,
+        ggml_tensor *             top_k,
+        float                     kq_scale,
+        int                       il) {
+    const auto * mctx_cur = inp->mctx;
 
-    return cur;
+    const int64_t width    = top_k->ne[0];
+    const int64_t n_tps    = top_k->ne[1];
+    const int64_t n_stream = top_k->ne[3];
+    const int64_t n_q      = n_tps*n_stream;
+
+    ggml_tensor * k_all = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v_all = mctx_cur->get_v(ctx0, il);
+    const int64_t n_kv = k_all->ne[2];
+
+    // All heads belonging to a cell are adjacent, so each gather row is one complete cell.
+    ggml_tensor * k_cells = ggml_view_3d(ctx0, k_all, k_all->ne[0]*k_all->ne[1], n_kv, n_stream,
+            k_all->nb[2], k_all->nb[3], 0);
+    ggml_tensor * v_cells = ggml_view_3d(ctx0, v_all, v_all->ne[0]*v_all->ne[1], n_kv, n_stream,
+            v_all->nb[2], v_all->nb[3], 0);
+
+    // The ubatch lays each stream's queries contiguously, matching top_k's stream dimension.
+    ggml_tensor * idx_stream = ggml_reshape_2d(ctx0, top_k, width*n_tps, n_stream);
+    ggml_tensor * k_sel = ggml_get_rows(ctx0, k_cells, idx_stream);
+    ggml_tensor * v_sel = ggml_get_rows(ctx0, v_cells, idx_stream);
+
+    k_sel = ggml_reshape_4d(ctx0, k_sel, k_all->ne[0], k_all->ne[1], width, n_q);
+    v_sel = ggml_reshape_4d(ctx0, v_sel, v_all->ne[0], v_all->ne[1], width, n_q);
+    cb(k_sel, "qsa_k_sel", il);
+    cb(v_sel, "qsa_v_sel", il);
+
+    // Gather the ordinary causal/reachability mask at the same selected cells.
+    ggml_tensor * kq_mask = inp->get_kq_mask();
+    GGML_ASSERT(kq_mask->nb[3] == kq_mask->nb[1]*n_tps);
+
+    ggml_tensor * mask_cells = ggml_view_3d(ctx0, kq_mask, 1, n_kv, n_q,
+            kq_mask->nb[0], kq_mask->nb[1], 0);
+    ggml_tensor * idx_query = ggml_reshape_3d(ctx0, top_k, width, n_q, 1);
+    ggml_tensor * mask = ggml_get_rows(ctx0, mask_cells, idx_query);
+    mask = ggml_cast(ctx0, ggml_reshape_4d(ctx0, mask, width, 1, 1, n_q), GGML_TYPE_F16);
+    cb(mask, "qsa_mask_sel", il);
+
+    return build_attn_mha(q_cur, k_sel, v_sel, nullptr, mask, nullptr, nullptr, kq_scale, il);
 }
 
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(

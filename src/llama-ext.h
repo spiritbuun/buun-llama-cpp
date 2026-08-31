@@ -150,6 +150,10 @@ LLAMA_API size_t llama_model_get_moe_tensor_info(
         struct llama_moe_tensor_info * info,
         size_t capacity);
 
+// True when at least one routed-expert weight tensor is backed by host memory.
+// This is intentionally about resolved placement, not architecture metadata.
+LLAMA_API bool llama_model_has_host_moe_weights(const struct llama_model * model);
+
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);

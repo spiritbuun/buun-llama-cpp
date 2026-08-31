@@ -61,6 +61,7 @@ int main(int argc, char ** argv) {
 
         params.speculative.draft.ctx_tgt = ctx_tgt;
         params.speculative.draft.ctx_dft = spec_init->context();
+        params.speculative.draft.ctx_mtp = spec_init->context_mtp();
     }
 
     llama_context * ctx_dft = params.speculative.draft.ctx_dft;

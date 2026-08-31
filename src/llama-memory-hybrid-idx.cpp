@@ -442,6 +442,26 @@ uint32_t llama_memory_hybrid_idx_context::get_n_stream() const {
     return ns_ubatch[i_cur];
 }
 
+bool llama_memory_hybrid_idx_context::qsa_selection_safe(const llama_ubatch * ubatch) const {
+    GGML_ASSERT(ubatch != nullptr);
+    GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
+
+    if (get_n_stream() != 1) {
+        return true;
+    }
+
+    // One unified cache tensor has one cell->block map. It is safe when this ubatch addresses one
+    // logical sequence: set_input_qsa filters the unified cache to that sequence, so other dormant
+    // slots do not matter. Mixed logical queries need separate layouts and use dense attention.
+    const llama_seq_id seq = ubatch->seq_id[0][0];
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        if (ubatch->n_seq_id[i] != 1 || ubatch->seq_id[i][0] != seq) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor * cell_blk,
         ggml_tensor * blk_cells,
@@ -454,6 +474,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
 
     GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
+    GGML_ASSERT(qsa_selection_safe(ubatch));
 
     const int64_t n_kv     = cell_blk->ne[0];
     const int64_t n_ns     = cell_blk->ne[1];        // streams in this ubatch
@@ -469,6 +490,10 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     int32_t * dst_blk_pos   = (int32_t *) blk_pos->data;
     float   * dst_bias      = (float   *) bias->data;
 
+    GGML_ASSERT(r <= 64);
+    GGML_ASSERT(r*n_blocks >= n_kv);
+    const uint64_t slots_full = r == 64 ? ~uint64_t(0) : ((uint64_t(1) << r) - 1);
+
     // one pass per stream: cell j is a different token in each, so no mapping is shared
     for (int64_t s = 0; s < n_ns; ++s) {
         // ubatch index s*n_tps belongs to this stream; ask which cells array it uses
@@ -477,67 +502,238 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
 
         int32_t * cur_cell_blk  = dst_cell_blk  + s*n_kv;
         int32_t * cur_blk_cells = dst_blk_cells + s*(r*n_blocks);
-        // blk_pos is an input-owned host buffer. Its first section is safe
-        // staging until every bias has consumed the per-block fill counts;
-        // all four position sections are materialized below before upload.
-        int32_t * cur_filled = dst_blk_pos + s*n_blocks;
 
-        // an incomplete block cannot be pooled; the bias below forces those tail cells in
-        // -1 means no usable block, and block 0 only keeps the gather in range
-        std::fill(cur_cell_blk, cur_cell_blk + n_kv, -1);
-        std::fill(cur_filled, cur_filled + n_blocks, 0);
-        std::fill(cur_blk_cells, cur_blk_cells + r*n_blocks, 0);
+        const auto pos_at = [&](int64_t sec, int64_t b) -> int32_t & {
+            return dst_blk_pos[sec*(n_blocks*n_ns) + s*n_blocks + b];
+        };
 
-        // a cell no block covers needs its own -inf, which a per-block bias cannot carry
-        // every cache path keeps the position below the cell window, so this stays false
+        for (int64_t sec = 0; sec < 4; ++sec) {
+            std::fill(dst_blk_pos + sec*(n_blocks*n_ns) + s*n_blocks,
+                      dst_blk_pos + sec*(n_blocks*n_ns) + (s + 1)*n_blocks, 0);
+        }
+
+        // First try the overwhelmingly common one-sequence text layout in one linear pass. Keep
+        // natural position-block ids here: unlike one shared "dead" block, that preserves the
+        // distinction between an old incomplete block and the current causal tail.
+        std::fill(cur_cell_blk,  cur_cell_blk  + n_kv,       -1);
+        std::fill(cur_blk_cells, cur_blk_cells + r*n_blocks, -1);
+
+        bool direct = true;
         bool oor = false;
-
         for (int64_t j = 0; j < n_kv; ++j) {
-            if (cells.is_empty(j)) {
+            if (cells.is_empty(j) || !cells.seq_has((uint32_t) j, seq_of_stream)) {
                 continue;
             }
 
             const llama_pos p = cells.pos_get(j);
-            const int64_t   b = p/r;
-
-            if (b >= n_blocks) {
+            const int64_t pb = p/r;
+            if (p < 0 || pb >= n_blocks) {
                 oor = true;
-                continue;
+                direct = false;
+                break;
             }
 
-            cur_cell_blk[j] = (int32_t) b;
-            cur_blk_cells[b*r + (p%r)] = (int32_t) j;
-            cur_filled[b]++;
+            int32_t & slot = cur_blk_cells[pb*r + p%r];
+            if (slot >= 0) {
+                // Repeated temporal positions are M-RoPE and need y/x ranking.
+                direct = false;
+                break;
+            }
+            slot = (int32_t) j;
+            cur_cell_blk[j] = (int32_t) pb;
+        }
+
+        int64_t n_active = 0;
+        int32_t n_bid = 0;
+        bool ranked = false;
+
+        if (direct) {
+            // Empty gather slots are masked before attention. Pointing them at cell zero keeps the
+            // gather in range; an incomplete block's pooled score is used only for the forced tail.
+            for (int64_t pb = 0; pb < n_blocks; ++pb) {
+                int32_t rep = -1;
+                bool full = true;
+                for (int64_t slot = 0; slot < r; ++slot) {
+                    rep = rep < 0 ? cur_blk_cells[pb*r + slot] : rep;
+                    full &= cur_blk_cells[pb*r + slot] >= 0;
+                }
+                if (!full && !blk_bias) {
+                    for (int64_t slot = 0; slot < r; ++slot) {
+                        const int32_t cell = cur_blk_cells[pb*r + slot];
+                        if (cell >= 0) {
+                            cur_cell_blk[cell] = -1;
+                        }
+                    }
+                }
+                for (int64_t slot = 0; slot < r; ++slot) {
+                    if (cur_blk_cells[pb*r + slot] < 0) {
+                        cur_blk_cells[pb*r + slot] = 0;
+                    }
+                }
+                pos_at(0, pb) = (int32_t) (pb*r);
+                pos_at(1, pb) = rep;
+                pos_at(2, pb) = full ? 1 : 0;
+            }
+            n_bid = (int32_t) n_blocks;
+        } else {
+            // The fallback is cold (M-RoPE or repeated positions). Each stream owns a separate
+            // layout, so group all cells visible to that stream together. This lets a shared
+            // prefix and a private suffix complete the same causal block after a sequence fork.
+            std::fill(cur_cell_blk, cur_cell_blk + n_kv, -2);
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (!cells.is_empty(j) && cells.seq_has((uint32_t) j, seq_of_stream)) {
+                    cur_blk_cells[n_active++] = (int32_t) j;
+                }
+            }
+            std::sort(cur_blk_cells, cur_blk_cells + n_active, [&cells](int32_t a, int32_t b) {
+                const llama_pos pa = cells.pos_get(a);
+                const llama_pos pb = cells.pos_get(b);
+                if (pa != pb) {
+                    return pa < pb;
+                }
+                const auto & ea = cells.ext_get(a);
+                const auto & eb = cells.ext_get(b);
+                if (ea.y != eb.y) {
+                    return ea.y < eb.y;
+                }
+                if (ea.x != eb.x) {
+                    return ea.x < eb.x;
+                }
+                return a < b;
+            });
+            for (int64_t k = 1; k < n_active; ++k) {
+                ranked |= cells.pos_get(cur_blk_cells[k - 1]) == cells.pos_get(cur_blk_cells[k]);
+            }
+
+            int32_t slots[64];
+            if (ranked) {
+                for (int64_t begin = 0; begin < n_active; begin += r) {
+                    const int64_t count = std::min<int64_t>(r, n_active - begin);
+                    for (int64_t slot = 0; slot < count; ++slot) {
+                        cur_cell_blk[cur_blk_cells[begin + slot]] = -1;
+                    }
+                    if (count != r) {
+                        continue;
+                    }
+
+                    GGML_ASSERT(n_bid < n_blocks);
+                    const int32_t bid = n_bid++;
+                    const int32_t first = cur_blk_cells[begin];
+                    const auto & ext = cells.ext_get(first);
+                    pos_at(0, bid) = cells.pos_get(first);
+                    pos_at(1, bid) = ext.y;
+                    pos_at(2, bid) = ext.x;
+                    pos_at(3, bid) = cells.pos_get(first);
+                    for (int64_t slot = 0; slot < r; ++slot) {
+                        cur_cell_blk[cur_blk_cells[begin + slot]] = bid*r + slot;
+                    }
+                }
+            } else {
+                int64_t begin = 0;
+                while (begin < n_active) {
+                    const int64_t pb = cells.pos_get(cur_blk_cells[begin])/r;
+                    std::fill(slots, slots + r, -1);
+                    uint64_t used_slots = 0;
+                    int64_t end = begin;
+                    while (end < n_active && cells.pos_get(cur_blk_cells[end])/r == pb) {
+                        const int32_t cell = cur_blk_cells[end++];
+                        const int64_t slot = cells.pos_get(cell)%r;
+                        slots[slot] = cell;
+                        used_slots |= uint64_t(1) << slot;
+                        cur_cell_blk[cell] = -1;
+                    }
+
+                    if (pb < 0 || pb >= n_blocks) {
+                        oor = true;
+                    } else if (used_slots == slots_full) {
+                        GGML_ASSERT(n_bid < n_blocks);
+                        const int32_t bid = n_bid++;
+                        const int32_t p = (int32_t) (pb*r);
+                        pos_at(0, bid) = p;
+                        pos_at(1, bid) = p;
+                        pos_at(2, bid) = p;
+                        pos_at(3, bid) = p;
+                        for (int64_t slot = 0; slot < r; ++slot) {
+                            cur_cell_blk[slots[slot]] = bid*r + slot;
+                        }
+                    }
+                    begin = end;
+                }
+            }
+
         }
 
         GGML_ASSERT((!blk_bias || !oor) && "qsa: cell position runs past the cell window");
+        GGML_ASSERT(n_bid <= n_blocks);
 
-        // per-block mode keeps an unpooled cell's real block, so the block's own -inf reaches it
-        // per-cell mode carries that -inf itself and only needs the gather in range
-        for (int64_t j = 0; j < n_kv; ++j) {
-            if (cur_cell_blk[j] >= 0 &&
-                cur_filled[cur_cell_blk[j]] < r && !blk_bias) {
-                cur_cell_blk[j] = -1;
-            }
-        }
+        // Only fallback layouts use a shared in-range block for unpooled cells. Multi-sequence
+        // graphs carry per-cell bias; a one-sequence ranked layout has at most one incomplete tail.
+        const bool have_dead = !direct && n_bid < n_blocks;
+        const int32_t dead_bid = have_dead ? n_bid : n_blocks - 1;
 
         for (int64_t ii = 0; ii < n_tps; ++ii) {
             const int64_t      i      = s*n_tps + ii;
             const llama_seq_id seq_id = ubatch->seq_id[i][0];
-            const llama_pos    q      = ubatch->pos[i];
+
+            int64_t q = ubatch->pos[i];
+            bool query_ranked = false;
+            if (ranked && ubatch->is_pos_2d()) {
+                llama_pos last_pos = -1;
+                bool have_last = false;
+                for (int64_t k = 0; k < n_active; ++k) {
+                    const int32_t cell = cur_blk_cells[k];
+                    if (!cells.seq_has((uint32_t) cell, seq_id)) {
+                        continue;
+                    }
+                    const llama_pos p = cells.pos_get(cell);
+                    query_ranked |= have_last && p == last_pos;
+                    last_pos = p;
+                    have_last = true;
+                }
+            }
+
+            if (query_ranked) {
+                const llama_pos qt = ubatch->pos[i];
+                const llama_pos qy = ubatch->pos[i + n_tokens];
+                const llama_pos qx = ubatch->pos[i + n_tokens*2];
+
+                q = -1;
+                int64_t rank = 0;
+                for (int64_t k = 0; k < n_active; ++k) {
+                    const int32_t cell = cur_blk_cells[k];
+                    if (!cells.seq_has((uint32_t) cell, seq_id)) {
+                        continue;
+                    }
+                    const llama_pos pc = cells.pos_get(cell);
+                    const bool visible = pc < qt || (pc == qt && !cells.ext_get(cell).is_2d_gt(qx, qy));
+                    if (visible) {
+                        q = rank;
+                    }
+                    ++rank;
+                }
+            }
 
             // the tail is an incomplete block and is always visible, as in the reference
-            const llama_pos tail_start = (q + 1)/r*r;
+            const int64_t tail_start = (q + 1)/r*r;
 
             if (blk_bias) {
-                // a block sits wholly inside or outside the tail, so one value covers it
-                // the caller adds the attention mask, which drops empty, foreign and future cells
                 float * cur_blk_bias = dst_bias + i*n_blocks;
 
                 for (int64_t b = 0; b < n_blocks; ++b) {
-                    // finite, so it can never meet a -inf and produce a nan
-                    cur_blk_bias[b] = b*r >= tail_start ? 1e9f :
-                        (cur_filled[b] < r ? -INFINITY : 0.0f);
+                    const int32_t rep = direct ? pos_at(1, b) : 0;
+                    if (b >= n_bid || rep < 0 ||
+                        (direct && !cells.seq_has((uint32_t) rep, seq_id))) {
+                        cur_blk_bias[b] = -INFINITY;
+                        continue;
+                    }
+
+                    const int64_t block_start = query_ranked ? b*r : pos_at(0, b);
+                    cur_blk_bias[b] = block_start >= tail_start ? 1e9f :
+                        (direct && pos_at(2, b) == 0 ? -INFINITY : 0.0f);
+                }
+
+                if (have_dead) {
+                    cur_blk_bias[dead_bid] = 1e9f;
                 }
 
                 continue;
@@ -545,36 +741,60 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
 
             float * cur_bias = dst_bias + i*n_kv;
 
-            for (int64_t j = 0; j < n_kv; ++j) {
-                float v = -INFINITY;
-
-                if (!cells.is_empty(j) && cells.seq_has(j, seq_id) && cells.pos_get(j) <= q) {
-                    // finite, so it can never meet a -inf and produce a nan
-                    v = cells.pos_get(j) >= tail_start ? 1e9f :
-                        (cur_cell_blk[j] < 0 ? -INFINITY : 0.0f);
+            if (query_ranked) {
+                std::fill(cur_bias, cur_bias + n_kv, -INFINITY);
+                int64_t rank = 0;
+                for (int64_t k = 0; k < n_active; ++k) {
+                    const int32_t cell = cur_blk_cells[k];
+                    if (!cells.seq_has((uint32_t) cell, seq_id)) {
+                        continue;
+                    }
+                    if (rank <= q) {
+                        cur_bias[cell] = rank >= tail_start ? 1e9f :
+                            (cur_cell_blk[cell] < 0 ? -INFINITY : 0.0f);
+                    }
+                    ++rank;
                 }
+            } else {
+                for (int64_t j = 0; j < n_kv; ++j) {
+                    float v = -INFINITY;
 
-                cur_bias[j] = v;
+                    if (!cells.is_empty(j) && cells.seq_has(j, seq_id) && cells.pos_get(j) <= q) {
+                        v = cells.pos_get(j) >= tail_start ? 1e9f :
+                            (cur_cell_blk[j] < 0 ? -INFINITY : 0.0f);
+                    }
+
+                    cur_bias[j] = v;
+                }
             }
         }
 
-        // The gather requires an in-range index. Bias construction above has
-        // already consumed the -1 sentinel that distinguishes unpooled cells.
+        if (!direct) {
+            // The temporary non-negative cell value is its exact gather slot. Build the gather
+            // only after every bias has consumed the sorted active-cell list, then expose block ids.
+            std::fill(cur_blk_cells, cur_blk_cells + r*n_blocks, 0);
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (cur_cell_blk[j] >= 0) {
+                    const int32_t gather_slot = cur_cell_blk[j];
+                    cur_blk_cells[gather_slot] = (int32_t) j;
+                    cur_cell_blk[j] = gather_slot/r;
+                }
+            }
+        } else {
+            // The direct path kept a representative in section 1 for bias filtering.
+            for (int64_t b = 0; b < n_blocks; ++b) {
+                const int32_t p = pos_at(0, b);
+                pos_at(1, b) = p;
+                pos_at(2, b) = p;
+                pos_at(3, b) = p;
+            }
+        }
+
+        // The gather requires an in-range block index. Bias construction has already consumed
+        // the negative sentinel that distinguishes an incomplete group.
         for (int64_t j = 0; j < n_kv; ++j) {
             if (cur_cell_blk[j] < 0) {
-                cur_cell_blk[j] = 0;
-            }
-        }
-    }
-
-    // Block b covers [b*ratio, (b+1)*ratio), so its first token is at
-    // b*ratio. All M-RoPE sections carry it: exact for text, approximate for
-    // images. This overwrites the temporary fill-count section above.
-    for (int64_t sec = 0; sec < 4; ++sec) {
-        for (int64_t s = 0; s < n_ns; ++s) {
-            for (int64_t b = 0; b < n_blocks; ++b) {
-                dst_blk_pos[sec*(n_blocks*n_ns) + s*n_blocks + b] =
-                    int32_t(b*r);
+                cur_cell_blk[j] = dead_bid;
             }
         }
     }

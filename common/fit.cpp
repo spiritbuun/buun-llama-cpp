@@ -91,12 +91,14 @@ common_moe_cache_fit_result common_moe_cache_plan_fit(
             device.physical_device = input.physical_device;
             device.compute_capability = input.compute_capability;
             device.free_bytes = input.free_bytes;
+            device.reserve_bytes = input.reserve_bytes;
             result.devices.push_back(device);
         }
 
         common_moe_cache_fit_device & device = result.devices[device_index];
         device.free_bytes = std::min(device.free_bytes, input.free_bytes);
         device.compute_capability = std::min(device.compute_capability, input.compute_capability);
+        device.reserve_bytes = std::max(device.reserve_bytes, input.reserve_bytes);
         if ((int64_t)input.used_bytes > INT64_MAX - device.used_bytes) {
             result.reason = "device memory accounting overflowed";
             return result;
@@ -110,10 +112,12 @@ common_moe_cache_fit_result common_moe_cache_plan_fit(
 
     for (common_moe_cache_fit_device & device : result.devices) {
         const int64_t projected_free = device.free_bytes - device.used_bytes;
-        if (projected_free <= 0 || (uint64_t)projected_free <= reserve_bytes) {
+        const size_t effective_reserve = device.reserve_bytes > 0
+            ? device.reserve_bytes : reserve_bytes;
+        if (projected_free <= 0 || (uint64_t)projected_free <= effective_reserve) {
             continue;
         }
-        device.cache_bytes = (size_t)projected_free - reserve_bytes;
+        device.cache_bytes = (size_t)projected_free - effective_reserve;
         if (budget_bytes > 0) {
             device.cache_bytes = std::min(device.cache_bytes, budget_bytes);
         }
@@ -250,7 +254,8 @@ static common_moe_cache_fit_result common_moe_cache_evaluate_fit(
             return result;
         }
         device_inputs.push_back({caps.physical_device, caps.compute_capability,
-                memory[index].free - margins[index], memory[index].mb.total()});
+                memory[index].free - margins[index], memory[index].mb.total(),
+                caps.recommended_reserve_bytes});
         min_expert_bytes = std::max(min_expert_bytes, caps.min_expert_bytes);
     }
 

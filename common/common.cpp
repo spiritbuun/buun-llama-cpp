@@ -53,6 +53,7 @@
 #endif
 
 #if defined(__linux__)
+#include <sched.h>
 #include <sys/types.h>
 #include <pwd.h>
 #endif
@@ -89,12 +90,17 @@ int32_t common_cpu_get_num_physical_cores() {
     }
 #elif defined(__linux__)
     // enumerate the set of thread siblings, num entries is num cores
+    cpu_set_t affinity;
+    const bool affinity_known = sched_getaffinity(0, sizeof(affinity), &affinity) == 0;
     std::unordered_set<std::string> siblings;
     for (uint32_t cpu=0; cpu < UINT32_MAX; ++cpu) {
         std::ifstream thread_siblings("/sys/devices/system/cpu/cpu"
             + std::to_string(cpu) + "/topology/thread_siblings");
         if (!thread_siblings.is_open()) {
             break; // no more cpus
+        }
+        if (affinity_known && (cpu >= CPU_SETSIZE || !CPU_ISSET(cpu, &affinity))) {
+            continue;
         }
         std::string line;
         if (std::getline(thread_siblings, line)) {
@@ -227,6 +233,18 @@ int32_t common_cpu_get_num_math() {
     return phy_cpus * std::min(smt_factor, 2);
 #endif
     return common_cpu_get_num_physical_cores();
+}
+
+int32_t common_cpu_resolve_moe_threads(int32_t physical_cores) {
+    // Host-routed expert gathering is predominantly memory-bound. Beyond a
+    // modest physical-core count, additional lockstep workers add scheduling
+    // and cache pressure without increasing memory throughput. This cap keeps
+    // small/hybrid CPUs fully occupied while avoiding large-server oversubscription.
+    return std::max<int32_t>(1, std::min<int32_t>(physical_cores, 12));
+}
+
+int32_t common_cpu_get_num_moe_threads() {
+    return common_cpu_resolve_moe_threads(common_cpu_get_num_physical_cores());
 }
 
 // Helper for setting process priority
@@ -1344,6 +1362,18 @@ struct common_init_result::impl {
     std::vector<llama_sampler_seq_config> samplers_seq_config;
 };
 
+std::string common_moe_cache_profile_file(const uint8_t semantic_digest[32]) {
+    if (!semantic_digest) {
+        throw std::invalid_argument("missing model semantic digest");
+    }
+    char hex[65];
+    for (size_t i = 0; i < 32; ++i) {
+        snprintf(hex + 2*i, 3, "%02x", semantic_digest[i]);
+    }
+    hex[64] = '\0';
+    return fs_get_cache_file(string_format("moe-experts-%s.v1", hex));
+}
+
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
@@ -1449,6 +1479,37 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         return;
     }
 
+    if (params.moe_cache.profile && params.moe_cache.profile_path.empty() &&
+            params.moe_cache.mode != COMMON_MOE_CACHE_MODE_OFF) {
+        uint8_t digest[32];
+        if (llama_model_semantic_family_digest(model, digest)) {
+            try {
+                params.moe_cache.profile_path = common_moe_cache_profile_file(digest);
+            } catch (const std::exception & e) {
+                COM_WRN("MoE cache profile disabled: %s\n", e.what());
+            }
+        } else {
+            COM_WRN("%s", "MoE cache profile disabled: model has no semantic identity\n");
+        }
+    }
+
+    if (!params.cpuparams.n_threads_explicit && !params.cpuparams.mask_valid &&
+            llama_model_has_host_moe_weights(model)) {
+        const int resolved = common_cpu_get_num_moe_threads();
+        if (resolved != params.cpuparams.n_threads) {
+            COM_INF("CPU threads: routed experts are host-resident; auto-resolved generation threads %d -> %d\n",
+                    params.cpuparams.n_threads, resolved);
+            params.cpuparams.n_threads = resolved;
+            cparams.n_threads = resolved;
+        }
+        if (!params.cpuparams_batch.n_threads_explicit &&
+                !params.cpuparams_batch.mask_valid &&
+                resolved != params.cpuparams_batch.n_threads) {
+            params.cpuparams_batch.n_threads = resolved;
+            cparams.n_threads_batch = resolved;
+        }
+    }
+
     // Coupled-KV models (MLA family: V is a view of the K latent) require matching K/V cache
     // types — llama_init_from_model hard-errors on a mismatch. When exactly one side was set
     // explicitly, mirror it to the other instead of failing; two conflicting explicit types
@@ -1526,6 +1587,10 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }
 
+    // Fitting may replace params.moe_cache while restoring a recoverable
+    // fallback. Rebind the borrowed C pointer after the final policy decision.
+    cparams.moe_cache_profile_path = params.moe_cache.profile_path.empty()
+        ? nullptr : params.moe_cache.profile_path.c_str();
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
@@ -1846,6 +1911,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;
     mparams.lazy_mode = params.lazy_mode;
+    mparams.mmap_prefetch = params.mmap_prefetch;
     mparams.tensor_split    = params.tensor_split;
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
@@ -1934,6 +2000,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     }
     cparams.moe_cache_budget_mib = params.moe_cache.budget_mib;
     cparams.moe_cache_expert_parallel = params.moe_cache.expert_parallel;
+    cparams.moe_cache_profile_path = params.moe_cache.profile_path.empty()
+        ? nullptr : params.moe_cache.profile_path.c_str();
 
     return cparams;
 }

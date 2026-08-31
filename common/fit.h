@@ -16,6 +16,7 @@ struct common_moe_cache_fit_device_input {
     int compute_capability = 0;
     int64_t free_bytes = 0;
     size_t used_bytes = 0;
+    size_t reserve_bytes = 0;
 };
 
 struct common_moe_cache_fit_shape_input {
@@ -33,6 +34,7 @@ struct common_moe_cache_fit_device {
     int64_t free_bytes = 0;
     int64_t used_bytes = 0;
     size_t cache_bytes = 0;
+    size_t reserve_bytes = 0;
 };
 
 struct common_moe_cache_fit_result {

@@ -77,6 +77,7 @@ struct common_control_vector_load_info;
 
 struct common_cpu_params {
     int      n_threads                   = -1;
+    bool     n_threads_explicit          = false;
     bool     cpumask[GGML_MAX_N_THREADS] = {false}; // CPU affinity mask.
     bool     mask_valid                  = false;   // Default: any CPU
     enum ggml_sched_priority  priority   = GGML_SCHED_PRIO_NORMAL;  // Scheduling prio : (0 - normal, 1 - medium, 2 - high, 3 - realtime)
@@ -86,6 +87,8 @@ struct common_cpu_params {
 
 int32_t common_cpu_get_num_physical_cores();
 int32_t common_cpu_get_num_math();
+int32_t common_cpu_resolve_moe_threads(int32_t physical_cores);
+int32_t common_cpu_get_num_moe_threads();
 
 //
 // Common params
@@ -356,6 +359,11 @@ struct common_params_speculative_draft {
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
 
+    // Combined speculative lists may own both an ordinary external drafter and
+    // an MTP context built from the target model. A standalone MTP sidecar uses
+    // ctx_dft, just like native MTP does when no external drafter is present.
+    llama_context * ctx_mtp = nullptr;
+
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
@@ -439,6 +447,14 @@ struct common_params_speculative {
 
     bool has_dft() const {
         return !draft.mparams.empty();
+    }
+
+    bool has_non_mtp_model_drafter() const {
+        return has_type(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE) ||
+               has_type(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) ||
+               has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) ||
+               has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) ||
+               has_type(COMMON_SPECULATIVE_TYPE_DFLASH);
     }
 
     bool has_type(common_speculative_type t) const {
@@ -554,6 +570,8 @@ struct common_moe_cache_params {
     int expert_parallel        = 0;
     bool mode_explicit         = false;
     bool fit_selected          = false;
+    bool profile               = true;
+    std::string profile_path;
 };
 
 struct common_params {
@@ -599,6 +617,7 @@ struct common_params {
     enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_AUTO; // how to load the model
 
     enum llama_lazy_mode lazy_mode = LLAMA_LAZY_MODE_AUTO; // on-demand reading of tensors marked by the arch
+    enum llama_mmap_prefetch_mode mmap_prefetch = LLAMA_MMAP_PREFETCH_MODE_AUTO;
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
@@ -1133,6 +1152,9 @@ bool fs_is_directory(const std::string & path);
 
 std::string fs_get_cache_directory();
 std::string fs_get_cache_file(const std::string & filename);
+
+// Stable, versioned cache location for a model family's learned expert heatmap.
+std::string common_moe_cache_profile_file(const uint8_t semantic_digest[32]);
 std::string fs_get_config_directory();
 
 struct common_file_info {

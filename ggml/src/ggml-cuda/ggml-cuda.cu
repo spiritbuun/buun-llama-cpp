@@ -317,6 +317,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
         info.devices[id].physical_share_count = physical_share_count[physical_id];
         const size_t device_vram = prop.totalGlobalMem / info.devices[id].physical_share_count;
         const size_t device_vram_mib = device_vram / (1024 * 1024);
+        info.devices[id].total_vram = device_vram;
 
         info.default_tensor_split[id] = total_vram;
         total_vram += device_vram;
@@ -532,7 +533,12 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
                 GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: retry succeeded\n", device);
             }
         }
-        CUDA_CHECK(err);
+        if (err != cudaSuccess) {
+            // The caller converts a null pool allocation into GGML_STATUS_ALLOC_FAILED.
+            // Clear the runtime's sticky allocation error before returning control.
+            (void) cudaGetLastError();
+            return nullptr;
+        }
         *actual_size = look_ahead_size;
         pool_size += look_ahead_size;
 #ifdef DEBUG_CUDA_MALLOC
@@ -625,14 +631,21 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             CUmemGenericAllocationHandle handle;
             // On OOM, surrender MoE cache storage and retry once. Each vendor
             // returns its own error enum from cuMemCreate (CUresult on CUDA,
-            // hipError_t on HIP, MUresult on MUSA); auto + the per-vendor
-            // cudaErrorMemoryAllocation alias keeps this portable.
+            // hipError_t on HIP, MUresult on MUSA).
             auto create_result = cuMemCreate(&handle, reserve_size, &prop, 0);
-            if (create_result == cudaErrorMemoryAllocation &&
+            const bool out_of_memory =
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+                create_result == cudaErrorMemoryAllocation;
+#else
+                create_result == CUDA_ERROR_OUT_OF_MEMORY;
+#endif
+            if (out_of_memory &&
                 ggml_moe_cache_trim(device) > 0) {
                 create_result = cuMemCreate(&handle, reserve_size, &prop, 0);
             }
-            CU_CHECK(create_result);
+            if (create_result != CUDA_SUCCESS) {
+                return nullptr;
+            }
 
             // reserve virtual address space (if not already reserved)
             if (pool_addr == 0) {
@@ -5110,7 +5123,32 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
-    ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    try {
+        ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    } catch (const ggml_cuda_pool_alloc_failure &) {
+#ifdef USE_CUDA_GRAPH
+        if (use_cuda_graph && cuda_graph_update_required) {
+            // A capture owns one global CUDA-pool lock count until EndCapture. The
+            // normal evaluator releases it; the exceptional path must do the same.
+            cudaGraph_t captured_graph = nullptr;
+            const cudaError_t err = cudaStreamEndCapture(cuda_ctx->stream(), &captured_graph);
+            if (err == cudaSuccess && captured_graph != nullptr) {
+                // This is already a recoverable allocation-failure path. Do not
+                // turn a secondary graph-cleanup failure into a process abort.
+                (void) cudaGraphDestroy(captured_graph);
+            } else if (err != cudaSuccess) {
+                (void) cudaGetLastError();
+            }
+
+            std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+            if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
+                ggml_cuda_lock_cv.notify_all();
+            }
+        }
+#endif
+        GGML_LOG_ERROR("%s: CUDA pool allocation failed (out of VRAM), failing graph compute\n", __func__);
+        return GGML_STATUS_ALLOC_FAILED;
+    }
 
     return GGML_STATUS_SUCCESS;
 }

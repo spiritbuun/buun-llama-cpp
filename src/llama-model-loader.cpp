@@ -12,11 +12,246 @@
 #include <cstdint>
 #include <cstring>
 #include <future>
+#include <fstream>
+#include <filesystem>
+#include <optional>
 #include <regex>
+#include <sstream>
+
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#elif defined(__APPLE__)
+#  include <mach/mach.h>
+#  include <sys/sysctl.h>
+#endif
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
+
+bool llama_mmap_prefetch_resolve(
+        enum llama_mmap_prefetch_mode mode,
+        uint64_t mapped_bytes,
+        uint64_t available_bytes,
+        bool available_known) {
+    if (mode == LLAMA_MMAP_PREFETCH_MODE_OFF) {
+        return false;
+    }
+    if (mode == LLAMA_MMAP_PREFETCH_MODE_ON || !available_known) {
+        return true;
+    }
+    // Bulk WILLNEED is useful when the mapping comfortably fits. When it does
+    // not, it evicts the exact expert working set that lazy MoE models build up
+    // naturally. Keep one quarter of currently available RAM for the runtime,
+    // KV state, allocator metadata, and unrelated processes.
+    return mapped_bytes <= available_bytes - available_bytes/4;
+}
+
+struct llama_available_memory {
+    uint64_t bytes = 0;
+    bool known = false;
+};
+
+#if defined(__linux__)
+static bool llama_read_u64_file(const char * path, uint64_t & value) {
+    std::ifstream input(path);
+    std::string text;
+    if (!(input >> text) || text == "max") {
+        return false;
+    }
+    try {
+        size_t used = 0;
+        const uint64_t parsed = std::stoull(text, &used);
+        if (used != text.size()) {
+            return false;
+        }
+        value = parsed;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static std::optional<std::string> llama_linux_cgroup_path(
+        const char * cgroup_file, bool v2) {
+    std::ifstream input(cgroup_file);
+    std::string line;
+    while (std::getline(input, line)) {
+        const size_t first = line.find(':');
+        const size_t second = first == std::string::npos
+            ? std::string::npos : line.find(':', first + 1);
+        if (second == std::string::npos) {
+            continue;
+        }
+        const std::string controllers = line.substr(first + 1, second - first - 1);
+        const bool matches = v2
+            ? controllers.empty()
+            : ("," + controllers + ",").find(",memory,") != std::string::npos;
+        if (matches) {
+            std::string path = line.substr(second + 1);
+            if (path.empty() || path.front() != '/') {
+                path.insert(path.begin(), '/');
+            }
+            return path;
+        }
+    }
+    return std::nullopt;
+}
+
+struct llama_cgroup_mount {
+    std::string root;
+    std::string point;
+    bool v2 = false;
+};
+
+static std::optional<llama_cgroup_mount> llama_linux_cgroup_mount(
+        const char * mountinfo_file, bool v2, const std::string & membership) {
+    std::ifstream input(mountinfo_file);
+    std::string line;
+    std::optional<llama_cgroup_mount> best;
+    while (std::getline(input, line)) {
+        const size_t separator = line.find(" - ");
+        if (separator == std::string::npos) {
+            continue;
+        }
+        std::istringstream before(line.substr(0, separator));
+        std::istringstream after(line.substr(separator + 3));
+        std::string id, parent, device, root, point;
+        std::string fs_type, source, super_options;
+        if (!(before >> id >> parent >> device >> root >> point) ||
+                !(after >> fs_type >> source >> super_options)) {
+            continue;
+        }
+        const bool matches = v2 ? fs_type == "cgroup2" :
+            fs_type == "cgroup" &&
+                ("," + super_options + ",").find(",memory,") != std::string::npos;
+        const bool contains_membership = root == "/" || membership == root ||
+            (membership.size() > root.size() &&
+             membership.compare(0, root.size(), root) == 0 &&
+             membership[root.size()] == '/');
+        if (matches && contains_membership &&
+                (!best || root.size() > best->root.size())) {
+            best = llama_cgroup_mount{root, point, v2};
+        }
+    }
+    return best;
+}
+
+static bool llama_linux_cgroup_available_one(
+        const char * cgroup_file, const char * mountinfo_file,
+        bool v2, uint64_t & available) {
+    const auto membership = llama_linux_cgroup_path(cgroup_file, v2);
+    if (!membership) {
+        return false;
+    }
+    const auto mount = llama_linux_cgroup_mount(mountinfo_file, v2, *membership);
+    if (!mount) {
+        return false;
+    }
+
+    std::string relative;
+    if (mount->root == "/") {
+        relative = membership->substr(1);
+    } else if (*membership == mount->root) {
+        relative.clear();
+    } else if (membership->size() > mount->root.size() &&
+            membership->compare(0, mount->root.size(), mount->root) == 0 &&
+            (*membership)[mount->root.size()] == '/') {
+        relative = membership->substr(mount->root.size() + 1);
+    } else {
+        return false;
+    }
+
+    const std::filesystem::path mount_point =
+        std::filesystem::path(mount->point).lexically_normal();
+    std::filesystem::path current_path = relative.empty()
+        ? mount_point : (mount_point / relative).lexically_normal();
+    bool known = false;
+    uint64_t minimum = UINT64_MAX;
+    for (;;) {
+        const std::string limit_name = v2 ? "memory.max" : "memory.limit_in_bytes";
+        const std::string usage_name = v2 ? "memory.current" : "memory.usage_in_bytes";
+        uint64_t limit = 0;
+        uint64_t usage = 0;
+        if (llama_read_u64_file((current_path / limit_name).c_str(), limit) &&
+                llama_read_u64_file((current_path / usage_name).c_str(), usage)) {
+            minimum = std::min(minimum, usage < limit ? limit - usage : 0);
+            known = true;
+        }
+        if (current_path == mount_point) {
+            break;
+        }
+        const std::filesystem::path parent = current_path.parent_path();
+        if (parent == current_path ||
+                parent.native().compare(0, mount_point.native().size(), mount_point.native()) != 0) {
+            break;
+        }
+        current_path = parent;
+    }
+    if (known) {
+        available = minimum;
+    }
+    return known;
+}
+
+bool llama_linux_cgroup_memory_available(
+        const char * cgroup_file, const char * mountinfo_file,
+        uint64_t & available) {
+    return llama_linux_cgroup_available_one(
+            cgroup_file, mountinfo_file, true, available) ||
+        llama_linux_cgroup_available_one(
+            cgroup_file, mountinfo_file, false, available);
+}
+#endif
+
+static llama_available_memory llama_system_memory_available() {
+#ifdef _WIN32
+    MEMORYSTATUSEX status = {};
+    status.dwLength = sizeof(status);
+    return GlobalMemoryStatusEx(&status)
+        ? llama_available_memory{status.ullAvailPhys, true}
+        : llama_available_memory{};
+#elif defined(__linux__)
+    llama_available_memory result;
+    std::ifstream input("/proc/meminfo");
+    std::string key;
+    uint64_t value_kib = 0;
+    std::string unit;
+    while (input >> key >> value_kib >> unit) {
+        if (key == "MemAvailable:") {
+            result.bytes = value_kib <= UINT64_MAX/1024 ? value_kib*1024 : UINT64_MAX;
+            result.known = true;
+            break;
+        }
+    }
+    uint64_t cgroup_available = 0;
+    if (llama_linux_cgroup_memory_available(
+            "/proc/self/cgroup", "/proc/self/mountinfo", cgroup_available)) {
+        result.bytes = result.known ? std::min(result.bytes, cgroup_available) : cgroup_available;
+        result.known = true;
+    }
+    return result;
+#elif defined(__APPLE__)
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    vm_statistics64_data_t vm = {};
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                reinterpret_cast<host_info64_t>(&vm), &count) != KERN_SUCCESS) {
+        return {};
+    }
+    uint64_t page_size = 0;
+    size_t page_size_len = sizeof(page_size);
+    if (sysctlbyname("hw.pagesize", &page_size, &page_size_len, nullptr, 0) != 0) {
+        return {};
+    }
+    return {
+        (uint64_t(vm.free_count) + uint64_t(vm.inactive_count)) * page_size,
+        true,
+    };
+#else
+    return {};
+#endif
+}
 
 static std::string deepseek4_dspark_tensor_name(const char * name) {
     const std::string canonical(name);
@@ -1510,8 +1745,24 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
     }
 }
 
-void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
+void llama_model_loader::init_mappings(
+        enum llama_mmap_prefetch_mode prefetch_mode,
+        llama_mlocks * mlock_mmaps) {
     if (use_mmap) {
+        uint64_t mapped_bytes = 0;
+        for (const auto & file : files) {
+            const uint64_t size = file->size();
+            mapped_bytes = size <= UINT64_MAX - mapped_bytes ? mapped_bytes + size : UINT64_MAX;
+        }
+        const llama_available_memory available = llama_system_memory_available();
+        const bool prefetch = llama_mmap_prefetch_resolve(
+                prefetch_mode, mapped_bytes, available.bytes, available.known);
+        LLAMA_LOG_INFO("%s: mmap prefetch requested=%s resolved=%s, mapped=%.2f GiB available=%.2f GiB\n",
+                __func__,
+                prefetch_mode == LLAMA_MMAP_PREFETCH_MODE_ON ? "on" :
+                prefetch_mode == LLAMA_MMAP_PREFETCH_MODE_OFF ? "off" : "auto",
+                prefetch ? "on" : "off",
+                double(mapped_bytes)/double(GiB), double(available.bytes)/double(GiB));
         mappings.reserve(files.size());
         mmaps_used.reserve(files.size());
         for (uint32_t idx = 0; idx < files.size(); idx++) {

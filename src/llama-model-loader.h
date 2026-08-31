@@ -208,7 +208,7 @@ struct llama_model_loader {
 
     void done_getting_tensors(bool partial = false) const;
 
-    void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
+    void init_mappings(enum llama_mmap_prefetch_mode prefetch, llama_mlocks * mlock_mmaps = nullptr);
 
     void get_mapping_range(size_t * first, size_t * last, void ** addr, int idx, ggml_context * ctx) const;
 
@@ -231,3 +231,19 @@ struct llama_model_loader {
 
     void print_info() const;
 };
+
+// Pure policy helper used by tests and by init_mappings(). Unknown availability
+// preserves the historical eager-prefetch behavior; a known zero disables it.
+bool llama_mmap_prefetch_resolve(
+        enum llama_mmap_prefetch_mode mode,
+        uint64_t mapped_bytes,
+        uint64_t available_bytes,
+        bool available_known);
+
+#if defined(__linux__)
+// Testable Linux controller discovery and ancestor-limit calculation.
+bool llama_linux_cgroup_memory_available(
+        const char * cgroup_file,
+        const char * mountinfo_file,
+        uint64_t & available_bytes);
+#endif

@@ -352,6 +352,30 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
     bool process(const llama_batch & batch) override {
         auto * ctx_dft = params.ctx_dft;
 
+        // draft() has already evaluated the speculative suffix. Verification
+        // starts at the sampled token and may replace that entire suffix, so
+        // restore each participating sequence to the first incoming position
+        // before decoding the verification batch. Prompt chunks are naturally
+        // idempotent here because there is no suffix at or beyond their start.
+        if (batch.pos != nullptr) {
+            std::vector<llama_pos> first_pos(n_seq, std::numeric_limits<llama_pos>::max());
+            for (int32_t i = 0; i < batch.n_tokens; ++i) {
+                for (int32_t j = 0; j < batch.n_seq_id[i]; ++j) {
+                    const llama_seq_id seq_id = batch.seq_id[i][j];
+                    if (seq_id >= 0 && (uint32_t) seq_id < n_seq) {
+                        first_pos[seq_id] = std::min(first_pos[seq_id], batch.pos[i]);
+                    }
+                }
+            }
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (first_pos[seq_id] != std::numeric_limits<llama_pos>::max() &&
+                        !llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, first_pos[seq_id], -1)) {
+                    SPC_ERR("failed to trim draft sequence %d at position %d\n", seq_id, first_pos[seq_id]);
+                    return false;
+                }
+            }
+        }
+
         llama_batch batch_dft = batch;
         batch_dft.logits = nullptr;
 
@@ -2585,6 +2609,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         , params(params.draft)
     {
         auto * ctx_tgt = this->params.ctx_tgt;
+        if (this->params.ctx_mtp != nullptr) {
+            // Keep every subsequent MTP operation (samplers, memory maintenance,
+            // decode and teardown) on the same selected context.
+            this->params.ctx_dft = this->params.ctx_mtp;
+        }
         auto * ctx_dft = this->params.ctx_dft;
         GGML_ASSERT(ctx_tgt && ctx_dft && "MTP requires ctx_tgt and ctx_dft to be set");
 
@@ -2637,7 +2666,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
 
-        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
+        // Every MTP context points at its target through ctx_other, but Qwen-family
+        // MTP contexts own a separate filtered cache. Ask the memory about the cells
+        // that the drafting algorithm actually depends on.
+        is_mem_shared = llama_memory_has_shared_cells(llama_get_memory(ctx_dft));
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
         const char * adaptive_env = getenv("GGML_MTP_DRAFT_ADAPTIVE");
@@ -5402,8 +5434,13 @@ common_params common_base_params_to_speculative(const common_params & params) {
         result.tensor_buft_overrides = params_spec.tensor_buft_overrides;
 
         if (params_spec.cpuparams.n_threads > 0) {
-            result.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
+            result.cpuparams.n_threads          = params_spec.cpuparams.n_threads;
+            result.cpuparams.n_threads_explicit = params_spec.cpuparams.n_threads_explicit;
+        }
+        if (params_spec.cpuparams_batch.n_threads > 0) {
             result.cpuparams_batch.n_threads = params_spec.cpuparams_batch.n_threads;
+            result.cpuparams_batch.n_threads_explicit =
+                params_spec.cpuparams_batch.n_threads_explicit;
         }
     }
 
@@ -5450,6 +5487,7 @@ struct common_speculative_init_result::impl {
     // note: the order in which model, context, etc. are declared matters because their destructors will be called bottom-to-top
     llama_model_ptr   model;
     llama_context_ptr context;
+    llama_context_ptr context_mtp;
 };
 
 common_speculative_init_result::common_speculative_init_result(
@@ -5461,13 +5499,12 @@ common_speculative_init_result::common_speculative_init_result(
     const bool spec_mtp = std::find(params.speculative.types.begin(),
                                     params.speculative.types.end(),
                                     COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    const bool combined_external_and_mtp = has_draft && spec_mtp &&
+                                           params.speculative.has_non_mtp_model_drafter();
+    const bool external_mtp_sidecar = has_draft && spec_mtp && !combined_external_and_mtp;
 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
-
-    if (spec_mtp) {
-        cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
-    }
 
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
@@ -5477,12 +5514,15 @@ common_speculative_init_result::common_speculative_init_result(
     cparams.n_rs_seq  = 0;
     cparams.ctx_other = ctx_tgt;
 
+    auto cparams_mtp = cparams;
+    cparams_mtp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+
     std::string model_path;
     if (has_draft) {
         model_path = params.speculative.draft.mparams.path;
         LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
 
-        llama_model * model_dft = llama_model_load_from_file(params.model.path.c_str(), mparams);
+        llama_model * model_dft = llama_model_load_from_file(model_path.c_str(), mparams);
         if (model_dft == NULL) {
             LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());
             return;
@@ -5490,19 +5530,36 @@ common_speculative_init_result::common_speculative_init_result(
 
         pimpl->model.reset(model_dft);
 
-        llama_context * ctx_dft = llama_init_from_model(model_dft, cparams);
+        llama_context * ctx_dft = llama_init_from_model(
+                model_dft, external_mtp_sidecar ? cparams_mtp : cparams);
         if (ctx_dft == nullptr) {
-            LOG_ERR("%s: failed to create MTP context\n", __func__);
+            LOG_ERR("%s: failed to create draft context\n", __func__);
             return;
         }
 
         pimpl->context.reset(ctx_dft);
+
+        if (combined_external_and_mtp) {
+            LOG_INF("%s: creating native MTP context against the target model '%s'\n",
+                    __func__, params.model.path.c_str());
+
+            llama_context * ctx_mtp = llama_init_from_model(model_tgt, cparams_mtp);
+            if (ctx_mtp == nullptr) {
+                LOG_WRN("%s: target model has no native MTP layers, skipping draft-mtp\n", __func__);
+                params.speculative.types.erase(
+                        std::remove(params.speculative.types.begin(), params.speculative.types.end(),
+                                    COMMON_SPECULATIVE_TYPE_DRAFT_MTP),
+                        params.speculative.types.end());
+            } else {
+                pimpl->context_mtp.reset(ctx_mtp);
+            }
+        }
     } else if (spec_mtp) {
         model_path = params.model.path;
 
         LOG_INF("%s: creating MTP draft context against the target model '%s'\n", __func__, model_path.c_str());
 
-        llama_context * ctx_dft = llama_init_from_model(model_tgt, cparams);
+        llama_context * ctx_dft = llama_init_from_model(model_tgt, cparams_mtp);
         if (ctx_dft == nullptr) {
             LOG_ERR("%s: failed to create MTP context\n", __func__);
             return;
@@ -5520,6 +5577,10 @@ llama_model * common_speculative_init_result::model() {
 
 llama_context * common_speculative_init_result::context() {
     return pimpl->context.get();
+}
+
+llama_context * common_speculative_init_result::context_mtp() {
+    return pimpl->context_mtp.get();
 }
 
 common_speculative_init_result_ptr common_speculative_init_from_params(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt) {
@@ -5599,7 +5660,8 @@ common_speculative * common_speculative_init(common_params_speculative & params,
 
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, params.draft.ctx_dft != nullptr);
-        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP,    params.draft.ctx_dft != nullptr);
+        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP,
+                params.draft.ctx_mtp != nullptr || params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, params.draft.ctx_dft != nullptr);
     }

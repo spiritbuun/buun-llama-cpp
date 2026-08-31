@@ -12,6 +12,8 @@ extern "C" {
 struct ggml_moe_cache_config {
     size_t budget_bytes;
     size_t reserve_bytes;
+    // 0 means reserve_bytes is a provider default that may be hardware-resolved.
+    int32_t reserve_explicit;
     size_t minimum_slab_bytes;
     size_t min_expert_bytes;
     // 0 lets each selected device raise or lower the admission floor.
@@ -23,6 +25,7 @@ struct ggml_moe_cache_config {
     int32_t overlap_cpu_rows;
     // -1 selects the provider policy; 0 disables expert-parallel dispatch.
     int32_t expert_parallel;
+    const char * profile_path;
 };
 
 struct ggml_moe_cache_device_caps {
@@ -31,7 +34,15 @@ struct ggml_moe_cache_device_caps {
     int32_t compute_capability;
     // Effective admission floor for this device and configuration.
     size_t min_expert_bytes;
+    size_t recommended_reserve_bytes;
 };
+
+static inline size_t ggml_moe_cache_effective_reserve_bytes(
+        int32_t reserve_explicit,
+        size_t configured_reserve_bytes,
+        size_t automatic_reserve_bytes) {
+    return reserve_explicit ? configured_reserve_bytes : automatic_reserve_bytes;
+}
 
 struct ggml_moe_cache_shape_caps {
     size_t scratch_bytes;
@@ -106,7 +117,7 @@ GGML_API struct ggml_moe_cache_api ggml_moe_cache;
 GGML_API void ggml_moe_cache_unregister(const void * owner);
 GGML_API void ggml_backend_sched_set_moe_cache(
         ggml_backend_sched_t sched, enum ggml_moe_cache_mode mode,
-        size_t budget_mib, int expert_parallel);
+        size_t budget_mib, int expert_parallel, const char * profile_path);
 
 #ifdef __cplusplus
 }

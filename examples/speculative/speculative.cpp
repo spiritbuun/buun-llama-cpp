@@ -93,9 +93,13 @@ int main(int argc, char ** argv) {
     params.n_outputs_max_per_seq = 1;
     if (params.speculative.draft.cpuparams.n_threads > 0) {
         params.cpuparams.n_threads = params.speculative.draft.cpuparams.n_threads;
+        params.cpuparams.n_threads_explicit =
+            params.speculative.draft.cpuparams.n_threads_explicit;
     }
 
     params.cpuparams_batch.n_threads = params.speculative.draft.cpuparams_batch.n_threads;
+    params.cpuparams_batch.n_threads_explicit =
+        params.speculative.draft.cpuparams_batch.n_threads_explicit;
     params.tensor_buft_overrides     = params.speculative.draft.tensor_buft_overrides;
 
     auto llama_init_dft = common_init_from_params(params);

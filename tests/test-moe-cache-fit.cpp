@@ -1,4 +1,5 @@
 #include "fit.h"
+#include "../ggml/src/ggml-backend-moe-cache.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -27,6 +28,13 @@ static common_moe_cache_fit_shape_input shape(
 int main() {
     constexpr size_t MiB = 1024*1024;
 
+    expect(ggml_moe_cache_effective_reserve_bytes(0, 3*MiB, MiB) == MiB &&
+            ggml_moe_cache_effective_reserve_bytes(0, 3*MiB, 3*MiB) == 3*MiB,
+            "automatic runtime reserve must remain per-device");
+    expect(ggml_moe_cache_effective_reserve_bytes(1, 2*MiB, MiB) == 2*MiB &&
+            ggml_moe_cache_effective_reserve_bytes(1, 2*MiB, 3*MiB) == 2*MiB,
+            "explicit runtime reserve must remain uniform");
+
     const std::vector<common_moe_cache_fit_shape_input> one_pool = {
         shape(GGML_TYPE_Q4_0, MiB, 128*MiB, MiB/4, MiB),
     };
@@ -42,6 +50,29 @@ int main() {
         expect(result.devices.size() == 2, "two physical devices should remain distinct");
         expect(result.minimum_device_bytes == 5*MiB/4, "scratch and pool bytes should be combined");
         expect(result.cache_bytes == 8*MiB, "fixed budget should cap each device");
+    }
+
+    {
+        const std::vector<common_moe_cache_fit_device_input> devices = {
+            {0, 860, 10*(int64_t)MiB, 0, MiB},
+            {1, 860, 10*(int64_t)MiB, 0, 3*MiB},
+        };
+        const common_moe_cache_fit_result result = common_moe_cache_plan_fit(
+                devices, one_pool, 0, 0, 2);
+        expect(result.feasible, "heterogeneous automatic reserves should remain per-device");
+        expect(result.devices.size() == 2, "heterogeneous reserve devices should remain distinct");
+        expect(result.devices[0].cache_bytes == 9*MiB,
+                "small device should retain its one-MiB automatic reserve");
+        expect(result.devices[1].cache_bytes == 7*MiB,
+                "large device should retain its three-MiB automatic reserve");
+
+        const common_moe_cache_fit_result explicit_result = common_moe_cache_plan_fit(
+                {{0, 860, 10*(int64_t)MiB, 0}, {1, 860, 10*(int64_t)MiB, 0}},
+                one_pool, 2*MiB, 0, 2);
+        expect(explicit_result.feasible &&
+                explicit_result.devices[0].cache_bytes == 8*MiB &&
+                explicit_result.devices[1].cache_bytes == 8*MiB,
+                "explicit reserve should remain uniform across devices");
     }
 
     {

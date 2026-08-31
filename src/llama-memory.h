@@ -239,6 +239,11 @@ struct llama_memory_i {
     // getters
     virtual bool get_can_shift() const = 0;
 
+    // Whether this memory views KV cells owned by another context. Context linkage alone
+    // cannot answer this: every MTP context points at its target, while only some model
+    // families actually share the target's KV cells.
+    virtual bool get_has_shared_cells() const { return false; }
+
     // whether arbitrary token ranges can be removed without discarding the whole sequence
     // default to the conservative answer for out-of-tree memory implementations
     virtual bool can_seq_rm_partial() const { return false; }
