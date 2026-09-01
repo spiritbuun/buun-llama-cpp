@@ -176,7 +176,7 @@ common_fit_extra_cache_probe_result common_fit_extra_cache_probe(
                 common_fit_extra_context_size(
                     target_n_ctx, target_n_streams,
                     model->follows_target_per_sequence, model->fixed_n_ctx),
-                model->shares_model,
+                model->shares_model || model->borrows_target_tensors,
                 model->optional_if_no_mtp,
             });
         }
@@ -727,8 +727,11 @@ common_device_memory_data_vec common_get_device_memory_data_with_parent(
         throw std::runtime_error("failed to create parent llama_context");
     }
 
+    llama_model_params mparams_copy = *mparams;
+    mparams_copy.model_shared = model_parent.get();
+
     std::vector<llama_device_memory_data> impl = common_get_device_memory_data_impl(
-            path_model, mparams, cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert,
+            path_model, &mparams_copy, cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert,
             log_level, nullptr, false, nullptr, ctx_parent.get(), share_parent_tensors);
 
     common_device_memory_data_vec ret(impl.size());
@@ -810,7 +813,7 @@ static void common_params_fit_impl(
             current->cparams->n_ctx = n_ctx_current;
             requests.push_back({
                 n_ctx_current,
-                current->shares_model,
+                current->shares_model || current->borrows_target_tensors,
                 current->optional_if_no_mtp,
             });
         }
@@ -840,15 +843,32 @@ static void common_params_fit_impl(
 
                 dmds_t measured;
                 try {
-                    measured = common_get_device_memory_data_impl(
-                        current->path_model, &mparams_extra, current->cparams,
-                        devs_extra, ngl_extra, nct_extra, nex_extra, log_level,
-                        /* vbr_costs = */ nullptr,
-                        /* plan_hint = */ false,
-                        /* moe_tensors = */ nullptr,
-                        /* ctx_parent = */ nullptr,
-                        /* share_parent_tensors = */ false,
-                        current->optional_if_no_mtp);
+                    if (current->borrows_target_tensors) {
+                        GGML_ASSERT(target_mparams != nullptr);
+                        const auto with_parent = common_get_device_memory_data_with_parent(
+                            current->path_model, &mparams_extra, current->cparams,
+                            path_model, target_mparams, cparams,
+                            devs_extra, ngl_extra, nct_extra, nex_extra, log_level,
+                            /* share_parent_tensors = */ true);
+                        measured.resize(with_parent.size());
+                        for (size_t i = 0; i < with_parent.size(); ++i) {
+                            measured[i].total      = with_parent[i].total;
+                            measured[i].free       = with_parent[i].free;
+                            measured[i].mb.model   = with_parent[i].model;
+                            measured[i].mb.context = with_parent[i].context;
+                            measured[i].mb.compute = with_parent[i].compute;
+                        }
+                    } else {
+                        measured = common_get_device_memory_data_impl(
+                            current->path_model, &mparams_extra, current->cparams,
+                            devs_extra, ngl_extra, nct_extra, nex_extra, log_level,
+                            /* vbr_costs = */ nullptr,
+                            /* plan_hint = */ false,
+                            /* moe_tensors = */ nullptr,
+                            /* ctx_parent = */ nullptr,
+                            /* share_parent_tensors = */ false,
+                            current->optional_if_no_mtp);
+                    }
                 } catch (const std::runtime_error & e) {
                     throw common_params_fit_exception(string_format(
                         "failed to measure a required speculative model/context: %s", e.what()));

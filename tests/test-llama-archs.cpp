@@ -609,7 +609,44 @@ static void test_qwen4_ple_recurrent_resize(const size_t seed) {
     GGML_ASSERT(llama_decode(ctx.get(), llama_batch_get_one(&second, 1)) == 0);
     llama_synchronize(ctx.get());
 
-    printf("Qwen4 PLE recurrent resize test PASSED\n");
+    // A four-token speculative verify must populate rollback histories for
+    // both Qwen4 convolution owners. Roll back two rejected tokens and compare
+    // the next-token logits with a context that never observed them.
+    llama_context_params rollback_params = ctx_params;
+    rollback_params.n_seq_max = 1;
+    llama_context_ptr rollback_ctx(llama_init_from_model(model.get(), rollback_params));
+    llama_context_ptr reference_ctx(llama_init_from_model(model.get(), rollback_params));
+    GGML_ASSERT(rollback_ctx != nullptr && reference_ctx != nullptr);
+
+    const llama_token rollback_tokens[] = { 7, 11, 13, 17, 19, 23 };
+    const auto decode_range = [&](llama_context * lctx, int begin, int end, bool logits) {
+        llama_batch batch = llama_batch_init(end - begin, 0, 1);
+        for (int i = begin; i < end; ++i) {
+            common_batch_add(batch, rollback_tokens[i], i, { 0 }, logits && i + 1 == end);
+        }
+        const bool ok = llama_decode(lctx, batch) == 0;
+        llama_batch_free(batch);
+        return ok;
+    };
+
+    GGML_ASSERT(decode_range(reference_ctx.get(), 0, 4, false));
+    GGML_ASSERT(decode_range(rollback_ctx.get(),  0, 2, false));
+    GGML_ASSERT(decode_range(rollback_ctx.get(),  2, 6, false));
+    GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(rollback_ctx.get()), 0, 4, -1));
+    GGML_ASSERT(decode_range(reference_ctx.get(), 4, 5, true));
+    GGML_ASSERT(decode_range(rollback_ctx.get(),  4, 5, true));
+    llama_synchronize(reference_ctx.get());
+    llama_synchronize(rollback_ctx.get());
+
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+    const float * reference_logits = llama_get_logits(reference_ctx.get());
+    const float * rollback_logits  = llama_get_logits(rollback_ctx.get());
+    GGML_ASSERT(reference_logits != nullptr && rollback_logits != nullptr);
+    for (int32_t i = 0; i < n_vocab; ++i) {
+        GGML_ASSERT(fabsf(reference_logits[i] - rollback_logits[i]) <= 1e-6f);
+    }
+
+    printf("Qwen4 PLE recurrent resize/rollback test PASSED\n");
 }
 
 static std::vector<float> get_logits(
@@ -2855,7 +2892,10 @@ static gguf_context_ptr get_qwen4_mtp_gguf_ctx(uint32_t n_nextn = 1) {
 }
 
 static file_ptr make_qwen4_mtp_sidecar(
-        const size_t seed, std::vector<float> & target_h, const char * omit_tensor = nullptr) {
+        const size_t seed,
+        std::vector<float> & target_h,
+        const char * omit_tensor = nullptr,
+        bool shared_target_tensors = false) {
     file_ptr file = make_test_tmpfile();
     if (!file) {
         return file;
@@ -2930,9 +2970,14 @@ static file_ptr make_qwen4_mtp_sidecar(
     gguf_context_ptr sidecar_gguf(gguf_init_empty());
     gguf_set_kv(sidecar_gguf.get(), source_gguf.get());
     llama_model_saver saver(LLM_ARCH_QWEN4EXP, sidecar_gguf.get());
+    if (shared_target_tensors) {
+        saver.add_kv(LLM_KV_NEXTN_SHARED_TARGET_TENSORS, true);
+    }
     for (const auto & entry : llama_internal_get_tensor_map(source.get())) {
         if (entry.first.rfind("blk.0.", 0) == 0 ||
                 entry.first.rfind("output_hc_", 0) == 0 ||
+                (shared_target_tensors &&
+                    (entry.first == "token_embd.weight" || entry.first == "output.weight")) ||
                 (omit_tensor != nullptr && entry.first == omit_tensor)) {
             continue;
         }
@@ -3161,6 +3206,55 @@ static void test_qwen4_mtp_sidecar_contract(const size_t seed) {
     llama_context_ptr target_ctx(llama_init_from_model(target_model.get(), target_ctx_params));
     GGML_ASSERT(target_ctx != nullptr);
     ctx_params.ctx_other = target_ctx.get();
+
+    // The official compact sidecar declares that its global embedding and LM
+    // head come from the target. It must fail closed on its own, then borrow
+    // the exact target tensor objects without allocating duplicate weights.
+    std::vector<float> shared_target_h;
+    file_ptr shared_file = make_qwen4_mtp_sidecar(
+            seed, shared_target_h, nullptr, /* shared_target_tensors = */ true);
+    GGML_ASSERT(shared_file != nullptr);
+    llama_model_params detached_shared_params = model_params;
+    llama_model_ptr detached_shared(llama_model_load_from_file_ptr(
+            shared_file.get(), detached_shared_params));
+    GGML_ASSERT(detached_shared == nullptr);
+    rewind(shared_file.get());
+
+    llama_model_params shared_params = model_params;
+    shared_params.model_shared = target_model.get();
+    const int64_t target_embd_ne0 = target_model->tok_embd->ne[0];
+    target_model->tok_embd->ne[0] = target_embd_ne0 + 1;
+    llama_model_ptr mismatched_shared(llama_model_load_from_file_ptr(
+            shared_file.get(), shared_params));
+    target_model->tok_embd->ne[0] = target_embd_ne0;
+    GGML_ASSERT(mismatched_shared == nullptr);
+    rewind(shared_file.get());
+
+    llama_model_ptr shared_model(llama_model_load_from_file_ptr(shared_file.get(), shared_params));
+    GGML_ASSERT(shared_model != nullptr);
+    GGML_ASSERT(shared_model->tok_embd == target_model->tok_embd);
+    GGML_ASSERT(shared_model->output   == target_model->output);
+
+    // A tied target has no distinct output tensor/name. Borrow by the model's
+    // output role rather than by the sidecar's output.weight spelling.
+    rewind(shared_file.get());
+    ggml_tensor * target_output = target_model->output;
+    target_model->output = target_model->tok_embd;
+    llama_model_ptr tied_shared_model(llama_model_load_from_file_ptr(shared_file.get(), shared_params));
+    target_model->output = target_output;
+    GGML_ASSERT(tied_shared_model != nullptr);
+    GGML_ASSERT(tied_shared_model->output == target_model->tok_embd);
+    GGML_ASSERT(!llama_model_shared_output_needs_separate_copy(true, true, true));
+    GGML_ASSERT(llama_model_shared_output_needs_separate_copy(true, true, false));
+    GGML_ASSERT(llama_model_shared_output_needs_separate_copy(false, true, true));
+    GGML_ASSERT(!llama_model_shared_output_needs_separate_copy(true, false, true));
+
+    llama_context_ptr shared_ctx(llama_init_from_model(shared_model.get(), ctx_params));
+    GGML_ASSERT(shared_ctx != nullptr);
+    ggml_cgraph * shared_gf = llama_graph_reserve(shared_ctx.get(), 2, 1, 1);
+    GGML_ASSERT(shared_gf != nullptr);
+    GGML_ASSERT(ggml_graph_get_tensor(shared_gf, "mtp_h_input") != nullptr);
+    GGML_ASSERT(ggml_graph_get_tensor(shared_gf, "result_output") != nullptr);
 
     llama_context_ptr ctx(llama_init_from_model(model.get(), ctx_params));
     if (!ctx) {

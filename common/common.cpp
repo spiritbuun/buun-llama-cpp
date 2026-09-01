@@ -1419,15 +1419,13 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
         // the draft context is created from the same base params and follows the main context, fit both together
         const bool has_draft = params.speculative.has_dft();
-        const bool spec_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
-            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+        const bool spec_mtp = params.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
 
         common_params params_dft = common_base_params_to_speculative(params);
 
         auto mparams_dft = common_model_params_to_llama(params_dft);
         auto cparams_dft = common_context_params_to_llama(params_dft);
-        const bool extra_is_mtp = spec_mtp &&
-            !params.speculative.has_non_mtp_model_drafter();
+        const bool extra_is_mtp = params.speculative.uses_mtp_as_primary_drafter();
         if (extra_is_mtp) {
             const auto mtp_context = common_speculative_mtp_context_params_resolve(
                 0, params.speculative.draft.n_ctx,
@@ -1471,6 +1469,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             /*.fixed_n_ctx  =*/ extra_is_mtp && params.speculative.draft.n_ctx > 0
                 ? (uint32_t) params.speculative.draft.n_ctx : 0,
             /*.next         =*/ spec_mtp && !extra_is_mtp ? &extra_mtp : nullptr,
+            /*.optional_if_no_mtp =*/ false,
+            /*.borrows_target_tensors =*/ has_draft && extra_is_mtp,
         };
 
         const common_params_fit_status fit_status = common_fit_params(

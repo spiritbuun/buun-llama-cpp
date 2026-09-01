@@ -457,6 +457,19 @@ struct common_params_speculative {
                has_type(COMMON_SPECULATIVE_TYPE_DFLASH);
     }
 
+    bool has_external_mtp_sidecar() const {
+        return has_dft() && uses_mtp_as_primary_drafter();
+    }
+
+    bool uses_mtp_as_primary_drafter() const {
+        return has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) &&
+               !has_non_mtp_model_drafter();
+    }
+
+    bool uses_native_mtp_as_primary_drafter() const {
+        return !has_dft() && uses_mtp_as_primary_drafter();
+    }
+
     bool has_type(common_speculative_type t) const {
         return std::find(types.begin(), types.end(), t) != types.end();
     }

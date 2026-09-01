@@ -5495,6 +5495,15 @@ bool common_speculative_mtp_context_available(const common_params_speculative & 
     return params.draft.ctx_mtp != nullptr || params.draft.ctx_dft != nullptr;
 }
 
+void common_speculative_configure_draft_model_parent(
+        const common_params_speculative & params,
+        llama_model_params & mparams_dft,
+        const llama_model * model_tgt) {
+    if (params.has_external_mtp_sidecar()) {
+        mparams_dft.model_shared = model_tgt;
+    }
+}
+
 struct common_speculative_init_result::impl {
     impl() = default;
     ~impl() = default;
@@ -5511,12 +5520,9 @@ common_speculative_init_result::common_speculative_init_result(
     llama_context * ctx_tgt) :
     pimpl(new impl{}) {
     const bool has_draft = params.speculative.has_dft();
-    const bool spec_mtp = std::find(params.speculative.types.begin(),
-                                    params.speculative.types.end(),
-                                    COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
-    const bool combined_external_and_mtp = has_draft && spec_mtp &&
-                                           params.speculative.has_non_mtp_model_drafter();
-    const bool external_mtp_sidecar = has_draft && spec_mtp && !combined_external_and_mtp;
+    const bool spec_mtp = params.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
+    const bool external_mtp_sidecar = params.speculative.has_external_mtp_sidecar();
+    const bool combined_external_and_mtp = has_draft && spec_mtp && !external_mtp_sidecar;
 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
@@ -5544,10 +5550,23 @@ common_speculative_init_result::common_speculative_init_result(
         model_path = params.speculative.draft.mparams.path;
         LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
 
+        // Official shared MTP sidecars borrow their embedding and output head
+        // from the already-loaded target. Ordinary external drafters remain
+        // independent even when combined with native MTP.
+        common_speculative_configure_draft_model_parent(params.speculative, mparams, model_tgt);
+
         llama_model * model_dft = llama_model_load_from_file(model_path.c_str(), mparams);
         if (model_dft == NULL) {
             LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());
             return;
+        }
+
+        if (external_mtp_sidecar) {
+            // The loader borrows exact pointers so the compact file can be
+            // constructed. Normalize them for the drafter scheduler now:
+            // same-device tensors stay shared; foreign/meta tensors become
+            // draft-owned gathered copies.
+            llama_model_share_tensors(model_dft, model_tgt);
         }
 
         pimpl->model.reset(model_dft);

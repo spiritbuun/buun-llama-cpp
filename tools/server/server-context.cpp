@@ -6730,9 +6730,8 @@ private:
         // the ordinary margin plus the larger of those two phase-local consumers, not their sum.
         // Native MTP is sized from the fitted context, so solve the resulting dependency to a
         // fixed point.
-        const bool has_mtp = params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
-        if (params_base.mmproj_gpu_swap && has_mtp && has_mmproj
-                && !params_base.speculative.has_non_mtp_model_drafter()
+        if (params_base.mmproj_gpu_swap && has_mmproj
+                && params_base.speculative.uses_native_mtp_as_primary_drafter()
                 && params_base.fit_params && params_base.n_ctx == 0) {
             std::vector<size_t> margins_base = params_base.fit_params_target;
             GGML_ASSERT(!margins_base.empty());
@@ -7042,6 +7041,9 @@ private:
 
             auto mparams_dft = common_model_params_to_llama(params_dft);
 
+            common_speculative_configure_draft_model_parent(
+                    params_base.speculative, mparams_dft, llama_get_model(ctx_tgt));
+
             // progress callback
             mparams_dft.progress_callback           = load_progress_callback;
             mparams_dft.progress_callback_user_data = &load_progress_spec;
@@ -7244,8 +7246,8 @@ private:
             // share buffers with the target context (upstream #24922 family)
             params_base.speculative.cparams_dft.ctx_other = ctx_tgt;
 
-            const bool combined_external_and_mtp = spec_mtp &&
-                                                    params_base.speculative.has_non_mtp_model_drafter();
+            const bool combined_external_and_mtp = has_draft && spec_mtp &&
+                                                    !params_base.speculative.has_external_mtp_sidecar();
 
             // Shared MTP and block-diffusion graphs consume the target's token
             // embedding/output tensors. This is also required for an external MTP

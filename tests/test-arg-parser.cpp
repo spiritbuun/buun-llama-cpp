@@ -253,10 +253,25 @@ static void test(void) {
         common_params_speculative spec;
         spec.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
         assert(!spec.has_non_mtp_model_drafter());
+        assert(!spec.has_external_mtp_sidecar());
+        assert(spec.uses_mtp_as_primary_drafter());
+        assert(spec.uses_native_mtp_as_primary_drafter());
 
         // Model-free helpers do not change an external MTP sidecar's role.
         spec.types.push_back(COMMON_SPECULATIVE_TYPE_NGRAM_MOD);
         assert(!spec.has_non_mtp_model_drafter());
+        assert(!spec.has_external_mtp_sidecar());
+        assert(spec.uses_mtp_as_primary_drafter());
+        assert(spec.uses_native_mtp_as_primary_drafter());
+
+        spec.draft.mparams.path = "mtp-sidecar.gguf";
+        assert(spec.has_external_mtp_sidecar());
+        assert(spec.uses_mtp_as_primary_drafter());
+        assert(!spec.uses_native_mtp_as_primary_drafter());
+        llama_model_params sidecar_mparams = llama_model_default_params();
+        llama_model * const target_sentinel = reinterpret_cast<llama_model *>(uintptr_t{1});
+        common_speculative_configure_draft_model_parent(spec, sidecar_mparams, target_sentinel);
+        assert(sidecar_mparams.model_shared == target_sentinel);
 
         for (const auto type : {
                 COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,
@@ -266,6 +281,12 @@ static void test(void) {
                 COMMON_SPECULATIVE_TYPE_DFLASH }) {
             spec.types = { type, COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
             assert(spec.has_non_mtp_model_drafter());
+            assert(!spec.has_external_mtp_sidecar());
+            assert(!spec.uses_mtp_as_primary_drafter());
+            assert(!spec.uses_native_mtp_as_primary_drafter());
+            llama_model_params combined_mparams = llama_model_default_params();
+            common_speculative_configure_draft_model_parent(spec, combined_mparams, target_sentinel);
+            assert(combined_mparams.model_shared == nullptr);
         }
     }
 

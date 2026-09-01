@@ -43,17 +43,22 @@ int main() {
 
     {
         llama_model_params probe_mparams = llama_model_default_params();
-        llama_context_params probe_cparams[4] = {
+        llama_context_params probe_cparams[5] = {
             llama_context_default_params(), llama_context_default_params(),
             llama_context_default_params(), llama_context_default_params(),
+            llama_context_default_params(),
         };
         const common_fit_extra_model changing = {
-            "changing", &probe_mparams, &probe_cparams[3], false,
+            "changing", &probe_mparams, &probe_cparams[4], false,
             true, 0, nullptr, false,
+        };
+        const common_fit_extra_model borrowed = {
+            "borrowed", &probe_mparams, &probe_cparams[3], false,
+            false, 2048, &changing, false, true,
         };
         const common_fit_extra_model optional_missing = {
             "optional", &probe_mparams, &probe_cparams[2], true,
-            true, 0, &changing, true,
+            true, 0, &borrowed, true,
         };
         const common_fit_extra_model shared = {
             "shared", &probe_mparams, &probe_cparams[1], true,
@@ -73,13 +78,16 @@ int main() {
                 {true, {10, 20}},
                 // Missing native MTP is an optional zero contribution.
                 {false, {1000, 2000}},
+                // A compact sidecar with borrowed target tensors must be
+                // remeasured for every candidate placement even at fixed n_ctx.
+                {true, {3, 4}},
                 // A non-shared context still refreshes when its inherited size changes.
                 {true, {1, 2}},
             });
         expect(result.success, "linked required and optional extras should aggregate");
-        expect(result.measurement_counts == std::vector<size_t>({1, 2, 1, 2}),
-                "fixed extras should cache while shared/size-changing extras refresh and missing optional extras retire");
-        expect(result.aggregate_bytes_by_device == std::vector<size_t>({13423, 13534}),
+        expect(result.measurement_counts == std::vector<size_t>({1, 2, 1, 2, 2}),
+                "fixed extras should cache while shared/borrowed/size-changing extras refresh and missing optional extras retire");
+        expect(result.aggregate_bytes_by_device == std::vector<size_t>({15474, 15586}),
                 "linked extras should sum every device and host-style destination exactly once");
 
         llama_context_params required_cparams = llama_context_default_params();
