@@ -283,6 +283,18 @@ llama_safetensors_quant_config::rule llama_safetensors_quant_config::make_rule(c
     return result;
 }
 
+static std::string module_prefix_rule(const std::string & module) {
+    std::string pattern = R"(re:(?:.*\.)?)";
+    for (char c : module) {
+        if (std::string_view(R"(\.^$|()[]{}*+?)").find(c) != std::string_view::npos) {
+            pattern.push_back('\\');
+        }
+        pattern.push_back(c);
+    }
+    pattern += R"((?:$|\.))";
+    return pattern;
+}
+
 bool llama_safetensors_quant_config::rule_matches(const rule & candidate, const std::string & module_name) {
     if (!candidate.is_regex) {
         return candidate.target == module_name;
@@ -465,7 +477,10 @@ llama_safetensors_quant_config llama_safetensors_quant_config::from_json(const l
             require_json_value(quant, "activation_scheme", "quantization_config").get<std::string>();
         if (quant.contains("weight_block_size")) {
             const json block = quant.at("weight_block_size");
-            if (require_json_value(quant, "fmt", "quantization_config").get<std::string>() != "e4m3" ||
+            // Current Hugging Face block-FP8 exports may omit `fmt`; the
+            // adapter still verifies every selected weight is stored as
+            // F8_E4M3 before binding it.
+            if (quant.value("fmt", std::string("e4m3")) != "e4m3" ||
                 activation_scheme != "dynamic" || !block.is_array() || block.size() != 2 ||
                 block[0].get<uint32_t>() != 128 || block[1].get<uint32_t>() != 128) {
                 throw std::runtime_error("unsupported native block-FP8 quantization contract");
@@ -500,6 +515,20 @@ llama_safetensors_quant_config llama_safetensors_quant_config::from_json(const l
                     throw std::runtime_error("non-string module in quantization_config.modules_to_not_convert");
                 }
                 result.ignore_.push_back(make_rule(target.get<std::string>(), 0));
+            }
+        }
+        if (quant.contains("modules_to_convert")) {
+            const json & embeddings = quant.at("modules_to_convert");
+            if (!embeddings.is_array()) {
+                throw std::runtime_error("quantization_config.modules_to_convert must be an array");
+            }
+            for (const auto & target : embeddings) {
+                if (!target.is_string()) {
+                    throw std::runtime_error("non-string module in quantization_config.modules_to_convert");
+                }
+                // FineGrainedFP8 uses this list for raw FP8 embedding tables.
+                // They have one parent scale and are not block-scaled linears.
+                result.ignore_.push_back(make_rule(module_prefix_rule(target.get<std::string>()), 0));
             }
         }
         return result;

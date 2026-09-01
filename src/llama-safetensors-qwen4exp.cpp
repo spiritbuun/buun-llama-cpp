@@ -14,6 +14,7 @@
 #include <regex>
 #include <stdexcept>
 #include <string_view>
+#include <thread>
 
 namespace {
 
@@ -40,7 +41,10 @@ struct source_spec {
     size_t scale_broadcast = 0;
     std::vector<std::string> concat_sources;
     std::vector<std::string> stack_sources;
+    std::vector<llama_safetensors_quant_binding> stack_quant_weights;
+    std::vector<llama_safetensors_quant_binding> stack_quant_scales;
     bool ple_table = false;
+    bool ple_scale = false;
 };
 
 class unsupported_target : public std::runtime_error {
@@ -165,6 +169,11 @@ source_spec map_target(
         result.ple_table = true;
         return result;
     }
+    if (target == "per_layer_token_embd.scale") {
+        source_spec result;
+        result.ple_scale = true;
+        return result;
+    }
 
     static const std::regex layer_pattern(R"(^blk\.([0-9]+)\.(.+)$)");
     std::smatch match;
@@ -219,6 +228,31 @@ source_spec map_target(
     const std::string down_module    = prefix + "mlp.experts.down_proj";
     const bool gate_up_quantized = quant.applies(gate_up_module);
     const bool split_experts = registry.find(prefix + "mlp.experts.0.gate_proj.weight") != nullptr;
+    const auto bind_split_experts = [&](const char * projection) {
+        source_spec result;
+        const std::string first_module = prefix + "mlp.experts.0." + projection;
+        const bool quantized = quant.applies(first_module);
+        for (uint32_t expert = 0; expert < geometry.n_expert; ++expert) {
+            const std::string module = prefix + "mlp.experts." + std::to_string(expert) + "." + projection;
+            if (quantized) {
+                auto weight = quant.bind(module, llama_safetensors_quant_role::WEIGHT);
+                auto scale  = quant.bind(module, llama_safetensors_quant_role::WEIGHT_SCALE);
+                if (!weight || !scale || weight->target_type != GGML_TYPE_F8_E4M3 ||
+                        scale->target_type != GGML_TYPE_F32 ||
+                        scale->materialization != llama_safetensors_quant_materialization::FP8_BLOCK_SCALE) {
+                    throw std::runtime_error("unsupported split-expert FP8 contract for '" + module + "'");
+                }
+                result.stack_quant_weights.push_back(std::move(*weight));
+                result.stack_quant_scales.push_back(std::move(*scale));
+            } else {
+                if (quant.applies(module)) {
+                    throw std::runtime_error("mixed split-expert quantization in '" + module + "'");
+                }
+                result.stack_sources.push_back(module + ".weight");
+            }
+        }
+        return result;
+    };
     if (suffix == "ffn_gate_up_exps.weight") {
         if (gate_up_quantized) {
             return {};
@@ -233,12 +267,7 @@ source_spec map_target(
             return {};
         }
         if (split_experts) {
-            source_spec result;
-            const char * projection = suffix == "ffn_gate_exps.weight" ? "gate_proj.weight" : "up_proj.weight";
-            for (uint32_t expert = 0; expert < geometry.n_expert; ++expert) {
-                result.stack_sources.push_back(prefix + "mlp.experts." + std::to_string(expert) + "." + projection);
-            }
-            return result;
+            return bind_split_experts(suffix == "ffn_gate_exps.weight" ? "gate_proj" : "up_proj");
         }
         source_spec result = bind_projection(
             quant, gate_up_module, llama_safetensors_quant_role::WEIGHT);
@@ -251,16 +280,19 @@ source_spec map_target(
             return bind_projection(quant, down_module, llama_safetensors_quant_role::WEIGHT);
         }
         if (split_experts) {
-            source_spec result;
-            for (uint32_t expert = 0; expert < geometry.n_expert; ++expert) {
-                result.stack_sources.push_back(prefix + "mlp.experts." + std::to_string(expert) + ".down_proj.weight");
-            }
-            return result;
+            return bind_split_experts("down_proj");
         }
         return { down_module };
     }
     if (suffix == "ffn_gate_exps.scale" || suffix == "ffn_up_exps.scale" ||
         suffix == "ffn_down_exps.scale") {
+        if (split_experts) {
+            const char * projection = suffix == "ffn_down_exps.scale" ? "down_proj" :
+                suffix == "ffn_gate_exps.scale" ? "gate_proj" : "up_proj";
+            if (quant.applies(prefix + "mlp.experts.0." + projection)) {
+                return {};
+            }
+        }
         const std::string & module = suffix == "ffn_down_exps.scale" ? down_module : gate_up_module;
         source_spec result = bind_projection(quant, module, llama_safetensors_quant_role::WEIGHT_SCALE);
         result.scale_broadcast = geometry.n_expert;
@@ -340,7 +372,9 @@ source_spec map_target(
                     result.source = prefix + std::string(name.source);
                 }
                 if (name.transform == transform_kind::A_LOG) {
-                    result.transforms = { transform_kind::A_LOG, transform_kind::HEAD_ROWS };
+                    // Preserve the source element width while permuting; A_LOG
+                    // then converts the reordered values to F32.
+                    result.transforms = { transform_kind::HEAD_ROWS, transform_kind::A_LOG };
                 } else if (suffix != "ssm_norm.weight") {
                     result.transforms = { name.transform };
                 }
@@ -393,14 +427,19 @@ std::vector<int64_t> reverse_shape(const llama_safetensors_tensor & source) {
 
 ggml_type plain_type(const llama_safetensors_tensor & source, const source_spec & spec,
                      const std::string & target) {
+    const bool numerical_transform = std::find(spec.transforms.begin(), spec.transforms.end(),
+        transform_kind::OFFSET_NORM) != spec.transforms.end() ||
+        std::find(spec.transforms.begin(), spec.transforms.end(),
+        transform_kind::A_LOG) != spec.transforms.end();
+    const bool backend_requires_f32 = ends_with(target, "ssm_conv1d.weight");
     switch (source.dtype) {
         case llama_safetensors_dtype::BF16:
-            if (!spec.transforms.empty() || source.shape.size() < 2) {
+            if (numerical_transform || backend_requires_f32 || source.shape.size() < 2) {
                 return target == "token_embd.weight" ? GGML_TYPE_BF16 : GGML_TYPE_F32;
             }
             return GGML_TYPE_BF16;
         case llama_safetensors_dtype::F16:
-            if (!spec.transforms.empty() || source.shape.size() < 2) {
+            if (numerical_transform || backend_requires_f32 || source.shape.size() < 2) {
                 return target == "token_embd.weight" ? GGML_TYPE_F16 : GGML_TYPE_F32;
             }
             return GGML_TYPE_F16;
@@ -728,20 +767,50 @@ bool llama_safetensors_qwen4exp_importer::describe(
     if (spec.ple_table) {
         if (ple_layer_ == UINT32_MAX || ple_shards_ == 0) return false;
         uint64_t rows = 0, dim = 0;
+        llama_safetensors_dtype dtype = llama_safetensors_dtype::F32;
         const std::string prefix = model_prefix_ + ".layers." + std::to_string(ple_layer_) +
             ".ple.ple_embedding.ngram_embedding.shard_";
         for (uint32_t i = 0; i < ple_shards_; ++i) {
             const std::string shard_name = prefix + std::to_string(i) + ".weight";
             const auto & shard = require_tensor(registry_, shard_name);
-            if (shard.shape.size() != 2 || (i != 0 && shard.shape[1] != dim) ||
+            if (shard.shape.size() != 2 || (i != 0 && (shard.shape[1] != dim || shard.dtype != dtype)) ||
                 (shard.dtype != llama_safetensors_dtype::BF16 && shard.dtype != llama_safetensors_dtype::F16 &&
-                 shard.dtype != llama_safetensors_dtype::F32) || rows > std::numeric_limits<uint64_t>::max() - shard.shape[0]) {
+                 shard.dtype != llama_safetensors_dtype::F32 && shard.dtype != llama_safetensors_dtype::F8_E4M3) ||
+                rows > std::numeric_limits<uint64_t>::max() - shard.shape[0]) {
                 throw std::runtime_error("invalid Qwen4 PLE shard contract");
             }
-            dim = shard.shape[1]; rows += shard.shape[0];
+            dtype = shard.dtype; dim = shard.shape[1]; rows += shard.shape[0];
         }
         if (dim > INT64_MAX || rows > INT64_MAX) throw std::runtime_error("Qwen4 PLE table exceeds runtime limits");
-        type = GGML_TYPE_F32; shape = { static_cast<int64_t>(dim), static_cast<int64_t>(rows) };
+        type = dtype == llama_safetensors_dtype::F8_E4M3 ? GGML_TYPE_F8_E4M3 : GGML_TYPE_F32;
+        shape = { static_cast<int64_t>(dim), static_cast<int64_t>(rows) };
+    } else if (spec.ple_scale) {
+        if (ple_layer_ == UINT32_MAX || ple_shards_ == 0) return false;
+        const std::string name = model_prefix_ + ".layers." + std::to_string(ple_layer_) +
+            ".ple.ple_embedding.ngram_embedding.weight_scale";
+        const auto & scale = require_tensor(registry_, name);
+        if (scale.dtype != llama_safetensors_dtype::BF16 || scale.shape != std::vector<uint64_t>{1}) {
+            throw std::runtime_error("invalid Qwen4 PLE scale contract");
+        }
+        type = GGML_TYPE_F32;
+        shape = { 1 };
+    } else if (!spec.stack_quant_weights.empty()) {
+        const auto & first = spec.stack_quant_weights.front();
+        if (first.target_shape.size() != 2 || first.target_shape[0] % 128 != 0 ||
+                first.target_shape[1] % 128 != 0 ||
+                spec.stack_quant_scales.size() != spec.stack_quant_weights.size()) {
+            throw std::runtime_error("invalid split-expert FP8 target geometry");
+        }
+        for (size_t i = 0; i < spec.stack_quant_weights.size(); ++i) {
+            if (spec.stack_quant_weights[i].target_shape != first.target_shape ||
+                    spec.stack_quant_scales[i].target_shape !=
+                        std::vector<int64_t>{ first.target_shape[1] / 128, first.target_shape[0] / 128 }) {
+                throw std::runtime_error("incompatible split-expert FP8 source tensors");
+            }
+        }
+        type = GGML_TYPE_Q8_0_G128;
+        shape = first.target_shape;
+        shape.push_back(static_cast<int64_t>(spec.stack_quant_weights.size()));
     } else if (!spec.stack_sources.empty()) {
         const auto & first = require_tensor(registry_, spec.stack_sources.front());
         if (first.shape.size() != 2) throw std::runtime_error("Qwen4 expert source must be rank two");
@@ -796,6 +865,8 @@ void llama_safetensors_qwen4exp_importer::bind(const std::string & target) const
         indexer_n_heads_, indexer_head_dim_, full_attention_interval_, text.at("num_experts").get<uint32_t>(), text.at("moe_intermediate_size").get<uint32_t>(), ple_layer_, ple_shards_ };
     const source_spec spec = map_target(registry_, *quant_, geometry, target);
     if (spec.quant) quant_->consume(*spec.quant);
+    for (const auto & binding : spec.stack_quant_weights) quant_->consume(binding);
+    for (const auto & binding : spec.stack_quant_scales)  quant_->consume(binding);
 }
 
 bool llama_safetensors_qwen4exp_importer::load(
@@ -805,27 +876,45 @@ bool llama_safetensors_qwen4exp_importer::load(
         indexer_n_heads_, indexer_head_dim_, full_attention_interval_, text.at("num_experts").get<uint32_t>(), text.at("moe_intermediate_size").get<uint32_t>(), ple_layer_, ple_shards_ };
     const source_spec spec = map_target(registry_, *quant_, geometry, target);
     if (spec.ple_table) {
-        if (destination->type != GGML_TYPE_F32) throw std::runtime_error("Qwen4 PLE destination must be F32");
+        if (destination->type != GGML_TYPE_F32 && destination->type != GGML_TYPE_F8_E4M3) {
+            throw std::runtime_error("Qwen4 PLE destination has an unsupported type");
+        }
         size_t offset = 0;
         const std::string prefix = model_prefix_ + ".layers." + std::to_string(ple_layer_) +
             ".ple.ple_embedding.ngram_embedding.shard_";
         for (uint32_t i = 0; i < ple_shards_; ++i) {
             const std::string shard_name = prefix + std::to_string(i) + ".weight";
             const auto & desc = require_tensor(registry_, shard_name);
-            std::vector<uint8_t> bytes = registry_.read(desc);
-            if (desc.dtype == llama_safetensors_dtype::BF16) bytes = llama_safetensors_bf16_to_f32(bytes);
-            else if (desc.dtype == llama_safetensors_dtype::F16) bytes = llama_safetensors_f16_to_f32(bytes);
-            if (check_tensor && !ggml_validate_row_data(GGML_TYPE_F32, bytes.data(), bytes.size()))
+            std::vector<uint8_t> owned;
+            const uint8_t * data = nullptr;
+            size_t size = static_cast<size_t>(desc.size);
+            if (destination->type == GGML_TYPE_F32) {
+                owned = registry_.read(desc);
+                if (desc.dtype == llama_safetensors_dtype::BF16) owned = llama_safetensors_bf16_to_f32(owned);
+                else if (desc.dtype == llama_safetensors_dtype::F16) owned = llama_safetensors_f16_to_f32(owned);
+                data = owned.data();
+                size = owned.size();
+            } else if (desc.dtype != llama_safetensors_dtype::F8_E4M3) {
+                throw std::runtime_error("Qwen4 PLE shard type does not match its destination");
+            } else if ((data = registry_.data(desc)) == nullptr) {
+                owned = registry_.read(desc);
+                data = owned.data();
+            }
+            if (check_tensor && !ggml_validate_row_data(destination->type, data, size))
                 throw std::runtime_error("Qwen4 PLE shard contains invalid data");
-            if (offset > ggml_nbytes(destination) || bytes.size() > ggml_nbytes(destination) - offset)
+            if (offset > ggml_nbytes(destination) || size > ggml_nbytes(destination) - offset)
                 throw std::runtime_error("Qwen4 PLE shard exceeds destination");
-            ggml_backend_tensor_set(destination, bytes.data(), offset, bytes.size());
-            offset += bytes.size();
+            ggml_backend_tensor_set(destination, data, offset, size);
+            offset += size;
         }
         if (offset != ggml_nbytes(destination)) throw std::runtime_error("Qwen4 PLE upload is incomplete");
         return true;
     }
+    if (spec.ple_scale) {
+        return false;
+    }
     if (!spec.transforms.empty() || spec.row_count != 0 || spec.scale_broadcast != 0 ||
+        !spec.stack_quant_weights.empty() ||
         !spec.concat_sources.empty() || !spec.stack_sources.empty()) return false;
     return llama_safetensors_load_tensor_direct(registry_, { spec.source, spec.quant }, destination, check_tensor);
 }
@@ -837,10 +926,93 @@ std::vector<uint8_t> llama_safetensors_qwen4exp_importer::materialize(
         indexer_n_heads_, indexer_head_dim_, full_attention_interval_, text.at("num_experts").get<uint32_t>(), text.at("moe_intermediate_size").get<uint32_t>(), ple_layer_, ple_shards_ };
     try {
         const source_spec spec = map_target(registry_, *quant_, geometry, target);
+        if (spec.ple_scale) {
+            const std::string name = model_prefix_ + ".layers." + std::to_string(ple_layer_) +
+                ".ple.ple_embedding.ngram_embedding.weight_scale";
+            std::vector<uint8_t> result = llama_safetensors_bf16_to_f32(registry_.read(require_tensor(registry_, name)));
+            if (target_type != GGML_TYPE_F32 || result.size() != target_size) {
+                throw std::runtime_error("Qwen4 PLE scale materialization has the wrong type or size");
+            }
+            return result;
+        }
         if (spec.ple_table) throw std::runtime_error("PLE table must use bounded direct upload");
         std::vector<uint8_t> result;
         const llama_safetensors_tensor * source_desc = nullptr;
-        if (!spec.stack_sources.empty()) {
+        if (!spec.stack_quant_weights.empty()) {
+            if (target_type != GGML_TYPE_Q8_0_G128 || spec.stack_quant_weights.size() != spec.stack_quant_scales.size()) {
+                throw std::runtime_error("split-expert FP8 repack has an invalid target");
+            }
+            const size_t n_expert = spec.stack_quant_weights.size();
+            const size_t n_cols = static_cast<size_t>(spec.stack_quant_weights.front().target_shape[0]);
+            const size_t n_rows = static_cast<size_t>(spec.stack_quant_weights.front().target_shape[1]);
+            const size_t n_col_blocks = n_cols / 128;
+            const size_t n_row_blocks = n_rows / 128;
+            const size_t source_row_size = n_cols;
+            const size_t target_row_size = ggml_row_size(target_type, n_cols);
+            std::vector<uint8_t> weights(n_expert * n_rows * source_row_size);
+            std::vector<float> scales(n_expert * n_row_blocks * n_col_blocks);
+            for (size_t expert = 0; expert < n_expert; ++expert) {
+                const auto weight = quant_->read(spec.stack_quant_weights[expert]);
+                if (weight.size() != n_rows * source_row_size) {
+                    throw std::runtime_error("split-expert FP8 weight has the wrong size");
+                }
+                std::memcpy(weights.data() + expert * n_rows * source_row_size,
+                            weight.data(), weight.size());
+                const auto scale = quant_->finalize(
+                    spec.stack_quant_scales[expert], quant_->read(spec.stack_quant_scales[expert]));
+                if (scale.size() != n_row_blocks * n_col_blocks * sizeof(float)) {
+                    throw std::runtime_error("split-expert FP8 scale has the wrong size");
+                }
+                for (size_t i = 0; i < n_row_blocks * n_col_blocks; ++i) {
+                    float value;
+                    std::memcpy(&value, scale.data() + i * sizeof(value), sizeof(value));
+                    if (!(value > 0.0f) || !std::isfinite(value)) {
+                        throw std::runtime_error("split-expert FP8 scale must be finite and positive");
+                    }
+                    scales[expert * n_row_blocks * n_col_blocks + i] = value;
+                }
+            }
+            result.resize(n_expert * n_rows * target_row_size);
+            const auto * source_traits = ggml_get_type_traits(GGML_TYPE_F8_E4M3);
+            const auto * target_traits = ggml_get_type_traits(target_type);
+            if (!source_traits->to_float || !target_traits->from_float_ref || result.size() != target_size) {
+                throw std::runtime_error("split-expert FP8 repack is unavailable");
+            }
+            const int64_t total_rows = static_cast<int64_t>(n_expert * n_rows);
+            const size_t n_threads = std::max<size_t>(1, std::min<size_t>(
+                std::thread::hardware_concurrency(), static_cast<size_t>(total_rows)));
+            std::vector<std::thread> workers;
+            workers.reserve(n_threads);
+            for (size_t thread = 0; thread < n_threads; ++thread) {
+                const int64_t row_begin = total_rows * static_cast<int64_t>(thread) /
+                    static_cast<int64_t>(n_threads);
+                const int64_t row_end = total_rows * static_cast<int64_t>(thread + 1) /
+                    static_cast<int64_t>(n_threads);
+                workers.emplace_back([&, row_begin, row_end] {
+                std::vector<float> row(n_cols);
+                for (int64_t flat_row = row_begin; flat_row < row_end; ++flat_row) {
+                    const size_t expert = static_cast<size_t>(flat_row) / n_rows;
+                    const size_t output_row = static_cast<size_t>(flat_row) % n_rows;
+                    source_traits->to_float(
+                        weights.data() + static_cast<size_t>(flat_row) * source_row_size,
+                        row.data(), static_cast<int64_t>(n_cols));
+                    const float * expert_scales =
+                        scales.data() + expert * n_row_blocks * n_col_blocks;
+                    for (size_t block = 0; block < n_col_blocks; ++block) {
+                        const float scale = expert_scales[block * n_row_blocks + output_row / 128];
+                        for (size_t col = block * 128; col < (block + 1) * 128; ++col) {
+                            row[col] *= scale;
+                        }
+                    }
+                    target_traits->from_float_ref(
+                        row.data(), result.data() + static_cast<size_t>(flat_row) * target_row_size,
+                        static_cast<int64_t>(n_cols));
+                }
+                });
+            }
+            for (auto & worker : workers) worker.join();
+            return result;
+        } else if (!spec.stack_sources.empty()) {
             source_desc = &require_tensor(registry_, spec.stack_sources.front());
             result.reserve(target_size);
             for (const auto & name : spec.stack_sources) {
@@ -888,7 +1060,11 @@ std::vector<uint8_t> llama_safetensors_qwen4exp_importer::materialize(
             if (spec.quant) throw std::runtime_error("Qwen4 transformed quantized projection is not supported");
             result = transform_plain(transform, geometry, *source_desc, std::move(result));
         }
-        if (!spec.quant && spec.transforms.empty() && spec.scale_broadcast == 0) {
+        const bool numerically_transformed = std::find(spec.transforms.begin(), spec.transforms.end(),
+            transform_kind::OFFSET_NORM) != spec.transforms.end() ||
+            std::find(spec.transforms.begin(), spec.transforms.end(),
+            transform_kind::A_LOG) != spec.transforms.end();
+        if (!spec.quant && !numerically_transformed && spec.scale_broadcast == 0) {
             if (target_type == GGML_TYPE_F32 && source_desc->dtype == llama_safetensors_dtype::BF16)
                 result = llama_safetensors_bf16_to_f32(result);
             else if (target_type == GGML_TYPE_F32 && source_desc->dtype == llama_safetensors_dtype::F16)

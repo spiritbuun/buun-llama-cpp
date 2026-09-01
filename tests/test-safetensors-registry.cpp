@@ -4,6 +4,7 @@
 #include "llama-safetensors-quant.h"
 #include "llama-safetensors-qwen3.h"
 #include "llama-safetensors-qwen35.h"
+#include "llama-safetensors-qwen4exp.h"
 #include "llama-safetensors-tensor.h"
 #include "llama-safetensors.h"
 #include "llama.h"
@@ -108,6 +109,12 @@ const char * fp8_static_tensor_config =
 
 const char * fp8_block_config =
     R"({"quantization_config":{"quant_method":"fp8","fmt":"e4m3","activation_scheme":"dynamic","weight_block_size":[128,128]}})";
+
+const char * fp8_block_inferred_format_config =
+    R"({"quantization_config":{"quant_method":"fp8","activation_scheme":"dynamic","weight_block_size":[128,128]}})";
+
+const char * fp8_block_embedding_config =
+    R"({"quantization_config":{"quant_method":"fp8","activation_scheme":"dynamic","weight_block_size":[128,128],"modules_to_convert":["module.embedding"]}})";
 
 const char * deepseek4_mixed_fp8_config =
     R"({"expert_dtype":"fp4","quantization_config":{"quant_method":"fp8","fmt":"e4m3","scale_fmt":"ue8m0","activation_scheme":"dynamic","weight_block_size":[128,128]}})";
@@ -679,6 +686,126 @@ int main(int argc, char ** argv) {
     require(argc == 1, "usage: test-safetensors-registry [model-directory [control.gguf]]");
 
     temp_dir dir;
+
+    {
+        const auto path = dir.path / "qwen4-permutation-types";
+        write_single_shard_model(path, {
+            { "model.layers.0.linear_attn.in_proj_qkv.weight", "BF16", { 8, 3 },
+              std::vector<uint8_t>(8 * 3 * sizeof(uint16_t), 0) },
+            { "model.layers.0.linear_attn.dt_bias", "BF16", { 2 },
+              { 0x80, 0x3f, 0x00, 0x40 } },
+            { "model.layers.0.linear_attn.A_log", "BF16", { 2 },
+              { 0x80, 0x3f, 0x00, 0x40 } },
+            { "model.layers.0.linear_attn.conv1d.weight", "BF16", { 8, 3 },
+              std::vector<uint8_t>(8 * 3 * sizeof(uint16_t), 0) },
+        });
+        write_text(path / "tokenizer.json", "{}");
+        const json config = {
+            { "model_type", "qwen4_exp" },
+            { "num_hidden_layers", 1 },
+            { "mtp_num_hidden_layers", 0 },
+            { "linear_num_key_heads", 1 },
+            { "linear_num_value_heads", 2 },
+            { "linear_key_head_dim", 2 },
+            { "linear_value_head_dim", 2 },
+            { "indexer_n_heads", 1 },
+            { "indexer_head_dim", 2 },
+            { "full_attention_interval", 2 },
+            { "split_ngram_parts", 0 },
+            { "ple_layer_ids", json::array() },
+            { "num_experts", 2 },
+            { "moe_intermediate_size", 128 },
+        };
+        write_text(path / "config.json", config.dump());
+        llama_safetensors_qwen4exp_importer importer(path, config);
+
+        ggml_type type = GGML_TYPE_COUNT;
+        std::array<int64_t, GGML_MAX_DIMS> ne{};
+        require(importer.describe("blk.0.attn_qkv.weight", type, ne) &&
+                    type == GGML_TYPE_BF16 && ne[0] == 3 && ne[1] == 8,
+                "Qwen4 permutation-only matrix did not retain BF16");
+        require(importer.materialize("blk.0.attn_qkv.weight", type, 48).size() == 48,
+                "Qwen4 BF16 matrix permutation changed its byte width");
+
+        require(importer.describe("blk.0.ssm_dt.bias", type, ne) &&
+                    type == GGML_TYPE_F32 && ne[0] == 2,
+                "Qwen4 transformed runtime scalar did not declare F32");
+        require(importer.materialize("blk.0.ssm_dt.bias", type, 8).size() == 8,
+                "Qwen4 transformed runtime scalar was not converted to F32");
+
+        require(importer.describe("blk.0.ssm_conv1d.weight", type, ne) &&
+                    type == GGML_TYPE_F32 && ne[0] == 3 && ne[1] == 8,
+                "Qwen4 SSM convolution kernel did not declare backend-required F32");
+        require(importer.materialize("blk.0.ssm_conv1d.weight", type, 96).size() == 96,
+                "Qwen4 SSM convolution kernel was not converted to F32");
+
+        require(importer.describe("blk.0.ssm_a", type, ne) &&
+                    type == GGML_TYPE_F32 && ne[0] == 2,
+                "Qwen4 numerical transform did not declare F32");
+        const auto a_log = importer.materialize("blk.0.ssm_a", type, 8);
+        float a0;
+        float a1;
+        std::memcpy(&a0, a_log.data(), sizeof(a0));
+        std::memcpy(&a1, a_log.data() + sizeof(a0), sizeof(a1));
+        require(std::isfinite(a0) && std::isfinite(a1) && a0 < 0.0f && a1 < 0.0f,
+                "Qwen4 A_log permutation/conversion produced invalid values");
+    }
+
+    {
+        const auto path = dir.path / "qwen4-split-fp8-experts";
+        constexpr size_t dim = 128;
+        std::vector<tensor_fixture> tensors;
+        for (size_t expert = 0; expert < 2; ++expert) {
+            const std::string module = "model.layers.0.mlp.experts." +
+                std::to_string(expert) + ".gate_proj";
+            tensors.push_back({ module + ".weight", "F8_E4M3", { dim, dim },
+                                std::vector<uint8_t>(dim * dim, expert == 0 ? 0x38 : 0x40) });
+            tensors.push_back({ module + ".weight_scale_inv", "BF16", { 1, 1 }, { 0x80, 0x3f } });
+        }
+        write_single_shard_model(path, tensors);
+        write_text(path / "tokenizer.json", "{}");
+        json config = {
+            { "model_type", "qwen4_exp" },
+            { "num_hidden_layers", 1 },
+            { "mtp_num_hidden_layers", 0 },
+            { "linear_num_key_heads", 1 },
+            { "linear_num_value_heads", 2 },
+            { "linear_key_head_dim", 2 },
+            { "linear_value_head_dim", 2 },
+            { "indexer_n_heads", 1 },
+            { "indexer_head_dim", 2 },
+            { "full_attention_interval", 2 },
+            { "split_ngram_parts", 0 },
+            { "ple_layer_ids", json::array() },
+            { "num_experts", 2 },
+            { "moe_intermediate_size", dim },
+        };
+        config["quantization_config"] =
+            json::parse(fp8_block_inferred_format_config).at("quantization_config");
+        write_text(path / "config.json", config.dump());
+        llama_safetensors_qwen4exp_importer importer(path, config);
+
+        ggml_type type = GGML_TYPE_COUNT;
+        std::array<int64_t, GGML_MAX_DIMS> ne{};
+        require(importer.describe("blk.0.ffn_gate_exps.weight", type, ne) &&
+                    type == GGML_TYPE_Q8_0_G128 && ne[0] == dim && ne[1] == dim && ne[2] == 2,
+                "Qwen4 split FP8 experts did not select the portable Q8 bridge");
+        importer.bind("blk.0.ffn_gate_exps.weight");
+        const size_t row_size = ggml_row_size(type, dim);
+        const auto packed = importer.materialize(
+            "blk.0.ffn_gate_exps.weight", type, 2 * dim * row_size);
+        const auto * traits = ggml_get_type_traits(type);
+        require(traits != nullptr && traits->to_float != nullptr,
+                "Qwen4 expert bridge target cannot be decoded");
+        std::vector<float> row(dim);
+        traits->to_float(packed.data(), row.data(), dim);
+        require(std::all_of(row.begin(), row.end(), [](float value) { return std::fabs(value - 1.0f) < 1e-3f; }),
+                "Qwen4 first split FP8 expert was repacked incorrectly");
+        traits->to_float(packed.data() + dim * row_size, row.data(), dim);
+        require(std::all_of(row.begin(), row.end(), [](float value) { return std::fabs(value - 2.0f) < 1e-3f; }),
+                "Qwen4 second split FP8 expert was repacked incorrectly");
+        importer.validate_complete();
+    }
 
     {
         const auto path = dir.path / "plain-f16";
@@ -1481,6 +1608,17 @@ int main(int argc, char ** argv) {
         adapters.validate_complete();
         require(adapters.finalize(*scale, adapters.read(*scale)).size() == sizeof(float),
                 "FP8 block scale conversion has the wrong size");
+
+        llama_safetensors_quant_adapters inferred(
+            llama_safetensors_json::parse(fp8_block_inferred_format_config), registry);
+        const auto inferred_weight = inferred.bind("module", llama_safetensors_quant_role::WEIGHT);
+        const auto inferred_scale  = inferred.bind("module", llama_safetensors_quant_role::WEIGHT_SCALE);
+        require(inferred_weight.has_value() && inferred_scale.has_value() &&
+                    inferred_scale->materialization == llama_safetensors_quant_materialization::FP8_BLOCK_SCALE,
+                "FP8 block binding did not infer E4M3 from the stored weight dtype");
+        inferred.consume(*inferred_weight);
+        inferred.consume(*inferred_scale);
+        inferred.validate_complete();
     }
     {
         const auto path = dir.path / "fp8-block-wrong-grid";
@@ -1493,6 +1631,27 @@ int main(int argc, char ** argv) {
         const auto registry = llama_safetensors_registry::load(path);
         require_rejected([&] { (void) llama_safetensors_quant_adapters(llama_safetensors_read_json(path / "config.json"), registry); },
                          "FP8 block contract accepted the wrong scale grid");
+    }
+    {
+        const auto path = dir.path / "fp8-embedding";
+        write_single_shard_model(path, {
+            { "model.language_model.module.embedding.shard_0.weight", "F8_E4M3", { 2, 32 }, std::vector<uint8_t>(64) },
+            { "model.language_model.module.embedding.weight_scale",  "BF16",    { 1 },     { 0x80, 0x3f }           },
+            { "linear.weight",                                    "F8_E4M3", { 128, 128 }, std::vector<uint8_t>(16384) },
+            { "linear.weight_scale_inv",                          "BF16",     { 1, 1 },     std::vector<uint8_t>(2)     },
+        });
+        write_text(path / "config.json", fp8_block_embedding_config);
+        const auto registry = llama_safetensors_registry::load(path);
+        llama_safetensors_quant_adapters adapters(
+            llama_safetensors_read_json(path / "config.json"), registry);
+        require(!adapters.applies("model.language_model.module.embedding.shard_0"),
+                "raw FP8 embedding shard was misclassified as a block-scaled linear");
+        const auto weight = adapters.bind("linear", llama_safetensors_quant_role::WEIGHT);
+        const auto scale  = adapters.bind("linear", llama_safetensors_quant_role::WEIGHT_SCALE);
+        require(weight.has_value() && scale.has_value(), "FP8 embedding exception disabled ordinary block FP8");
+        adapters.consume(*weight);
+        adapters.consume(*scale);
+        adapters.validate_complete();
     }
     {
         const auto path = dir.path / "deepseek4-mixed-fp8";
