@@ -1658,11 +1658,12 @@ static void test_qwen4_vbr_cuda(const size_t seed) {
     };
     const uint32_t saved_top_k = model->hparams.indexer_top_k;
     model->hparams.indexer_top_k = 8;
-    const auto gathered_logits = [&](ggml_type type_v, qsa_gather_trace & gather_trace) {
+    const auto gathered_logits = [&](ggml_type type_k, ggml_type type_v, qsa_gather_trace & gather_trace) {
         llama_context_params gather_params = static_ref_params;
         gather_params.n_ctx = 128;
         gather_params.n_batch = 64;
         gather_params.n_ubatch = 64;
+        gather_params.type_k = type_k;
         gather_params.type_v = type_v;
         gather_params.cb_eval = trace_qsa_gather;
         gather_params.cb_eval_user_data = &gather_trace;
@@ -1675,12 +1676,20 @@ static void test_qwen4_vbr_cuda(const size_t seed) {
         return last_logits(gather_ctx.get());
     };
     qsa_gather_trace gather_f16_trace;
+    qsa_gather_trace gather_turbo_k_trace;
     qsa_gather_trace gather_turbo_v_trace;
-    const auto gather_f16_logits = gathered_logits(GGML_TYPE_F16, gather_f16_trace);
-    const auto gather_turbo_v_logits = gathered_logits(GGML_TYPE_TURBO8_0, gather_turbo_v_trace);
+    const auto gather_f16_logits = gathered_logits(
+        GGML_TYPE_F16, GGML_TYPE_F16, gather_f16_trace);
+    const auto gather_turbo_k_logits = gathered_logits(
+        GGML_TYPE_TURBO8_0, GGML_TYPE_F16, gather_turbo_k_trace);
+    const auto gather_turbo_v_logits = gathered_logits(
+        GGML_TYPE_F16, GGML_TYPE_TURBO8_0, gather_turbo_v_trace);
+    const double gather_k_nmse = nmse(gather_f16_logits, gather_turbo_k_logits);
     const double gather_v_nmse = nmse(gather_f16_logits, gather_turbo_v_logits);
     GGML_ASSERT(gather_f16_trace.inverse_wht == 0);
+    GGML_ASSERT(gather_turbo_k_trace.inverse_wht > 0);
     GGML_ASSERT(gather_turbo_v_trace.inverse_wht > 0);
+    GGML_ASSERT(std::isfinite(gather_k_nmse) && gather_k_nmse <= 1.0e-5);
     GGML_ASSERT(std::isfinite(gather_v_nmse) && gather_v_nmse <= 1.0e-5);
 
     // The same eight-token continuation runs through gather when decoded token by token and scan
@@ -1859,9 +1868,9 @@ static void test_qwen4_vbr_cuda(const size_t seed) {
     GGML_ASSERT(std::isfinite(fork1_nmse) && fork1_nmse <= 1.0e-10);
 
     model->hparams.indexer_top_k = saved_top_k;
-    printf("Qwen4 selected-cell gather F16/Turbo8 V NMSE %.9g, scan parity %.9g, "
+    printf("Qwen4 selected-cell gather Turbo8 K/V NMSE %.9g/%.9g, scan parity %.9g, "
            "streams %.9g/%.9g, dormant %.9g, unified fork %.9g/%.9g\n",
-           gather_v_nmse, gather_scan_nmse, stream0_nmse, stream1_nmse,
+           gather_k_nmse, gather_v_nmse, gather_scan_nmse, stream0_nmse, stream1_nmse,
            dormant_nmse, fork0_nmse, fork1_nmse);
 
     // Dynamic device VBR needs a non-transposed FA cache, so an explicit FA-off

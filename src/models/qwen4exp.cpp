@@ -1097,6 +1097,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_gather(
 
     k_sel = ggml_reshape_4d(ctx0, k_sel, k_all->ne[0], k_all->ne[1], width, n_q);
     v_sel = ggml_reshape_4d(ctx0, v_sel, v_all->ne[0], v_all->ne[1], width, n_q);
+
+    // GET_ROWS materializes a static Turbo cache as F32, but its K rows are still in the
+    // rotated storage domain. The ordinary F32 attention below cannot infer that provenance,
+    // so restore K to the original domain just as the non-gather Turbo attention kernels do.
+    // Dynamic VBR exposes reconstructed F16 K and therefore deliberately does not enter here.
+    if (ggml_is_turbo_kv_type(k_all->type)) {
+        k_sel = ggml_turbo_wht(ctx0, k_sel, 1);
+    }
+
     cb(k_sel, "qsa_k_sel", il);
     cb(v_sel, "qsa_v_sel", il);
 
