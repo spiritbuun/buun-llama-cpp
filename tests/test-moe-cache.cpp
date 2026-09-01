@@ -523,6 +523,13 @@ static bool run_capability_queries(
     ok &= ggml_moe_cache.query_shape(
             GGML_TYPE_Q4_0, n_in, n_out, 0, expert_size, &shape) == 0;
 
+    const size_t q8_g128_expert_size =
+        ggml_row_size(GGML_TYPE_Q8_0_G128, n_in) * n_out;
+    ok &= ggml_moe_cache.query_shape(
+            GGML_TYPE_Q8_0_G128, n_in, n_out, 64,
+            q8_g128_expert_size, &shape) == 1;
+    ok &= shape.pool_bytes == q8_g128_expert_size * 64;
+
     set_env("GGML_CUDA_MOE_CACHE", "0");
     set_env("GGML_CUDA_MOE_CACHE_MODE", "off");
     ok &= ggml_moe_cache.query_config(-1, 0, &config) == 0;

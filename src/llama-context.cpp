@@ -836,19 +836,32 @@ static bool llama_model_has_cacheable_moe_weights(
 
     std::vector<int32_t> physical_devices;
     size_t min_expert_bytes = 0;
+    const auto add_device = [&](ggml_backend_dev_t device) {
+        if (!device) {
+            return;
+        }
+        ggml_moe_cache_device_caps caps = {};
+        if (!ggml_moe_cache.query_device(device, &config, &caps) ||
+            std::find(physical_devices.begin(), physical_devices.end(),
+                    caps.physical_device) != physical_devices.end()) {
+            return;
+        }
+        physical_devices.push_back(caps.physical_device);
+        min_expert_bytes = std::max(min_expert_bytes, caps.min_expert_bytes);
+    };
     for (ggml_backend_t backend : backends) {
         if (!backend) {
             continue;
         }
-        ggml_moe_cache_device_caps caps = {};
-        if (!ggml_moe_cache.query_device(
-                    ggml_backend_get_device(backend), &config, &caps) ||
-            std::find(physical_devices.begin(), physical_devices.end(),
-                    caps.physical_device) != physical_devices.end()) {
-            continue;
+        ggml_backend_dev_t device = ggml_backend_get_device(backend);
+        if (ggml_backend_dev_is_meta(device)) {
+            const size_t n_devices = ggml_backend_meta_dev_n_devs(device);
+            for (size_t i = 0; i < n_devices; ++i) {
+                add_device(ggml_backend_meta_dev_simple_dev(device, i));
+            }
+        } else {
+            add_device(device);
         }
-        physical_devices.push_back(caps.physical_device);
-        min_expert_bytes = std::max(min_expert_bytes, caps.min_expert_bytes);
     }
     if ((int) physical_devices.size() < config.min_devices) {
         return false;

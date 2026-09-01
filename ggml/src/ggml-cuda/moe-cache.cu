@@ -1127,6 +1127,7 @@ static bool moe_cache_type_supported(ggml_type type) {
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q8_0_G128:
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:
         case GGML_TYPE_Q2_K:
@@ -2005,22 +2006,21 @@ static void * moe_cache_session_create(
         std::unordered_set<int> seen_devices;
         size_t default_min_expert_bytes = moe_cache_expert_bytes_ampere_min;
         int minimum_capability = INT_MAX;
-        for (int index = 0; index < n_backends &&
-                            (int)session->devices.size() < session->config.max_devices; index++) {
-            ggml_backend_t backend = (ggml_backend_t)backends[index];
-            if (!backend || !ggml_backend_is_cuda(backend)) {
-                continue;
+        const auto add_backend = [&](ggml_backend_t backend) {
+            if (!backend || !ggml_backend_is_cuda(backend) ||
+                (int)session->devices.size() >= session->config.max_devices) {
+                return;
             }
             ggml_backend_cuda_context * context =
                 (ggml_backend_cuda_context *)backend->context;
             const int logical = context->device;
             const ggml_cuda_device_info & info = ggml_cuda_info();
             if (logical < 0 || logical >= info.device_count) {
-                continue;
+                return;
             }
             const int physical = info.devices[logical].physical_device;
             if (!seen_devices.insert(physical).second) {
-                continue;
+                return;
             }
 
             ggml_cuda_set_device(logical);
@@ -2029,7 +2029,7 @@ static void * moe_cache_session_create(
                 MOE_CACHE_LOG("[moe-cache] CUDA%d skipped: compute capability %d is below %d\n",
                         physical, capability,
                         session->config.min_compute_capability);
-                continue;
+                return;
             }
 
             default_min_expert_bytes = std::max(
@@ -2039,6 +2039,18 @@ static void * moe_cache_session_create(
             session->devices.emplace_back(new moe_cache_device(logical, physical));
             session->devices.back()->automatic_reserve_bytes =
                 moe_cache_recommended_reserve_bytes(info.devices[logical].total_vram);
+        };
+        for (int index = 0; index < n_backends &&
+                            (int)session->devices.size() < session->config.max_devices; index++) {
+            ggml_backend_t backend = (ggml_backend_t)backends[index];
+            if (ggml_backend_is_meta(backend)) {
+                const size_t n_simple = ggml_backend_meta_n_backends(backend);
+                for (size_t i = 0; i < n_simple; ++i) {
+                    add_backend(ggml_backend_meta_simple_backend(backend, i));
+                }
+            } else {
+                add_backend(backend);
+            }
         }
 
         if (session->devices.empty() ||

@@ -879,9 +879,15 @@ Current architecture proof (2026-09-01):
   20.46, 20.48, and 19.75 GiB pools. Five cold/warm requests generated correct
   answers or coherent code; repeated code decode rose from 8.11 to 9.25 t/s.
   Clean teardown reported 86.3--87.4% residency-probe hits, 16,521 successful
-  fills, and zero fill, dispatch, or collection failures. This proves `auto`
-  plus expert-parallel operation; `on`, `soft`, fixed budgets, eviction, and
-  multi-slot behavior remain separate gates.
+  fills, and zero fill, dispatch, or collection failures. Explicit `on` also
+  passed with two concurrently active slots: both slots completed their short
+  reasoning probes at 5.67 t/s each, with 5,296 successful fills and zero fill,
+  dispatch, or collection failures. A 4096 MiB/device fixed-budget arm filled
+  all four 962-slot pools, produced the same coherent quicksort twice, warmed
+  decode from 6.37 to 6.93 t/s, and performed 30 replacements without a cache
+  failure. This proves `auto`, `on`, expert-parallel operation, fixed budgets,
+  replacement, and multi-slot execution; cache-aware `soft` placement remains
+  a separate fit gate.
 - The same regression pass restored the legacy `llama_model_init_from_user()`
   callback contract. Callback-backed models synthesize the canonical tensor
   requests because their GGUF metadata is not a complete tensor manifest;
@@ -896,9 +902,56 @@ Current architecture proof (2026-09-01):
   proof found and fixed a reversed grouped-to-tiled V-head permutation, a
   GGUF-only PLE shape probe, two production PLE dimension assumptions, and
   incorrect canonical indexer suffixes.
-- The full production Qwen binary, multimodal path, split placement, adaptive
-  expert cache, MTP/VBR, long-context, and KLD gates remain required. The tiny
-  fixture is an architecture/transform proof, not a quality model.
+- The official Qwen4 FP8 source at revision
+  `236dfdf285828023ca3bcd3f37366c58a3469b13` now passes a full four-GPU
+  layer-split load with its routed experts and 128-shard PLE table in host
+  memory. The source contains 75,264 block-FP8 tensors. Its PLE embedding is a
+  raw F8 table plus one mandatory parent scale, so the native path keeps the
+  51-GiB table in F8, gathers directly, and applies the scale afterward instead
+  of expanding it to F32. Mapped shard upload reduced end-to-end load time from
+  11:41 to 10:28 on the proof host. Pure Qwen4 row/column permutations retain
+  BF16, while numerical transforms and the CUDA SSM convolution kernel retain
+  their required F32 contract; focused fixtures pin all three cases. Final
+  model buffers were 1945.82, 1735.39, 1883.13, and 2664.95 MiB on CUDA plus
+  167040.86 MiB in pinned host memory. With the cache disabled, deterministic
+  probes returned `Paris` and `Berlin` at 16.2--16.5 prompt t/s and 8.3--8.7
+  decode t/s. Teardown released all device and host allocations; it also logged
+  a non-fatal pre-existing compute-buffer expectation mismatch, so accounting
+  silence is not claimed by this gate.
+- Qwen4's checkpoint stores each routed expert as a separate 128x128-block-FP8
+  matrix, while the current portable `MUL_MAT_ID`, CPU-offload, and MoE-cache
+  contract requires one canonical 3-D allocation root without a block-scale
+  sidecar. The bounded bridge therefore converts each expert independently to
+  `Q8_0_G128`: 8.125 bpw versus 8.001 source bpw (+1.55%), with no whole-model
+  duplicate. A two-expert fixture verifies independent values and scale-grid
+  orientation. This is a portability bridge, not a fidelity result: the added
+  requantization requires reference KLD before production acceptance, and an
+  exact block-FP8 `MUL_MAT_ID` path remains a possible later optimization.
+- The canonical `Q8_0_G128` expert bridge now participates in adaptive caching.
+  The cache admission allowlist and both its dedicated and fused dispatch
+  switches accept the type; the underlying MMVQ type traits and dot product
+  were already shared with ordinary execution. On the official Qwen source,
+  `--moe-cache 4096 --moe-cache-expert-parallel auto` resolved on and allocated
+  2,579 slots on each of four RTX 3090s. The first 64-token quicksort request
+  generated coherent code at 14.95 t/s; an identical warm request produced the
+  same bytes at 23.01 t/s. Eight repeated merge-sort probes then forced 96--135
+  replacements per device while sustaining 22.44--23.45 t/s. All four devices
+  reported zero fill, dispatch, and collection failures.
+- Tensor split exposed two independent Meta-backend enumeration gaps in the
+  cache integration. Admission inspected only the top-level Meta device instead
+  of its physical children, and session creation accepted only top-level CUDA
+  backends even though the scheduler supplies one Meta backend. Both sites now
+  use the public Meta child-enumeration APIs and deduplicate physical devices.
+  On the official Qwen source, `-sm tensor -ts 1,1,1,1 -np 2` resolved the cache
+  on, created one 4,092-MiB/2,579-slot `Q8_0_G128` pool on each RTX 3090, and
+  served two simultaneous slots coherently. A warm concurrent probe returned
+  `Paris` and a correct factorial implementation while all devices performed
+  replacements; fill, dispatch, and collection failures remained zero. This
+  closes the tensor-split and multi-slot cache execution gate, not a throughput
+  comparison against layer split.
+- The full production Qwen multimodal path, cache-aware `soft` placement,
+  MTP/VBR, long-context, and KLD gates remain required. The tiny fixture remains
+  an architecture/transform proof rather than a quality model.
 
 ## 7. Test matrix
 
