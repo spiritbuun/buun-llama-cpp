@@ -1505,6 +1505,65 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
     return nullptr;
 }
 
+// Declared in llama-model.h, which this translation unit deliberately does not
+// include in order to keep the loader/model dependency one-way.
+ggml_tensor * llama_internal_get_shared_tensor(const llama_model * model, llm_tensor tensor);
+
+ggml_tensor * llama_model_loader::borrow_shared_tensor(
+        const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne) {
+    if (tn.tensor != LLM_TENSOR_TOKEN_EMBD && tn.tensor != LLM_TENSOR_OUTPUT) {
+        return nullptr;
+    }
+
+    if (shared_target_tensors < 0) {
+        bool shared = false;
+        get_key(LLM_KV_NEXTN_SHARED_TARGET_TENSORS, shared, false);
+        shared_target_tensors = shared ? 1 : 0;
+    }
+    if (shared_target_tensors == 0) {
+        return nullptr;
+    }
+
+    const std::string name = tn.str();
+    if (get_weight(name.c_str()) != nullptr) {
+        return nullptr;
+    }
+    if (model_shared == nullptr) {
+        throw std::runtime_error(format(
+                "%s: MTP sidecar shares tensor '%s'; load it as a draft of its target model",
+                __func__, name.c_str()));
+    }
+
+    ggml_tensor * source = llama_internal_get_shared_tensor(model_shared, tn.tensor);
+    if (source == nullptr) {
+        throw std::runtime_error(format(
+                "%s: MTP sidecar needs target tensor '%s', but the target does not provide it",
+                __func__, name.c_str()));
+    }
+
+    size_t dim = 0;
+    for (const int64_t expected : ne) {
+        if (dim >= GGML_MAX_DIMS || source->ne[dim] != expected) {
+            throw std::runtime_error(format(
+                    "%s: MTP sidecar and target disagree on '%s': target has %s, draft expects %s",
+                    __func__, name.c_str(), llama_format_tensor_shape(source).c_str(),
+                    llama_format_tensor_shape(ne).c_str()));
+        }
+        ++dim;
+    }
+    for (; dim < GGML_MAX_DIMS; ++dim) {
+        if (source->ne[dim] != 1) {
+            throw std::runtime_error(format(
+                    "%s: MTP sidecar and target disagree on '%s': target has %s, draft expects %s",
+                    __func__, name.c_str(), llama_format_tensor_shape(source).c_str(),
+                    llama_format_tensor_shape(ne).c_str()));
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: borrowing tensor %s from the target model\n", __func__, name.c_str());
+    return source;
+}
+
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
@@ -1778,6 +1837,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
         size_data += ggml_nbytes(ret);
         return ret;
+    }
+
+    // Shared MTP sidecars declare missing input/output tensors explicitly. This
+    // must precede required/optional lookup and tied-output fallback.
+    if (ggml_tensor * shared = borrow_shared_tensor(tn, ne)) {
+        return shared;
     }
 
     LLAMA_LOG_DEBUG("%s: loading tensor %s\n", __func__, tn.str().c_str());

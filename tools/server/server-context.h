@@ -222,6 +222,8 @@ struct server_context_meta {
     bool vbr_dynamic;
     bool vbr_type_k;
     bool vbr_type_v;
+    std::string vbr_entry_type_k;
+    std::string vbr_entry_type_v;
     double vbr_min_bits;
     double vbr_capacity_bits;
     double vbr_selected_bpv;

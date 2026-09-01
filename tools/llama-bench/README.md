@@ -59,6 +59,9 @@ test parameters:
   -ub, --ubatch-size <n>                    (default: 512)
   -ctk, --cache-type-k <t>                  (default: f16)
   -ctv, --cache-type-v <t>                  (default: f16)
+  --vbr-entry <f16|t8|t4|t3|t2|t1>         dynamic VBR entry tier (default: f16)
+  --vbr-floor <t8|t4|t3tcq|t2tcq|t1tcq|auto>
+                                            arm dynamic VBR and set its aggregate floor
   -t, --threads <n>                         (default: system dependent)
   -C, --cpu-mask <hex,hex>                  (default: 0x0)
   --cpu-strict <0|1>                        (default: 0)
@@ -229,6 +232,10 @@ The CSV, JSON, JSONL, and SQL printers use the same runtime-generated schema. In
 | `moe_cache` | string | selected cache policy: `auto`, `on`, `off`, or a per-device MiB budget |
 | `repack` | boolean | whether the loader allows extra buffer types used for weight repacking after cache compatibility rules |
 | `n_gen_warmup` | integer | effective number of untimed generation warmup tokens |
+| `type_k` / `type_v` | string | `vbr` only for the movable side; pinned sides retain their concrete cache type |
+| `vbr_entry` | string | resolved dynamic entry tier, or `none` for a non-VBR matrix row |
+| `vbr_floor` / `vbr_floor_explicit` | number / boolean | resolved aggregate floor and whether it was explicitly supplied |
+| `vbr_vram_bytes` / `vbr_vram_explicit` | integer / boolean | resolved KV VRAM budget (`0` means auto) and whether the option was explicitly supplied |
 
 `moe_cache` records the requested policy, not proof that a cache pool engaged. `repack` records loader policy, not proof that every eligible tensor was repacked. The full field list is emitted by the selected formatter, which avoids copying a version-specific schema into this document.
 

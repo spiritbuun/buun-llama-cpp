@@ -85,6 +85,11 @@ struct llama_model_loader {
     bool no_alloc;
     bool load_mtp;
 
+    // Target model whose embedding/output tensors may be borrowed by an MTP
+    // sidecar that explicitly declares nextn_shared_target_tensors.
+    const struct llama_model * model_shared = nullptr;
+    int shared_target_tensors = -1;
+
     // antirez/ds4 standalone DeepSeek-V4-Flash DSpark support GGUF.  This
     // container intentionally omits the target model's architectural and
     // tokenizer metadata and retains the original mtp.* tensor names.
@@ -213,6 +218,9 @@ struct llama_model_loader {
     struct ggml_tensor * create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+
+    struct ggml_tensor * borrow_shared_tensor(
+        const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne);
 
     void done_getting_tensors(bool partial = false) const;
 

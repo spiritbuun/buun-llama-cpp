@@ -3061,6 +3061,7 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.model_shared                =*/ nullptr,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
@@ -3362,6 +3363,11 @@ float llama_model_rope_freq_scale_train(const llama_model * model) {
     return model->hparams.rope_freq_scale_train;
 }
 
+bool llama_model_shared_output_needs_separate_copy(
+        bool copy_embedding, bool copy_output, bool tied_output) {
+    return copy_output && !(copy_embedding && tied_output);
+}
+
 void llama_model_share_tensors(llama_model * dst, const llama_model * src) {
     // a target tensor can be shared by pointer only if the drafter can schedule it: host
     // buffers and buffers on one of the drafter's own devices. Meta (tensor-sharded)
@@ -3414,7 +3420,12 @@ void llama_model_share_tensors(llama_model * dst, const llama_model * src) {
         return out;
     };
     ggml_tensor * embd_cp = copy_embd ? declare_copy(src->tok_embd) : nullptr;
-    ggml_tensor * out_cp  = copy_out  ? declare_copy(src->output)   : nullptr;
+    const bool tied_output = src->output == src->tok_embd;
+    const bool copy_out_separately = llama_model_shared_output_needs_separate_copy(
+            copy_embd, copy_out, tied_output);
+    ggml_tensor * out_cp = copy_out_separately
+        ? declare_copy(src->output)
+        : (copy_out ? embd_cp : nullptr);
     const size_t copy_bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx, buft);
 
     ggml_backend_buffer_t buf;
@@ -3446,7 +3457,7 @@ void llama_model_share_tensors(llama_model * dst, const llama_model * src) {
         if (embd_cp != nullptr) {
             gather(src->tok_embd, embd_cp);
         }
-        if (out_cp != nullptr) {
+        if (out_cp != nullptr && out_cp != embd_cp) {
             gather(src->output, out_cp);
         }
     }
@@ -3914,6 +3925,15 @@ bool llama_model_is_diffusion(const llama_model * model) {
 
 const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_tensor_map(const llama_model * model) {
     return model->tensors_by_name;
+}
+
+ggml_tensor * llama_internal_get_shared_tensor(const llama_model * model, llm_tensor tensor) {
+    GGML_ASSERT(model != nullptr);
+    switch (tensor) {
+        case LLM_TENSOR_TOKEN_EMBD:  return model->tok_embd;
+        case LLM_TENSOR_OUTPUT:      return model->output;
+        default:                     return nullptr;
+    }
 }
 
 int32_t llama_model_n_expert(const struct llama_model * model) {

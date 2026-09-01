@@ -884,3 +884,14 @@ const char * llm_type_name(llm_type type);
 // For internal test use
 // TODO: remove
 const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_tensor_map(const llama_model * model);
+
+// Resolve the model-owned tensor object for the small set of global tensors
+// that an explicitly marked MTP sidecar may borrow. Unlike a name lookup this
+// preserves tied-output models, where output points at token_embd and no
+// output.weight entry exists in the tensor map.
+ggml_tensor * llama_internal_get_shared_tensor(const llama_model * model, llm_tensor tensor);
+
+// Internal pure seam for the tied embedding/output copy plan used by
+// llama_model_share_tensors().
+bool llama_model_shared_output_needs_separate_copy(
+        bool copy_embedding, bool copy_output, bool tied_output);

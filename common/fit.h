@@ -73,6 +73,7 @@ struct common_fit_extra_model {
     uint32_t fixed_n_ctx = 0;
     const common_fit_extra_model * next = nullptr;
     bool optional_if_no_mtp = false;
+    bool borrows_target_tensors = false;
 };
 
 uint32_t common_fit_extra_context_size(

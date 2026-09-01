@@ -1,17 +1,18 @@
 // Dynamic VBR (S2, "option C"): CUDA/HIP virtual-memory pool for the KV cache.
 //
 // One cuMemAddressReserve VA range holds every (layer,side) KV tensor at a FIXED, page-aligned
-// offset sized for its MAX tier (F16 x kv_size) — tensor data pointers never move. Physical 2MB
-// pages are mapped on demand as the write watermark advances and unmapped from a tensor's tail
+// offset sized for its MAX tier (F16 x kv_size) — tensor data pointers never move. Physical
+// commit chunks are mapped on demand as the write watermark advances and unmapped from a tensor's tail
 // after a tier degrade shrinks its byte footprint. Freed pages are fungible across tensors, so
 // no relocation/compaction is ever needed. Same-source on ROCm (vendors/hip.h maps cuMem*).
 //
-// Chunks are tracked at allocation-granularity (typically 2MB). Handles are released immediately
+// Chunks are tracked at the effective commit granularity. Handles are released immediately
 // after mapping (physical is freed by cuMemUnmap), matching ggml_cuda_pool_vmm; per-chunk unmap
 // also sidesteps ROCR-Runtime issue #285 (can't unmap one giant range on HIP).
 
 #include "common.cuh"
 #include "ggml-cuda.h"
+#include "vbr-vmm-policy.h"
 
 #include <set>
 
@@ -31,7 +32,17 @@ bool ggml_backend_cuda_vmm_available(int device) {
 }
 
 size_t ggml_backend_cuda_vmm_granularity(int device) {
-    return ggml_backend_cuda_vmm_available(device) ? ggml_cuda_info().devices[device].vmm_granularity : 0;
+    if (!ggml_backend_cuda_vmm_available(device)) {
+        return 0;
+    }
+    return ggml_cuda_vbr_vmm_commit_granularity(
+        ggml_cuda_info().devices[device].vmm_granularity,
+#if defined(GGML_USE_HIP)
+        true
+#else
+        false
+#endif
+    );
 }
 
 ggml_vbr_vmm_pool * ggml_backend_cuda_vmm_pool_init(int device, size_t va_size) {
@@ -40,7 +51,7 @@ ggml_vbr_vmm_pool * ggml_backend_cuda_vmm_pool_init(int device, size_t va_size) 
     }
     auto * pool = new ggml_vbr_vmm_pool;
     pool->device = device;
-    pool->gran   = ggml_cuda_info().devices[device].vmm_granularity;
+    pool->gran   = ggml_backend_cuda_vmm_granularity(device);
     pool->va_size = GGML_PAD(va_size, pool->gran);
     CUdeviceptr base = 0;
     if (cuMemAddressReserve(&base, pool->va_size, 0, 0, 0) != CUDA_SUCCESS) {

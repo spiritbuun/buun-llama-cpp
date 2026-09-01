@@ -24,7 +24,7 @@ int main(int argc, char ** argv) {
     const int device = argc > 1 ? std::atoi(argv[1]) : 0;
     const ggml_vbr_backend_iface * be = ggml_backend_cuda_vbr_iface();
     if (be == nullptr || device < 0 || device >= be->get_device_count() || !be->vmm_available(device)) {
-        std::printf("SKIP: CUDA device %d has no VMM support\n", device);
+        std::printf("SKIP: GPU device %d has no VMM support\n", device);
         return 0;
     }
 

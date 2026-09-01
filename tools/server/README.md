@@ -23,8 +23,8 @@ For the full list of features, please refer to [server's changelog](https://gith
 
 ## VBR (variable-bit-rate KV cache)
 
-`-ctk vbr` runs the KV cache under the dynamic VBR controller: it starts at the turbo8
-tier and degrades tensors down a measured price order as the context fills, within an
+`-ctk vbr` runs the KV cache under the dynamic VBR controller: it starts at F16 by
+default (or the explicit `--vbr-entry` tier) and degrades tensors down a measured price order as the context fills, within an
 auto-derived (or `--vbr-vram`) VRAM budget. See [docs/vbr.md](../../docs/vbr.md) for
 flags, the floor semantics and limitations. Server specifics: `/props` and `/models`
 expose a `vbr` object; the ordinary nonzero `--cache-ram` budget automatically enables
@@ -87,6 +87,9 @@ full matrix is in
 | `--no-host` | bypass host buffer allowing extra buffers to be used<br/>(env: LLAMA_ARG_NO_HOST) |
 | `-ctk, --cache-type-k TYPE` | KV cache data type for K<br/>allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1, turbo tiers, vbr<br/>(default: dynamic VBR with an implicit t4 floor; explicit `vbr` without `--vbr-floor` opens the ladder to t1, see [docs/vbr.md](../../docs/vbr.md))<br/>(env: LLAMA_ARG_CACHE_TYPE_K) |
 | `-ctv, --cache-type-v TYPE` | KV cache data type for V<br/>allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1, turbo tiers, vbr<br/>(default: dynamic VBR with an implicit t4 floor; explicit `vbr` without `--vbr-floor` opens the ladder to t1)<br/>(env: LLAMA_ARG_CACHE_TYPE_V) |
+| `--vbr-entry TIER` | dynamic VBR entry tier: f16 (default), t8, t4, t3, t2, or t1. Lower entries explicitly trade quality for bandwidth<br/>(env: LLAMA_ARG_VBR_ENTRY) |
+| `--vbr-floor BITS` | aggregate dynamic-VBR quality floor; accepts a tier alias or literal bits/value<br/>(env: LLAMA_ARG_VBR_MIN_BITS) |
+| `--vbr-vram SIZE` | KV VRAM budget; default auto derives it from remaining VRAM<br/>(env: LLAMA_ARG_VBR_VRAM_BUDGET) |
 | `-dt, --defrag-thold N` | KV cache defragmentation threshold (DEPRECATED)<br/>(env: LLAMA_ARG_DEFRAG_THOLD) |
 | `--rpc SERVERS` | comma-separated list of RPC servers (host:port)<br/>(env: LLAMA_ARG_RPC) |
 | `--mlock` | DEPRECATED in favor of `--load-mode`: force system to keep model in RAM rather than swapping or compressing<br/>(env: LLAMA_ARG_MLOCK) |

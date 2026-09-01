@@ -80,6 +80,25 @@ Q4_K_M MTP head, 16K and 8K lost more draft acceptance than their smaller heads 
 Unsupported architectures, model sizes, split files, and already-trimmed sidecars
 fall back to their original behavior.
 
+Qwen3.8-Flash-Next uses the official MTP sidecars published with the
+[Unsloth GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF). Prefer the
+`shared-Q8_0` sidecar on memory-constrained GPUs: it borrows the target model's
+embedding and output tensors instead of loading duplicate copies. The target must
+remain loaded for the lifetime of the sidecar. A shared sidecar therefore cannot be
+loaded as a standalone target, and mismatched target tensor shapes are rejected.
+
+```bash
+llama-server -m Qwen3.8-Flash-Next.gguf \
+    -md mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
+    --spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-p-min 0
+```
+
+This path is intended primarily for low-concurrency serving. CUDA graphs keep a
+bounded cache for the alternating verification shapes, and the Qwen4 recurrent and
+PLE convolution histories are included in partial rollback. For byte-for-byte
+speculative/non-speculative comparisons, also pass `--ctx-checkpoints 0` so server
+prompt-checkpoint recomputation does not introduce an independent numerical change.
+
 ### DFlash (`draft-dflash`)
 
 DFlash produces an entire block of draft tokens in a single forward pass (block diffusion) and

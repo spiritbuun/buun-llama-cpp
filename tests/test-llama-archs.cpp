@@ -609,7 +609,44 @@ static void test_qwen4_ple_recurrent_resize(const size_t seed) {
     GGML_ASSERT(llama_decode(ctx.get(), llama_batch_get_one(&second, 1)) == 0);
     llama_synchronize(ctx.get());
 
-    printf("Qwen4 PLE recurrent resize test PASSED\n");
+    // A four-token speculative verify must populate rollback histories for
+    // both Qwen4 convolution owners. Roll back two rejected tokens and compare
+    // the next-token logits with a context that never observed them.
+    llama_context_params rollback_params = ctx_params;
+    rollback_params.n_seq_max = 1;
+    llama_context_ptr rollback_ctx(llama_init_from_model(model.get(), rollback_params));
+    llama_context_ptr reference_ctx(llama_init_from_model(model.get(), rollback_params));
+    GGML_ASSERT(rollback_ctx != nullptr && reference_ctx != nullptr);
+
+    const llama_token rollback_tokens[] = { 7, 11, 13, 17, 19, 23 };
+    const auto decode_range = [&](llama_context * lctx, int begin, int end, bool logits) {
+        llama_batch batch = llama_batch_init(end - begin, 0, 1);
+        for (int i = begin; i < end; ++i) {
+            common_batch_add(batch, rollback_tokens[i], i, { 0 }, logits && i + 1 == end);
+        }
+        const bool ok = llama_decode(lctx, batch) == 0;
+        llama_batch_free(batch);
+        return ok;
+    };
+
+    GGML_ASSERT(decode_range(reference_ctx.get(), 0, 4, false));
+    GGML_ASSERT(decode_range(rollback_ctx.get(),  0, 2, false));
+    GGML_ASSERT(decode_range(rollback_ctx.get(),  2, 6, false));
+    GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(rollback_ctx.get()), 0, 4, -1));
+    GGML_ASSERT(decode_range(reference_ctx.get(), 4, 5, true));
+    GGML_ASSERT(decode_range(rollback_ctx.get(),  4, 5, true));
+    llama_synchronize(reference_ctx.get());
+    llama_synchronize(rollback_ctx.get());
+
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+    const float * reference_logits = llama_get_logits(reference_ctx.get());
+    const float * rollback_logits  = llama_get_logits(rollback_ctx.get());
+    GGML_ASSERT(reference_logits != nullptr && rollback_logits != nullptr);
+    for (int32_t i = 0; i < n_vocab; ++i) {
+        GGML_ASSERT(fabsf(reference_logits[i] - rollback_logits[i]) <= 1e-6f);
+    }
+
+    printf("Qwen4 PLE recurrent resize/rollback test PASSED\n");
 }
 
 static std::vector<float> get_logits(
@@ -626,6 +663,32 @@ static void test_dflash_selector_family_contract() {
     GGML_ASSERT(llm_dflash_selector_family_from_identity(true,  false, true)  == family::upstream_compat);
     GGML_ASSERT(llm_dflash_selector_family_from_identity(false, true,  true)  == family::mixed);
     GGML_ASSERT(llm_dflash_selector_family_from_identity(true,  true,  true)  == family::mixed);
+
+    const auto fork_schema = llm_dflash_selector_tensor_schema_for_family(family::fork_dflash2);
+    GGML_ASSERT(fork_schema.valid);
+    GGML_ASSERT(fork_schema.selector_hidden == LLM_TENSOR_DFLASH2_SELECTOR_HIDDEN);
+    GGML_ASSERT(fork_schema.selector_pred   == LLM_TENSOR_DFLASH2_SELECTOR_PRED);
+    GGML_ASSERT(fork_schema.selector_succ   == LLM_TENSOR_DFLASH2_SELECTOR_SUCC);
+    GGML_ASSERT(fork_schema.attn_conv_base  == LLM_TENSOR_DFLASH2_ATTN_CONV_BASE);
+    GGML_ASSERT(fork_schema.attn_conv_proj  == LLM_TENSOR_DFLASH2_ATTN_CONV_PROJ);
+    GGML_ASSERT(fork_schema.ffn_conv_base   == LLM_TENSOR_DFLASH2_FFN_CONV_BASE);
+    GGML_ASSERT(fork_schema.ffn_conv_proj   == LLM_TENSOR_DFLASH2_FFN_CONV_PROJ);
+    GGML_ASSERT(!fork_schema.selector_codebooks_have_weight_suffix);
+
+    const auto upstream_schema = llm_dflash_selector_tensor_schema_for_family(family::upstream_compat);
+    GGML_ASSERT(upstream_schema.valid);
+    GGML_ASSERT(upstream_schema.selector_hidden == LLM_TENSOR_DFLASH_SELECTOR_HIDDEN);
+    GGML_ASSERT(upstream_schema.selector_pred   == LLM_TENSOR_DFLASH_SELECTOR_PREV);
+    GGML_ASSERT(upstream_schema.selector_succ   == LLM_TENSOR_DFLASH_SELECTOR_NEXT);
+    GGML_ASSERT(upstream_schema.attn_conv_base  == LLM_TENSOR_DFLASH_ATTN_CONV_BASE);
+    GGML_ASSERT(upstream_schema.attn_conv_proj  == LLM_TENSOR_DFLASH_ATTN_CONV_PROJ);
+    GGML_ASSERT(upstream_schema.ffn_conv_base   == LLM_TENSOR_DFLASH_FFN_CONV_BASE);
+    GGML_ASSERT(upstream_schema.ffn_conv_proj   == LLM_TENSOR_DFLASH_FFN_CONV_PROJ);
+    GGML_ASSERT(upstream_schema.selector_codebooks_have_weight_suffix);
+
+    GGML_ASSERT(!llm_dflash_selector_tensor_schema_for_family(family::none).valid);
+    GGML_ASSERT(!llm_dflash_selector_tensor_schema_for_family(family::mixed).valid);
+    GGML_ASSERT(!llm_dflash_selector_tensor_schema_for_family(family::unidentified).valid);
 }
 
 static void test_qwen4_qsa_layout_cpu(llama_model * model, size_t seed) {
@@ -1658,11 +1721,12 @@ static void test_qwen4_vbr_cuda(const size_t seed) {
     };
     const uint32_t saved_top_k = model->hparams.indexer_top_k;
     model->hparams.indexer_top_k = 8;
-    const auto gathered_logits = [&](ggml_type type_v, qsa_gather_trace & gather_trace) {
+    const auto gathered_logits = [&](ggml_type type_k, ggml_type type_v, qsa_gather_trace & gather_trace) {
         llama_context_params gather_params = static_ref_params;
         gather_params.n_ctx = 128;
         gather_params.n_batch = 64;
         gather_params.n_ubatch = 64;
+        gather_params.type_k = type_k;
         gather_params.type_v = type_v;
         gather_params.cb_eval = trace_qsa_gather;
         gather_params.cb_eval_user_data = &gather_trace;
@@ -1675,12 +1739,20 @@ static void test_qwen4_vbr_cuda(const size_t seed) {
         return last_logits(gather_ctx.get());
     };
     qsa_gather_trace gather_f16_trace;
+    qsa_gather_trace gather_turbo_k_trace;
     qsa_gather_trace gather_turbo_v_trace;
-    const auto gather_f16_logits = gathered_logits(GGML_TYPE_F16, gather_f16_trace);
-    const auto gather_turbo_v_logits = gathered_logits(GGML_TYPE_TURBO8_0, gather_turbo_v_trace);
+    const auto gather_f16_logits = gathered_logits(
+        GGML_TYPE_F16, GGML_TYPE_F16, gather_f16_trace);
+    const auto gather_turbo_k_logits = gathered_logits(
+        GGML_TYPE_TURBO8_0, GGML_TYPE_F16, gather_turbo_k_trace);
+    const auto gather_turbo_v_logits = gathered_logits(
+        GGML_TYPE_F16, GGML_TYPE_TURBO8_0, gather_turbo_v_trace);
+    const double gather_k_nmse = nmse(gather_f16_logits, gather_turbo_k_logits);
     const double gather_v_nmse = nmse(gather_f16_logits, gather_turbo_v_logits);
     GGML_ASSERT(gather_f16_trace.inverse_wht == 0);
+    GGML_ASSERT(gather_turbo_k_trace.inverse_wht > 0);
     GGML_ASSERT(gather_turbo_v_trace.inverse_wht > 0);
+    GGML_ASSERT(std::isfinite(gather_k_nmse) && gather_k_nmse <= 1.0e-5);
     GGML_ASSERT(std::isfinite(gather_v_nmse) && gather_v_nmse <= 1.0e-5);
 
     // The same eight-token continuation runs through gather when decoded token by token and scan
@@ -1859,9 +1931,9 @@ static void test_qwen4_vbr_cuda(const size_t seed) {
     GGML_ASSERT(std::isfinite(fork1_nmse) && fork1_nmse <= 1.0e-10);
 
     model->hparams.indexer_top_k = saved_top_k;
-    printf("Qwen4 selected-cell gather F16/Turbo8 V NMSE %.9g, scan parity %.9g, "
+    printf("Qwen4 selected-cell gather Turbo8 K/V NMSE %.9g/%.9g, scan parity %.9g, "
            "streams %.9g/%.9g, dormant %.9g, unified fork %.9g/%.9g\n",
-           gather_v_nmse, gather_scan_nmse, stream0_nmse, stream1_nmse,
+           gather_k_nmse, gather_v_nmse, gather_scan_nmse, stream0_nmse, stream1_nmse,
            dormant_nmse, fork0_nmse, fork1_nmse);
 
     // Dynamic device VBR needs a non-transposed FA cache, so an explicit FA-off
@@ -1937,6 +2009,15 @@ static void test_qwen4_vbr_cuda(const size_t seed) {
     GGML_ASSERT(llama_kv_cache_vbr_epoch_test::n_stream(idx) == 1);
     GGML_ASSERT(llama_kv_cache_vbr_epoch_test::map_seed_watermark(attn));
     GGML_ASSERT(idx->type_k() == GGML_TYPE_F16 && idx->type_v() == GGML_TYPE_F16);
+
+    // Entry and floor queries use the same bits-per-context-token unit. This pins the fit's
+    // fractional-floor denominator against accidentally returning aggregate bits/value.
+    const double entry_f16 = llama_vbr_entry_bits_per_token(ctx.get(), GGML_TYPE_F16, GGML_TYPE_F16);
+    const double floor_f16 = llama_vbr_floor_bits_per_token(ctx.get(), GGML_TYPE_F16, GGML_TYPE_F16, 16.0);
+    const double floor_six = llama_vbr_floor_bits_per_token(ctx.get(), GGML_TYPE_F16, GGML_TYPE_F16, 6.0);
+    const double price_t4  = llama_vbr_entry_bits_per_token(ctx.get(), GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0);
+    GGML_ASSERT(entry_f16 > 0.0 && std::abs(entry_f16 - floor_f16) <= entry_f16*1.0e-12);
+    GGML_ASSERT(floor_six > price_t4 && floor_six/price_t4 < 2.0);
 
     decode_range(ctx.get(), 0, 256);
     GGML_ASSERT(trace.raw_key_nodes > 0);
@@ -2480,7 +2561,7 @@ static void test_dflash_loader_exact_identity() {
         return;
     }
 
-    const auto check = [](const char * stored_name, bool expect_fork, llm_dflash_selector_family expected_family) {
+    const auto check = [](const char * stored_name, bool fork_wire, llm_dflash_selector_family expected_family) {
         file_ptr file = make_dflash_selector_identity_file({ stored_name });
         GGML_ASSERT(file != nullptr);
         std::vector<std::string> splits;
@@ -2501,10 +2582,10 @@ static void test_dflash_loader_exact_identity() {
 
         // Generic tensor lookup must not cross the two wire families. Admission
         // below owns the compatibility decision before any tensor is loaded.
-        GGML_ASSERT((loader.get_tensor_meta("selector.hidden_proj.weight") != nullptr) == expect_fork);
-        GGML_ASSERT((loader.get_tensor_meta("selector_hidden.weight") != nullptr) != expect_fork);
-        GGML_ASSERT((loader.get_tensor_meta_exact("selector.hidden_proj.weight") != nullptr) == expect_fork);
-        GGML_ASSERT((loader.get_tensor_meta_exact("selector_hidden.weight") != nullptr) != expect_fork);
+        GGML_ASSERT((loader.get_tensor_meta("selector.hidden_proj.weight") != nullptr) == fork_wire);
+        GGML_ASSERT((loader.get_tensor_meta("selector_hidden.weight") != nullptr) != fork_wire);
+        GGML_ASSERT((loader.get_tensor_meta_exact("selector.hidden_proj.weight") != nullptr) == fork_wire);
+        GGML_ASSERT((loader.get_tensor_meta_exact("selector_hidden.weight") != nullptr) != fork_wire);
         GGML_ASSERT(llm_dflash_selector_family_from_loader(true, 1, loader) == expected_family);
 
         llama_model_params params = llama_model_default_params();
@@ -2520,17 +2601,13 @@ static void test_dflash_loader_exact_identity() {
             admitted = false;
             refusal = error.what();
         }
-        if (admitted != expect_fork) {
+        if (!admitted) {
             std::fprintf(stderr, "DFlash admission mismatch stored=%s admitted=%d refusal=%s\n",
                     stored_name, int(admitted), refusal.c_str());
         }
-        GGML_ASSERT(admitted == expect_fork);
-        if (expect_fork) {
-            GGML_ASSERT(model->hparams.dflash2_selector_rank == 1);
-        } else {
-            GGML_ASSERT(refusal.find("upstream DFlash convolution/selector tensor schema is unsupported") !=
-                    std::string::npos);
-        }
+        GGML_ASSERT(admitted);
+        GGML_ASSERT(model->hparams.dflash2_selector_rank == 1);
+        GGML_ASSERT(llm_dflash_selector_tensor_schema_for_family(expected_family).valid);
     };
 
     check("selector.hidden_proj.weight", true,  llm_dflash_selector_family::fork_dflash2);
@@ -2816,7 +2893,10 @@ static gguf_context_ptr get_qwen4_mtp_gguf_ctx(uint32_t n_nextn = 1) {
 }
 
 static file_ptr make_qwen4_mtp_sidecar(
-        const size_t seed, std::vector<float> & target_h, const char * omit_tensor = nullptr) {
+        const size_t seed,
+        std::vector<float> & target_h,
+        const char * omit_tensor = nullptr,
+        bool shared_target_tensors = false) {
     file_ptr file = make_test_tmpfile();
     if (!file) {
         return file;
@@ -2891,9 +2971,14 @@ static file_ptr make_qwen4_mtp_sidecar(
     gguf_context_ptr sidecar_gguf(gguf_init_empty());
     gguf_set_kv(sidecar_gguf.get(), source_gguf.get());
     llama_model_saver saver(LLM_ARCH_QWEN4EXP, sidecar_gguf.get());
+    if (shared_target_tensors) {
+        saver.add_kv(LLM_KV_NEXTN_SHARED_TARGET_TENSORS, true);
+    }
     for (const auto & entry : llama_internal_get_tensor_map(source.get())) {
         if (entry.first.rfind("blk.0.", 0) == 0 ||
                 entry.first.rfind("output_hc_", 0) == 0 ||
+                (shared_target_tensors &&
+                    (entry.first == "token_embd.weight" || entry.first == "output.weight")) ||
                 (omit_tensor != nullptr && entry.first == omit_tensor)) {
             continue;
         }
@@ -3122,6 +3207,55 @@ static void test_qwen4_mtp_sidecar_contract(const size_t seed) {
     llama_context_ptr target_ctx(llama_init_from_model(target_model.get(), target_ctx_params));
     GGML_ASSERT(target_ctx != nullptr);
     ctx_params.ctx_other = target_ctx.get();
+
+    // The official compact sidecar declares that its global embedding and LM
+    // head come from the target. It must fail closed on its own, then borrow
+    // the exact target tensor objects without allocating duplicate weights.
+    std::vector<float> shared_target_h;
+    file_ptr shared_file = make_qwen4_mtp_sidecar(
+            seed, shared_target_h, nullptr, /* shared_target_tensors = */ true);
+    GGML_ASSERT(shared_file != nullptr);
+    llama_model_params detached_shared_params = model_params;
+    llama_model_ptr detached_shared(llama_model_load_from_file_ptr(
+            shared_file.get(), detached_shared_params));
+    GGML_ASSERT(detached_shared == nullptr);
+    rewind(shared_file.get());
+
+    llama_model_params shared_params = model_params;
+    shared_params.model_shared = target_model.get();
+    const int64_t target_embd_ne0 = target_model->tok_embd->ne[0];
+    target_model->tok_embd->ne[0] = target_embd_ne0 + 1;
+    llama_model_ptr mismatched_shared(llama_model_load_from_file_ptr(
+            shared_file.get(), shared_params));
+    target_model->tok_embd->ne[0] = target_embd_ne0;
+    GGML_ASSERT(mismatched_shared == nullptr);
+    rewind(shared_file.get());
+
+    llama_model_ptr shared_model(llama_model_load_from_file_ptr(shared_file.get(), shared_params));
+    GGML_ASSERT(shared_model != nullptr);
+    GGML_ASSERT(shared_model->tok_embd == target_model->tok_embd);
+    GGML_ASSERT(shared_model->output   == target_model->output);
+
+    // A tied target has no distinct output tensor/name. Borrow by the model's
+    // output role rather than by the sidecar's output.weight spelling.
+    rewind(shared_file.get());
+    ggml_tensor * target_output = target_model->output;
+    target_model->output = target_model->tok_embd;
+    llama_model_ptr tied_shared_model(llama_model_load_from_file_ptr(shared_file.get(), shared_params));
+    target_model->output = target_output;
+    GGML_ASSERT(tied_shared_model != nullptr);
+    GGML_ASSERT(tied_shared_model->output == target_model->tok_embd);
+    GGML_ASSERT(!llama_model_shared_output_needs_separate_copy(true, true, true));
+    GGML_ASSERT(llama_model_shared_output_needs_separate_copy(true, true, false));
+    GGML_ASSERT(llama_model_shared_output_needs_separate_copy(false, true, true));
+    GGML_ASSERT(!llama_model_shared_output_needs_separate_copy(true, false, true));
+
+    llama_context_ptr shared_ctx(llama_init_from_model(shared_model.get(), ctx_params));
+    GGML_ASSERT(shared_ctx != nullptr);
+    ggml_cgraph * shared_gf = llama_graph_reserve(shared_ctx.get(), 2, 1, 1);
+    GGML_ASSERT(shared_gf != nullptr);
+    GGML_ASSERT(ggml_graph_get_tensor(shared_gf, "mtp_h_input") != nullptr);
+    GGML_ASSERT(ggml_graph_get_tensor(shared_gf, "result_output") != nullptr);
 
     llama_context_ptr ctx(llama_init_from_model(model.get(), ctx_params));
     if (!ctx) {

@@ -423,14 +423,7 @@ common_vbr_cpu_fallback_result common_params_apply_vbr_cpu_fallback(
 
     // Only the untouched common default may fall back. Every explicit VBR
     // selector remains armed so the core emits its existing hard refusal.
-    const bool explicit_vbr =
-        params.vbr_cache_type_k_explicit ||
-        params.vbr_cache_type_v_explicit ||
-        params.vbr_budget_explicit ||
-        params.vbr_min_bits_explicit ||
-        params.vbr_vram_budget_explicit ||
-        params.vbr_policy_explicit;
-    if (explicit_vbr) {
+    if (params.vbr_explicitly_selected()) {
         return common_vbr_cpu_fallback_result::explicit_vbr;
     }
 
@@ -448,10 +441,42 @@ common_vbr_cpu_fallback_result common_params_apply_vbr_cpu_fallback(
     // Drop the derived t4 floor that was attached to the implicit aliases.
     // It is not marked explicit, but common_context_params_to_llama transports
     // the scalar independently and would otherwise re-arm VBR.
-    params.vbr_min_bits = "auto";
-    params.vbr_min_bits_value = 0.0;
-    params.vbr_capacity_bits = 0.0;
+    params.reset_vbr_runtime_state();
     return common_vbr_cpu_fallback_result::applied;
+}
+
+bool common_vbr_resolve_coupled_cache_types(common_params & params, llama_context_params & cparams) {
+    const bool k_authoritative = params.cache_type_k_explicit && !params.vbr_cache_type_k;
+    const bool v_authoritative = params.cache_type_v_explicit && !params.vbr_cache_type_v;
+    const bool k_vbr_explicit = params.vbr_cache_type_k_explicit;
+    const bool v_vbr_explicit = params.vbr_cache_type_v_explicit;
+    if ((k_authoritative && v_vbr_explicit) || (v_authoritative && k_vbr_explicit)) {
+        throw std::invalid_argument(
+            "coupled-KV models cannot combine an explicit static cache side with an explicit VBR peer");
+    }
+    if (k_authoritative == v_authoritative) {
+        return false; // neither static side, or two static sides whose equality core validates
+    }
+    if (params.vbr_explicitly_selected()) {
+        throw std::invalid_argument(
+            "explicit VBR controls cannot be combined with a single static K/V type on a coupled-KV model");
+    }
+
+    const ggml_type t = k_authoritative ? cparams.type_k : cparams.type_v;
+    cparams.type_k = t;
+    cparams.type_v = t;
+    params.cache_type_k = t;
+    params.cache_type_v = t;
+    params.reset_vbr_runtime_state();
+    cparams.vbr_dynamic = false;
+    cparams.vbr_min_bits = 0.0;
+    cparams.vbr_vram_budget_bytes = 0;
+    cparams.vbr_growth_headroom_bytes = 0;
+    cparams.vbr_min_bits_explicit = false;
+    cparams.vbr_budget_explicit = false;
+    cparams.vbr_pin_k = false;
+    cparams.vbr_pin_v = false;
+    return true;
 }
 
 common_vbr_prompt_cache_mode common_vbr_prompt_cache_mode_for(
@@ -1394,15 +1419,13 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
         // the draft context is created from the same base params and follows the main context, fit both together
         const bool has_draft = params.speculative.has_dft();
-        const bool spec_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
-            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+        const bool spec_mtp = params.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
 
         common_params params_dft = common_base_params_to_speculative(params);
 
         auto mparams_dft = common_model_params_to_llama(params_dft);
         auto cparams_dft = common_context_params_to_llama(params_dft);
-        const bool extra_is_mtp = spec_mtp &&
-            !params.speculative.has_non_mtp_model_drafter();
+        const bool extra_is_mtp = params.speculative.uses_mtp_as_primary_drafter();
         if (extra_is_mtp) {
             const auto mtp_context = common_speculative_mtp_context_params_resolve(
                 0, params.speculative.draft.n_ctx,
@@ -1446,6 +1469,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             /*.fixed_n_ctx  =*/ extra_is_mtp && params.speculative.draft.n_ctx > 0
                 ? (uint32_t) params.speculative.draft.n_ctx : 0,
             /*.next         =*/ spec_mtp && !extra_is_mtp ? &extra_mtp : nullptr,
+            /*.optional_if_no_mtp =*/ false,
+            /*.borrows_target_tensors =*/ has_draft && extra_is_mtp,
         };
 
         const common_params_fit_status fit_status = common_fit_params(
@@ -1550,17 +1575,10 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     // explicitly, mirror it to the other instead of failing; two conflicting explicit types
     // still error at init. When the mirror leaves both sides explicit-static and no --vbr-*
     // knob was given, dynamic VBR is disarmed (a fully pinned cache has nothing to degrade).
-    if (llama_model_kv_cache_types_coupled(model) && cparams.type_k != cparams.type_v &&
-            params.cache_type_k_explicit != params.cache_type_v_explicit) {
-        const ggml_type t = params.cache_type_k_explicit ? cparams.type_k : cparams.type_v;
-        COM_WRN("model requires matching K/V cache types: mirroring %s to both sides\n", ggml_type_name(t));
-        cparams.type_k = t;
-        cparams.type_v = t;
-        if (!params.vbr_budget_explicit && !params.vbr_min_bits_explicit &&
-            !params.vbr_vram_budget_explicit && !params.vbr_policy_explicit &&
-            !params.vbr_cache_type_k_explicit && !params.vbr_cache_type_v_explicit) {
-            cparams.vbr_dynamic = false;
-        }
+    if (llama_model_kv_cache_types_coupled(model) &&
+            common_vbr_resolve_coupled_cache_types(params, cparams)) {
+        COM_WRN("model requires matching K/V cache types: mirrored %s to both sides and disabled implicit VBR\n",
+                ggml_type_name(cparams.type_k));
     }
 
     const llama_vocab * vocab = llama_model_get_vocab(model);

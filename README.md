@@ -70,6 +70,7 @@ contradictory answers.
 | `-ct vbr` (or `-ctk vbr` / `-ctv vbr`) | VBR is already enabled by default. Explicitly selecting it opens the full ladder to t1 when no `--vbr-floor` is supplied. Explicitly pinning a side (`-ctv q8_0`) holds it at fixed bits and never degrades it. Use `-ct f16` or another concrete type to opt out of VBR. |
 | `-c <N>` | Cap the context at N tokens; VBR then spends your whole VRAM budget running *that* window at the highest quality it can, instead of advertising the max floor-tier capacity. E.g. `-c 30000` = the best-quality cache that fits a 30k window. |
 | `--vbr-vram <SIZE>` | Explicit KV VRAM budget (e.g. `8G`). Default `auto` = whatever VRAM is left after weights and compute. |
+| `--vbr-entry <tier>` | Dynamic VBR entry tier. Default `f16` preserves maximum quality; `t8` (or a lower tier) explicitly trades some quality for lower KV bandwidth and memory from the first token. |
 | `--vbr-floor <bits\|tier>` | Literal aggregate bits/value floor for dynamic mode. Implicit VBR defaults to t4 (4.125); explicit `-ct vbr` without this flag uses t1 (1.25). Degrades stop at the last step still ≥ the floor. |
 | `--vbr-budget <tier\|number>` | Default `dynamic` (runtime controller). A tier (`t8/t4/t3/t2/t1`) or a number instead selects a **fixed** static tier — no runtime degrades. |
 
@@ -178,9 +179,35 @@ NVLink.
 
 ### Choose the MoE cache mode
 
-Use `--moe-cache auto` with two or more GPUs. Automatic mode is deliberately conservative and
-requires two eligible devices. On a single GPU, use `--moe-cache on`; otherwise the cache remains
-off and most of the card can sit unused.
+Start with `--fit on --moe-cache soft` on both single- and multi-GPU hosts. This is the recommended
+adaptive path for large CPU-expert models. It first tries the normal model placement and uses only
+spare VRAM; if that cannot form useful cache pools, the fit pass evicts the minimum number of expert
+layers needed to make the cache viable. Explicit tensor overrides, GPU layers, tensor splits, CPU
+affinity, and thread counts remain authoritative.
+
+Leave the other resource knobs unset for the first run. The defaults now:
+
+- derive a per-device safety reserve from each GPU's physical VRAM;
+- cap host-MoE generation threads at the smaller of 12 and the physical cores available to the
+  process, while respecting explicit thread and affinity settings;
+- disable eager whole-model mmap prefetch when the mapping would crowd currently available system
+  or cgroup memory; and
+- persist a bounded per-model expert heatmap in the normal llama.cpp cache directory for later
+  prewarming.
+
+`--moe-cache auto` remains the conservative, repack-preserving default and requires at least two
+eligible devices. `--moe-cache on` forces canonical CPU expert weights immediately. Prefer `soft`
+for a new deployment because it can use one GPU, preserves more of the stock placement when that
+wins, and adapts before resorting to expert eviction.
+
+### Choose the KV/VBR entry tier
+
+For these bandwidth-heavy models, start with `--vbr-entry t8`. This starts the dynamic VBR cache at
+Turbo8 instead of F16, then retains VBR's ability to degrade colder or older regions as its VRAM
+budget fills. Use `--vbr-entry t4` when cache capacity and bandwidth matter more than the additional
+quality loss. Omit the option (F16 entry) when maximum KV quality is more important than decode
+speed. Static `-ctk t8 -ctv t8` and `-ctk t4 -ctv t4` remain useful for fixed-tier comparisons, but
+`--vbr-entry` is the recommended deployment interface.
 
 ### Target model only (two or more GPUs)
 
@@ -188,48 +215,66 @@ off and most of the card can sit unused.
 ./build/bin/llama-server \
   -m DeepSeek-V4-Flash-0731-UD-IQ2_M-00001-of-00003.gguf \
   -ngl 99 -sm layer -fa on -c 8192 -np 1 -ub 4096 \
-  -ctk f16 -ctv f16 \
-  -ot 'exps=CPU' --moe-cache auto \
+  --vbr-entry t8 \
+  -ot 'exps=CPU' --fit on --moe-cache soft \
   --moe-cache-expert-parallel auto \
   --host 0.0.0.0 --port 8081
 ```
 
 `-ot 'exps=CPU'` leaves the routed experts in system RAM while keeping the remaining offloaded
-weights on GPU. `--moe-cache auto` then fills otherwise spare VRAM with the hottest expert tensors
-and adapts their residency as routing changes. Expert-parallel mode divides resident rows within a
-layer across the selected cache devices while the CPU computes misses. `auto` uses both devices on
-a dual-GPU host and caps larger hosts at three-way dispatch. For one GPU, change the cache mode to
-`--moe-cache on` and omit expert parallelism.
+weights on GPU. `--moe-cache soft` then fits the least disruptive viable placement, fills available
+VRAM with the hottest expert tensors, and adapts their residency as routing changes. Expert-parallel
+mode divides resident rows within a layer across the selected cache devices while the CPU computes
+misses. `auto` uses both devices on a dual-GPU host and caps larger hosts at three-way dispatch. On
+one GPU, omit `--moe-cache-expert-parallel auto`; the remaining command is unchanged.
+
+### Qwen3.8 Flash Next + official MTP sidecar
+
+```sh
+./build/bin/llama-server \
+  -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
+  -md MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
+  -ngl 99 -sm layer -fa on -c 8192 -np 1 -ub 512 \
+  --vbr-entry t8 \
+  -ot 'exps=CPU' --fit on --moe-cache soft \
+  --spec-type draft-mtp \
+  --host 0.0.0.0 --port 8081
+```
+
+The shared sidecar borrows the target embedding and output tensors instead of loading duplicate
+copies. On a multi-GPU host, add `--moe-cache-expert-parallel auto` after selecting the intended
+CUDA devices. Prefer layer placement for this CPU-expert workload; tensor splitting has been
+substantially slower in testing.
 
 ### Dual RTX 3090 + DSpark
 
 ```sh
-GGML_CUDA_MOE_CACHE_RESERVE_MB=1024 \
 ./build/bin/llama-server \
   -m DeepSeek-V4-Flash-0731-UD-IQ2_M-00001-of-00003.gguf \
   -md dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf \
   -ngl 99 -sm layer -fa on -c 8192 -np 1 -ub 4096 \
-  -ctk f16 -ctv f16 \
-  -ot 'exps=CPU' --moe-cache auto \
+  --vbr-entry t8 \
+  -ot 'exps=CPU' --fit on --moe-cache soft \
   --moe-cache-expert-parallel auto \
   --spec-type draft-dspark -ngld 0 -otd 'exps=CPU' \
   --spec-draft-n-max 3 --spec-draft-p-min 0 \
-  -t 22 -tb 22 -td 22 -tbd 22 \
   --host 0.0.0.0 --port 8081
 ```
 
 Without expert-parallel dispatch, the best measured dual-RTX-3090 configuration for the IQ2_M
 target averaged about **41.1 tokens/s** on a 24-core EPYC 7443. With complete miss-row accounting,
-the command above produced seven warm 500-token completions at **50.26--52.28 tokens/s**
+the historical manually tuned variant (22 threads and a 1 GiB reserve) produced seven warm
+500-token completions at **50.26--52.28 tokens/s**
 (**51.48 mean**). A 2 GiB reserve reduced the mean to **49.94 tokens/s** but leaves more allocation
 headroom. The expert-parallel cache defaults to admitting up to 16 entries per node and requires 40
 fresh misses before replacing a resident entry; these settings reduce expensive cache churn in
 both one- and two-slot testing. Two concurrent DSpark slots averaged **59.20 aggregate tokens/s**
 over four warm 1,000-token waves and completed every response cleanly.
 
-The 1 GiB reserve is an aggressive performance setting, not the global default. The thread count is
-also machine-specific; using all 24 physical cores reduced this host sharply. Prompt processing
-measured **326 pp/s at 2,048 tokens** before expert parallelism was added.
+The 1 GiB reserve is an aggressive reproduction setting, not the recommendation or global default.
+The adaptive reserve resolves to 1408 MiB on a 24 GiB RTX 3090, and automatic host-MoE threads
+resolve to 12 on this 24-core host. Prompt processing measured **326 pp/s at 2,048 tokens** before
+expert parallelism was added.
 
 On four or more eligible GPUs, `auto` selects three-way dispatch. Fanout and CPU-thread optima are
 host-specific, so compare fanouts two, three, and four rather than assuming every card should join
@@ -249,53 +294,58 @@ use `--spec-draft-device none` to keep the entire drafter on CPU.
   -m DeepSeek-V4-Flash-0731-UD-IQ2_M-00001-of-00003.gguf \
   -md dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf \
   -ngl 99 -sm layer -fa on -c 8192 -np 1 -ub 4096 \
-  -ctk f16 -ctv f16 \
-  -ot 'exps=CPU' --moe-cache on \
+  --vbr-entry t8 \
+  -ot 'exps=CPU' --fit on --moe-cache soft \
   --spec-type draft-dspark -ngld 0 -otd 'exps=CPU' \
   --spec-draft-n-max 2 --spec-draft-p-min 0 \
-  -t 20 -tb 20 -td 20 -tbd 20 \
   --host 0.0.0.0 --port 8081
 ```
 
-On an RTX 3090 with a 24-core EPYC 7443, this configuration averaged **31.5 tokens/s** after
-warmup. Target-only inference with the same forced cache averaged about 24.0 tokens/s. Depth two
-slightly beat depth three and four; depth five was slower. Twenty CPU threads beat 12, 16, 24 and
-32 on this host, but the ideal count is machine-specific—benchmark around your number of physical
-cores while leaving capacity for cache service and server work. Prompt processing measured
-**333 pp/s at 2,048 tokens**.
+On an RTX 3090 with a 24-core EPYC 7443, the older manually tuned F16-KV configuration averaged
+**31.5 tokens/s** after warmup. Target-only inference with the same forced cache averaged about
+24.0 tokens/s. Depth two slightly beat depth three and four; depth five was slower. Twenty CPU
+threads won that historical sweep, but the current automatic 12-thread cap is the portable starting
+point; override it only after a matched local comparison. Prompt processing measured **333 pp/s at
+2,048 tokens**.
 
-The CUDA MoE cache normally keeps a 3 GiB safety reserve. Advanced users can try a 2 GiB reserve:
+The CUDA MoE cache now derives its safety reserve per device: 6% of physical VRAM, rounded to
+128 MiB and clamped to 1--3 GiB (and at most one quarter of the device). This is 1408 MiB on an
+RTX 3090. Leave it automatic initially. Advanced users can still test an explicit 2 GiB reserve:
 
 ```sh
 GGML_CUDA_MOE_CACHE_RESERVE_MB=2048 ./build/bin/llama-server ...
 ```
 
-That raised the tested single-GPU result only slightly, from 31.5 to 31.8 tokens/s. The dual-GPU
-headline above uses 1 GiB, but 2 GiB is the safer starting point. Do not eliminate the reserve:
-CUDA graphs, workspaces and transient allocations still need headroom.
+That raised the older single-GPU result only slightly, from 31.5 to 31.8 tokens/s. The historical
+dual-GPU headline used an aggressive 1 GiB override. Do not eliminate the reserve: CUDA graphs,
+workspaces and transient allocations still need headroom.
 
 ### Tuning on another host
 
-Change one group at a time and restart the server between configurations. Use the same prompt,
-temperature and output length throughout; discard the first completion after each load and compare
-at least three warmed 512-token completions. Record both generation speed and accepted/drafted token
-counts—a faster result caused only by a luckier generation is not a reliable configuration win.
+First run the adaptive recipe without `-t`, `-tb`, a reserve environment variable, or a fixed cache
+budget. Let the persistent heatmap learn during normal use; it is keyed by model semantics rather
+than the model's pathname. Pass `-lv 4` once to confirm the resolved thread count, mmap policy,
+per-device reserve and pools, nonzero hits, and zero fill/dispatch/collect failures.
 
-1. Select the cache mode first: `--moe-cache on` for one GPU, `--moe-cache auto` for two or more.
-2. On two or more GPUs, try `--moe-cache-expert-parallel auto`. The option is deliberately not the
-   default: it changes cache placement and the CPU/GPU numerical path, and models other than the
-   tested DeepSeek V4 Flash IQ2_M may have a different working-set tradeoff. Compare it against 0.
-3. Keep the safe 3 GiB reserve and sweep CPU concurrency. Set all four pools together with
-   `-t N -tb N -td N -tbd N`. Start around physical cores minus 8, minus 4, minus 2, and all
-   physical cores; avoid assuming SMT threads help.
-4. With the best thread count, sweep `--spec-draft-n-max 2`, `3`, and `4`. Depth five was already
-   clearly worse on the tested host.
-5. Only then try cache reserves of 2560 and 2048 MiB using
-   `GGML_CUDA_MOE_CACHE_RESERVE_MB`. On a dedicated, well-characterized host, 1536 and 1024 MiB are
-   additional performance points. Keep the larger reserve unless the smaller value wins
-   repeatedly, and verify long generation without an allocation failure.
-6. Recheck the winner in reverse order against the original configuration to catch temperature,
-   power and host-load drift.
+Only tune manually when a repeatable gap remains. Change one group at a time and restart the server
+between configurations. Use the same prompt, temperature and output length throughout; discard the
+first completion after each load and compare at least three warmed 512-token completions. Record
+both generation speed and accepted/drafted token counts—a faster result caused only by a different
+temperature-0 numerical trajectory or luckier speculative acceptance is not a reliable win.
+
+1. Start with `--fit on --moe-cache soft --vbr-entry t8`; use `--vbr-entry t4` only after checking
+   the quality tradeoff on your workload.
+2. On two or more GPUs, compare `--moe-cache-expert-parallel auto` with 0. It changes cache placement
+   and the CPU/GPU numerical path, so it is not enabled implicitly for every model.
+3. If host concurrency remains limiting, override all relevant pools together with `-t N -tb N`
+   and, when a drafter is present, `-td N -tbd N`. Compare around the automatic value instead of
+   starting at every physical or SMT thread.
+4. With the best thread count, sweep the drafter depth supported by that architecture. For the
+   tested DSpark host, depths two through four were useful candidates and depth five was slower.
+5. Only then override `GGML_CUDA_MOE_CACHE_RESERVE_MB`. Keep the automatic or larger reserve unless
+   a smaller value wins repeatedly and survives long-context generation without allocation errors.
+6. Recheck the winner in reverse order against the adaptive configuration to catch temperature,
+   power, host-load, cache-warmth, and output-trajectory drift.
 
 The reported PP figures used `-ub 4096`, five distinct 2,048-token prompts per server, no reusable
 prefix, and one discarded cold prompt. Two server loads were run in reverse single/dual order; the

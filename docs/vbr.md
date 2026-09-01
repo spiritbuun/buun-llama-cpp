@@ -35,7 +35,8 @@ runs stay coherent — the price orders were measured on KLD panels per model.
 | no cache flags | common CLI tools default to dynamic VBR on both sides with a t4 quality floor; the tensors still enter at F16 and degrade only under pressure. |
 | `-ctk vbr` / `-ctv vbr` / `-ct vbr` | explicitly select VBR and, without `--vbr-floor`, open the complete ladder to t1. An explicitly non-VBR side (`-ctv q8_0`) is pinned — it never degrades and counts in the aggregate at its fixed bits/value. |
 | `--vbr-budget <tier\|number>` (`--vbr-bits`) | `dynamic` (default) = runtime controller. A tier (`t8/t4/t3/t2/t1`) or a number selects a **fixed** static tier instead — no runtime degrades. |
-| `--vbr-floor <bits\|tier>` (`--vbr-min-bits`) | LITERAL aggregate bits/value floor for dynamic mode. The degrade order stops at the last step whose aggregate stays ≥ the floor — e.g. `4.25` means "t4 layout with a few units held one tier higher", **not** a snap-up to the next tier. Clamped to the ladder range [1.25, 16]. Implicit VBR defaults to t4 (4.125); explicit `-ct vbr` without this flag uses t1 (1.25). |
+| `--vbr-entry <tier>` | dynamic entry tier: `f16` (default), `t8`, `t4`, `t3`, `t2`, or `t1`. A lower entry is an explicit quality-for-bandwidth trade; VBR continues degrading from that tier toward the floor. |
+| `--vbr-floor <bits\|tier>` (`--vbr-min-bits`) | LITERAL aggregate K+V bits/value floor for dynamic mode. The degrade order stops at the last step whose aggregate stays ≥ the floor — e.g. `4.25` means "t4 layout with a few units held one tier higher", **not** a snap-up to the next tier. Clamped to the reachable ladder range (minimum 1.25; maximum depends on the selected entry and any pinned side). Implicit VBR defaults to t4 (4.125); explicit `-ct vbr` without this flag uses t1 (1.25). |
 | `--vbr-vram <SIZE>` | explicit KV VRAM budget (e.g. `8G`). Default `auto` = derived by the fit pass. |
 | `--vbr-policy <json>` | fixed mode only: a measured policy ladder; the best rung ≤ the fixed budget (and ≥ the floor) is selected and its per-layer schedule applied. |
 | `--cache-ram <MiB>` | on the server, a nonzero value enables automatic projected-artifact host caching for supported dynamic-VBR topologies (default: 8192). `--cache-ram 0` is the zero-cost opt-out. |
@@ -46,6 +47,8 @@ Notes:
   `vbr_min_bits` — that struct is the runtime channel; the CLI flags map onto it.
 - A non-tier floor costs slightly more than the tier below it; capacity estimates account
   for this (the advertised context is scaled to the literal floor's cost).
+- When both K and V are movable, the floor cannot exceed the selected entry tier. With one
+  pinned side, the floor is aggregate and may be higher than the movable side's entry bpv.
 - `/props` and `/models` on the server expose a `vbr` object (mode, floor, budget,
   realized/selected bits — `null` where a value is not a fixed number under the dynamic
   controller).

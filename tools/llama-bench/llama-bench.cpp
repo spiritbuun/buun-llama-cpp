@@ -23,6 +23,7 @@
 #include "arg.h"
 #include "build-info.h"
 #include "common.h"
+#include "llama-bench-vbr.h"
 #include "download.h"
 #include "fit.h"
 #include "ggml.h"
@@ -423,6 +424,12 @@ static std::vector<int> parse_int_range(const std::string & s, bool allow_negati
     return result;
 }
 
+using cmd_cache_type = common_vbr_cache_choice;
+
+static const char * cmd_cache_type_name(const cmd_cache_type & choice) {
+    return choice.vbr ? "vbr" : ggml_type_name(choice.type);
+}
+
 struct cmd_params {
     std::vector<std::string>         model;
     std::vector<std::string>         hf_repo;
@@ -436,8 +443,8 @@ struct cmd_params {
     std::vector<int>                 n_depth;
     std::vector<int>                 n_batch;
     std::vector<int>                 n_ubatch;
-    std::vector<ggml_type>           type_k;
-    std::vector<ggml_type>           type_v;
+    std::vector<cmd_cache_type>      type_k;
+    std::vector<cmd_cache_type>      type_v;
     std::vector<int>                 n_threads;
     std::vector<std::string>         cpu_mask;
     std::vector<bool>                cpu_strict;
@@ -461,9 +468,13 @@ struct cmd_params {
     std::vector<bool>                no_host;
     std::vector<size_t>              fit_params_target;
     std::vector<uint32_t>            fit_params_min_ctx;
-    bool                             vbr = false; // arm dynamic VBR (F16 entry + decode-time degrade controller)
+    bool                             vbr = false; // arm dynamic VBR and its decode-time degrade controller
+    std::string                      vbr_entry;  // discrete entry tier (quality-first default: f16)
     std::string                      vbr_floor;  // aggregate floor tier (t8/t4/t3tcq/t2tcq/t1tcq, auto = bottom)
     std::string                      vbr_vram;   // KV VRAM budget: auto (floor-layout fallback) or explicit MiB
+    bool                             vbr_entry_explicit = false;
+    bool                             vbr_floor_explicit = false;
+    bool                             vbr_vram_explicit = false;
     ggml_numa_strategy               numa;
     int                              reps;
     ggml_sched_priority              prio;
@@ -493,8 +504,8 @@ static const cmd_params cmd_params_defaults = {
     /* n_depth              */ { 0 },
     /* n_batch              */ { 2048 },
     /* n_ubatch             */ { 512 },
-    /* type_k               */ { GGML_TYPE_F16 },
-    /* type_v               */ { GGML_TYPE_F16 },
+    /* type_k               */ { { GGML_TYPE_F16, false, false } },
+    /* type_v               */ { { GGML_TYPE_F16, false, false } },
     /* n_threads            */ { common_cpu_get_num_math() },
     /* cpu_mask             */ { "0x0" },
     /* cpu_strict           */ { false },
@@ -519,8 +530,12 @@ static const cmd_params cmd_params_defaults = {
     /* fit_params_target    */ { 0 },
     /* fit_params_min_ctx   */ { 0 },
     /* vbr                  */ false,
+    /* vbr_entry            */ "f16",
     /* vbr_floor            */ "auto",
     /* vbr_vram             */ "auto",
+    /* vbr_entry_explicit   */ false,
+    /* vbr_floor_explicit   */ false,
+    /* vbr_vram_explicit    */ false,
     /* numa                 */ GGML_NUMA_STRATEGY_DISABLED,
     /* reps                 */ 5,
     /* prio                 */ GGML_SCHED_PRIO_NORMAL,
@@ -577,9 +592,10 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -d, --n-depth <n>                                 (default: %s)\n", join(cmd_params_defaults.n_depth, ",").c_str());
     printf("  -b, --batch-size <n>                              (default: %s)\n", join(cmd_params_defaults.n_batch, ",").c_str());
     printf("  -ub, --ubatch-size <n>                            (default: %s)\n", join(cmd_params_defaults.n_ubatch, ",").c_str());
-    printf("  -ctk, --cache-type-k <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_k, ggml_type_name), ",").c_str());
-    printf("  -ctv, --cache-type-v <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_v, ggml_type_name), ",").c_str());
-    printf("  --vbr-floor <t8|t4|t3tcq|t2tcq|t1tcq|auto>        arm dynamic VBR (F16 entry, both sides), aggregate floor tier\n");
+    printf("  -ctk, --cache-type-k <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_k, cmd_cache_type_name), ",").c_str());
+    printf("  -ctv, --cache-type-v <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_v, cmd_cache_type_name), ",").c_str());
+    printf("  --vbr-entry <f16|t8|t4|t3|t2|t1>                 dynamic VBR entry tier (default: f16)\n");
+    printf("  --vbr-floor <t8|t4|t3tcq|t2tcq|t1tcq|auto>        arm dynamic VBR (both sides), aggregate floor tier\n");
     printf("                                                    (also enabled by -ctk vbr / -ctv vbr; default floor: bottom tier)\n");
     printf("  --vbr-vram <auto|SIZE[K|M|G]>                     VBR KV VRAM budget (default: auto = floor-layout-cost fallback)\n");
     printf("  -t, --threads <n>                                 (default: %s)\n", join(cmd_params_defaults.n_threads, ",").c_str());
@@ -684,8 +700,12 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.no_warmup            = cmd_params_defaults.no_warmup;
     params.offline              = cmd_params_defaults.offline;
     params.vbr                  = cmd_params_defaults.vbr;
+    params.vbr_entry            = cmd_params_defaults.vbr_entry;
     params.vbr_floor            = cmd_params_defaults.vbr_floor;
     params.vbr_vram             = cmd_params_defaults.vbr_vram;
+    params.vbr_entry_explicit   = cmd_params_defaults.vbr_entry_explicit;
+    params.vbr_floor_explicit   = cmd_params_defaults.vbr_floor_explicit;
+    params.vbr_vram_explicit    = cmd_params_defaults.vbr_vram_explicit;
     params.n_gen_warmup         = cmd_params_defaults.n_gen_warmup;
     params.repack               = cmd_params_defaults.repack;
     params.moe_cache_explicit    = cmd_params_defaults.moe_cache_explicit;
@@ -802,13 +822,11 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<std::string>(argv[i], split_delim);
 
-                std::vector<ggml_type> types;
+                std::vector<cmd_cache_type> types;
                 for (const auto & t : p) {
                     if (t == "vbr") {
-                        // dynamic VBR: F16 entry tier, controller armed in to_llama_cparams (both
-                        // sides). Floor via --vbr-floor (default: bottom tier).
                         params.vbr = true;
-                        types.push_back(GGML_TYPE_F16);
+                        types.push_back({ GGML_TYPE_F16, true, true });
                         continue;
                     }
                     ggml_type gt = ggml_type_from_name(t);
@@ -816,7 +834,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                         invalid_param = true;
                         break;
                     }
-                    types.push_back(gt);
+                    types.push_back({ gt, false, true });
                 }
                 if (invalid_param) {
                     break;
@@ -829,13 +847,11 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<std::string>(argv[i], split_delim);
 
-                std::vector<ggml_type> types;
+                std::vector<cmd_cache_type> types;
                 for (const auto & t : p) {
                     if (t == "vbr") {
-                        // dynamic VBR: F16 entry tier, controller armed in to_llama_cparams (both
-                        // sides). Floor via --vbr-floor (default: bottom tier).
                         params.vbr = true;
-                        types.push_back(GGML_TYPE_F16);
+                        types.push_back({ GGML_TYPE_F16, true, true });
                         continue;
                     }
                     ggml_type gt = ggml_type_from_name(t);
@@ -843,7 +859,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                         invalid_param = true;
                         break;
                     }
-                    types.push_back(gt);
+                    types.push_back({ gt, false, true });
                 }
                 if (invalid_param) {
                     break;
@@ -856,6 +872,15 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 params.vbr       = true;
                 params.vbr_floor = argv[i];
+                params.vbr_floor_explicit = true;
+            } else if (arg == "--vbr-entry") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.vbr       = true;
+                params.vbr_entry = argv[i];
+                params.vbr_entry_explicit = true;
             } else if (arg == "--vbr-vram" || arg == "--vbr-budget") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -863,6 +888,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 params.vbr      = true;
                 params.vbr_vram = argv[i];
+                params.vbr_vram_explicit = true;
             } else if (arg == "-dev" || arg == "--device") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1529,6 +1555,9 @@ struct cmd_params_instance {
     size_t             fit_target;
     uint32_t           fit_min_ctx;
     bool               vbr;
+    bool               vbr_k;
+    bool               vbr_v;
+    std::string        vbr_entry;
     double             vbr_min_bits;
     bool               vbr_min_bits_explicit;
     uint64_t           vbr_budget_bytes;
@@ -1606,26 +1635,24 @@ struct cmd_params_instance {
         cparams.n_ctx           = n_prompt + std::max(n_gen + n_depth, n_gen_warmup);
         cparams.n_batch         = n_batch;
         cparams.n_ubatch        = n_ubatch;
-        cparams.type_k          = type_k;
-        cparams.type_v          = type_v;
         cparams.offload_kqv     = !no_kv_offload;
         cparams.flash_attn_type = flash_attn;
         cparams.embeddings      = embeddings;
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
 
-        if (vbr) {
-            // dynamic VBR: F16 entry tier (full quality until budget pressure), controller armed
-            // via cparams; the baked degrade order transcodes fp16->t8->... down to the floor. This
-            // mirrors the main CLI's -ctk vbr / --vbr-floor path (common_params_postprocess_vbr).
-            cparams.type_k                = GGML_TYPE_F16;
-            cparams.type_v                = GGML_TYPE_F16;
-            cparams.vbr_dynamic           = true;
-            cparams.vbr_min_bits          = vbr_min_bits;
-            cparams.vbr_min_bits_explicit = vbr_min_bits_explicit;
-            cparams.vbr_vram_budget_bytes = vbr_budget_bytes;
-            cparams.vbr_budget_explicit   = vbr_budget_explicit;
-        }
+        llama_bench_vbr_row row;
+        row.active = vbr;
+        row.k = vbr_k;
+        row.v = vbr_v;
+        row.type_k = type_k;
+        row.type_v = type_v;
+        row.entry = vbr_entry;
+        row.floor_bits = vbr_min_bits;
+        row.floor_explicit = vbr_min_bits_explicit;
+        row.budget_bytes = vbr_budget_bytes;
+        row.budget_explicit = vbr_budget_explicit;
+        llama_bench_vbr_apply_row(row, cparams);
 
         return cparams;
     }
@@ -1633,14 +1660,9 @@ struct cmd_params_instance {
 
 static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_params & params) {
     std::vector<cmd_params_instance> instances;
-
-    // dynamic VBR (see -ctk vbr / --vbr-floor): resolve the floor bits and budget once for all
-    // instances. budget 0 = floor-layout-cost fallback, self-armed by the controller (no fit pass).
-    const double   vbr_min_bits       = params.vbr ? common_vbr_floor_bits(params.vbr_floor) : 0.0;
-    // canonical parser (shared with the CLI): "auto" -> 0, size specs -> bytes; explicit == a real cap.
-    const uint64_t vbr_budget_bytes    = params.vbr ? common_vbr_vram_bytes(params.vbr_vram) : 0;
-    const bool     vbr_budget_explicit = vbr_budget_bytes != 0;
-    const bool     vbr_min_bits_explicit = params.vbr && params.vbr_floor != "auto";
+    const llama_bench_vbr_plan vbr_plan = llama_bench_vbr_make_plan(
+        params.type_k, params.type_v, params.vbr_entry, params.vbr_floor, params.vbr_vram,
+        params.vbr_entry_explicit, params.vbr_floor_explicit, params.vbr_vram_explicit);
 
     // this ordering minimizes the number of times that each model needs to be reloaded
     // clang-format off
@@ -1672,6 +1694,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & cs : params.cpu_strict)
     for (const auto & nd : params.n_depth)
     for (const auto & pl : params.poll) {
+        const llama_bench_vbr_row vbr = llama_bench_vbr_resolve_row(vbr_plan, tk, tv);
         for (const auto & n_prompt : params.n_prompt) {
             if (n_prompt == 0) {
                 continue;
@@ -1684,8 +1707,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_depth               = */ nd,
                 /* .n_batch               = */ nb,
                 /* .n_ubatch              = */ nub,
-                /* .type_k                = */ tk,
-                /* .type_v                = */ tv,
+                /* .type_k                = */ vbr.type_k,
+                /* .type_v                = */ vbr.type_v,
                 /* .n_threads             = */ nt,
                 /* .cpu_mask              = */ cm,
                 /* .cpu_strict            = */ cs,
@@ -1709,11 +1732,14 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host               = */ noh,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
-                /* .vbr                   = */ params.vbr,
-                /* .vbr_min_bits          = */ vbr_min_bits,
-                /* .vbr_min_bits_explicit = */ vbr_min_bits_explicit,
-                /* .vbr_budget_bytes      = */ vbr_budget_bytes,
-                /* .vbr_budget_explicit   = */ vbr_budget_explicit,
+                /* .vbr                   = */ vbr.active,
+                /* .vbr_k                 = */ vbr.k,
+                /* .vbr_v                 = */ vbr.v,
+                /* .vbr_entry             = */ vbr.entry,
+                /* .vbr_min_bits          = */ vbr.floor_bits,
+                /* .vbr_min_bits_explicit = */ vbr.floor_explicit,
+                /* .vbr_budget_bytes      = */ vbr.budget_bytes,
+                /* .vbr_budget_explicit   = */ vbr.budget_explicit,
             };
             instances.push_back(instance);
         }
@@ -1730,8 +1756,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_depth               = */ nd,
                 /* .n_batch               = */ nb,
                 /* .n_ubatch              = */ nub,
-                /* .type_k                = */ tk,
-                /* .type_v                = */ tv,
+                /* .type_k                = */ vbr.type_k,
+                /* .type_v                = */ vbr.type_v,
                 /* .n_threads             = */ nt,
                 /* .cpu_mask              = */ cm,
                 /* .cpu_strict            = */ cs,
@@ -1755,11 +1781,14 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host               = */ noh,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
-                /* .vbr                   = */ params.vbr,
-                /* .vbr_min_bits          = */ vbr_min_bits,
-                /* .vbr_min_bits_explicit = */ vbr_min_bits_explicit,
-                /* .vbr_budget_bytes      = */ vbr_budget_bytes,
-                /* .vbr_budget_explicit   = */ vbr_budget_explicit,
+                /* .vbr                   = */ vbr.active,
+                /* .vbr_k                 = */ vbr.k,
+                /* .vbr_v                 = */ vbr.v,
+                /* .vbr_entry             = */ vbr.entry,
+                /* .vbr_min_bits          = */ vbr.floor_bits,
+                /* .vbr_min_bits_explicit = */ vbr.floor_explicit,
+                /* .vbr_budget_bytes      = */ vbr.budget_bytes,
+                /* .vbr_budget_explicit   = */ vbr.budget_explicit,
             };
             instances.push_back(instance);
         }
@@ -1776,8 +1805,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .n_depth               = */ nd,
                 /* .n_batch               = */ nb,
                 /* .n_ubatch              = */ nub,
-                /* .type_k                = */ tk,
-                /* .type_v                = */ tv,
+                /* .type_k                = */ vbr.type_k,
+                /* .type_v                = */ vbr.type_v,
                 /* .n_threads             = */ nt,
                 /* .cpu_mask              = */ cm,
                 /* .cpu_strict            = */ cs,
@@ -1801,11 +1830,14 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host               = */ noh,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
-                /* .vbr                   = */ params.vbr,
-                /* .vbr_min_bits          = */ vbr_min_bits,
-                /* .vbr_min_bits_explicit = */ vbr_min_bits_explicit,
-                /* .vbr_budget_bytes      = */ vbr_budget_bytes,
-                /* .vbr_budget_explicit   = */ vbr_budget_explicit,
+                /* .vbr                   = */ vbr.active,
+                /* .vbr_k                 = */ vbr.k,
+                /* .vbr_v                 = */ vbr.v,
+                /* .vbr_entry             = */ vbr.entry,
+                /* .vbr_min_bits          = */ vbr.floor_bits,
+                /* .vbr_min_bits_explicit = */ vbr.floor_explicit,
+                /* .vbr_budget_bytes      = */ vbr.budget_bytes,
+                /* .vbr_budget_explicit   = */ vbr.budget_explicit,
             };
             instances.push_back(instance);
         }
@@ -1833,6 +1865,13 @@ struct test {
     ggml_type                type_k;
     ggml_type                type_v;
     bool                     vbr;
+    bool                     vbr_k;
+    bool                     vbr_v;
+    std::string              vbr_entry;
+    double                   vbr_floor;
+    bool                     vbr_floor_explicit;
+    uint64_t                 vbr_vram_bytes;
+    bool                     vbr_vram_explicit;
     int                      n_gpu_layers;
     int                      n_cpu_moe;
     std::string              moe_cache;
@@ -1882,6 +1921,13 @@ struct test {
         type_k         = inst.type_k;
         type_v         = inst.type_v;
         vbr            = inst.vbr;
+        vbr_k          = inst.vbr_k;
+        vbr_v          = inst.vbr_v;
+        vbr_entry      = inst.vbr_entry;
+        vbr_floor      = inst.vbr_min_bits;
+        vbr_floor_explicit = inst.vbr_min_bits_explicit;
+        vbr_vram_bytes = inst.vbr_budget_bytes;
+        vbr_vram_explicit = inst.vbr_budget_explicit;
         n_gpu_layers   = mparams.n_gpu_layers;
         n_cpu_moe      = inst.n_cpu_moe;
         moe_cache      = inst.moe_cache;
@@ -1971,7 +2017,8 @@ struct test {
             "build_commit",   "build_number",   "cpu_info",      "gpu_info",       "backends",
             "model_filename", "model_type",     "model_size",    "model_n_params", "n_batch",
             "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
-            "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "moe_cache",
+            "type_k",         "type_v",         "vbr_entry",     "vbr_floor",      "vbr_floor_explicit",
+            "vbr_vram_bytes", "vbr_vram_explicit", "n_gpu_layers", "n_cpu_moe",    "moe_cache",
             "moe_cache_fit",  "repack",         "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "load_mode",     "lazy_mode",
@@ -1992,15 +2039,16 @@ struct test {
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_gen_warmup" ||
             field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
-            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn") {
+            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn" ||
+            field == "vbr_vram_bytes") {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" ||
             field == "embeddings" || field == "no_host" || field == "moe_cache_fit" || field == "repack" ||
-            field == "moe_cache_profile") {
+            field == "moe_cache_profile" || field == "vbr_floor_explicit" || field == "vbr_vram_explicit") {
             return BOOL;
         }
-        if (field == "avg_ts" || field == "stddev_ts") {
+        if (field == "avg_ts" || field == "stddev_ts" || field == "vbr_floor") {
             return FLOAT;
         }
         if (field == "load_mode" || field == "lazy_mode" || field == "mmap_prefetch") {
@@ -2061,8 +2109,13 @@ struct test {
                                             cpu_mask,
                                             std::to_string(cpu_strict),
                                             std::to_string(poll),
-                                            vbr ? "vbr" : ggml_type_name(type_k),
-                                            vbr ? "vbr" : ggml_type_name(type_v),
+                                            vbr_k ? "vbr" : ggml_type_name(type_k),
+                                            vbr_v ? "vbr" : ggml_type_name(type_v),
+                                            vbr_entry,
+                                            std::to_string(vbr_floor),
+                                            std::to_string(vbr_floor_explicit),
+                                            std::to_string(vbr_vram_bytes),
+                                            std::to_string(vbr_vram_explicit),
                                             std::to_string(n_gpu_layers),
                                             std::to_string(n_cpu_moe),
                                             moe_cache,
@@ -2413,6 +2466,13 @@ struct markdown_printer : public printer {
         if (params.type_v.size() > 1 || params.type_v != cmd_params_defaults.type_v) {
             fields.emplace_back("type_v");
         }
+        if (params.vbr) {
+            fields.emplace_back("vbr_entry");
+            fields.emplace_back("vbr_floor");
+            fields.emplace_back("vbr_floor_explicit");
+            fields.emplace_back("vbr_vram_bytes");
+            fields.emplace_back("vbr_vram_explicit");
+        }
         if (params.main_gpu.size() > 1 || params.main_gpu != cmd_params_defaults.main_gpu) {
             fields.emplace_back("main_gpu");
         }
@@ -2701,6 +2761,13 @@ int llama_bench(int argc, char ** argv) {
     ggml_backend_load_all();
 
     cmd_params params = parse_cmd_params(argc, argv);
+    std::vector<cmd_params_instance> params_instances;
+    try {
+        params_instances = get_cmd_params_instances(params);
+    } catch (const std::invalid_argument & e) {
+        fprintf(stderr, "error: %s\n", e.what());
+        return 1;
+    }
 
     auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (!cpu_dev) {
@@ -2736,8 +2803,6 @@ int llama_bench(int argc, char ** argv) {
         p_err->fout = stderr;
         p_err->print_header(params);
     }
-
-    std::vector<cmd_params_instance> params_instances = get_cmd_params_instances(params);
 
     llama_model *               lmodel    = nullptr;
     const cmd_params_instance * prev_inst = nullptr;

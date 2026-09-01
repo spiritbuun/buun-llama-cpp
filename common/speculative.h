@@ -76,6 +76,14 @@ common_speculative_mtp_context_params common_speculative_mtp_context_params_reso
 
 bool common_speculative_mtp_context_available(const common_params_speculative & params);
 
+// Compact external MTP sidecars borrow their missing global tensors from the
+// loaded target. Other external drafters and native MTP keep independent model
+// loading contracts.
+void common_speculative_configure_draft_model_parent(
+        const common_params_speculative & params,
+        llama_model_params & mparams_dft,
+        const llama_model * model_tgt);
+
 struct common_speculative_output_limits {
     int32_t total;
     int32_t per_seq;

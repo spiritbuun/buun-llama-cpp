@@ -2,6 +2,7 @@
 
 #include "common.cuh"
 #include "convert.cuh"
+#include "fattn-rdna2-policy.h"
 #include "vecdotq.cuh"
 
 #include <cstdint>
@@ -2052,6 +2053,34 @@ void launch_fattn(
     const dim3 block_dim(warp_size, nwarps, 1);
     int max_blocks_per_sm = 1; // Max. number of active blocks limited by occupancy.
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, fattn_kernel, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
+#if defined(GGML_USE_HIP)
+    if (max_blocks_per_sm == 0 && GGML_CUDA_CC_IS_RDNA2(cc)) {
+        hipFuncAttributes attr = {};
+        hipDeviceProp_t prop = {};
+        const cudaError_t attr_status = hipFuncGetAttributes(
+            &attr, reinterpret_cast<const void *>(fattn_kernel));
+        const cudaError_t prop_status = hipGetDeviceProperties(
+            &prop, ggml_cuda_info().devices[id].physical_device);
+        if (attr_status == cudaSuccess && prop_status == cudaSuccess) {
+            max_blocks_per_sm = ggml_cuda_fattn_correct_rdna2_wgp_occupancy({
+                true,
+                true,
+                max_blocks_per_sm,
+                (int) Q->ne[0],
+                DV,
+                ncols1,
+                ncols2,
+                (int) (block_dim.x * block_dim.y * block_dim.z),
+                attr.maxThreadsPerBlock,
+                attr.numRegs,
+                prop.regsPerBlock,
+                attr.sharedSizeBytes,
+                nbytes_shared,
+                ggml_cuda_info().devices[id].smpb,
+            });
+        }
+    }
+#endif // defined(GGML_USE_HIP)
     GGML_ASSERT(max_blocks_per_sm > 0);
     int parallel_blocks = max_blocks_per_sm;
 

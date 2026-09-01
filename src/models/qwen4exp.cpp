@@ -1110,6 +1110,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_gather(
 
     k_sel = ggml_reshape_4d(ctx0, k_sel, k_all->ne[0], k_all->ne[1], width, n_q);
     v_sel = ggml_reshape_4d(ctx0, v_sel, v_all->ne[0], v_all->ne[1], width, n_q);
+
+    // GET_ROWS materializes a static Turbo cache as F32, but its K rows are still in the
+    // rotated storage domain. The ordinary F32 attention below cannot infer that provenance,
+    // so restore K to the original domain just as the non-gather Turbo attention kernels do.
+    // Dynamic VBR exposes reconstructed F16 K and therefore deliberately does not enter here.
+    if (ggml_is_turbo_kv_type(k_all->type)) {
+        k_sel = ggml_turbo_wht(ctx0, k_sel, 1);
+    }
+
     cb(k_sel, "qsa_k_sel", il);
     cb(v_sel, "qsa_v_sel", il);
 
@@ -1512,20 +1521,27 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
 
     ggml_tensor * conv_input = ggml_concat(ctx0, state, ggml_transpose(ctx0, x), 0);
 
-    // keep the last state_cols columns for the next ubatch
+    // Keep one history per rollback slot. Slot s ends s tokens earlier so a
+    // speculative rollback never restores convolution state that already saw
+    // a rejected token. Both the delta-net and PLE convolutions use this path.
     const size_t row_size = ggml_row_size(conv_states_all->type, row_total);
+    const uint32_t mem_size = mctx_cur->get_size();
 
-    ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
-            state_cols, channels, n_seqs,
-            conv_input->nb[1], conv_input->nb[2],
-            ggml_row_size(conv_input->type, conv_input->ne[0] - state_cols));
+    for (int64_t slot = 0; slot <= (int64_t) cparams.n_rs_seq; ++slot) {
+        const int64_t tail_offset = std::max<int64_t>(0, conv_input->ne[0] - state_cols - slot);
 
-    ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
-            state_cols * channels, n_seqs,
-            conv_states_all->nb[1],
-            kv_head * row_size);
+        ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
+                state_cols, channels, n_seqs,
+                conv_input->nb[1], conv_input->nb[2],
+                ggml_row_size(conv_input->type, tail_offset));
 
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+        ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
+                state_cols * channels, n_seqs,
+                conv_states_all->nb[1],
+                (slot * mem_size + kv_head) * row_size);
+
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+    }
 
     return conv_input;
 }
