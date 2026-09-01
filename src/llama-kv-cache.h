@@ -346,7 +346,11 @@ public:
     void vbr_shared_scratch_detach() override;
 
     double memory_vbr_floor_bits_per_token(ggml_type entry_k, ggml_type entry_v, double floor_bpv) override;
+    double memory_vbr_entry_bits_per_token(ggml_type entry_k, ggml_type entry_v) override;
     double memory_vbr_scratch_bytes_per_token(ggml_type entry_k, ggml_type entry_v, double floor_bpv) override;
+    static bool vbr_floor_reachable(double initial_bpv, double floor_bpv) {
+        return initial_bpv + 1e-9 >= floor_bpv;
+    }
 
     // shared ladder-sim primitives: seed a per-(layer,side) type view + per-step
     // applicability under vbr_degrade_next's exact skip rules (see impl comment) — the
@@ -361,6 +365,9 @@ public:
     struct vbr_floor_sim_result {
         size_t clamp_step     = 0;     // steps applied before the clamp (== order size if unclamped)
         size_t n_pinned       = 0;
+        bool floor_reachable  = true;
+        double initial_bpv    = 0.0;   // aggregate entry-layout bits/value
+        double initial_bits_per_token = 0.0; // entry-layout KV row bits per context token
         double next_bpv       = 0.0;   // aggregate the clamping step would have produced
         double bits_per_token = 0.0;   // end-state KV bits per token (0 = no units)
         std::vector<ggml_type> end_types; // [layers*2] end-state tier, GGML_TYPE_COUNT = absent
@@ -793,6 +800,8 @@ private:
         // authority; this holder owns only the committed C references.
         std::unique_ptr<vbr_downward_resource_receipts> transform_receipts;
     };
+
+    void vbr_release_resources();
     // A share-linked cache aliases another context's K/V tensors but executes attention on
     // this context's compute backends. Since fattn scratch is backend-context-owned, each
     // device needs scratch-only metadata here even though the drafter intentionally owns no

@@ -410,6 +410,39 @@ static bool common_vbr_budget_to_type(const std::string & raw, ggml_type & out, 
     return false;
 }
 
+ggml_type common_vbr_entry_type(const std::string & entry) {
+    ggml_type type = GGML_TYPE_COUNT;
+    const char * name = nullptr;
+    if (!common_vbr_budget_to_type(entry, type, name)) {
+        throw std::invalid_argument("unsupported VBR entry tier: " + entry);
+    }
+    return type;
+}
+
+common_vbr_side_selection common_vbr_resolve_sides(
+        const common_vbr_cache_choice & k,
+        const common_vbr_cache_choice & v,
+        bool vbr_options_selected,
+        bool matrix_has_vbr_alias) {
+    common_vbr_side_selection result = { k.vbr, v.vbr };
+    const bool alias_selected = result.k || result.v;
+    if (!alias_selected && (!vbr_options_selected || matrix_has_vbr_alias)) {
+        return {};
+    }
+    if (alias_selected) {
+        if (result.k && !v.explicit_choice && v.type == GGML_TYPE_F16) {
+            result.v = true;
+        }
+        if (result.v && !k.explicit_choice && k.type == GGML_TYPE_F16) {
+            result.k = true;
+        }
+    } else {
+        result.k = !k.explicit_choice && k.type == GGML_TYPE_F16;
+        result.v = !v.explicit_choice && v.type == GGML_TYPE_F16;
+    }
+    return result;
+}
+
 static std::string common_vbr_format_bits(double value) {
     std::ostringstream ss;
     ss << std::setprecision(8) << value;
@@ -808,6 +841,7 @@ static double common_vbr_apply_policy_ladder(
 static void common_params_postprocess_vbr(common_params & params) {
     const bool vbr_selected =
         params.vbr_budget_explicit ||
+        params.vbr_entry_explicit ||
         params.vbr_min_bits_explicit ||
         params.vbr_vram_budget_explicit ||
         params.vbr_policy_explicit ||
@@ -817,6 +851,12 @@ static void common_params_postprocess_vbr(common_params & params) {
         return;
     }
 
+    std::string budget = common_vbr_lower(params.vbr_budget);
+    if (budget.empty()) {
+        budget = "dynamic";
+    }
+    params.vbr_budget = budget;
+
     // The common CLI selects dynamic VBR implicitly with a conservative t4 quality floor.
     // Typing a VBR cache alias is an intentional opt-in to the complete ladder, so preserve
     // the historical bottom-tier (t1) floor unless --vbr-floor was also typed. Fixed-tier
@@ -825,7 +865,7 @@ static void common_params_postprocess_vbr(common_params & params) {
         const bool explicit_vbr_alias =
             (params.vbr_cache_type_k && params.vbr_cache_type_k_explicit) ||
             (params.vbr_cache_type_v && params.vbr_cache_type_v_explicit);
-        params.vbr_min_bits = params.vbr_dynamic() && !explicit_vbr_alias ? "t4" : "auto";
+        params.vbr_min_bits = common_vbr_budget_is_dynamic(budget) && !explicit_vbr_alias ? "t4" : "auto";
     }
 
     if (!params.vbr_cache_type_k && !params.vbr_cache_type_v) {
@@ -871,21 +911,64 @@ static void common_params_postprocess_vbr(common_params & params) {
     params.vbr_vram_budget_bytes = vram_budget_bytes;
     common_setenv_override("VBR_VRAM_BUDGET", vram_budget);
 
-    std::string budget = common_vbr_lower(params.vbr_budget);
-    if (budget.empty()) {
-        budget = "dynamic";
-    }
-    params.vbr_budget = budget;
     if (common_vbr_budget_is_dynamic(budget)) {
-        // the dynamic ladder spans f16 (entry) down to t1tcq: a floor at/above 16 means the
-        // cache never degrades at all, one below t1 is unreachable — clamp both
+        ggml_type entry_type = GGML_TYPE_COUNT;
+        const char * entry_name = nullptr;
+        if (!common_vbr_budget_to_type(params.vbr_entry, entry_type, entry_name)) {
+            throw std::invalid_argument("unsupported VBR entry tier: " + params.vbr_entry);
+        }
+        params.vbr_entry = entry_name;
+
+        // One-sided VBR also covers an untouched default-F16 peer. Resolve that intent before
+        // validating the aggregate floor, because it determines whether both sides share the
+        // selected entry endpoint. An explicitly selected peer remains pinned.
+        if (params.vbr_cache_type_k != params.vbr_cache_type_v) {
+            const bool k_is_vbr = params.vbr_cache_type_k;
+            const common_vbr_cache_choice k = {
+                params.cache_type_k, params.vbr_cache_type_k, params.cache_type_k_explicit };
+            const common_vbr_cache_choice v = {
+                params.cache_type_v, params.vbr_cache_type_v, params.cache_type_v_explicit };
+            const common_vbr_side_selection sides =
+                common_vbr_resolve_sides(k, v, /*vbr_options_selected=*/true, /*matrix_has_vbr_alias=*/false);
+            const bool peer_was_implied = sides.k != params.vbr_cache_type_k || sides.v != params.vbr_cache_type_v;
+            params.vbr_cache_type_k = sides.k;
+            params.vbr_cache_type_v = sides.v;
+            if (peer_was_implied) {
+                LOG_INF("VBR dynamic: applying vbr to the %s cache as well (it was unset); set "
+                        "-ct%s to a concrete type to pin it instead\n",
+                        k_is_vbr ? "V" : "K", k_is_vbr ? "v" : "k");
+            } else {
+                const ggml_type other_type = k_is_vbr ? params.cache_type_v : params.cache_type_k;
+                LOG_WRN("VBR dynamic: the %s cache stays PINNED at %s — it will not degrade and "
+                        "counts in the aggregate at its fixed bits/value\n",
+                        k_is_vbr ? "V" : "K", ggml_type_name(other_type));
+            }
+        }
+
+        // The dynamic ladder spans the selected entry down to t1tcq. A floor below t1 is
+        // unreachable; a floor above the entry is contradictory rather than something to clamp.
         const double floor_lo = common_vbr_type_bits(GGML_TYPE_TURBO1_TCQ);
-        const double floor_hi = 16.0;
-        if (floor_bits > 0.0 && (floor_bits < floor_lo - 1e-9 || floor_bits > floor_hi + 1e-9)) {
-            const double clamped = floor_bits < floor_lo ? floor_lo : floor_hi;
-            LOG_WRN("VBR dynamic: --vbr-floor %.4g is outside the degrade ladder [%.4g, %.4g] — clamping to %.4g\n",
-                    floor_bits, floor_lo, floor_hi, clamped);
-            floor_bits = clamped;
+        const double entry_bits = entry_type == GGML_TYPE_F16 ? 16.0 : common_vbr_type_bits(entry_type);
+        const bool both_sides_movable = params.vbr_cache_type_k && params.vbr_cache_type_v;
+        if (both_sides_movable && floor_bits > entry_bits + 1e-9) {
+            if (params.vbr_min_bits_explicit) {
+                throw std::invalid_argument("--vbr-floor (" + common_vbr_format_bits(floor_bits) +
+                    " bits/value) cannot exceed --vbr-entry " + params.vbr_entry + " (" +
+                    common_vbr_format_bits(entry_bits) + " bits/value)");
+            }
+            // A deliberately low entry also bounds the friendly implicit t4 floor. Requiring a
+            // redundant floor flag for t3/t2/t1 entries would make --vbr-entry needlessly brittle.
+            LOG_INF("VBR dynamic: lowering the implicit floor to the %s entry tier (%.4g bits/value)\n",
+                    params.vbr_entry.c_str(), entry_bits);
+            floor_bits = entry_bits;
+            params.vbr_min_bits       = common_vbr_format_bits(floor_bits);
+            params.vbr_min_bits_value = floor_bits;
+            params.vbr_capacity_bits  = common_vbr_capacity_surrogate_bits(floor_bits);
+        }
+        if (floor_bits > 0.0 && floor_bits < floor_lo - 1e-9) {
+            LOG_WRN("VBR dynamic: --vbr-floor %.4g is below the degrade ladder minimum %.4g — clamping to %.4g\n",
+                    floor_bits, floor_lo, floor_lo);
+            floor_bits = floor_lo;
             params.vbr_min_bits       = common_vbr_format_bits(floor_bits);
             params.vbr_min_bits_value = floor_bits;
             params.vbr_capacity_bits  = common_vbr_capacity_surrogate_bits(floor_bits);
@@ -893,7 +976,7 @@ static void common_params_postprocess_vbr(common_params & params) {
         // Dynamic means the runtime degrade controller (VMM-backed pool, price-ordered in-place
         // transcodes). Whole (layer,side) tensors degrade selectively as mapped bytes approach
         // the KV VRAM budget:
-        //   entry = F16 (forced below); the baked orders' fp16->t8 band degrades it first under pressure;
+        //   entry = --vbr-entry (F16 by default); the controller degrades only movable sides;
         //   --vbr-vram <SIZE>  explicit budget, armed here;
         //   --vbr-vram auto    (default) budget derived from remaining VRAM after model/overhead
         //                      by the fit pass (common_fit_params), which also advertises
@@ -922,34 +1005,13 @@ static void common_params_postprocess_vbr(common_params & params) {
                     "(per-seq KV streams) — forcing --kv-unified\n", params.n_parallel);
             params.kv_unified = true;
         }
-        // One-sided VBR with the opposite side untouched means half the cache would never
-        // degrade — treat "vbr" as the mode it is and imply it on that free side (the one-flag
-        // quickstart intent). Any explicitly selected opposite type, including F16, stays
-        // PINNED: the runtime skips its degrade steps.
-        if (params.vbr_cache_type_k != params.vbr_cache_type_v) {
-            const bool k_is_vbr = params.vbr_cache_type_k;
-            ggml_type & other_type     = k_is_vbr ? params.cache_type_v          : params.cache_type_k;
-            bool &      other_vbr      = k_is_vbr ? params.vbr_cache_type_v      : params.vbr_cache_type_k;
-            const bool  other_explicit = k_is_vbr ? params.cache_type_v_explicit : params.cache_type_k_explicit;
-            if (!other_explicit && other_type == GGML_TYPE_F16) {
-                other_vbr = true;
-                LOG_INF("VBR dynamic: applying vbr to the %s cache as well (it was unset); set "
-                        "-ct%s to a concrete type to pin it instead\n",
-                        k_is_vbr ? "V" : "K", k_is_vbr ? "v" : "k");
-            } else {
-                LOG_WRN("VBR dynamic: the %s cache stays PINNED at %s — it will not degrade and "
-                        "counts in the aggregate at its fixed bits/value\n",
-                        k_is_vbr ? "V" : "K", ggml_type_name(other_type));
-            }
-        }
-        // dynamic entry tier = F16: full quality (and f16 decode speed) until budget pressure;
-        // the measured orders' first band (fp16->t8) then fires layer by layer. VBR maximizes
-        // quality within the VRAM budget — starting lower would spend nothing and cost quality.
+        // The quality-first default enters at F16. --vbr-entry can deliberately start lower to
+        // trade quality for bandwidth without disabling the runtime controller or its floor.
         if (params.vbr_cache_type_k) {
-            params.cache_type_k = GGML_TYPE_F16;
+            params.cache_type_k = entry_type;
         }
         if (params.vbr_cache_type_v) {
-            params.cache_type_v = GGML_TYPE_F16;
+            params.cache_type_v = entry_type;
         }
         // capacity contract for telemetry/server metadata: the floor the advertised n_ctx is
         // computed at (implicit CLI default t4; explicit -ct vbr without a floor uses t1)
@@ -962,10 +1024,14 @@ static void common_params_postprocess_vbr(common_params & params) {
         const std::string budget_desc = (params.vbr_vram_budget_explicit && vram_budget_bytes > 0)
             ? std::to_string(vram_budget_bytes / (1024ull*1024ull)) + " MiB (explicit)"
             : "auto (remaining VRAM, resolved by fit)";
-        LOG_INF("VBR dynamic runtime controller: KV budget %s, entry tier f16, floor %.4g bits/value, "
+        LOG_INF("VBR dynamic runtime controller: KV budget %s, entry tier %s, floor %.4g bits/value, "
                 "price-ordered decode-time degrades\n",
-                budget_desc.c_str(), params.vbr_capacity_bits);
+                budget_desc.c_str(), params.vbr_entry.c_str(), params.vbr_capacity_bits);
         return;
+    }
+
+    if (params.vbr_entry_explicit) {
+        throw std::invalid_argument("--vbr-entry applies only to dynamic VBR; fixed --vbr-budget already selects the cache tier");
     }
 
     ggml_type fixed_type = GGML_TYPE_COUNT;
@@ -3264,12 +3330,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
         {"--vbr-bits", "--vbr-budget"}, "VALUE",
-        "VBR target budget: dynamic/auto = runtime degrade controller (starts at turbo8, degrades down the measured price order as the KV VRAM budget fills; see --vbr-vram/--vbr-floor); or a fixed tier f16, 8/t8, 4/t4, 3/t3, 2/t2, 1/t1; or numeric bits/value with --vbr-policy (default: dynamic when cache type is vbr)",
+        "VBR target budget: dynamic/auto = runtime degrade controller (starts at --vbr-entry, F16 by default, and degrades down the measured price order as the KV VRAM budget fills; see --vbr-vram/--vbr-floor); or a fixed tier f16, 8/t8, 4/t4, 3/t3, 2/t2, 1/t1; or numeric bits/value with --vbr-policy (default: dynamic when cache type is vbr)",
         [](common_params & params, const std::string & value) {
             params.vbr_budget = value;
             params.vbr_budget_explicit = true;
         }
     ).set_env("LLAMA_ARG_VBR_BUDGET").set_hidden());
+    add_opt(common_arg(
+        {"--vbr-entry"}, "TIER",
+        "dynamic VBR entry tier: f16 (quality-first default), t8, t4, t3, t2, or t1. "
+        "Starting below F16 is an explicit quality-for-bandwidth trade; tensors still degrade "
+        "toward --vbr-floor as the KV VRAM budget fills",
+        [](common_params & params, const std::string & value) {
+            params.vbr_entry = value;
+            params.vbr_entry_explicit = true;
+        }
+    ).set_env("LLAMA_ARG_VBR_ENTRY"));
     add_opt(common_arg(
         {"--vbr-floor", "--vbr-min-bits"}, "BITS",
         "aggregate VBR bits/value floor; accepts decimal bits or tier aliases f16, t8, t4, t3, t2, t1. "

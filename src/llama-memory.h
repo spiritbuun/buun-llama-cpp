@@ -324,6 +324,11 @@ struct llama_memory_i {
         return 0.0;
     }
 
+    // Per-token KV bits at the requested entry layout before walking the degrade order.
+    virtual double memory_vbr_entry_bits_per_token(ggml_type /*entry_k*/, ggml_type /*entry_v*/) {
+        return 0.0;
+    }
+
     // Per-token bytes of the flash-attention f16 dequant scratch at the settled deep-fill tier
     // state, summed over KV-hosting devices — a context-linear consumer that lives OUTSIDE the
     // KV budget (it draws from the fit margin). The fit charges it in the total-VRAM wall

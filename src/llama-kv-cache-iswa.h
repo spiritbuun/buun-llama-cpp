@@ -31,6 +31,18 @@ llama_memory_vbr_preflight_data llama_memory_vbr_preflight_children(
         first_result, first_physical, second_result, second_physical, physical);
 }
 
+template<typename First, typename Second>
+double llama_memory_vbr_floor_bits_children(
+        First & first,
+        Second & second,
+        ggml_type entry_k,
+        ggml_type entry_v,
+        double floor_bpv) {
+    const double first_bits = first.memory_vbr_floor_bits_per_token(entry_k, entry_v, floor_bpv);
+    const double second_bits = second.memory_vbr_floor_bits_per_token(entry_k, entry_v, floor_bpv);
+    return first_bits < 0.0 || second_bits < 0.0 ? -1.0 : first_bits + second_bits;
+}
+
 class llama_kv_cache_iswa : public llama_memory_i {
 public:
     llama_kv_cache_iswa(
@@ -122,8 +134,12 @@ public:
     // per-token floor cost is additive (SWA rows recycle, but the fit's measured KV bytes
     // count both caches the same way — the ratio consumer stays on one basis)
     double memory_vbr_floor_bits_per_token(ggml_type entry_k, ggml_type entry_v, double floor_bpv) override {
-        return kv_base->memory_vbr_floor_bits_per_token(entry_k, entry_v, floor_bpv) +
-               kv_swa ->memory_vbr_floor_bits_per_token(entry_k, entry_v, floor_bpv);
+        return llama_memory_vbr_floor_bits_children(*kv_base, *kv_swa, entry_k, entry_v, floor_bpv);
+    }
+
+    double memory_vbr_entry_bits_per_token(ggml_type entry_k, ggml_type entry_v) override {
+        return kv_base->memory_vbr_entry_bits_per_token(entry_k, entry_v) +
+               kv_swa ->memory_vbr_entry_bits_per_token(entry_k, entry_v);
     }
 
     // Not summed: both children share one per-device scratch sized by the widest attended

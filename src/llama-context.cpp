@@ -622,8 +622,8 @@ llama_context::llama_context(
             const bool turbo_k = ggml_is_turbo_kv_type(params.type_k);
             const bool turbo_v = ggml_is_turbo_kv_type(params.type_v);
             const bool vbr_layer_schedule = turbo_vbr_layer_schedule_enabled();
-            // dynamic VBR with the f16 entry tier: no turbo types at init, but later degrades
-            // flip tensors to turbo (FA-only decode) and the VMM gate needs v_trans == false
+            // Dynamic VBR may enter at F16 (so no turbo types exist yet) and later flip tensors
+            // to turbo. All dynamic entries require the same FA-only decode/VMM contract.
             const bool needs_device_fa = cparams.offload_kqv &&
                 (turbo_k || turbo_v || vbr_layer_schedule || params.vbr_dynamic);
             if (needs_device_fa) {
@@ -8360,6 +8360,15 @@ double llama_vbr_floor_bits_per_token(struct llama_context * ctx, enum ggml_type
     }
 
     return mem->memory_vbr_floor_bits_per_token(entry_k, entry_v, floor_bpv);
+}
+
+double llama_vbr_entry_bits_per_token(struct llama_context * ctx, enum ggml_type entry_k, enum ggml_type entry_v) {
+    llama_memory_t mem = ctx ? llama_get_memory(ctx) : nullptr;
+    if (!mem) {
+        return 0.0;
+    }
+
+    return mem->memory_vbr_entry_bits_per_token(entry_k, entry_v);
 }
 
 double llama_vbr_scratch_bytes_per_token(struct llama_context * ctx, enum ggml_type entry_k, enum ggml_type entry_v, double floor_bpv) {

@@ -5451,12 +5451,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
     // dynamic-VBR context trips the one-marker-per-process co-tenancy guard, failing
     // draft-context creation outright (observed with the Muse-Glimmer day-0 drafter).
     // Static -ctkd/-ctvd types still apply verbatim.
-    result.vbr_cache_type_k         = false;
-    result.vbr_cache_type_v         = false;
-    result.vbr_budget_explicit      = false;
-    result.vbr_min_bits_explicit    = false;
-    result.vbr_vram_budget_explicit = false;
-    result.vbr_policy_explicit      = false;
+    result.reset_vbr_runtime_state();
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
 

@@ -225,6 +225,13 @@ struct common_vbr_fit_costs {
     double    scratch_bytes_pt = 0.0;    // out
 };
 
+double common_vbr_fit_kv_scale(double floor_bits_per_token, double price_bits_per_token, bool types_coupled) {
+    if (types_coupled || floor_bits_per_token <= 0.0 || price_bits_per_token <= 0.0) {
+        return 1.0;
+    }
+    return std::max(1.0, floor_bits_per_token / price_bits_per_token);
+}
+
 const char * common_moe_cache_tensor_override_pattern() {
     return "blk\\.\\d+\\.ffn_(up|down|gate_up|gate)_(ch|)exps";
 }
@@ -657,7 +664,10 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
 
     if (vbr_costs != nullptr) {
         vbr_costs->bits_pt_floor = llama_vbr_floor_bits_per_token(ctx.get(), vbr_costs->entry_k, vbr_costs->entry_v, cparams->vbr_min_bits);
-        vbr_costs->bits_pt_price = llama_vbr_floor_bits_per_token(ctx.get(), cparams->type_k, cparams->type_v, 1e30);
+        if (vbr_costs->bits_pt_floor < 0.0) {
+            throw std::runtime_error("VBR aggregate floor exceeds the selected mixed K/V entry layout");
+        }
+        vbr_costs->bits_pt_price = llama_vbr_entry_bits_per_token(ctx.get(), cparams->type_k, cparams->type_v);
         vbr_costs->scratch_bytes_pt = llama_vbr_scratch_bytes_per_token(ctx.get(), vbr_costs->entry_k, vbr_costs->entry_v, cparams->vbr_min_bits);
         vbr_costs->types_coupled = llama_model_kv_cache_types_coupled(model.get());
     }
@@ -929,14 +939,14 @@ static void common_params_fit_impl(
     // but the runtime clamp holds the aggregate at a discrete tier MIX >= the literal floor —
     // capacity estimates must scale measured KV cost up by mix/price or they over-advertise
     // (e.g. floor 6: price t4 = 4.125 bpv vs an achievable mix of ~6.04)
-    double vbr_kv_scale = 1.0;
+    const double vbr_kv_scale = common_vbr_fit_kv_scale(
+        vbr_costs.bits_pt_floor, vbr_costs.bits_pt_price, vbr_costs.types_coupled);
     if (vbr_costs.types_coupled) {
         // coupled-KV model (MLA family): dynamic VBR runs a static cap there, the dry-load
         // bytes are already the achievable cost — floor/price scaling would over-advertise
         LOG_INF("%s: VBR dynamic: coupled-KV model runs a static cap — pricing KV at dry-load bytes\n",
                 __func__);
-    } else if (vbr_costs.bits_pt_floor > 0.0 && vbr_costs.bits_pt_price > 0.0) {
-        vbr_kv_scale = std::max(1.0, vbr_costs.bits_pt_floor / vbr_costs.bits_pt_price);
+    } else {
         if (vbr_kv_scale > 1.0 + 1e-6) {
             LOG_INF("%s: VBR dynamic: floor mix costs %.4g bits/token vs %.4g at the pricing tier "
                     "— scaling KV capacity math by %.3f\n",
@@ -1029,7 +1039,7 @@ static void common_params_fit_impl(
 
     // The dynamic-VBR runtime controller's fit pass owns the "auto" KV VRAM budget. In
     // dynamic mode the KV is priced at the FLOOR tier throughout this function (swap in
-    // common_fit_params) — the runtime cache starts at turbo8 and degrades toward the floor as
+    // common_fit_params) — the runtime cache starts at its configured entry and degrades toward the floor as
     // it fills, with mapped-physical bytes capped at the budget. The BUDGET handed to the
     // controller (env VBR_BUDGET_MIB) = explicit --vbr-vram, or the bytes the KV can take on
     // this box: its (floor-priced) projected footprint plus whatever would remain free above the
@@ -2215,6 +2225,16 @@ static ggml_type common_vbr_floor_price_tier(double floor_bpv) {
     return GGML_TYPE_TURBO1_TCQ;
 }
 
+ggml_type common_vbr_fit_price_type(ggml_type entry, double floor_bpv, bool pinned) {
+    if (pinned || (entry != GGML_TYPE_F16 && !ggml_is_turbo_kv_type(entry))) {
+        return entry;
+    }
+    const ggml_type price_t = common_vbr_floor_price_tier(floor_bpv);
+    const double price_bits = 8.0 * ggml_type_size(price_t) / ggml_blck_size(price_t);
+    const double entry_bits = 8.0 * ggml_type_size(entry) / ggml_blck_size(entry);
+    return price_bits < entry_bits ? price_t : entry;
+}
+
 enum common_params_fit_status common_fit_params(
         const char * path_model,
         llama_model_params * mparams,
@@ -2241,13 +2261,13 @@ enum common_params_fit_status common_fit_params(
         return COMMON_PARAMS_FIT_STATUS_SUCCESS;
     }
 
-    // Dynamic VBR: price the KV at the degrade FLOOR for the whole fit, not at the turbo8 entry
+    // Dynamic VBR: price the KV at the degrade FLOOR for the whole fit, not at the configured entry
     // tier. The runtime controller caps mapped-physical KV at the budget and the layout sits at
     // the floor when the context is full — so floor cost is what capacity/fitting must assume.
     // With this swap every fit branch does the right thing: a memory-constrained box shrinks
     // n_ctx to the FLOOR capacity of its VRAM (not the ~6.5x smaller entry-tier capacity), and
     // the auto KV budget prices its headroom correctly. Entry types are restored for the real
-    // load — the cache still STARTS at turbo8 and degrades toward the floor as it fills.
+    // load — the cache still starts at its configured entry and degrades toward the floor as it fills.
     const ggml_type type_k_entry = cparams->type_k;
     const ggml_type type_v_entry = cparams->type_v;
     if (cparams->vbr_dynamic) {
@@ -2261,10 +2281,10 @@ enum common_params_fit_status common_fit_params(
             return !pinned && (t == GGML_TYPE_F16 || ggml_is_turbo_kv_type(t));
         };
         if (movable(cparams->type_k, cparams->vbr_pin_k)) {
-            cparams->type_k = price_t;
+            cparams->type_k = common_vbr_fit_price_type(type_k_entry, cparams->vbr_min_bits, false);
         }
         if (movable(cparams->type_v, cparams->vbr_pin_v)) {
-            cparams->type_v = price_t;
+            cparams->type_v = common_vbr_fit_price_type(type_v_entry, cparams->vbr_min_bits, false);
         }
         LOG_INF("%s: VBR dynamic: fitting with KV priced at the %s floor tier%s\n",
                 __func__, ggml_type_name(price_t),

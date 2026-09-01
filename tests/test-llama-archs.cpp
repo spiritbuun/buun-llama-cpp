@@ -1973,6 +1973,15 @@ static void test_qwen4_vbr_cuda(const size_t seed) {
     GGML_ASSERT(llama_kv_cache_vbr_epoch_test::map_seed_watermark(attn));
     GGML_ASSERT(idx->type_k() == GGML_TYPE_F16 && idx->type_v() == GGML_TYPE_F16);
 
+    // Entry and floor queries use the same bits-per-context-token unit. This pins the fit's
+    // fractional-floor denominator against accidentally returning aggregate bits/value.
+    const double entry_f16 = llama_vbr_entry_bits_per_token(ctx.get(), GGML_TYPE_F16, GGML_TYPE_F16);
+    const double floor_f16 = llama_vbr_floor_bits_per_token(ctx.get(), GGML_TYPE_F16, GGML_TYPE_F16, 16.0);
+    const double floor_six = llama_vbr_floor_bits_per_token(ctx.get(), GGML_TYPE_F16, GGML_TYPE_F16, 6.0);
+    const double price_t4  = llama_vbr_entry_bits_per_token(ctx.get(), GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0);
+    GGML_ASSERT(entry_f16 > 0.0 && std::abs(entry_f16 - floor_f16) <= entry_f16*1.0e-12);
+    GGML_ASSERT(floor_six > price_t4 && floor_six/price_t4 < 2.0);
+
     decode_range(ctx.get(), 0, 256);
     GGML_ASSERT(trace.raw_key_nodes > 0);
     GGML_ASSERT(trace.score_nodes == 0 && trace.top_k_nodes == 0);

@@ -480,6 +480,7 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp)
+llama_build_and_test(test-llama-bench-vbr.cpp)
 llama_build_and_test(test-mtp-vocab-trim.cpp)
 if (MSVC)
     target_compile_options(test-arg-parser PRIVATE /UNDEBUG)

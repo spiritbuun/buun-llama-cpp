@@ -179,11 +179,15 @@ LLAMA_API llama_live_memory_breakdown llama_get_live_memory_breakdown(
 
 // Per-token KV bits of the layout the --vbr-floor clamp lands on: walk the VBR degrade order
 // from the given entry types (GGML_TYPE_COUNT = each tensor's current type) until the aggregate
-// bits/value would cross floor_bpv (<= 0 = bottom-tier default; pass 1e30 for the un-walked
-// layout cost of the given types). Returns 0 when the context has no VBR-capable cache.
+// bits/value would cross floor_bpv (<= 0 = bottom-tier default). Returns -1 when the requested
+// aggregate floor is above the entry layout and 0 when the context has no VBR-capable cache.
 // Works on no_alloc (fit dry-load) contexts — the fit uses it for floor-true capacity math.
 LLAMA_API double llama_vbr_floor_bits_per_token(struct llama_context * ctx,
         enum ggml_type entry_k, enum ggml_type entry_v, double floor_bpv);
+
+// Per-token KV bits at the requested entry layout before walking the degrade order.
+LLAMA_API double llama_vbr_entry_bits_per_token(struct llama_context * ctx,
+        enum ggml_type entry_k, enum ggml_type entry_v);
 
 // Per-token bytes of the flash-attention f16 dequant scratch at the settled deep-fill tier state
 // (see llama-memory.h memory_vbr_scratch_bytes_per_token). The fit charges this in its

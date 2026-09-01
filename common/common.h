@@ -728,6 +728,7 @@ struct common_params {
     bool cache_type_k_explicit = false;      // whether -ct/-ctk explicitly selected the K type
     bool cache_type_v_explicit = false;      // whether -ct/-ctv explicitly selected the V type
     std::string vbr_budget = "dynamic"; // VBR target budget: dynamic or a fixed tier/bit width
+    std::string vbr_entry = "f16";       // dynamic VBR entry tier; quality-first default remains F16
     std::string vbr_min_bits = "auto";  // VBR aggregate effective bits/value floor for dynamic capacity planning
     std::string vbr_vram_budget = "auto"; // VBR KV VRAM budget: auto or explicit byte/suffixed size
     std::string vbr_policy = "auto";    // VBR policy ladder JSON/path; auto checks VBR_POLICY_LADDER env
@@ -740,10 +741,11 @@ struct common_params {
     double vbr_selected_kld = 0.0;       // measured KLD of the selected policy/rung
     uint64_t vbr_vram_budget_bytes = 0;  // explicit VBR KV VRAM budget in bytes, 0 == auto
     bool vbr_budget_explicit = false;   // whether --vbr-budget/--vbr-bits was provided
+    bool vbr_entry_explicit = false;    // whether --vbr-entry was provided
     bool vbr_min_bits_explicit = false; // whether --vbr-min-bits/--vbr-floor was provided
     bool vbr_vram_budget_explicit = false; // whether --vbr-vram/--vbr-vram-budget was provided
     bool vbr_policy_explicit = false;   // whether --vbr-policy was provided
-    // Common CLI default: dynamic VBR on both sides. The underlying entry tensors remain F16;
+    // Common CLI default: dynamic VBR on both sides at the selected entry tier (F16 by default);
     // postprocessing supplies the friendly implicit t4 floor. Explicit `-ct vbr` is tracked
     // separately and deliberately retains the full t1 ladder when no floor was typed.
     bool vbr_cache_type_k = true;
@@ -763,10 +765,39 @@ struct common_params {
     // canonical predicates — use these instead of re-deriving the flag combinations
     bool vbr_enabled() const {
         return vbr_cache_type_k || vbr_cache_type_v || vbr_budget_explicit ||
-               vbr_min_bits_explicit || vbr_vram_budget_explicit || vbr_policy_explicit;
+               vbr_entry_explicit || vbr_min_bits_explicit || vbr_vram_budget_explicit || vbr_policy_explicit;
     }
     bool vbr_dynamic() const {
         return vbr_enabled() && (vbr_budget == "dynamic" || vbr_budget == "auto" || vbr_budget.empty());
+    }
+    bool vbr_explicitly_selected() const {
+        return vbr_cache_type_k_explicit || vbr_cache_type_v_explicit ||
+               vbr_budget_explicit || vbr_entry_explicit || vbr_min_bits_explicit ||
+               vbr_vram_budget_explicit || vbr_policy_explicit;
+    }
+    void reset_vbr_runtime_state() {
+        vbr_budget = "dynamic";
+        vbr_entry = "f16";
+        vbr_min_bits = "auto";
+        vbr_vram_budget = "auto";
+        vbr_policy = "auto";
+        vbr_selected_family.clear();
+        vbr_selected_policy.clear();
+        vbr_selected_schedule.clear();
+        vbr_min_bits_value = 0.0;
+        vbr_capacity_bits = 0.0;
+        vbr_selected_bpv = 0.0;
+        vbr_selected_kld = 0.0;
+        vbr_vram_budget_bytes = 0;
+        vbr_budget_explicit = false;
+        vbr_entry_explicit = false;
+        vbr_min_bits_explicit = false;
+        vbr_vram_budget_explicit = false;
+        vbr_policy_explicit = false;
+        vbr_cache_type_k = false;
+        vbr_cache_type_v = false;
+        vbr_cache_type_k_explicit = false;
+        vbr_cache_type_v_explicit = false;
     }
     // mixed config: a side that did NOT select the vbr alias while the other did is PINNED at
     // its explicit type (arg.cpp warns at parse time; the runtime ladder skips it). Whole-cache
@@ -983,6 +1014,11 @@ enum class common_vbr_cpu_fallback_result {
     explicit_vbr,
 };
 
+// Resolve a coupled-KV model after loading. Returns true when one explicit static side was
+// mirrored to the other. Explicit VBR controls cannot be honored by that static resolution and
+// are rejected instead of silently reporting a controller that never armed.
+bool common_vbr_resolve_coupled_cache_types(common_params & params, llama_context_params & cparams);
+
 enum class common_vbr_prompt_cache_mode {
     disabled_cache_ram,
     disabled_static,
@@ -1013,6 +1049,39 @@ std::string common_params_get_system_info(const common_params & params);
 // aggregate floor in effective bits/value (0 == bottom-tier floor). Throws std::invalid_argument on
 // bad input. Single source of truth for the floor→bits mapping, shared by the main CLI and llama-bench.
 double common_vbr_floor_bits(const std::string & floor);
+
+// Resolve a discrete dynamic-VBR entry tier (f16/t8/t4/t3/t2/t1 and aliases) to its ggml type.
+// Unlike the floor, the entry cannot be fractional. Throws std::invalid_argument on bad input.
+ggml_type common_vbr_entry_type(const std::string & entry);
+
+struct common_vbr_cache_choice {
+    ggml_type type = GGML_TYPE_F16;
+    bool vbr = false;
+    bool explicit_choice = false;
+
+    bool operator==(const common_vbr_cache_choice & other) const {
+        return type == other.type && vbr == other.vbr && explicit_choice == other.explicit_choice;
+    }
+};
+
+struct common_vbr_side_selection {
+    bool k = false;
+    bool v = false;
+};
+
+// Resolve which cache sides a benchmark/configuration row makes movable. Explicit `vbr` aliases
+// apply only to that matrix row and may claim an untouched F16 peer; standalone VBR options arm
+// untouched sides only when the matrix itself has no aliases.
+common_vbr_side_selection common_vbr_resolve_sides(
+        const common_vbr_cache_choice & k,
+        const common_vbr_cache_choice & v,
+        bool vbr_options_selected,
+        bool matrix_has_vbr_alias);
+
+// Fit-time representation for a cache side: never price a movable side wider than its selected
+// entry, and never alter a pinned side.
+ggml_type common_vbr_fit_price_type(ggml_type entry, double floor_bpv, bool pinned);
+double common_vbr_fit_kv_scale(double floor_bits_per_token, double price_bits_per_token, bool types_coupled);
 
 // Resolve a VBR VRAM budget spec ("auto"/"none" or a size with optional K/M/G[i]B suffix) to bytes
 // (0 == auto). Throws std::invalid_argument on bad input. Shared with the main CLI's parser.

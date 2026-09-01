@@ -171,7 +171,7 @@ bool llama_kv_cache::vbr_hard_seal_step_blocked(
     return verdict == vbr_hard_seal_guard_result::hard_lease_blocked;
 }
 
-// a type the degrade ladder can move: the five turbo tiers plus F16, which is the dynamic
+// a type the degrade ladder can move: the five turbo tiers plus F16, which is the default dynamic
 // entry tier (full-quality until budget pressure; the measured orders' first band is
 // fp16->t8). Anything else living in a VMM pool — an explicitly non-vbr side of a mixed
 // -ct config (q8_0, bf16) — is PINNED: the transcode dequant has no source support for it,
@@ -910,6 +910,12 @@ llama_kv_cache::llama_kv_cache(
     // Construct eagerly so multiple share-linked contexts can register without racing a lazy
     // owner-side pointer initialization. The registry itself stays empty for ordinary caches.
     vbr_shared_scratch_registry_ = std::make_shared<vbr_shared_scratch_registry>();
+
+    // A constructor failure does not run ~llama_kv_cache(), while VMM pools are raw backend
+    // resources owned outside the ggml buffers. Keep the normal teardown armed until every
+    // initialization step (including model-aware floor validation) has succeeded.
+    auto construction_rollback = std::unique_ptr<llama_kv_cache, std::function<void(llama_kv_cache *)>>(
+        this, [](llama_kv_cache * cache) { cache->vbr_release_resources(); });
 
     // A share-linked cache follows the OWNER's dynamic VBR: tier flips mutate the owner's
     // tensors in place (which this cache's layer entries alias) and graph reuse fences on
@@ -2018,6 +2024,7 @@ llama_kv_cache::llama_kv_cache(
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
+    construction_rollback.release();
 }
 
 llama_kv_cache::llama_kv_cache(
@@ -2044,6 +2051,10 @@ llama_kv_cache::llama_kv_cache(
 }
 
 llama_kv_cache::~llama_kv_cache() {
+    vbr_release_resources();
+}
+
+void llama_kv_cache::vbr_release_resources() {
     // vbr_trace_fp_ closes itself through its RAII unique_ptr.
     // Normally the enclosing llama_context's detach guard clears these while this context's
     // compute backends are still alive. Keep RAII cleanup for direct construction and for a
@@ -5020,6 +5031,13 @@ llama_kv_cache::vbr_floor_sim_result llama_kv_cache::vbr_floor_sim(
     if (sum_vals == 0) {
         return res;
     }
+    res.initial_bits_per_token = sum_bits;
+    res.initial_bpv = sum_bits / sum_vals;
+    res.floor_reachable = vbr_floor_reachable(res.initial_bpv, floor_bpv);
+    if (!res.floor_reachable) {
+        res.bits_per_token = sum_bits;
+        return res;
+    }
     for (size_t i = 0; i < vbr_degrade_order_.size(); ++i) {
         size_t slot; const ggml_tensor * t; ggml_type type_B;
         if (!vbr_sim_step(sim, i, slot, t, type_B)) {
@@ -5046,7 +5064,16 @@ double llama_kv_cache::memory_vbr_floor_bits_per_token(ggml_type entry_k, ggml_t
     if (vbr_degrade_order_.empty()) {
         vbr_load_degrade_order(); // dry contexts never reach the VMM arming block
     }
-    return vbr_floor_sim(vbr_resolve_floor_bpv(floor_bpv), !vbr_pools_.empty(), entry_k, entry_v).bits_per_token;
+    const auto res = vbr_floor_sim(
+        vbr_resolve_floor_bpv(floor_bpv), !vbr_pools_.empty(), entry_k, entry_v);
+    return res.floor_reachable ? res.bits_per_token : -1.0;
+}
+
+double llama_kv_cache::memory_vbr_entry_bits_per_token(ggml_type entry_k, ggml_type entry_v) {
+    if (vbr_degrade_order_.empty()) {
+        vbr_load_degrade_order();
+    }
+    return vbr_floor_sim(0.0, !vbr_pools_.empty(), entry_k, entry_v).initial_bits_per_token;
 }
 
 // Per-token bytes of flash-attention f16 dequant scratch at the settled deep-fill state,
@@ -5110,6 +5137,11 @@ double llama_kv_cache::memory_vbr_scratch_bytes_per_token(ggml_type entry_k, ggm
 void llama_kv_cache::vbr_floor_clamp_order() {
     const double floor_bpv = vbr_resolve_floor_bpv(vbr_params_.min_bits);
     const auto res = vbr_floor_sim(floor_bpv, /*pooled_only =*/ true);
+    if (!res.floor_reachable) {
+        throw std::runtime_error("VBR aggregate floor " + std::to_string(floor_bpv) +
+            " bits/value exceeds the mixed K/V entry layout (" +
+            std::to_string(res.initial_bpv) + " bits/value)");
+    }
     vbr_degrade_limit_ = res.clamp_step;
     if (res.bits_per_token == 0.0) {
         return; // no VMM-pooled units
@@ -8369,7 +8401,7 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
             // rows (V - mu_V), and neither t8 nor f16 decode restores the means (turbo_tap_mu
             // gates t8 out of the tap; f16 has no add-back) — promoting across the boundary
             // would serve mean-shifted values. Promotion still operates within the tapped
-            // tiers (t4 <-> t3 <-> t2 <-> t1); the f16 entry returns losslessly at full reset.
+            // tiers (t4 <-> t3 <-> t2 <-> t1); the configured entry returns losslessly at full reset.
             return false;
         }
         for (const auto & u : units) {

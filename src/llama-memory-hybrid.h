@@ -119,6 +119,10 @@ public:
         return mem_attn->memory_vbr_floor_bits_per_token(entry_k, entry_v, floor_bpv);
     }
 
+    double memory_vbr_entry_bits_per_token(ggml_type entry_k, ggml_type entry_v) override {
+        return mem_attn->memory_vbr_entry_bits_per_token(entry_k, entry_v);
+    }
+
     double memory_vbr_scratch_bytes_per_token(ggml_type entry_k, ggml_type entry_v, double floor_bpv) override {
         return mem_attn->memory_vbr_scratch_bytes_per_token(entry_k, entry_v, floor_bpv);
     }
