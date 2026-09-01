@@ -13,11 +13,246 @@
 #include <cstring>
 #include <future>
 #include <limits>
+#include <fstream>
+#include <filesystem>
+#include <optional>
 #include <regex>
+#include <sstream>
+
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#elif defined(__APPLE__)
+#  include <mach/mach.h>
+#  include <sys/sysctl.h>
+#endif
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
+
+bool llama_mmap_prefetch_resolve(
+        enum llama_mmap_prefetch_mode mode,
+        uint64_t mapped_bytes,
+        uint64_t available_bytes,
+        bool available_known) {
+    if (mode == LLAMA_MMAP_PREFETCH_MODE_OFF) {
+        return false;
+    }
+    if (mode == LLAMA_MMAP_PREFETCH_MODE_ON || !available_known) {
+        return true;
+    }
+    // Bulk WILLNEED is useful when the mapping comfortably fits. When it does
+    // not, it evicts the exact expert working set that lazy MoE models build up
+    // naturally. Keep one quarter of currently available RAM for the runtime,
+    // KV state, allocator metadata, and unrelated processes.
+    return mapped_bytes <= available_bytes - available_bytes/4;
+}
+
+struct llama_available_memory {
+    uint64_t bytes = 0;
+    bool known = false;
+};
+
+#if defined(__linux__)
+static bool llama_read_u64_file(const char * path, uint64_t & value) {
+    std::ifstream input(path);
+    std::string text;
+    if (!(input >> text) || text == "max") {
+        return false;
+    }
+    try {
+        size_t used = 0;
+        const uint64_t parsed = std::stoull(text, &used);
+        if (used != text.size()) {
+            return false;
+        }
+        value = parsed;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static std::optional<std::string> llama_linux_cgroup_path(
+        const char * cgroup_file, bool v2) {
+    std::ifstream input(cgroup_file);
+    std::string line;
+    while (std::getline(input, line)) {
+        const size_t first = line.find(':');
+        const size_t second = first == std::string::npos
+            ? std::string::npos : line.find(':', first + 1);
+        if (second == std::string::npos) {
+            continue;
+        }
+        const std::string controllers = line.substr(first + 1, second - first - 1);
+        const bool matches = v2
+            ? controllers.empty()
+            : ("," + controllers + ",").find(",memory,") != std::string::npos;
+        if (matches) {
+            std::string path = line.substr(second + 1);
+            if (path.empty() || path.front() != '/') {
+                path.insert(path.begin(), '/');
+            }
+            return path;
+        }
+    }
+    return std::nullopt;
+}
+
+struct llama_cgroup_mount {
+    std::string root;
+    std::string point;
+    bool v2 = false;
+};
+
+static std::optional<llama_cgroup_mount> llama_linux_cgroup_mount(
+        const char * mountinfo_file, bool v2, const std::string & membership) {
+    std::ifstream input(mountinfo_file);
+    std::string line;
+    std::optional<llama_cgroup_mount> best;
+    while (std::getline(input, line)) {
+        const size_t separator = line.find(" - ");
+        if (separator == std::string::npos) {
+            continue;
+        }
+        std::istringstream before(line.substr(0, separator));
+        std::istringstream after(line.substr(separator + 3));
+        std::string id, parent, device, root, point;
+        std::string fs_type, source, super_options;
+        if (!(before >> id >> parent >> device >> root >> point) ||
+                !(after >> fs_type >> source >> super_options)) {
+            continue;
+        }
+        const bool matches = v2 ? fs_type == "cgroup2" :
+            fs_type == "cgroup" &&
+                ("," + super_options + ",").find(",memory,") != std::string::npos;
+        const bool contains_membership = root == "/" || membership == root ||
+            (membership.size() > root.size() &&
+             membership.compare(0, root.size(), root) == 0 &&
+             membership[root.size()] == '/');
+        if (matches && contains_membership &&
+                (!best || root.size() > best->root.size())) {
+            best = llama_cgroup_mount{root, point, v2};
+        }
+    }
+    return best;
+}
+
+static bool llama_linux_cgroup_available_one(
+        const char * cgroup_file, const char * mountinfo_file,
+        bool v2, uint64_t & available) {
+    const auto membership = llama_linux_cgroup_path(cgroup_file, v2);
+    if (!membership) {
+        return false;
+    }
+    const auto mount = llama_linux_cgroup_mount(mountinfo_file, v2, *membership);
+    if (!mount) {
+        return false;
+    }
+
+    std::string relative;
+    if (mount->root == "/") {
+        relative = membership->substr(1);
+    } else if (*membership == mount->root) {
+        relative.clear();
+    } else if (membership->size() > mount->root.size() &&
+            membership->compare(0, mount->root.size(), mount->root) == 0 &&
+            (*membership)[mount->root.size()] == '/') {
+        relative = membership->substr(mount->root.size() + 1);
+    } else {
+        return false;
+    }
+
+    const std::filesystem::path mount_point =
+        std::filesystem::path(mount->point).lexically_normal();
+    std::filesystem::path current_path = relative.empty()
+        ? mount_point : (mount_point / relative).lexically_normal();
+    bool known = false;
+    uint64_t minimum = UINT64_MAX;
+    for (;;) {
+        const std::string limit_name = v2 ? "memory.max" : "memory.limit_in_bytes";
+        const std::string usage_name = v2 ? "memory.current" : "memory.usage_in_bytes";
+        uint64_t limit = 0;
+        uint64_t usage = 0;
+        if (llama_read_u64_file((current_path / limit_name).c_str(), limit) &&
+                llama_read_u64_file((current_path / usage_name).c_str(), usage)) {
+            minimum = std::min(minimum, usage < limit ? limit - usage : 0);
+            known = true;
+        }
+        if (current_path == mount_point) {
+            break;
+        }
+        const std::filesystem::path parent = current_path.parent_path();
+        if (parent == current_path ||
+                parent.native().compare(0, mount_point.native().size(), mount_point.native()) != 0) {
+            break;
+        }
+        current_path = parent;
+    }
+    if (known) {
+        available = minimum;
+    }
+    return known;
+}
+
+bool llama_linux_cgroup_memory_available(
+        const char * cgroup_file, const char * mountinfo_file,
+        uint64_t & available) {
+    return llama_linux_cgroup_available_one(
+            cgroup_file, mountinfo_file, true, available) ||
+        llama_linux_cgroup_available_one(
+            cgroup_file, mountinfo_file, false, available);
+}
+#endif
+
+static llama_available_memory llama_system_memory_available() {
+#ifdef _WIN32
+    MEMORYSTATUSEX status = {};
+    status.dwLength = sizeof(status);
+    return GlobalMemoryStatusEx(&status)
+        ? llama_available_memory{status.ullAvailPhys, true}
+        : llama_available_memory{};
+#elif defined(__linux__)
+    llama_available_memory result;
+    std::ifstream input("/proc/meminfo");
+    std::string key;
+    uint64_t value_kib = 0;
+    std::string unit;
+    while (input >> key >> value_kib >> unit) {
+        if (key == "MemAvailable:") {
+            result.bytes = value_kib <= UINT64_MAX/1024 ? value_kib*1024 : UINT64_MAX;
+            result.known = true;
+            break;
+        }
+    }
+    uint64_t cgroup_available = 0;
+    if (llama_linux_cgroup_memory_available(
+            "/proc/self/cgroup", "/proc/self/mountinfo", cgroup_available)) {
+        result.bytes = result.known ? std::min(result.bytes, cgroup_available) : cgroup_available;
+        result.known = true;
+    }
+    return result;
+#elif defined(__APPLE__)
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    vm_statistics64_data_t vm = {};
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                reinterpret_cast<host_info64_t>(&vm), &count) != KERN_SUCCESS) {
+        return {};
+    }
+    uint64_t page_size = 0;
+    size_t page_size_len = sizeof(page_size);
+    if (sysctlbyname("hw.pagesize", &page_size, &page_size_len, nullptr, 0) != 0) {
+        return {};
+    }
+    return {
+        (uint64_t(vm.free_count) + uint64_t(vm.inactive_count)) * page_size,
+        true,
+    };
+#else
+    return {};
+#endif
+}
 
 static std::string deepseek4_dspark_tensor_name(const char * name) {
     const std::string canonical(name);
@@ -445,14 +680,19 @@ namespace GGUFMeta {
         struct GGUFMeta::ArrayInfo arr_info =
             GGUFMeta::GKV<GGUFMeta::ArrayInfo>::get_kv(ctx, kid);
 
+        bool type_ok = false;
         switch (arr_info.gt) {
             case GGUF_TYPE_UINT32:
-            case GGUF_TYPE_INT32:   GGML_ASSERT((std::is_same<T,     int32_t>::value) ||
-                                                (std::is_same<T,    uint32_t>::value)); break;
-            case GGUF_TYPE_FLOAT32: GGML_ASSERT((std::is_same<T,       float>::value)); break;
-            case GGUF_TYPE_STRING:  GGML_ASSERT((std::is_same<T, std::string>::value)); break;
+            case GGUF_TYPE_INT32:   type_ok = (std::is_same<T,     int32_t>::value) ||
+                                              (std::is_same<T,    uint32_t>::value); break;
+            case GGUF_TYPE_UINT64:  type_ok = (std::is_same<T,    uint64_t>::value); break;
+            case GGUF_TYPE_FLOAT32: type_ok = (std::is_same<T,       float>::value); break;
+            case GGUF_TYPE_STRING:  type_ok = (std::is_same<T, std::string>::value); break;
             default:
-                throw std::runtime_error(format("%s is not a string/float32/uint32/int32 array", key.c_str()));
+                throw std::runtime_error(format("%s is not a string/float32/uint32/int32/uint64 array", key.c_str()));
+        }
+        if (!type_ok) {
+            throw std::runtime_error(format("%s has wrong array element type %s", key.c_str(), gguf_type_name(arr_info.gt)));
         }
 
         if constexpr (std::is_same<T, std::string>::value) {
@@ -486,15 +726,20 @@ namespace GGUFMeta {
         struct GGUFMeta::ArrayInfo arr_info =
             GGUFMeta::GKV<GGUFMeta::ArrayInfo>::get_kv(ctx, kid);
 
+        bool type_ok = false;
         switch (arr_info.gt) {
             case GGUF_TYPE_BOOL:
             case GGUF_TYPE_UINT32:
-            case GGUF_TYPE_INT32:   GGML_ASSERT((std::is_same<T,     int32_t>::value) ||
-                                                (std::is_same<T,    uint32_t>::value)); break;
-            case GGUF_TYPE_FLOAT32: GGML_ASSERT((std::is_same<T,       float>::value)); break;
-            case GGUF_TYPE_STRING:  GGML_ASSERT((std::is_same<T, std::string>::value)); break;
+            case GGUF_TYPE_INT32:   type_ok = (std::is_same<T,     int32_t>::value) ||
+                                              (std::is_same<T,    uint32_t>::value); break;
+            case GGUF_TYPE_UINT64:  type_ok = (std::is_same<T,    uint64_t>::value); break;
+            case GGUF_TYPE_FLOAT32: type_ok = (std::is_same<T,       float>::value); break;
+            case GGUF_TYPE_STRING:  type_ok = (std::is_same<T, std::string>::value); break;
             default:
-                throw std::runtime_error(format("%s is not a string/float32/uint32/int32 array", key.c_str()));
+                throw std::runtime_error(format("%s is not a string/float32/uint32/int32/uint64 array", key.c_str()));
+        }
+        if (!type_ok) {
+            throw std::runtime_error(format("%s has wrong array element type %s", key.c_str(), gguf_type_name(arr_info.gt)));
         }
 
         if (arr_info.length > N_MAX) {
@@ -531,6 +776,9 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_arr<std::array<int32_t, 512>>(enum llm_kv kid, std::array<int32_t, 512> & result, bool required);
     template bool llama_model_loader::get_arr<std::vector<int32_t>>(enum llm_kv kid, std::vector<int32_t> & result, bool required);
     template bool llama_model_loader::get_arr<std::array<uint32_t, LLAMA_MAX_LAYERS>>(enum llm_kv kid, std::array<uint32_t, LLAMA_MAX_LAYERS> & result, bool required);
+    template bool llama_model_loader::get_arr<std::vector<uint32_t>>(enum llm_kv kid, std::vector<uint32_t> & result, bool required);
+    template bool llama_model_loader::get_arr<std::array<uint64_t, LLAMA_MAX_PLE_NGRAM>>(enum llm_kv kid, std::array<uint64_t, LLAMA_MAX_PLE_NGRAM> & result, bool required);
+    template bool llama_model_loader::get_arr<std::array<uint64_t, LLAMA_MAX_PLE_HEADS>>(enum llm_kv kid, std::array<uint64_t, LLAMA_MAX_PLE_HEADS> & result, bool required);
 
     template<typename T>
     bool llama_model_loader::get_key(const std::string & key, T & result, bool required) {
@@ -674,7 +922,7 @@ llama_model_loader::llama_model_loader(
 
     tensor_buft_overrides = param_tensor_buft_overrides_p;
 
-    this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
+    this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK || load_mode == LLAMA_LOAD_MODE_AUTO;
     this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
 
     if (!fname.empty()) {
@@ -986,39 +1234,6 @@ const llama_model_loader::llama_tensor_weight * llama_model_loader::get_weight(c
         return &pos->second;
     }
 
-    if (llm_kv.arch == LLM_ARCH_DFLASH) {
-        // DFlash2 was published with two GGUF naming conventions. Keep the fork's
-        // descriptive dotted names canonical, but accept the names emitted by the
-        // upstream converter as aliases so public sidecars load without rewriting.
-        static constexpr const char * dflash2_aliases[][2] = {
-            { "selector.hidden_proj.weight", "selector_hidden.weight"      },
-            { "selector.pred_codebook",      "selector_predecessor.weight" },
-            { "selector.succ_codebook",      "selector_successor.weight"   },
-            { ".attn_conv.base",             ".attn_conv_base"             },
-            { ".attn_conv.proj.weight",      ".attn_conv_proj.weight"      },
-            { ".ffn_conv.base",              ".ffn_conv_base"              },
-            { ".ffn_conv.proj.weight",       ".ffn_conv_proj.weight"       },
-        };
-        for (const auto & alias : dflash2_aliases) {
-            std::string alternate = name;
-            size_t at = alternate.find(alias[0]);
-            const char * from = alias[0];
-            const char * to   = alias[1];
-            if (at == std::string::npos) {
-                at   = alternate.find(alias[1]);
-                from = alias[1];
-                to   = alias[0];
-            }
-            if (at != std::string::npos) {
-                alternate.replace(at, std::strlen(from), to);
-                pos = weights_map.find(alternate);
-                if (pos != weights_map.end()) {
-                    return &pos->second;
-                }
-            }
-        }
-    }
-
     if (deepseek4_dspark_support) {
         const std::string raw_name = deepseek4_dspark_tensor_name(name);
         if (!raw_name.empty()) {
@@ -1068,6 +1283,11 @@ bool llama_model_loader::get_tensor_info(
     type = gguf_get_tensor_type(metadata, tid);
     std::copy_n(gguf_get_tensor_ne(metadata, tid), GGML_MAX_DIMS, ne.begin());
     return true;
+}
+
+struct ggml_tensor * llama_model_loader::get_tensor_meta_exact(const char * name) const {
+    const auto pos = weights_map.find(name);
+    return pos == weights_map.end() ? nullptr : pos->second.tensor;
 }
 
 struct ggml_tensor * llama_model_loader::require_tensor_meta(const std::string & name) const {
@@ -1158,10 +1378,11 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
             } break;
         case GGML_OP_MUL_MAT_ID:
             {
-                const int n_expert_used = hparams.n_expert_used;
-                GGML_ASSERT(n_expert_used > 0);
-                ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, w->ne[0], n_expert_used, 512);
-                ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert_used, 512);
+                // Used for either MoE expert routing or embedded adapter routing
+                const int n_ids_used = hparams.router_layer >= 0 ? 1 : hparams.n_expert_used;
+                GGML_ASSERT(n_ids_used > 0);
+                ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, w->ne[0], n_ids_used, 512);
+                ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_ids_used, 512);
                 op_tensor = ggml_mul_mat_id(ctx, w, b, ids);
             } break;
         case GGML_OP_ADD:
@@ -1222,7 +1443,7 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
                 ggml_tensor * B   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d_state, n_group, n_seq_tokens, n_seqs);
                 ggml_tensor * C   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d_state, n_group, n_seq_tokens, n_seqs);
                 ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
-                op_tensor = ggml_ssm_scan(ctx, s, x, dt, w, B, C, ids);
+                op_tensor = ggml_ssm_scan(ctx, s, x, dt, w, B, C, ids, /*K=*/1);
             } break;
         case GGML_OP_RWKV_WKV6:
             {
@@ -1343,15 +1564,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             return nullptr;
         }
 
-        // tensors with "bias" suffix are always used with GGML_OP_ADD or GGML_OP_ADD_ID
+        // tensors with "bias" suffix are always used with GGML_OP_ADD or GGML_OP_ADD_ID;
+        // embedded-adapter ".lora_a"/".lora_b" tensors are always used with GGML_OP_MUL_MAT_ID
         ggml_op op;
-        bool bias = tn.suffix != nullptr && strcmp(tn.suffix, "bias") == 0;
-        if (bias) {
-            if (info.op == GGML_OP_MUL_MAT_ID) {
-                op = GGML_OP_ADD_ID;
-            } else {
-                op = GGML_OP_ADD;
-            }
+        if (tn.suffix != nullptr && strcmp(tn.suffix, "bias") == 0) {
+            op = info.op == GGML_OP_MUL_MAT_ID ? GGML_OP_ADD_ID : GGML_OP_ADD;
+        } else if (hparams.router_layer >= 0 && tn.suffix != nullptr &&
+                (strcmp(tn.suffix, "lora_a") == 0 || strcmp(tn.suffix, "lora_b") == 0)) {
+            op = GGML_OP_MUL_MAT_ID;
         } else {
             op = info.op;
         }
@@ -1398,7 +1618,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                         if (use_mmap) {
                             static std::once_flag once;
                             std::call_once(once, [] {
-                                LLAMA_LOG_WARN("llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --no-mmap for better performance\n");
+                                LLAMA_LOG_WARN("llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --load-mode none for better performance\n");
                             });
                         }
                     } else {
@@ -1543,6 +1763,18 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return NULL;
     }
 
+    if ((flags & TENSOR_READ_LAZY) && use_mmap && lazy_mode != LLAMA_LAZY_MODE_OFF) {
+        // in auto mode, small tensors are cheap enough to keep resident
+        constexpr size_t auto_lazy_min_size = 4ull * 1024 * 1024 * 1024;
+        if (lazy_mode == LLAMA_LAZY_MODE_ON || ggml_nbytes(cur) > auto_lazy_min_size) {
+            const auto & w = require_weight(tn.str().c_str());
+            lazy_tensor_ranges[w.idx].emplace_back(w.offs, w.offs + ggml_nbytes(cur));
+
+            LLAMA_LOG_INFO("%s: tensor %s (size = %zu MiB) lazy read enabled\n",
+                    __func__, tn.str().c_str(), ggml_nbytes(cur)/1024/1024);
+        }
+    }
+
     ggml_tensor t_meta = *cur;
     if (flags & TENSOR_ALLOW_RESHAPE) {
         for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
@@ -1612,11 +1844,29 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
     }
 }
 
-void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
+void llama_model_loader::init_mappings(
+        enum llama_mmap_prefetch_mode prefetch_mode,
+        llama_mlocks * mlock_mmaps) {
     if (use_mmap) {
+        uint64_t mapped_bytes = 0;
+        for (const auto & file : files) {
+            const uint64_t size = file->size();
+            mapped_bytes = size <= UINT64_MAX - mapped_bytes ? mapped_bytes + size : UINT64_MAX;
+        }
+        const llama_available_memory available = llama_system_memory_available();
+        const bool prefetch = llama_mmap_prefetch_resolve(
+                prefetch_mode, mapped_bytes, available.bytes, available.known);
+        LLAMA_LOG_INFO("%s: mmap prefetch requested=%s resolved=%s, mapped=%.2f GiB available=%.2f GiB\n",
+                __func__,
+                prefetch_mode == LLAMA_MMAP_PREFETCH_MODE_ON ? "on" :
+                prefetch_mode == LLAMA_MMAP_PREFETCH_MODE_OFF ? "off" : "auto",
+                prefetch ? "on" : "off",
+                double(mapped_bytes)/double(GiB), double(available.bytes)/double(GiB));
         mappings.reserve(files.size());
         mmaps_used.reserve(files.size());
-        for (const auto & file : files) {
+        for (uint32_t idx = 0; idx < files.size(); idx++) {
+            const auto & file = files[idx];
+
             bool is_numa = false;
 
             auto * dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -1628,7 +1878,11 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                 }
             }
 
-            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch ? -1 : 0, is_numa);
+            const auto it_lazy = lazy_tensor_ranges.find(idx);
+            static const llama_mmap::ranges no_lazy_ranges;
+
+            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch ? -1 : 0, is_numa,
+                    it_lazy != lazy_tensor_ranges.end() ? it_lazy->second : no_lazy_ranges);
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
@@ -1662,27 +1916,31 @@ void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void *
     }
 }
 
-void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
-    const auto & w = require_weight(ggml_get_name(cur));
+void llama_model_loader::unmap_weight(const llama_tensor_weight & w) const {
+    if (!use_mmap) { return; }
+    mappings.at(w.idx)->unmap_fragment(w.offs, w.offs + ggml_nbytes(w.tensor));
+}
+
+const void * llama_model_loader::load_data_range(const llama_tensor_weight & w, size_t offs, size_t size, void * buf) const {
+    GGML_ASSERT(offs + size <= ggml_nbytes(w.tensor));
+
+    const void * data = buf;
 
     if (use_mmap) {
-        const auto & mapping = mappings.at(w.idx);
-        if (cur->data == nullptr) {
-            cur->data = (uint8_t *)mapping->addr() + w.offs;
-        } else {
-            memcpy(cur->data, (uint8_t *)mapping->addr() + w.offs, ggml_nbytes(cur));
-        }
+        data = (const uint8_t *) mappings.at(w.idx)->addr() + w.offs + offs;
     } else {
-        GGML_ASSERT(cur->data != nullptr);
+        GGML_ASSERT(buf != nullptr);
         GGML_ASSERT(w.idx < files.size());
         const auto & file = files.at(w.idx);
-        file->seek(w.offs, SEEK_SET);
-        file->read_raw(cur->data, ggml_nbytes(cur));
+        file->seek(w.offs + offs, SEEK_SET);
+        file->read_raw(buf, size);
     }
 
-    if (check_tensors && !ggml_validate_row_data(cur->type, cur->data, ggml_nbytes(cur))) {
-        throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+    if (check_tensors && !ggml_validate_row_data(w.tensor->type, data, size)) {
+        throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(w.tensor)));
     }
+
+    return data;
 }
 
 bool llama_model_loader::load_all_data(

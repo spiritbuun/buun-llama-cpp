@@ -105,6 +105,9 @@ struct llama_memory_breakdown_data {
     // n_seq_max). Included in `context`, never added separately. Budget formulas that exploit
     // the context term cancelling out of context-linear projections must still charge this part.
     size_t context_fixed = 0;
+    // Portion of `context` whose representation/footprint is selected by Turbo/VBR. Auxiliary
+    // fixed-layout caches can be context-linear without belonging to this subset.
+    size_t context_vbr_managed = 0;
 
     size_t total() const {
         return model + context + compute;
@@ -123,6 +126,14 @@ using llama_memory_breakdown = std::map<ggml_backend_buffer_type_t, llama_memory
 LLAMA_API int32_t llama_model_n_expert (const struct llama_model * model);
 LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 
+// Copies the effective, non-cumulative model split weights in physical-device
+// order. Passing nullptr/zero capacity returns the required element count.
+// Unlike llama_model_params::tensor_split, automatic placement is resolved.
+LLAMA_API size_t llama_model_resolved_tensor_split(
+        const struct llama_model * model,
+        float * weights,
+        size_t capacity);
+
 struct llama_moe_tensor_info {
     enum ggml_type type;
     size_t expert_size;
@@ -138,6 +149,10 @@ LLAMA_API size_t llama_model_get_moe_tensor_info(
         const struct llama_model * model,
         struct llama_moe_tensor_info * info,
         size_t capacity);
+
+// True when at least one routed-expert weight tensor is backed by host memory.
+// This is intentionally about resolved placement, not architecture metadata.
+LLAMA_API bool llama_model_has_host_moe_weights(const struct llama_model * model);
 
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
@@ -232,6 +247,8 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 //
 // model/context data extraction
 //
+
+LLAMA_API int32_t llama_model_dflash_selector_top_k(const struct llama_model * model);
 
 // returns pointer to the target-model layer indices
 LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);

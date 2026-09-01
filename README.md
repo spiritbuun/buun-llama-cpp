@@ -6,6 +6,8 @@
 
 A research and development fork of [llama.cpp](https://github.com/ggml-org/llama.cpp), providing unique KV cache codecs, inference techniques, and bleeding edge features.
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 ## VBR — Variable Bit-Rate KV Cache
 
 Why pay 3-bit or 4-bit quality for a context length you only sometimes reach? VBR quantizes the KV cache
@@ -167,7 +169,7 @@ On VRAM-constrained GPUs, a speculative context and the vision encoder (mmproj) 
 
 When combined with auto-fit (no `-c` flag), the server automatically sizes context to leave room for the swap. With a single slot, it also auto-enables `--kv-unified` to avoid splitting the KV cache into separate streams, which doubles usable per-slot context.
 
-## DeepSeek V4 Flash — MoE cache and DSpark
+## DeepSeek V4 Flash and Qwen3.8 Flash Next — MoE cache
 
 DeepSeek V4 Flash is much larger than a typical consumer-GPU model, but its routed experts can stay
 in system RAM while the hot expert tensors are cached in spare VRAM. On a multi-GPU machine, use
@@ -496,6 +498,7 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 - [XCFramework](docs/xcframework.md)
 - [Completions](docs/completions.md)
 - [Models](docs/models.md)
+- [Release process](docs/release.md)
 
 ## Contributing
 
@@ -508,7 +511,7 @@ The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-or
 ## Acknowledgements
 
 - [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [stb-image](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
+- [nothings/stb](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
 - [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [miniaudio.h](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+- [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
+- [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain

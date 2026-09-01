@@ -371,6 +371,7 @@ bool occupied_companions_compatible(
             case vbr_artifact_companion_kind::required_spec_payload:
             case vbr_artifact_companion_kind::typed_accelerator:
             case vbr_artifact_companion_kind::frontier_logits:
+            case vbr_artifact_companion_kind::qsa_index:
                 break;
             case vbr_artifact_companion_kind::_count:
                 return false;

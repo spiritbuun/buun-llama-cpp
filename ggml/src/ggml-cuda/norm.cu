@@ -197,6 +197,43 @@ static __global__ void rms_norm_mul_bcast_f32(const float * __restrict__ x,
     }
 }
 
+// RMS-normalize each [ncols] HC stream independently, then apply the flattened
+// [nrows*ncols] gamma used by the reshaped HC representation. Keep the two
+// multiply roundings explicit: the unfused graph stores RMS_NORM before MUL.
+template <int block_size>
+static __global__ void rms_norm_mul_grouped_f32(
+        const float * __restrict__ x, const float * __restrict__ gamma,
+        float * __restrict__ dst, const int ncols,
+        const int64_t stride_row, const int64_t stride_channel,
+        const int64_t stride_sample, const float eps) {
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+    const int row       = blockIdx.x;
+    const int channel   = blockIdx.y;
+    const int sample    = blockIdx.z;
+    const int tid       = threadIdx.x;
+
+    x     += sample*stride_sample + channel*stride_channel + row*stride_row;
+    gamma += int64_t(row)*ncols;
+    dst   += ((sample*nchannels + channel)*nrows + row)*ncols;
+
+    float tmp = 0.0f;
+    ggml_cuda_pdl_sync();
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    for (int col = tid; col < ncols; col += block_size) {
+        const float normalized = __fmul_rn(scale, x[col]);
+        dst[col] = __fmul_rn(normalized, gamma[col]);
+    }
+}
 
 template <int block_size>
 static __global__ void rms_norm_bf16(const nv_bfloat16 * x,
@@ -558,6 +595,24 @@ static void rms_norm_mul_f32_cuda(const float *  x,
     }
 }
 
+static void rms_norm_mul_grouped_f32_cuda(
+        const float * x, const float * gamma, float * dst,
+        const int ncols, const int nrows, const int nchannels, const int nsamples,
+        const int64_t stride_row, const int64_t stride_channel,
+        const int64_t stride_sample, const float eps, cudaStream_t stream) {
+    const dim3 blocks_num(nrows, nchannels, nsamples);
+    const int block_size = ncols < 1024 ? 256 : 1024;
+    const dim3 block_dims(block_size, 1, 1);
+    const size_t nbytes_shared = block_size > WARP_SIZE ? 32*sizeof(float) : 0;
+    if (block_size == 256) {
+        rms_norm_mul_grouped_f32<256><<<blocks_num, block_dims, nbytes_shared, stream>>>(
+            x, gamma, dst, ncols, stride_row, stride_channel, stride_sample, eps);
+    } else {
+        rms_norm_mul_grouped_f32<1024><<<blocks_num, block_dims, nbytes_shared, stream>>>(
+            x, gamma, dst, ncols, stride_row, stride_channel, stride_sample, eps);
+    }
+}
+
 static void rms_norm_back_f32_cuda(const float * grad, const float * xf, float * dst, const int ncols, const int nrows, const float eps, cudaStream_t stream) {
     if (ncols < 1024) {
         const dim3 block_dims(WARP_SIZE, 1, 1);
@@ -714,6 +769,26 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
                           /*add_s00*/ 0, 0, 0,
                           0, 0, 0, 0,
                           eps, stream);
+}
+
+void ggml_cuda_op_rms_norm_grouped_mul(
+        ggml_backend_cuda_context & ctx, ggml_tensor * rms,
+        ggml_tensor * gamma, ggml_tensor * dst) {
+    const ggml_tensor * src = rms->src[0];
+    GGML_ASSERT(src && src->type == GGML_TYPE_F32 && rms->type == GGML_TYPE_F32);
+    GGML_ASSERT(gamma->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(src->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_nelements(gamma) == src->ne[0]*src->ne[1]);
+
+    float eps = 0.0f;
+    memcpy(&eps, rms->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    rms_norm_mul_grouped_f32_cuda(
+        (const float *) src->data, (const float *) gamma->data, (float *) dst->data,
+        src->ne[0], src->ne[1], src->ne[2], src->ne[3],
+        src->nb[1]/sizeof(float), src->nb[2]/sizeof(float), src->nb[3]/sizeof(float),
+        eps, ctx.stream());
 }
 
 void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,

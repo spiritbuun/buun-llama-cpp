@@ -6,7 +6,9 @@
 #include "build-info.h"
 #include "../../src/llama-context.h"
 #include "../../src/llama-io.h"
+#include "../../src/llama-memory-hybrid-idx.h"
 #include "../../src/llama-sha256.h"
+#include "../../src/llama-vbr-qsa-index.h"
 
 #include <algorithm>
 #include <array>
@@ -30,6 +32,13 @@ bool server_vbr_companion_codec_for(
         case vbr_artifact_companion_kind::frontier_logits:
             domain = "buun.vbr.frontier-logits-codec/v1";
             break;
+        case vbr_artifact_companion_kind::qsa_index:
+            output.kind = kind;
+            output.format_version =
+                vbr_qsa_index_companion_format_version();
+            output.build_identity_digest =
+                vbr_qsa_index_companion_build_identity();
+            return true;
         default:
             return false;
     }
@@ -838,6 +847,10 @@ bool import_parse_companion(
         std::unique_ptr<vbr_parsed_companion_image> & output) noexcept {
     if (descriptor.kind == vbr_artifact_companion_kind::recurrent) {
         return vbr_parse_recurrent_companion(
+            opaque, descriptor, source, target, output);
+    }
+    if (descriptor.kind == vbr_artifact_companion_kind::qsa_index) {
+        return vbr_parse_qsa_index_companion(
             opaque, descriptor, source, target, output);
     }
     if (descriptor.kind ==
@@ -3075,6 +3088,11 @@ server_vbr_artifact_store::complete_validated_import(
                 hooks.companions.push_back(
                     vbr_recurrent_companion_adoption_provider(
                         *child.recurrent));
+            }
+            if (child.qsa_index_owner) {
+                hooks.companions.push_back(
+                    vbr_qsa_index_adoption_provider(
+                        *child.qsa_index_owner, child.child_id));
             }
         }
         server_vbr_draft_target draft_target {

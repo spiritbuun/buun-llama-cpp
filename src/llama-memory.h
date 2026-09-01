@@ -239,6 +239,11 @@ struct llama_memory_i {
     // getters
     virtual bool get_can_shift() const = 0;
 
+    // Whether this memory views KV cells owned by another context. Context linkage alone
+    // cannot answer this: every MTP context points at its target, while only some model
+    // families actually share the target's KV cells.
+    virtual bool get_has_shared_cells() const { return false; }
+
     // whether arbitrary token ranges can be removed without discarding the whole sequence
     // default to the conservative answer for out-of-tree memory implementations
     virtual bool can_seq_rm_partial() const { return false; }
@@ -391,6 +396,12 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
+
+    // The subset of memory_breakdown() whose representation and physical footprint are selected
+    // by the attention Turbo/VBR policy. This is deliberately narrower than all context-linear
+    // memory: auxiliary index caches can grow with n_ctx while remaining fixed-layout and outside
+    // the controller's budget. Empty for memories with no Turbo/VBR-managed attention storage.
+    virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown_vbr_managed() const { return {}; }
 
     // the subset of memory_breakdown() that does NOT scale with the context length (e.g. the
     // recurrent-state cache, sized by n_seq_max). Reported so budget math can charge it even

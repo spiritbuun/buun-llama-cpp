@@ -34,6 +34,9 @@ const char * common_speculative_all_types_str();
 // parse user provided types
 std::vector<enum common_speculative_type> common_speculative_types_from_names(const std::vector<std::string> & names);
 
+// infer the spec types from the GGUF metadata of a draft model; empty if unknown
+std::vector<enum common_speculative_type> common_speculative_types_from_gguf(const std::string & path);
+
 // convert string to type
 enum common_speculative_type common_speculative_type_from_name(const std::string & name);
 
@@ -43,7 +46,44 @@ std::string common_speculative_type_to_str(enum common_speculative_type type);
 // return the max number of draft tokens based on the speculative parameters
 int32_t common_speculative_n_max(const common_params_speculative * spec);
 
+// return the max number of draft tokens from the initialized implementations
+int32_t common_speculative_n_max(const common_speculative * spec);
+
+// validate and resolve the unconditional synthetic acceptance rates
+std::vector<double> common_speculative_synth_rates_resolve(const common_params_speculative * spec, int32_t n_max);
+
+// return the conditional synthetic acceptance probabilities
+const std::vector<double> & common_speculative_get_synth_probs(const common_speculative * spec);
+
 common_params common_base_params_to_speculative(const common_params & params);
+
+struct common_speculative_mtp_context_params {
+    uint32_t n_ctx;
+    uint32_t n_seq_max;
+    bool kv_unified;
+};
+
+// Native and sidecar MTP contexts must expose the target's realized context
+// width per sequence. An implicit draft context can do that without multiplying
+// its KV allocation by the number of server slots by using unified KV. An
+// explicit -cd remains an exact user override, including the requested KV
+// topology.
+common_speculative_mtp_context_params common_speculative_mtp_context_params_resolve(
+        uint32_t target_n_ctx_seq,
+        int32_t explicit_draft_n_ctx,
+        uint32_t requested_n_seq_max,
+        bool requested_kv_unified);
+
+bool common_speculative_mtp_context_available(const common_params_speculative & params);
+
+struct common_speculative_output_limits {
+    int32_t total;
+    int32_t per_seq;
+};
+
+// return the output limits needed for speculative decoding
+common_speculative_output_limits common_speculative_get_output_limits(
+        int32_t n_batch, int32_t n_parallel, int32_t n_draft);
 
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq);
 
@@ -91,10 +131,8 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 //      begin()/process()/draft().
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
 
-// true if any implementation requires target post-norm embeddings to be extracted
+// Whether any configured implementation requires target embeddings.
 bool common_speculative_need_embd(common_speculative * spec);
-
-// true if any implementation requires target nextn embeddings to be extracted
 bool common_speculative_need_embd_nextn(common_speculative * spec);
 
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
@@ -108,13 +146,51 @@ bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
 
 enum class common_speculative_sequence_event : uint8_t {
-    prompt_rewind = 0,       // retained draft prefix remains installed
-    checkpoint_reconstruct,  // no complete draft sequence was restored
-    checkpoint_complete,     // a complete draft sequence was restored
-    live_range_shift,        // live target/draft positions were renumbered
-    target_replaced,         // target replaced; draft sequence was cleared
-    full_clear,              // target and draft sequences were cleared
+    prompt_rewind = 0,          // retained draft prefix remains installed
+    target_restored_without_draft, // target restored; draft must reconstruct
+    draft_image_restored,       // complete target+draft sequence images restored
+    composite_image_restored,   // draft plus typed accelerator state restored
+    live_range_shift,           // live target/draft positions were renumbered
+    target_replaced,            // target replaced; draft sequence was cleared
+    full_clear,                 // target and draft sequences were cleared
 };
+
+// MTP's pending target-hidden row is process-local state: sequence images do
+// not serialize it. Keep the validity decision separate from the row storage
+// so a restored/cloned sequence cannot consume a row from the previous branch.
+class common_speculative_mtp_carry_lifecycle {
+public:
+    enum class process_mode {
+        retained_carry,
+        cold_zero,
+        target_only,
+    };
+
+    bool draft_ready() const noexcept;
+    const float * draft_carry(const float * pending_h) const noexcept;
+    process_mode target_process_mode(llama_pos first_position) const noexcept;
+
+    void target_process_refreshed() noexcept;
+    void target_process_skipped() noexcept;
+    void sequence_transition(common_speculative_sequence_event event) noexcept;
+
+private:
+    bool ready = false;
+};
+
+enum class common_speculative_mtp_process_preflight {
+    cold_or_retained,
+    target_only,
+};
+
+// Resolve every active sequence before process() mutates draft memory. A
+// single nonzero frontier without an authenticated carry makes the whole
+// multi-sequence batch target-only so no sequence advances on partial state.
+common_speculative_mtp_process_preflight
+common_speculative_mtp_process_preflight_resolve(
+    const std::vector<common_speculative_mtp_carry_lifecycle> & lifecycles,
+    const std::vector<int32_t> & active_batch_beg,
+    const llama_pos * positions) noexcept;
 
 // One owner for external sequence lifecycle mutations. Implementations discard
 // branch-local state and apply the event-specific memory/ring policy.
@@ -238,6 +314,7 @@ struct common_speculative_init_result {
 
     llama_model   * model();
     llama_context * context();
+    llama_context * context_mtp();
 
 private:
     struct impl;

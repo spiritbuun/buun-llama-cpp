@@ -4,14 +4,80 @@
 #include "server-task.h"
 #include "server-queue.h"
 
-#include <nlohmann/json_fwd.hpp>
+#include "json.h"
 
 #include <cstddef>
 #include <memory>
+#include <mutex>
 #include <set>
 
 struct server_context_impl; // private implementation
 class server_cache_control_authority;
+
+enum class server_speculative_decode_terminal {
+    success,
+    preserve_hard_seal,
+    ordinary_ret_error,
+    retry,
+    reset_committed_then_throw,
+};
+
+server_speculative_decode_terminal
+server_speculative_decode_terminal_resolve(
+    int decode_result,
+    bool hard_seal_terminal,
+    bool single_token_batch,
+    bool selected_exception,
+    bool speculative_ok) noexcept;
+
+struct server_committed_decode_reset_test_result {
+    bool processing_prompt_cleared = false;
+    bool processing_family_cleared = false;
+    bool idle_prompt_preserved = false;
+};
+
+server_committed_decode_reset_test_result
+server_committed_decode_reset_for_test();
+
+struct server_slot_frontier_logits_test_result {
+    bool round_trip = false;
+    bool primary_binding_mutation_refused = false;
+    bool runtime_family_mutation_refused = false;
+    bool model_family_mutation_refused = false;
+    bool model_nonsemantic_variation_matches = false;
+    bool unresolved_context_fallback_changes_identity = false;
+    bool explicit_context_override_ignores_training_context = false;
+    bool sequence_geometry_changes_identity = false;
+    bool padding_equivalent_geometry_matches = false;
+    bool control_content_mutation_refused = false;
+    bool missing_family_receipt_disables_hot = false;
+    bool adapter_mutation_refused = false;
+    bool token_count_mutation_refused = false;
+    bool next_position_mutation_refused = false;
+    bool token_digest_mutation_refused = false;
+    bool vocabulary_mutation_refused = false;
+    bool logits_mutation_refused = false;
+    bool serialized_payload_mutation_refused = false;
+    bool nonfinite_logits_refused = false;
+    bool torn_companion_refused = false;
+    bool missing_companion_is_cold = false;
+    bool destination_slot_rebound = false;
+    bool destination_epoch_rebound = false;
+    bool source_process_epoch_not_reused = false;
+    bool exact_hit_skips_decode = false;
+    bool missing_capability_replays = false;
+    bool decode_failure_refuses_publication = false;
+    bool decode_failure_clears_slot = false;
+    bool rollback_decode_allows_cold_save = false;
+    bool partial_decode_requires_reset = false;
+    bool aligned_without_logits_allows_cold_save = false;
+    bool missing_memory_requires_reset = false;
+    bool multi_token_gap_requires_reset = false;
+    bool consumed_logits_release_capacity = false;
+};
+
+server_slot_frontier_logits_test_result
+server_slot_frontier_logits_for_test();
 
 struct server_vbr_occupied_quarantine_reset_result {
     bool replay_preserved_prefix = false;
@@ -57,6 +123,26 @@ struct server_rejected_prompt_preservation_result {
 
 server_rejected_prompt_preservation_result
 server_rejected_prompt_preservation_for_test();
+
+struct server_mmproj_lifecycle_test_result {
+    bool null_binding_clears_views = false;
+    bool restored_binding_updates_views = false;
+    bool failed_recreation_stays_null = false;
+    bool normal_restore_once = false;
+    bool thrown_media_restore_once = false;
+    bool thrown_callback_restore_once = false;
+    bool throwing_restore_not_retried = false;
+    bool incompatible_draft_disables_shift = false;
+    bool incompatible_draft_not_shifted = false;
+    bool compatible_draft_enables_shift = false;
+    bool compatible_draft_shifted = false;
+};
+
+// TEST-ONLY model-free exercise of the production slot rebinder and exactly-once
+// restoration guard. It uses opaque pointer identities but never dereferences
+// them, so ownership transitions can be proved without loading a projector.
+server_mmproj_lifecycle_test_result
+server_mmproj_lifecycle_for_test();
 
 struct server_vbr_retention_wiring_result {
     bool slot_metadata_wired = false;
@@ -292,15 +378,25 @@ private:
     std::unique_ptr<server_res_generator> handle_slots_capture(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_slots_import(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_embeddings_impl(const server_http_req & req, task_response_type res_type);
-    std::unique_ptr<server_res_generator> handle_count_tokens(const llama_vocab * vocab, mtmd_context * mctx, const server_http_req & req, task_response_type res_type);
+    std::unique_ptr<server_res_generator> handle_count_tokens(const llama_vocab * vocab, mtmd_context * mctx, const mtmd_helper_init_opt & init_opt, const server_http_req & req, task_response_type res_type);
 
     // using unique_ptr to allow late initialization of const
     std::unique_ptr<const server_context_meta> meta;
 
     const common_params & params;
-    const server_context_impl & ctx_server;
+    server_context_impl & ctx_server;
 
     server_queue & queue_tasks;
     server_response & queue_results;
     std::unique_ptr<server_res_generator> create_response(bool bypass_sleep = false);
+
+    // cached responses, to be used during sleep
+    std::mutex     mutex_cache;
+    json           cached_models  = nullptr;
+    json           cached_props   = nullptr;
+    server_metrics cached_metrics;
+    // set when a scrape during sleep already reported the throughput buckets
+    bool           should_reset_buckets = false;
+    // call right before sleep to update the cached responses
+    void update_cached_responses(bool is_sleeping);
 };

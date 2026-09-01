@@ -35,14 +35,19 @@ With default settings, a node must satisfy all of these conditions:
 - The weight tensor name contains `_exps`.
 - The weight type is supported by the CUDA quantized matvec kernel.
 - One expert meets the selected devices' effective size floor. The default is 512 KiB when every selected device is compute capability 8.0 or newer and 1 MiB otherwise. An explicit threshold remains authoritative.
-- The graph node contains no more than the configured maximum token batch and no more than 64 routed rows. The default maximum is eight tokens in every active mode.
+- The graph node contains no more than the configured maximum token batch and no more than 64 routed rows. The default maximum is ten tokens in every active mode.
 - The selected device can hold a pool of at least 64 experts of that shape. Entries are aggregated across same-shape tensors, so an individual tensor may contain fewer than 64 experts.
 - In `auto`, each selected device has at least 1 GiB available for aggregate cache slabs after dispatch scratch. Forced modes retain the 64-slot floor for explicit capacity experiments.
 
-Each physical device budget is coordinated across every target, draft, MTP, and server scheduler in the process. It is claimed once, at first eligible use. Shape inventory counts the exact number of experts in every observed tensor; mixed expert counts do not reserve nonexistent slots. Device reservations are tracked per participating session, so releasing a high-reserve target immediately restores the correct capacity for the remaining sessions. The automatic budget is:
+Each physical device budget is coordinated across every target, draft, MTP, and server scheduler in the process. It is claimed once, at first eligible use. Shape inventory counts the exact number of experts in every observed tensor; mixed expert counts do not reserve nonexistent slots. Device reservations are tracked per participating session, so releasing a high-reserve target immediately restores the correct capacity for the remaining sessions.
+
+The automatic reserve is hardware-derived. By default it is 6% of physical
+VRAM rounded down to 128 MiB, clamped to 1024--3072 MiB and at most one quarter
+of the device. This resolves to 1408 MiB on a 24 GiB RTX 3090. An explicit
+`GGML_CUDA_MOE_CACHE_RESERVE_MB` remains authoritative. The automatic budget is:
 
 ```
-min(configured budget, free VRAM - 3072 MiB reserve)
+min(configured budget, free VRAM - resolved reserve)
 ```
 
 The configured-budget term is omitted for `auto` and `on`. A fixed `N` is a cap for cache slabs and device-side dispatch scratch together, not a guaranteed slab allocation. Pool allocation may be smaller after reserving scratch or retrying an allocation, and no pool is created when fewer than 64 slots fit.
@@ -66,13 +71,23 @@ By default:
 - Independent device workers run concurrently when at least two compute capability 8.0 or newer devices are selected. Fills remain serialized on single-device or older-device configurations.
 - Full pools use LRU eviction. After a successful fill, that expert needs eight fresh misses before it can replace another entry.
 
-The default maximum is eight tokens. Larger prompt-processing nodes bypass the cache, while single-token decode and current speculative verification batches remain eligible in `auto`, `on`, and fixed-budget modes.
+Common applications persist a small, versioned per-model expert heatmap in the
+canonical llama.cpp cache directory (`LLAMA_CACHE`, `XDG_CACHE_HOME`, or the
+platform default). A later process uses it to advise the OS about exact hot
+expert ranges and enqueue at most eight bounded seed fills when each tensor is
+first encountered. All other experts retain the normal demand-admission policy. Current observations
+are merged with a decayed prior profile at clean session teardown. Corrupt,
+incompatible, missing, or unwritable profiles are ignored; they never affect
+correctness or disable the CPU fallback. Use `--no-moe-cache-profile` to disable
+both loading and saving.
+
+The default maximum is ten tokens. Larger prompt-processing nodes bypass the cache, while single-token decode and current speculative verification batches remain eligible in `auto`, `on`, and fixed-budget modes.
 
 ## DeepSeek V4 Flash and MXFP4
 
 The DeepSeek V4 Flash GGUF uses the conventional `ffn_gate_exps`, `ffn_up_exps`, and `ffn_down_exps` tensors. These names contain `_exps`, and CPU-resident canonical weights reach the regular `MUL_MAT_ID` path, so the MXFP4 experts are compatible with the cache. For this model, the gate and up projections have `(n_in, n_out) = (4096, 2048)` and the down projection has `(n_in, n_out) = (2048, 4096)`. Each projection occupies 4,456,448 bytes per expert.
 
-Automatic mode accepts up to eight tokens per node. This covers the current DSpark target-verification batch, whose tested node shape is six tokens selecting six experts each. Prompt nodes above eight tokens bypass the cache and do not drive admission. The model-free cache test compares the 6 x 6 hit path with the stock CPU result.
+Automatic mode accepts up to ten tokens per node. This covers the current DSpark target-verification batch, whose tested node shape is six tokens selecting six experts each. Prompt nodes above ten tokens bypass the cache and do not drive admission. The model-free cache test compares the 6 x 6 hit path with the stock CPU result.
 
 The server understands the target/draft dependency and is the supported DSpark entry point. With automatic fit, draft-device selection, and cache policy, a four-GPU launch is:
 
@@ -198,9 +213,9 @@ The following environment variables are implementation controls, not a stable co
 
 | Variable | Default | Meaning |
 | --- | ---: | --- |
-| `GGML_CUDA_MOE_CACHE_RESERVE_MB` | `3072` | VRAM left outside the cache on each device |
+| `GGML_CUDA_MOE_CACHE_RESERVE_MB` | hardware dependent | VRAM left outside the cache on each device; automatic policy uses 6% rounded to 128 MiB, clamped to 1024--3072 MiB and at most 25% |
 | `GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB` | hardware dependent | Minimum bytes per expert, in KiB; `512` when all selected devices are compute capability 8.0 or newer and `1024` otherwise |
-| `GGML_CUDA_MOE_CACHE_MAX_BATCH` | `8` | Maximum tokens in an eligible node |
+| `GGML_CUDA_MOE_CACHE_MAX_BATCH` | `10` | Maximum tokens in an eligible node |
 | `GGML_CUDA_MOE_CACHE_INSERTS` | `8` (`16` with expert parallelism) | Maximum admissions per node |
 | `GGML_CUDA_MOE_CACHE_ADMIT_AFTER` | adaptive | Override the initial miss count; by default it is `1` for complete pools and `2` for capacity-constrained pools |
 | `GGML_CUDA_MOE_CACHE_THROTTLE` | `8` (`40` with expert parallelism) | Fresh misses required before replacing a full-pool entry |
@@ -210,6 +225,7 @@ The following environment variables are implementation controls, not a stable co
 | `GGML_CUDA_MOE_CACHE_NDEV` | all | Maximum selected CUDA devices used by a session |
 | `GGML_CUDA_MOE_CACHE_SERIAL_FILL` | hardware dependent | Serialize fills across devices; defaults to `0` with at least two compute capability 8.0 or newer devices and `1` otherwise |
 | `GGML_CUDA_MOE_CACHE_DEDICATED_MMV` | `0` | Force the cache-specific activation-map matvec; compatible routing uses the existing modulo-index MMV path by default |
+| `GGML_CUDA_MOE_CACHE_DOWN_DEDICATED_MMV` | `0` | Use the cache-specific MMV for a full-fusion down projection; the generic modulo-index MMV remains the default |
 | `GGML_CUDA_MOE_CACHE_OVERLAP_CPU_ROWS` | automatic | Rows retained on CPU only when every row is resident; an explicit value from `0` through `8` overrides the size-aware policy |
 | `GGML_CUDA_MOE_CACHE_MIN_CC` | mode dependent | Override the minimum compute capability encoded as `major * 100 + minor * 10` |
 
@@ -259,8 +275,7 @@ An `off` versus `on` comparison without `--repack off` includes the intended rep
 
 - CUDA only. HIP, MUSA, Metal, Vulkan, and other backends do not register an implementation.
 - CPU-resident expert `MUL_MAT_ID` only. Exact gate/up/SwiGLU graphs, including DeepSeek's per-input clamps, can fuse for up to the configured token batch and 64 flattened routed rows. Other GLU graphs use the stock path. There is no GPU-resident output handoff.
-- Demand fill only. There is no predictive prefetch or separate prompt-time population path.
-- No hot-set file or persistence across scheduler sessions or process restarts.
+- Heatmap prewarming is deliberately bounded and approximate. It does not reserve slots, synchronously fetch experts, or guarantee that a prior hot set remains profitable.
 - Direct writes through a raw host pointer bypass invalidation. Mutate cached weight buffers through the backend tensor and buffer APIs.
 - No runtime performance bail-out. An eligible but unprofitable cache remains active unless it fails, is trimmed, or is disabled by configuration.
 - Every scheduler owns independent residency state. Process-wide physical-device coordination prevents those sessions from claiming the same free VRAM, but it does not share expert slots between them.

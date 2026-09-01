@@ -154,9 +154,12 @@ target_include_directories(test-server-recurrent-expansion PRIVATE ${PROJECT_SOU
 llama_build(test-safetensors-registry.cpp)
 target_include_directories(test-safetensors-registry PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_test(test-safetensors-registry)
+llama_build(test-save-load-state.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
+    llama_build_and_test(test-unicode.cpp)
+
     llama_build(test-recurrent-state-rollback.cpp)
     target_include_directories(test-recurrent-state-rollback PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
@@ -410,6 +413,33 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-lora-determinism PROPERTIES
         FIXTURES_REQUIRED generate-lora-model
     )
+
+    llama_test(
+        test-recurrent-state-rollback
+        NAME test-recurrent-state-rollback-nemotron-h
+        LABEL main
+        ARGS -m "${MODEL_DIR}/nemotron_h-dense.gguf"
+    )
+    set_tests_properties(test-recurrent-state-rollback-nemotron-h PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+    llama_test(
+        test-recurrent-state-rollback
+        NAME test-recurrent-state-rollback-dsv4
+        LABEL main
+        ARGS -m "${MODEL_DIR}/deepseek4-moe.gguf"
+    )
+    set_tests_properties(test-recurrent-state-rollback-dsv4 PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+
+    # Test state save/load functionality across all architectures, using the generated dummy models
+    llama_test(
+        test-save-load-state
+        LABEL main
+        ARGS --models "${MODEL_DIR}" --fit off -ctk f16 -ctv f16
+    )
+    set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED generate-models)
 endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
@@ -417,6 +447,8 @@ llama_build_and_test(test-jinja.cpp)
 llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)
 llama_build_and_test(test-chat-auto-parser.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-chat-template.cpp)
+# debug tool for chat template differential analysis (not registered as a test, run it manually)
+llama_build(test-chat-analysis.cpp)
 llama_build_and_test(test-log.cpp)
 llama_build_and_test(
     test-peg-parser.cpp
@@ -483,13 +515,131 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   llama_build_and_test(test-opt.cpp)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
+if (TARGET ggml-cuda AND GGML_CUDA_Q8_MMV_TEST_INSTRUMENTATION)
+    llama_test(test-backend-ops NAME test-cuda-q8-mmv-dispatch
+        LABEL "main;backend"
+        ARGS test -b CUDA0 -o MUL_MAT -p "type_a=q8_0.*m=257,n=1,k=5120")
+    set_property(TEST test-cuda-q8-mmv-dispatch PROPERTY
+        ENVIRONMENT "GGML_TEST_Q8_0_MMV_EXPECT_PATH=auto")
+endif()
+llama_build_and_test(test-cuda-q8-mmv-selector.cpp)
+if (TARGET ggml-cuda AND NOT GGML_BACKEND_DL)
+    llama_build(test-cuda-hc-combine-match.cpp)
+    target_link_libraries(test-cuda-hc-combine-match PRIVATE ggml-cuda)
+    llama_test(test-cuda-hc-combine-match LABEL "main;backend")
+    llama_build(test-cuda-hc-stream-mean-match.cpp)
+    target_link_libraries(test-cuda-hc-stream-mean-match PRIVATE ggml-cuda)
+    llama_test(test-cuda-hc-stream-mean-match LABEL "main;backend")
+    llama_build(test-cuda-hc-stream-mean-zero.cpp)
+    llama_test(test-cuda-hc-stream-mean-zero NAME test-cuda-hc-stream-mean-zero-enabled LABEL "main;backend")
+    llama_test(test-cuda-hc-stream-mean-zero NAME test-cuda-hc-stream-mean-zero-disabled LABEL "main;backend")
+    set_property(TEST test-cuda-hc-stream-mean-zero-disabled PROPERTY ENVIRONMENT "GGML_CUDA_DISABLE_FUSION=1")
+    set_tests_properties(test-cuda-hc-stream-mean-zero-enabled test-cuda-hc-stream-mean-zero-disabled
+        PROPERTIES SKIP_RETURN_CODE 77)
+    llama_build(test-cuda-hc-grouped-rms-match.cpp)
+    target_link_libraries(test-cuda-hc-grouped-rms-match PRIVATE ggml-cuda)
+    llama_test(test-cuda-hc-grouped-rms-match LABEL "main;backend")
+    llama_build(test-cuda-hc-grouped-rms-special.cpp)
+    llama_test(test-cuda-hc-grouped-rms-special LABEL "main;backend")
+    set_tests_properties(test-cuda-hc-grouped-rms-special PROPERTIES SKIP_RETURN_CODE 77)
+    llama_build(test-cuda-mmvq-post-silu-match.cpp)
+    target_link_libraries(test-cuda-mmvq-post-silu-match PRIVATE ggml-cuda)
+    llama_test(test-cuda-mmvq-post-silu-match LABEL "main;backend")
+    llama_build(test-cuda-mmvq-post-silu-special.cpp)
+    llama_test(test-cuda-mmvq-post-silu-special LABEL "main;backend")
+    set_tests_properties(test-cuda-mmvq-post-silu-special PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+if (TARGET ggml-cuda AND GGML_CUDA_HC_COMBINE_TEST_INSTRUMENTATION)
+    llama_test(test-backend-ops NAME test-cuda-hc-combine-dispatch
+        LABEL "main;backend"
+        ARGS test -b CUDA0 -o HC_COMBINE_FUSION -p "n_embd=127,hc=4,nt=5,variant=7")
+    set_property(TEST test-cuda-hc-combine-dispatch PROPERTY
+        ENVIRONMENT "GGML_TEST_HC_COMBINE_EXPECT_DISPATCH=enabled")
+    llama_test(test-backend-ops NAME test-cuda-hc-combine-fusion-disabled
+        LABEL "main;backend"
+        ARGS test -b CUDA0 -o HC_COMBINE_FUSION -p "n_embd=257,hc=4,nt=17,variant=0")
+    set_property(TEST test-cuda-hc-combine-fusion-disabled PROPERTY
+        ENVIRONMENT "GGML_TEST_HC_COMBINE_EXPECT_DISPATCH=disabled;GGML_CUDA_DISABLE_FUSION=1")
+endif()
+if (TARGET ggml-cuda AND GGML_CUDA_HC_STREAM_MEAN_TEST_INSTRUMENTATION)
+    llama_test(test-backend-ops NAME test-cuda-hc-stream-mean-dispatch
+        LABEL "main;backend"
+        ARGS test -b CUDA0 -o HC_STREAM_MEAN_FUSION -p "n_embd=257,nt=17,variant=0")
+    set_property(TEST test-cuda-hc-stream-mean-dispatch PROPERTY
+        ENVIRONMENT "GGML_TEST_HC_STREAM_MEAN_EXPECT_DISPATCH=enabled")
+    llama_test(test-backend-ops NAME test-cuda-hc-stream-mean-fusion-disabled
+        LABEL "main;backend"
+        ARGS test -b CUDA0 -o HC_STREAM_MEAN_FUSION -p "n_embd=257,nt=17,variant=0")
+    set_property(TEST test-cuda-hc-stream-mean-fusion-disabled PROPERTY
+        ENVIRONMENT "GGML_TEST_HC_STREAM_MEAN_EXPECT_DISPATCH=disabled;GGML_CUDA_DISABLE_FUSION=1")
+endif()
+if (TARGET ggml-cuda AND GGML_CUDA_HC_GROUPED_RMS_TEST_INSTRUMENTATION)
+    llama_test(test-backend-ops NAME test-cuda-hc-grouped-rms-dispatch
+        LABEL "main;backend"
+        ARGS test -b CUDA0 -o HC_GROUPED_RMS_FUSION -p "n_embd=257,hc=4,nt=17,variant=0")
+    set_property(TEST test-cuda-hc-grouped-rms-dispatch PROPERTY
+        ENVIRONMENT "GGML_TEST_HC_GROUPED_RMS_EXPECT_DISPATCH=enabled")
+    llama_test(test-backend-ops NAME test-cuda-hc-grouped-rms-disabled
+        LABEL "main;backend"
+        ARGS test -b CUDA0 -o HC_GROUPED_RMS_FUSION -p "n_embd=257,hc=4,nt=17,variant=0")
+    set_property(TEST test-cuda-hc-grouped-rms-disabled PROPERTY
+        ENVIRONMENT "GGML_TEST_HC_GROUPED_RMS_EXPECT_DISPATCH=disabled;GGML_CUDA_DISABLE_FUSION=1")
+endif()
+if (TARGET ggml-cuda AND GGML_CUDA_Q8_POST_SILU_TEST_INSTRUMENTATION)
+    llama_test(test-backend-ops NAME test-cuda-q8-post-silu-dispatch
+        LABEL "main;backend"
+        ARGS test -b CUDA0 -o MMVQ_POST_SILU_FUSION -p "m=257,k=5120,variant=0")
+    set_property(TEST test-cuda-q8-post-silu-dispatch PROPERTY
+        ENVIRONMENT "GGML_TEST_Q8_POST_SILU_EXPECT_DISPATCH=enabled")
+    llama_test(test-backend-ops NAME test-cuda-q8-post-silu-disabled
+        LABEL "main;backend"
+        ARGS test -b CUDA0 -o MMVQ_POST_SILU_FUSION -p "m=257,k=5120,variant=0")
+    set_property(TEST test-cuda-q8-post-silu-disabled PROPERTY
+        ENVIRONMENT "GGML_TEST_Q8_POST_SILU_EXPECT_DISPATCH=disabled;GGML_CUDA_DISABLE_FUSION=1")
+    llama_test(test-backend-ops NAME test-cuda-q8-post-silu-force-mmq-refused
+        LABEL "main;backend"
+        ARGS test -b CUDA0 -o MMVQ_POST_SILU_FUSION -p "m=127,k=5120,variant=3")
+    set_property(TEST test-cuda-q8-post-silu-force-mmq-refused PROPERTY
+        ENVIRONMENT "GGML_TEST_Q8_POST_SILU_EXPECT_DISPATCH=disabled")
+    llama_test(test-backend-ops NAME test-cuda-q8-post-silu-padded-view-refused
+        LABEL "main;backend"
+        ARGS test -b CUDA0 -o MMVQ_POST_SILU_FUSION -p "m=127,k=5088,variant=4")
+    set_property(TEST test-cuda-q8-post-silu-padded-view-refused PROPERTY
+        ENVIRONMENT "GGML_TEST_Q8_POST_SILU_EXPECT_DISPATCH=disabled")
+    llama_test(test-backend-ops NAME test-cuda-q8-post-silu-small-k-refused
+        LABEL "main;backend"
+        ARGS test -b CUDA0 -o MMVQ_POST_SILU_FUSION -p "m=127,k=512,variant=5")
+    set_property(TEST test-cuda-q8-post-silu-small-k-refused PROPERTY
+        ENVIRONMENT "GGML_TEST_Q8_POST_SILU_EXPECT_DISPATCH=disabled")
+endif()
 if (NOT LLAMA_USE_SYSTEM_GGML)
     llama_build(test-moe-cache.cpp)
     llama_test(test-moe-cache LABEL "main;backend")
     set_tests_properties(test-moe-cache PROPERTIES TIMEOUT 120)
+    llama_build_and_test(test-cuda-moe-cache-flat-hits-selector.cpp)
+    if (TARGET ggml-cuda AND NOT GGML_BACKEND_DL)
+        find_package(CUDAToolkit REQUIRED)
+        llama_build(test-cuda-moe-cache-flat-hits.cpp)
+        target_link_libraries(test-cuda-moe-cache-flat-hits PRIVATE ggml-cuda CUDA::cudart)
+        llama_test(test-cuda-moe-cache-flat-hits LABEL "main;backend")
+        set_property(TEST test-cuda-moe-cache-flat-hits PROPERTY ENVIRONMENT "CUDA_VISIBLE_DEVICES=0")
+        set_tests_properties(test-cuda-moe-cache-flat-hits PROPERTIES TIMEOUT 120)
+        if (GGML_CUDA_MOE_CACHE_FLAT_HITS_TEST_INSTRUMENTATION)
+            target_compile_definitions(test-cuda-moe-cache-flat-hits
+                PRIVATE GGML_CUDA_MOE_CACHE_FLAT_HITS_TEST_INSTRUMENTATION)
+        endif()
+    endif()
+    if (TARGET ggml-cuda AND GGML_CUDA_MOE_CACHE_FLAT_HITS_TEST_INSTRUMENTATION)
+        llama_test(test-moe-cache NAME test-moe-cache-flat-hits-baseline LABEL "main;backend")
+        set_property(TEST test-moe-cache-flat-hits-baseline PROPERTY
+            ENVIRONMENT "GGML_TEST_MOE_CACHE_FLAT_HITS_EXPECT_BASELINE=1;CUDA_VISIBLE_DEVICES=0")
+        set_tests_properties(test-moe-cache-flat-hits-baseline PROPERTIES TIMEOUT 180)
+    endif()
 endif()
 
 llama_build_and_test(test-moe-cache-fit.cpp)
+llama_build_and_test(test-auto-memory-policy.cpp)
+llama_build_and_test(test-kv-cell-position-index.cpp)
 
 if (TARGET ggml-cuda AND NOT GGML_BACKEND_DL)
     llama_build(test-vbr-vmm.cpp)
@@ -505,10 +655,6 @@ llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 # Requires a model, uses same args pattern as test-thread-safety
 llama_build_and_test(test-state-restore-fragmented.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED test-download-model)
-
-# Test state save/load functionality
-llama_build_and_test(test-save-load-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
-set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 if (APPLE)
     llama_build(test-rset-release.cpp)
@@ -528,6 +674,9 @@ set(LLAMA_TEST_NAME test-mtmd-c-api)
 llama_build_and_test(test-mtmd-c-api.c)
 target_link_libraries(${LLAMA_TEST_NAME} PRIVATE mtmd)
 unset(LLAMA_TEST_NAME)
+
+llama_build_and_test(test-mtmd-impl.cpp)
+target_link_libraries(test-mtmd-impl PRIVATE mtmd)
 
 # GGUF model data fetcher library for tests that need real model metadata
 # Only compile when cpp-httplib has SSL support (CPPHTTPLIB_OPENSSL_SUPPORT)

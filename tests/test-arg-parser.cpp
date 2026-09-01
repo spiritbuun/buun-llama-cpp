@@ -2,10 +2,13 @@
 #include "common.h"
 #include "download.h"
 #include "llama.h"
+#include "speculative.h"
 
 #include <cstdlib>
 #include <fstream>
 #include <cstdio>
+#include <cmath>
+#include <limits>
 #include <string>
 #include <vector>
 #include <sstream>
@@ -20,6 +23,160 @@
 
 static void test(void) {
     common_params params;
+
+    auto assert_output_limits = [](int32_t n_batch, int32_t n_parallel, int32_t n_draft,
+                                   int32_t total, int32_t per_seq) {
+        const auto limits = common_speculative_get_output_limits(n_batch, n_parallel, n_draft);
+        assert(limits.total == total);
+        assert(limits.per_seq == per_seq);
+    };
+
+    assert_output_limits(16, 2,  3, 8, 4);
+    assert_output_limits(16, 2, -1, 2, 1);
+    assert_output_limits( 6, 2,  3, 6, 4);
+    assert_output_limits( 2, 1,  3, 2, 2);
+    assert_output_limits(
+            std::numeric_limits<int32_t>::max(),
+            std::numeric_limits<int32_t>::max(),
+            std::numeric_limits<int32_t>::max(),
+            std::numeric_limits<int32_t>::max(),
+            std::numeric_limits<int32_t>::max());
+
+    {
+        const auto implicit = common_speculative_mtp_context_params_resolve(
+            4096, 0, 2, false);
+        assert(implicit.n_ctx == 4096);
+        assert(implicit.n_seq_max == 2);
+        assert(implicit.kv_unified);
+
+        const auto explicit_split = common_speculative_mtp_context_params_resolve(
+            4096, 8192, 3, false);
+        assert(explicit_split.n_ctx == 8192);
+        assert(explicit_split.n_seq_max == 3);
+        assert(!explicit_split.kv_unified);
+
+        const auto explicit_unified = common_speculative_mtp_context_params_resolve(
+            4096, 8192, 4, true);
+        assert(explicit_unified.n_ctx == 8192);
+        assert(explicit_unified.n_seq_max == 4);
+        assert(explicit_unified.kv_unified);
+
+        common_params_speculative pure_mtp;
+        pure_mtp.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+        pure_mtp.draft.ctx_dft = reinterpret_cast<llama_context *>(uintptr_t(1));
+        assert(common_speculative_mtp_context_available(pure_mtp));
+
+        common_params_speculative combined = pure_mtp;
+        combined.types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
+        assert(!common_speculative_mtp_context_available(combined));
+        combined.draft.ctx_mtp = reinterpret_cast<llama_context *>(uintptr_t(2));
+        assert(common_speculative_mtp_context_available(combined));
+    }
+
+    {
+        common_params_speculative spec;
+        spec.synth_len = 3.4;
+
+        auto assert_invalid = [](const common_params_speculative & value, int32_t n_max) {
+            try {
+                common_speculative_synth_rates_resolve(&value, n_max);
+                assert(false);
+            } catch (const std::invalid_argument &) {
+            }
+        };
+
+        const auto rates = common_speculative_synth_rates_resolve(&spec, 4);
+        assert(rates.size() == 4);
+        assert(std::abs(rates[0] - 0.80581) < 1e-5);
+        assert(std::abs(rates[1] - 0.64933) < 1e-5);
+        assert(std::abs(rates[2] - 0.52323) < 1e-5);
+        assert(std::abs(rates[3] - 0.42163) < 1e-5);
+        assert(std::abs(1.0 + rates[0] + rates[1] + rates[2] + rates[3] - 3.4) < 1e-8);
+
+        spec.synth_len = 1.0;
+        assert(common_speculative_synth_rates_resolve(&spec, 4) == std::vector<double>({0.0, 0.0, 0.0, 0.0}));
+
+        spec.synth_len = 5.0;
+        assert(common_speculative_synth_rates_resolve(&spec, 4) == std::vector<double>({1.0, 1.0, 1.0, 1.0}));
+
+        spec.synth_len = 5.1;
+        assert_invalid(spec, 4);
+
+        spec.synth_len = std::numeric_limits<double>::quiet_NaN();
+        assert_invalid(spec, 4);
+
+        spec.synth_len = 0.0;
+        assert_invalid(spec, 4);
+
+        spec.synth_len = -1.0;
+        spec.synth_rates = {0.8, 0.6, 0.4};
+        assert_invalid(spec, 4);
+
+        spec.synth_rates = {0.8, 0.6, 0.4, 0.2};
+        assert(common_speculative_synth_rates_resolve(&spec, 4) == spec.synth_rates);
+
+        spec.synth_rates = {0.8, 0.9, 0.4, 0.2};
+        assert_invalid(spec, 4);
+
+        spec.synth_rates = {0.8, std::numeric_limits<double>::quiet_NaN(), 0.4, 0.2};
+        assert_invalid(spec, 4);
+
+        spec.synth_rates = {0.8, 0.6, 0.4, -0.2};
+        assert_invalid(spec, 4);
+
+        spec.synth_rates = {0.8, 0.6, 0.4, 0.2};
+        spec.synth_len = 3.0;
+        assert_invalid(spec, 4);
+    }
+
+    {
+        common_params base;
+        base.n_parallel = 4;
+        base.n_outputs_max_per_seq = 8;
+
+        const auto draft = common_base_params_to_speculative(base);
+        assert(draft.n_outputs_max == 4);
+        assert(draft.n_outputs_max_per_seq == 1);
+    }
+
+    {
+        common_params base;
+        base.cpuparams.n_threads = 6;
+        base.cpuparams.n_threads_explicit = false;
+        base.cpuparams_batch.n_threads = 6;
+        base.cpuparams_batch.n_threads_explicit = false;
+        base.speculative.draft.mparams.path = "draft.gguf";
+        base.speculative.draft.cpuparams.n_threads = 8;
+        base.speculative.draft.cpuparams.n_threads_explicit = true;
+        base.speculative.draft.cpuparams_batch.n_threads = 7;
+        base.speculative.draft.cpuparams_batch.n_threads_explicit = true;
+
+        const auto draft = common_base_params_to_speculative(base);
+        assert(draft.cpuparams.n_threads == 8);
+        assert(draft.cpuparams.n_threads_explicit);
+        assert(draft.cpuparams_batch.n_threads == 7);
+        assert(draft.cpuparams_batch.n_threads_explicit);
+    }
+
+    {
+        common_params_speculative spec;
+        spec.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+        assert(!spec.has_non_mtp_model_drafter());
+
+        // Model-free helpers do not change an external MTP sidecar's role.
+        spec.types.push_back(COMMON_SPECULATIVE_TYPE_NGRAM_MOD);
+        assert(!spec.has_non_mtp_model_drafter());
+
+        for (const auto type : {
+                COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,
+                COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,
+                COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,
+                COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,
+                COMMON_SPECULATIVE_TYPE_DFLASH }) {
+            spec.types = { type, COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+            assert(spec.has_non_mtp_model_drafter());
+        }
+    }
 
     printf("test-arg-parser: make sure there is no duplicated arguments in any examples\n\n");
     for (int ex = 0; ex < LLAMA_EXAMPLE_COUNT; ex++) {
@@ -230,6 +387,26 @@ static void test(void) {
 
     argv = {"binary_name", "--spec-mtp-vocab-size", "16384"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    {
+        common_params synth_params;
+        argv = {"binary_name", "--spec-synth-len", "3.4"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), synth_params, LLAMA_EXAMPLE_SERVER));
+        assert(synth_params.speculative.synth_len == 3.4);
+    }
+
+    {
+        common_params synth_params;
+        argv = {"binary_name", "--spec-synth-rates", "0.8,0.6,0.2"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), synth_params, LLAMA_EXAMPLE_SERVER));
+        assert(synth_params.speculative.synth_rates == std::vector<double>({0.8, 0.6, 0.2}));
+    }
+
+    {
+        common_params synth_params;
+        argv = {"binary_name", "--spec-synth-len", "3.4x"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), synth_params, LLAMA_EXAMPLE_SERVER));
+    }
 
     argv = {"binary_name", "-lm", "none"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));

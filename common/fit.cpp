@@ -33,6 +33,179 @@ class common_params_fit_exception : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+uint32_t common_fit_extra_context_size(
+        uint32_t target_n_ctx,
+        uint32_t target_n_streams,
+        bool follows_target_per_sequence,
+        uint32_t fixed_n_ctx) {
+    if (fixed_n_ctx > 0) {
+        return fixed_n_ctx;
+    }
+    if (!follows_target_per_sequence) {
+        return target_n_ctx;
+    }
+
+    const uint32_t n_streams = std::max<uint32_t>(1, target_n_streams);
+    const uint32_t n_ctx     = GGML_PAD(target_n_ctx, 256);
+    return GGML_PAD(n_ctx / n_streams, 256);
+}
+
+using common_fit_extra_mapped_memory = std::vector<llama_memory_breakdown_data>;
+
+struct common_fit_extra_cache_state {
+    common_fit_extra_mapped_memory mapped;
+    uint32_t n_ctx = 0;
+    bool unavailable = false;
+};
+
+struct common_fit_extra_cache_request {
+    uint32_t n_ctx;
+    bool refresh_always;
+    bool optional;
+};
+
+struct common_fit_extra_measurement {
+    bool available;
+    common_fit_extra_mapped_memory mapped;
+};
+
+static std::vector<const common_fit_extra_model *> common_fit_extra_model_chain(
+        const common_fit_extra_model * extra) {
+    std::vector<const common_fit_extra_model *> result;
+    for (const common_fit_extra_model * current = extra; current != nullptr; current = current->next) {
+        result.push_back(current);
+    }
+    return result;
+}
+
+static void common_fit_add_breakdown(
+        llama_memory_breakdown_data & dst,
+        const llama_memory_breakdown_data & src) {
+    dst.model               += src.model;
+    dst.context             += src.context;
+    dst.compute             += src.compute;
+    dst.context_fixed       += src.context_fixed;
+    dst.context_vbr_managed += src.context_vbr_managed;
+}
+
+template <typename Measure>
+static bool common_fit_extra_cache_update(
+        std::vector<common_fit_extra_cache_state> & states,
+        const std::vector<common_fit_extra_cache_request> & requests,
+        size_t n_destinations,
+        Measure && measure,
+        common_fit_extra_mapped_memory & aggregate) {
+    GGML_ASSERT(states.size() == requests.size());
+
+    for (size_t i = 0; i < requests.size(); ++i) {
+        auto & state = states[i];
+        const auto & request = requests[i];
+        const bool refresh = !state.unavailable &&
+            (state.mapped.empty() || state.n_ctx != request.n_ctx || request.refresh_always);
+        if (!refresh) {
+            continue;
+        }
+
+        common_fit_extra_measurement measured = measure(i, request.n_ctx);
+        if (!measured.available) {
+            if (!request.optional) {
+                return false;
+            }
+            state.mapped.clear();
+            state.n_ctx = request.n_ctx;
+            state.unavailable = true;
+            continue;
+        }
+        if (measured.mapped.size() != n_destinations) {
+            return false;
+        }
+
+        state.mapped = std::move(measured.mapped);
+        state.n_ctx = request.n_ctx;
+    }
+
+    aggregate.assign(n_destinations, {});
+    for (const auto & state : states) {
+        if (state.unavailable) {
+            continue;
+        }
+        if (state.mapped.size() != n_destinations) {
+            return false;
+        }
+        for (size_t id = 0; id < n_destinations; ++id) {
+            common_fit_add_breakdown(aggregate[id], state.mapped[id]);
+        }
+    }
+    return true;
+}
+
+common_fit_extra_cache_probe_result common_fit_extra_cache_probe(
+        const common_fit_extra_model * extra,
+        const std::vector<uint32_t> & target_n_ctx_steps,
+        uint32_t target_n_streams,
+        const std::vector<common_fit_extra_cache_probe_source> & sources) {
+    common_fit_extra_cache_probe_result result = {
+        /*.success =*/ true,
+        /*.aggregate_bytes_by_device =*/ {},
+        /*.measurement_counts =*/ std::vector<size_t>(sources.size(), 0),
+    };
+    const auto models = common_fit_extra_model_chain(extra);
+    if (models.size() != sources.size()) {
+        result.success = false;
+        return result;
+    }
+    if (models.empty()) {
+        return result;
+    }
+
+    const size_t n_destinations = sources.front().base_bytes_by_device.size();
+    std::vector<common_fit_extra_cache_state> states(sources.size());
+    common_fit_extra_mapped_memory aggregate;
+
+    for (uint32_t target_n_ctx : target_n_ctx_steps) {
+        std::vector<common_fit_extra_cache_request> requests;
+        requests.reserve(sources.size());
+        for (size_t i = 0; i < sources.size(); ++i) {
+            const auto & source = sources[i];
+            const auto * model = models[i];
+            if (source.base_bytes_by_device.size() != n_destinations) {
+                result.success = false;
+                return result;
+            }
+            requests.push_back({
+                common_fit_extra_context_size(
+                    target_n_ctx, target_n_streams,
+                    model->follows_target_per_sequence, model->fixed_n_ctx),
+                model->shares_model,
+                model->optional_if_no_mtp,
+            });
+        }
+
+        result.success = common_fit_extra_cache_update(
+            states, requests, n_destinations,
+            [&](size_t i, uint32_t n_ctx) {
+                result.measurement_counts[i]++;
+                if (!sources[i].available) {
+                    return common_fit_extra_measurement { false, {} };
+                }
+                common_fit_extra_mapped_memory mapped(n_destinations);
+                for (size_t id = 0; id < n_destinations; ++id) {
+                    mapped[id].context = sources[i].base_bytes_by_device[id] + n_ctx;
+                }
+                return common_fit_extra_measurement { true, std::move(mapped) };
+            }, aggregate);
+        if (!result.success) {
+            return result;
+        }
+    }
+
+    result.aggregate_bytes_by_device.resize(aggregate.size());
+    for (size_t id = 0; id < aggregate.size(); ++id) {
+        result.aggregate_bytes_by_device[id] = aggregate[id].total();
+    }
+    return result;
+}
+
 // floor-true KV pricing inputs/outputs for dynamic VBR (see common_params_fit_impl): the dry
 // context is created with PRICE-tier types (the movable swap in common_fit_params), while the
 // runtime floor clamp lands on a discrete tier MIX along the degrade order — capacity math must
@@ -91,12 +264,14 @@ common_moe_cache_fit_result common_moe_cache_plan_fit(
             device.physical_device = input.physical_device;
             device.compute_capability = input.compute_capability;
             device.free_bytes = input.free_bytes;
+            device.reserve_bytes = input.reserve_bytes;
             result.devices.push_back(device);
         }
 
         common_moe_cache_fit_device & device = result.devices[device_index];
         device.free_bytes = std::min(device.free_bytes, input.free_bytes);
         device.compute_capability = std::min(device.compute_capability, input.compute_capability);
+        device.reserve_bytes = std::max(device.reserve_bytes, input.reserve_bytes);
         if ((int64_t)input.used_bytes > INT64_MAX - device.used_bytes) {
             result.reason = "device memory accounting overflowed";
             return result;
@@ -110,10 +285,12 @@ common_moe_cache_fit_result common_moe_cache_plan_fit(
 
     for (common_moe_cache_fit_device & device : result.devices) {
         const int64_t projected_free = device.free_bytes - device.used_bytes;
-        if (projected_free <= 0 || (uint64_t)projected_free <= reserve_bytes) {
+        const size_t effective_reserve = device.reserve_bytes > 0
+            ? device.reserve_bytes : reserve_bytes;
+        if (projected_free <= 0 || (uint64_t)projected_free <= effective_reserve) {
             continue;
         }
-        device.cache_bytes = (size_t)projected_free - reserve_bytes;
+        device.cache_bytes = (size_t)projected_free - effective_reserve;
         if (budget_bytes > 0) {
             device.cache_bytes = std::min(device.cache_bytes, budget_bytes);
         }
@@ -250,7 +427,8 @@ static common_moe_cache_fit_result common_moe_cache_evaluate_fit(
             return result;
         }
         device_inputs.push_back({caps.physical_device, caps.compute_capability,
-                memory[index].free - margins[index], memory[index].mb.total()});
+                memory[index].free - margins[index], memory[index].mb.total(),
+                caps.recommended_reserve_bytes});
         min_expert_bytes = std::max(min_expert_bytes, caps.min_expert_bytes);
     }
 
@@ -310,7 +488,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         bool plan_hint = false,
         std::vector<llama_moe_tensor_info> * moe_tensors = nullptr,
         llama_context * ctx_parent = nullptr,
-        bool share_parent_tensors = false) {
+        bool share_parent_tensors = false,
+        bool optional_if_no_mtp = false) {
     common_fit_logger_guard logger_guard(log_level);
 
     llama_model_params mparams_copy = *mparams;
@@ -320,6 +499,9 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     llama_model_ptr model(llama_model_load_from_file(path_model, mparams_copy));
     if (model == nullptr) {
         throw std::runtime_error("failed to load model");
+    }
+    if (optional_if_no_mtp && !llama_model_has_mtp(model.get())) {
+        return {};
     }
 
     llama_context_params cparams_copy = *cparams;
@@ -350,6 +532,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
             ret.back().mb.context       += mb.context;
             ret.back().mb.compute       += mb.compute;
             ret.back().mb.context_fixed += mb.context_fixed;
+            ret.back().mb.context_vbr_managed += mb.context_vbr_managed;
             continue;
         }
 
@@ -363,6 +546,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
                 ret[i].mb.context       += mb.context;
                 ret[i].mb.compute       += mb.compute;
                 ret[i].mb.context_fixed += mb.context_fixed;
+                ret[i].mb.context_vbr_managed += mb.context_vbr_managed;
                 break;
             }
         }
@@ -568,7 +752,8 @@ bool common_model_uses_recurrent_memory(
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
-        common_moe_cache_params * moe_cache, size_t * margins_s, uint32_t n_ctx_min, enum ggml_log_level log_level,
+        common_moe_cache_params * moe_cache, size_t * margins_s, uint32_t n_ctx_min,
+        const common_fit_extra_model * extra, enum ggml_log_level log_level,
         ggml_type type_k_entry, ggml_type type_v_entry) {
     // SPLIT_MODE_TENSOR runs through the single-device paths below: the model exposes exactly one
     // meta device whose memory report is the balanced-equivalent aggregate of the real GPUs (see
@@ -588,14 +773,156 @@ static void common_params_fit_impl(
         moe_cache->fit_selected = false;
     }
 
+    // with non-unified kv, we need to take into account n_streams
+    // for example, if memory can hold more than model's trained context size, we must extend the n_ctx to hold enough n_streams
+    const uint32_t n_streams  = cparams->kv_unified ? 1 : std::max<uint32_t>(1, cparams->n_seq_max);
+    const bool     n_ctx_auto = cparams->n_ctx == 0;
+
+    const auto extra_models = common_fit_extra_model_chain(extra);
+    std::vector<common_fit_extra_cache_state> extra_caches(extra_models.size());
+    dmds_t dmds_extra; // latest aggregate, laid out on the target devices
+
+    // the extra model competes for the same memory as the main model, add it to every measurement
+    // its memory is measured again whenever the context it follows changes. A shared-model MTP
+    // context also follows the target placement, so candidate placements must not reuse the
+    // initial extra-model measurement.
+    auto add_extra_memory = [&](dmds_t & dmds, const llama_model_params * target_mparams) {
+        if (extra == nullptr) {
+            return;
+        }
+
+        std::vector<common_fit_extra_cache_request> requests;
+        requests.reserve(extra_models.size());
+        for (const common_fit_extra_model * current : extra_models) {
+            const uint32_t n_ctx_current = common_fit_extra_context_size(
+                cparams->n_ctx, n_streams,
+                current->follows_target_per_sequence, current->fixed_n_ctx);
+            current->cparams->n_ctx = n_ctx_current;
+            requests.push_back({
+                n_ctx_current,
+                current->shares_model,
+                current->optional_if_no_mtp,
+            });
+        }
+
+        common_fit_extra_mapped_memory aggregate;
+        const bool extra_ok = common_fit_extra_cache_update(
+            extra_caches, requests, devs.size() + 1,
+            [&](size_t iextra, uint32_t) {
+                const common_fit_extra_model * current = extra_models[iextra];
+                std::vector<ggml_backend_dev_t> devs_extra;
+                uint32_t ngl_extra = 0;
+                uint32_t nct_extra = 0;
+                uint32_t nex_extra = 0;
+
+                llama_model_params mparams_extra = *current->mparams;
+                if (current->shares_model) {
+                    GGML_ASSERT(target_mparams != nullptr);
+                    const bool load_mtp = mparams_extra.load_mtp;
+                    mparams_extra = *target_mparams;
+                    // The target candidate owns placement, but the extra probe still has to load
+                    // the native MTP tensors selected by the speculative configuration.
+                    mparams_extra.load_mtp = load_mtp;
+                }
+
+                LOG_TRC("%s: getting device memory data for an extra model at a context size of %" PRIu32 ":\n",
+                    __func__, current->cparams->n_ctx);
+
+                dmds_t measured;
+                try {
+                    measured = common_get_device_memory_data_impl(
+                        current->path_model, &mparams_extra, current->cparams,
+                        devs_extra, ngl_extra, nct_extra, nex_extra, log_level,
+                        /* vbr_costs = */ nullptr,
+                        /* plan_hint = */ false,
+                        /* moe_tensors = */ nullptr,
+                        /* ctx_parent = */ nullptr,
+                        /* share_parent_tensors = */ false,
+                        current->optional_if_no_mtp);
+                } catch (const std::runtime_error & e) {
+                    throw common_params_fit_exception(string_format(
+                        "failed to measure a required speculative model/context: %s", e.what()));
+                }
+
+                if (measured.empty() && current->optional_if_no_mtp) {
+                    return common_fit_extra_measurement { false, {} };
+                }
+
+                if (measured.size() != devs_extra.size() + 1) {
+                    throw common_params_fit_exception(
+                        "required speculative model/context returned an invalid device inventory");
+                }
+
+                common_fit_extra_mapped_memory mapped(devs.size() + 1);
+                llama_memory_breakdown_data mb_host = measured.back().mb;
+                if (current->shares_model) {
+                    mb_host.model = 0;
+                }
+                common_fit_add_breakdown(mapped.back(), mb_host);
+
+                for (size_t je = 0; je < devs_extra.size(); je++) {
+                    llama_memory_breakdown_data mb_extra = measured[je].mb;
+                    if (current->shares_model) {
+                        mb_extra.model = 0;
+                    }
+
+                    bool mapped_device = false;
+                    for (size_t id = 0; id < devs.size(); id++) {
+                        if (devs_extra[je] == devs[id]) {
+                            common_fit_add_breakdown(mapped[id], mb_extra);
+                            mapped_device = true;
+                            break;
+                        }
+                    }
+
+                    if (!mapped_device && mb_extra.total() != 0) {
+                        throw common_params_fit_exception(string_format(
+                            "required speculative model/context uses device %s outside the target fit authority",
+                            ggml_backend_dev_name(devs_extra[je])));
+                    }
+                }
+                return common_fit_extra_measurement { true, std::move(mapped) };
+            }, aggregate);
+
+        if (!extra_ok) {
+            throw common_params_fit_exception(
+                "required speculative model/context returned no usable memory inventory");
+        }
+
+        dmds_extra.assign(aggregate.size(), {});
+        for (size_t id = 0; id < dmds.size(); id++) {
+            dmds_extra[id].mb = aggregate[id];
+            common_fit_add_breakdown(dmds[id].mb, aggregate[id]);
+        }
+    };
+
     // step 1: get data for default parameters and check whether any changes are necessary in the first place
 
     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
     common_vbr_fit_costs vbr_costs;
     vbr_costs.entry_k = type_k_entry;
     vbr_costs.entry_v = type_v_entry;
-    const dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level,
+    dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level,
             cparams->vbr_dynamic ? &vbr_costs : nullptr, /*plan_hint=*/true, &moe_tensors);
+
+    // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
+    const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_streams, UINT32_MAX);
+    const uint32_t n_ctx_min_total = (uint32_t) std::min<uint64_t>(uint64_t(n_ctx_min) * n_streams, UINT32_MAX);
+
+    // llama_context would use only hp_nct in total for n_ctx == 0, resolve the context before measuring anything else:
+    if (n_ctx_auto) {
+        cparams->n_ctx = n_ctx_max;
+        if (n_streams > 1) {
+            LOG_TRC("%s: context size unset and KV cache not unified -> using %" PRIu32 " for %" PRIu32 " sequences:\n",
+                __func__, n_ctx_max, n_streams);
+            dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level,
+                    cparams->vbr_dynamic ? &vbr_costs : nullptr, /*plan_hint=*/true, &moe_tensors);
+        }
+    }
+    const dmds_t dmds_target_full = dmds_full;
+    add_extra_memory(dmds_full, mparams);
+    const dmds_t dmds_extra_full = dmds_extra;
+
     const size_t nd = devs.size(); // number of devices
 
     // dynamic VBR: measured dry-load KV bytes are PRICE-tier-priced (largest tier <= the floor)
@@ -678,15 +1005,16 @@ static void common_params_fit_impl(
         return result;
     };
 
-    // context bytes that scale with n_ctx (KV only): byte->token capacity math and floor-cost
-    // comparisons must exclude the n_seq_max-sized recurrent state or a constant term skews them
-    auto sum_context_kv_bytes = [&](const dmds_t & dmds) {
+    // Context bytes whose representation is selected by Turbo/VBR. This is intentionally not
+    // `context - context_fixed`: an auxiliary index cache can scale with n_ctx while remaining
+    // fixed-layout and outside the controller budget.
+    auto sum_context_vbr_managed_bytes = [&](const dmds_t & dmds) {
         int64_t result = 0;
         if (nd == 0) {
-            result += dmds.back().mb.context - dmds.back().mb.context_fixed;
+            result += dmds.back().mb.context_vbr_managed;
         } else {
             for (size_t id = 0; id < nd; id++) {
-                result += dmds[id].mb.context - dmds[id].mb.context_fixed;
+                result += dmds[id].mb.context_vbr_managed;
             }
         }
         return result;
@@ -738,17 +1066,26 @@ static void common_params_fit_impl(
         }
         return (int64_t) std::max(0.0, vbr_costs.scratch_bytes_pt * (double) n_tokens - margin_total);
     };
-    auto vbr_growth_reachable_ctx_cap = [&](const dmds_t & dmds_full) -> uint32_t {
+    auto vbr_growth_reachable_ctx_cap = [&]() -> uint32_t {
         if (nd == 0 || hp_nct == 0) {
             return 0;
         }
         int64_t budget_gr = 0;
         int64_t ctx_kv    = 0; // price-tier KV cost of the full context (RS excluded)
         for (size_t id = 0; id < nd; id++) {
-            const llama_device_memory_data & dmd = dmds_full[id];
-            budget_gr += std::max<int64_t>(0, dmd.total - (int64_t) dmd.mb.model - (int64_t) dmd.mb.compute
-                                              - (int64_t) dmd.mb.context_fixed - margins[id]);
-            ctx_kv    += (int64_t) dmd.mb.context - (int64_t) dmd.mb.context_fixed;
+            const llama_device_memory_data & target = dmds_target_full[id];
+            const llama_memory_breakdown_data extra_mb = dmds_extra_full.empty()
+                ? llama_memory_breakdown_data{} : dmds_extra_full[id].mb;
+
+            // The runtime VBR budget controls only the target KV. Reserve the complete extra
+            // model/context/compute allocation first; its fixed-F16 KV cannot be spent by the
+            // target controller or scaled by the target's floor-mix ratio.
+            const int64_t context_fixed_layout =
+                (int64_t) target.mb.context - (int64_t) target.mb.context_vbr_managed;
+            budget_gr += std::max<int64_t>(0,
+                target.total - (int64_t) target.mb.model - (int64_t) target.mb.compute
+                    - context_fixed_layout - (int64_t) extra_mb.total() - margins[id]);
+            ctx_kv += (int64_t) target.mb.context_vbr_managed;
         }
         ctx_kv = (int64_t) ((double) ctx_kv * vbr_kv_scale); // floor-mix cost, not price-tier
         budget_gr -= vbr_scratch_excess(hp_nct);
@@ -762,11 +1099,11 @@ static void common_params_fit_impl(
         return vbr_scale_est(cap_tokens);
     };
     // min-cap an auto-derived advert (never an explicit -c) + the honesty log
-    auto vbr_cap_advert = [&](const dmds_t & dmds_full) {
+    auto vbr_cap_advert = [&]() {
         if (!cparams->vbr_dynamic || cparams->n_ctx == 0) {
             return;
         }
-        const uint32_t cap = vbr_growth_reachable_ctx_cap(dmds_full);
+        const uint32_t cap = vbr_growth_reachable_ctx_cap();
         if (cap != 0 && cap < cparams->n_ctx) {
             LOG_INF("%s: VBR dynamic: advertised n_ctx capped %u -> %u = growth-reachable budget capacity at the quality floor\n",
                     __func__, cparams->n_ctx, cap);
@@ -780,8 +1117,7 @@ static void common_params_fit_impl(
     // -ctk turbo3_tcq gets the same capacity estimation as --vbr-bits t3 — same cache, same math.
     const bool vbr_selected = ggml_is_turbo_kv_type(cparams->type_k) || ggml_is_turbo_kv_type(cparams->type_v) ||
                               cparams->vbr_dynamic || vbr_budget_explicit != 0 || cparams->vbr_min_bits > 0.0;
-    auto vbr_dynamic_arm_budget = [&](const dmds_t & dmds_full,
-                                      const std::vector<int64_t> & projected_free_per_device,
+    auto vbr_dynamic_arm_budget = [&](const std::vector<int64_t> & projected_free_per_device,
                                       int64_t projected_free_host) {
         if (!cparams->vbr_dynamic) {
             return;
@@ -796,12 +1132,12 @@ static void common_params_fit_impl(
             // measured free. Once the probe honors no_alloc, only this subtraction charges it.)
             int64_t b = 0;
             if (nd == 0) {
-                b = (int64_t) (dmds_full.back().mb.context - dmds_full.back().mb.context_fixed)
+                b = (int64_t) dmds_target_full.back().mb.context_vbr_managed
                     + projected_free_host - margins[0];
             } else {
                 for (size_t id = 0; id < nd; id++) {
                     b += std::max<int64_t>(0,
-                            (int64_t) (dmds_full[id].mb.context - dmds_full[id].mb.context_fixed)
+                            (int64_t) dmds_target_full[id].mb.context_vbr_managed
                             + projected_free_per_device[id] - margins[id]);
                 }
             }
@@ -825,7 +1161,7 @@ static void common_params_fit_impl(
         // cannot deliver the full context there (the runtime will also warn, at fill).
         const double floor_bpv = cparams->vbr_min_bits > 0.0 ? cparams->vbr_min_bits
                                                              : vbr_type_bits(GGML_TYPE_TURBO1_TCQ);
-        const int64_t ctx_priced = sum_context_kv_bytes(dmds_full);
+        const int64_t ctx_priced = sum_context_vbr_managed_bytes(dmds_target_full);
         // fire for the tier-exact default floor too (scale 1): a budget below the floor-cost
         // full context is the only startup signal for the runtime's warn-once-exceed state
         if (ctx_priced > 0 && (double) budget < (double) ctx_priced * vbr_kv_scale) {
@@ -857,7 +1193,7 @@ static void common_params_fit_impl(
         // common_fit_params); scale to the achievable floor-mix cost so these byte->token
         // estimates are true floor capacities, capped at the trained context (beyond it rope
         // is invalid and compute growth unaccounted)
-        const int64_t ctx_full = (int64_t) ((double) sum_context_kv_bytes(dmds_full) * vbr_kv_scale);
+        const int64_t ctx_full = (int64_t) ((double) sum_context_vbr_managed_bytes(dmds_full) * vbr_kv_scale);
         if (ctx_full <= 0) {
             return uint32_t(0);
         }
@@ -871,7 +1207,7 @@ static void common_params_fit_impl(
         const dmds_t dmds_probe = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
         cparams->n_ctx = 0;
 
-        const int64_t ctx_probe = (int64_t) ((double) sum_context_kv_bytes(dmds_probe) * vbr_kv_scale);
+        const int64_t ctx_probe = (int64_t) ((double) sum_context_vbr_managed_bytes(dmds_probe) * vbr_kv_scale);
         if (ctx_probe <= 0 || ctx_full <= ctx_probe) {
             return vbr_scale_est((uint64_t) budget_bytes * hp_nct / (uint64_t) ctx_full);
         }
@@ -886,7 +1222,7 @@ static void common_params_fit_impl(
         return vbr_scale_est(n_ctx_est);
     };
 
-    auto vbr_estimate_ctx_from_remaining = [&](const dmds_t & dmds_full, const std::vector<int64_t> & projected_free_per_device, int64_t projected_free_host) {
+    auto vbr_estimate_ctx_from_remaining = [&](const dmds_t & dmds_target, const std::vector<int64_t> & projected_free_per_device, int64_t projected_free_host) {
         if (!vbr_selected || cparams->n_ctx != 0 || vbr_budget_explicit != 0 || hp_nct == 0) {
             return uint32_t(0);
         }
@@ -894,7 +1230,7 @@ static void common_params_fit_impl(
         // growth-reachable budget cannot serve it at the quality floor — advertising cells the
         // box can never hold at the floor tier ends in the warn-once-then-exceed state at depth
         if (cparams->vbr_dynamic) {
-            return vbr_growth_reachable_ctx_cap(dmds_full);
+            return vbr_growth_reachable_ctx_cap();
         }
 
         const uint32_t n_ctx_probe = std::min<uint32_t>(hp_nct, std::max<uint32_t>(256, std::min<uint32_t>(n_ctx_min, hp_nct)));
@@ -926,10 +1262,10 @@ static void common_params_fit_impl(
         };
 
         if (nd == 0) {
-            update_estimate(dmds_full.back().mb.context, dmds_probe.back().mb.context, projected_free_host, margins[0]);
+            update_estimate(dmds_target.back().mb.context, dmds_probe.back().mb.context, projected_free_host, margins[0]);
         } else {
             for (size_t id = 0; id < nd; id++) {
-                update_estimate(dmds_full[id].mb.context, dmds_probe[id].mb.context, projected_free_per_device[id], margins[id]);
+                update_estimate(dmds_target[id].mb.context, dmds_probe[id].mb.context, projected_free_per_device[id], margins[id]);
             }
         }
 
@@ -942,16 +1278,16 @@ static void common_params_fit_impl(
         return vbr_scale_est(n_ctx_est);
     };
 
-    auto vbr_select_ctx = [&](const dmds_t & dmds_full, const std::vector<int64_t> & projected_free_per_device, int64_t projected_free_host) {
+    auto vbr_select_ctx = [&](const std::vector<int64_t> & projected_free_per_device, int64_t projected_free_host) {
         // the controller budget is independent of context selection — arm it even when -c is
         // explicit (the estimators below no-op on n_ctx != 0) or the estimate comes up empty
-        vbr_dynamic_arm_budget(dmds_full, projected_free_per_device, projected_free_host);
+        vbr_dynamic_arm_budget(projected_free_per_device, projected_free_host);
 
         uint32_t vbr_n_ctx = 0;
         if (vbr_budget_explicit != 0) {
-            vbr_n_ctx = vbr_estimate_ctx_from_total_budget(vbr_budget_explicit, dmds_full);
+            vbr_n_ctx = vbr_estimate_ctx_from_total_budget(vbr_budget_explicit, dmds_target_full);
         } else {
-            vbr_n_ctx = vbr_estimate_ctx_from_remaining(dmds_full, projected_free_per_device, projected_free_host);
+            vbr_n_ctx = vbr_estimate_ctx_from_remaining(dmds_target_full, projected_free_per_device, projected_free_host);
         }
         if (vbr_n_ctx == 0) {
             return false;
@@ -984,7 +1320,7 @@ static void common_params_fit_impl(
         LOG_TRC("%s: projected to use %" PRId64 " MiB of host memory vs. %" PRId64 " MiB of total host memory\n",
             __func__, sum_projected_used/MiB, sum_free/MiB);
         if (sum_projected_free >= margins[0]) {
-            if (vbr_select_ctx(dmds_full, projected_free_per_device, sum_projected_free)) {
+            if (vbr_select_ctx(projected_free_per_device, sum_projected_free)) {
                 return;
             }
             LOG_TRC("%s: will leave %" PRId64 " >= %" PRId64 " MiB of system memory, no changes needed\n",
@@ -1017,7 +1353,7 @@ static void common_params_fit_impl(
             __func__, sum_projected_used/MiB, sum_free/MiB);
         if (nd == 1) {
             if (projected_free_per_device[0] >= margins[0]) {
-                if (vbr_select_ctx(dmds_full, projected_free_per_device, 0)) {
+                if (vbr_select_ctx(projected_free_per_device, 0)) {
                     return;
                 }
                 LOG_TRC("%s: will leave %" PRId64 " >= %" PRId64 " MiB of free device memory, no changes needed\n",
@@ -1034,7 +1370,7 @@ static void common_params_fit_impl(
                 }
             }
             if (!changes_needed) {
-                if (vbr_select_ctx(dmds_full, projected_free_per_device, 0)) {
+                if (vbr_select_ctx(projected_free_per_device, 0)) {
                     return;
                 }
                 LOG_TRC("%s: targets for free memory can be met on all devices, no changes needed\n", __func__);
@@ -1052,7 +1388,7 @@ static void common_params_fit_impl(
     // conservative floor-cost fallback. Arm it here, once, for all of them. Host-only (nd == 0)
     // is skipped: dynamic VBR needs a VMM-capable device and the controller is inert without one.
     if (nd >= 1) {
-        vbr_dynamic_arm_budget(dmds_full, projected_free_per_device, 0);
+        vbr_dynamic_arm_budget(projected_free_per_device, 0);
     }
 
     {
@@ -1073,8 +1409,8 @@ static void common_params_fit_impl(
                     "%s: cannot meet free memory targets on all devices, need to use %" PRId64 " MiB less in total\n",
                     __func__, -global_surplus/MiB);
             }
-            if (cparams->n_ctx == 0) {
-                if (hp_nct > n_ctx_min) {
+            if (n_ctx_auto) {
+                if (n_ctx_max > n_ctx_min_total) {
                     int64_t sum_used_target = sum_free;
                     if (nd == 0) {
                         sum_used_target -= margins[0];
@@ -1094,8 +1430,9 @@ static void common_params_fit_impl(
                     }
 
                     int64_t sum_projected_used_min_ctx = 0;
-                    cparams->n_ctx = n_ctx_min;
-                    const dmds_t dmds_min_ctx = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+                    cparams->n_ctx = n_ctx_min_total;
+                    dmds_t dmds_min_ctx = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+                    add_extra_memory(dmds_min_ctx, mparams);
                     if (nd == 0) {
                         sum_projected_used_min_ctx = dmds_min_ctx.back().mb.total();
                     } else {
@@ -1105,15 +1442,17 @@ static void common_params_fit_impl(
                     }
                     if (sum_used_target > sum_projected_used_min_ctx) {
                         // linear interpolation between minimum and maximum context size:
-                        cparams->n_ctx += (hp_nct - n_ctx_min) * (sum_used_target - sum_projected_used_min_ctx)
+                        cparams->n_ctx += (n_ctx_max - n_ctx_min_total) * (sum_used_target - sum_projected_used_min_ctx)
                             / (sum_projected_used - sum_projected_used_min_ctx);
-                        cparams->n_ctx = std::max(cparams->n_ctx - cparams->n_ctx % 256, n_ctx_min); // round down context for CUDA backend
+                        // round down context for CUDA backend, keep it divisible by the number of streams:
+                        const uint32_t align = 256 * n_streams;
+                        cparams->n_ctx = std::max(cparams->n_ctx - cparams->n_ctx % align, n_ctx_min_total);
 
-                        const int64_t bytes_per_ctx = (sum_projected_used - sum_projected_used_min_ctx) / (hp_nct - n_ctx_min);
-                        const int64_t memory_reduction = (hp_nct - cparams->n_ctx) * bytes_per_ctx;
+                        const int64_t bytes_per_ctx = (sum_projected_used - sum_projected_used_min_ctx) / (n_ctx_max - n_ctx_min_total);
+                        const int64_t memory_reduction = (n_ctx_max - cparams->n_ctx) * bytes_per_ctx;
                         LOG_TRC("%s: context size reduced from %" PRIu32 " to %" PRIu32 " -> need %" PRId64 " MiB less memory in total\n",
-                            __func__, hp_nct, cparams->n_ctx, memory_reduction/MiB);
-                        vbr_cap_advert(dmds_full); // shrunk advert must still be floor-servable
+                            __func__, n_ctx_max, cparams->n_ctx, memory_reduction/MiB);
+                        vbr_cap_advert(); // shrunk advert must still be floor-servable
                         if (nd <= 1) {
                             LOG_TRC("%s: entire model can be fit by reducing context\n", __func__);
                             return;
@@ -1122,15 +1461,15 @@ static void common_params_fit_impl(
                     } else {
                         const int64_t memory_reduction = sum_projected_used - sum_projected_used_min_ctx;
                         LOG_TRC("%s: context size reduced from %" PRIu32 " to %" PRIu32 " -> need %" PRId64 " MiB less memory in total\n",
-                            __func__, hp_nct, cparams->n_ctx, memory_reduction/MiB);
-                        vbr_cap_advert(dmds_full);
+                            __func__, n_ctx_max, cparams->n_ctx, memory_reduction/MiB);
+                        vbr_cap_advert();
                     }
                 } else {
                     if (n_ctx_min == UINT32_MAX) {
-                        LOG_TRC("%s: user has requested full context size of %" PRIu32 " -> no change\n", __func__, hp_nct);
+                        LOG_TRC("%s: user has requested full context size of %" PRIu32 " -> no change\n", __func__, n_ctx_max);
                     } else {
                         LOG_TRC("%s: default model context size is %" PRIu32 " which is <= the min. context size of %" PRIu32 " -> no change\n",
-                            __func__, hp_nct, n_ctx_min);
+                            __func__, n_ctx_max, n_ctx_min_total);
                     }
                 }
             } else {
@@ -1281,8 +1620,9 @@ static void common_params_fit_impl(
         llama_model_params mparams_copy = *mparams;
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, mparams_copy);
 
-        const dmds_t dmd_nl = common_get_device_memory_data_impl(
+        dmds_t dmd_nl = common_get_device_memory_data_impl(
             path_model, &mparams_copy, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+        add_extra_memory(dmd_nl, &mparams_copy);
 
         LOG_TRC("%s: memory for test allocation by device:\n", func_name);
         for (size_t id = 0; id < nd; id++) {
@@ -1339,6 +1679,7 @@ static void common_params_fit_impl(
         if (candidate_devs != devs || candidate_memory.size() != nd + 1) {
             return false;
         }
+        add_extra_memory(candidate_memory, &candidate);
         for (size_t id = 0; id < nd; id++) {
             if (candidate_memory[id].mb.total() > INT64_MAX ||
                 candidate_memory[id].free - (int64_t)candidate_memory[id].mb.total() < margins[id]) {
@@ -1361,8 +1702,9 @@ static void common_params_fit_impl(
         mparams->tensor_buft_overrides = tensor_buft_overrides;
 
         LOG_TRC("%s: getting device memory data with all MoE tensors moved to system memory:\n", __func__);
-        const dmds_t dmds_cpu_moe = common_get_device_memory_data_impl(
+        dmds_t dmds_cpu_moe = common_get_device_memory_data_impl(
             path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+        add_extra_memory(dmds_cpu_moe, mparams);
 
         for (size_t id = 0; id < nd; id++) {
             global_surplus_cpu_moe += dmds_cpu_moe[id].free;
@@ -1729,7 +2071,8 @@ static void common_params_fit_impl(
                     pattern_strings.clear();
                     int n_overrides = 0;
                     for (int i = 0; i < mid && n_overrides < (int)ntbo - 1; i++) {
-                        pattern_strings.push_back(llm_ffn_exps_block_regex(order[i]));
+                        pattern_strings.push_back(
+                            llm_ffn_block_regex(order[i], LLM_FFN_EXPS_REGEX));
                         candidate_overrides[n_overrides++] = {pattern_strings.back().c_str(), ggml_backend_cpu_buffer_type()};
                     }
                     candidate_overrides[n_overrides] = {nullptr, nullptr};
@@ -1745,6 +2088,7 @@ static void common_params_fit_impl(
 
                     bool candidate_valid = (candidate_devs == devs && candidate_memory.size() == nd + 1);
                     if (candidate_valid) {
+                        add_extra_memory(candidate_memory, &candidate);
                         for (size_t id = 0; id < nd; id++) {
                             if (candidate_memory[id].mb.total() > INT64_MAX ||
                                 candidate_memory[id].free - (int64_t)candidate_memory[id].mb.total() < margins[id]) {
@@ -1788,7 +2132,8 @@ static void common_params_fit_impl(
                     pattern_strings.clear();
                     int n_overrides = 0;
                     for (int i = 0; i < best_n_evict && n_overrides < (int)ntbo - 1; i++) {
-                        pattern_strings.push_back(llm_ffn_exps_block_regex(order[i]));
+                        pattern_strings.push_back(
+                            llm_ffn_block_regex(order[i], LLM_FFN_EXPS_REGEX));
                         tensor_buft_overrides[n_overrides++] = {pattern_strings.back().c_str(), ggml_backend_cpu_buffer_type()};
                     }
                     tensor_buft_overrides[n_overrides] = {nullptr, nullptr};
@@ -1879,15 +2224,19 @@ enum common_params_fit_status common_fit_params(
         common_moe_cache_params * moe_cache,
         size_t * margins,
         uint32_t n_ctx_min,
+        const common_fit_extra_model * extra,
         ggml_log_level log_level) {
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
 
-    // SPLIT_MODE_TENSOR with everything explicit (-c AND --vbr-vram): nothing left to size or
-    // arm (the estimators no-op on explicit values and there is no layer redistribution), so
-    // skip the dry model loads the fit would otherwise spend on a no-op
+    // SPLIT_MODE_TENSOR with everything explicit (-c AND --vbr-vram): when there is no extra
+    // model/context and no MoE fit authority, nothing remains to size or arm (the estimators
+    // no-op on explicit values and there is no layer redistribution). Required extras and MoE
+    // policy must still pass through the aggregate-device measurement.
+    const bool moe_fit_active = moe_cache != nullptr && moe_cache->mode != COMMON_MOE_CACHE_MODE_OFF;
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR && cparams->vbr_dynamic &&
-            cparams->n_ctx != 0 && cparams->vbr_vram_budget_bytes != 0) {
+            cparams->n_ctx != 0 && cparams->vbr_vram_budget_bytes != 0 &&
+            extra == nullptr && !moe_fit_active) {
         LOG_INF("%s: SPLIT_MODE_TENSOR: -c and --vbr-vram both explicit — nothing to fit, skipping\n", __func__);
         return COMMON_PARAMS_FIT_STATUS_SUCCESS;
     }
@@ -1924,7 +2273,8 @@ enum common_params_fit_status common_fit_params(
     }
 
     try {
-        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, moe_cache, margins, n_ctx_min, log_level,
+        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides,
+                moe_cache, margins, n_ctx_min, extra, log_level,
                 type_k_entry, type_v_entry);
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_exception & e) {

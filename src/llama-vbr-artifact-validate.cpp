@@ -1636,7 +1636,9 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                  companion.descriptor.kind ==
                      vbr_artifact_companion_kind::required_spec_payload ||
                  companion.descriptor.kind ==
-                     vbr_artifact_companion_kind::typed_accelerator)) {
+                     vbr_artifact_companion_kind::typed_accelerator ||
+                 companion.descriptor.kind ==
+                     vbr_artifact_companion_kind::qsa_index)) {
                 const auto & recovery =
                     policy.occupied_replacement->recovery_package();
                 if (companion_index >= recovery.companions().size()) {

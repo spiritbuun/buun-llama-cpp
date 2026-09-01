@@ -900,6 +900,30 @@ static void test_complete_tree_barrier_fail_closed() {
     CHECK(vbr_adopt_check_complete_tree(
               expected, live, { provider, provider }) ==
           vbr_adopt_status::required_companion_unavailable);
+
+    auto * qsa = reinterpret_cast<llama_memory_hybrid_idx *>(
+        uintptr_t(0x4040));
+    live[0].qsa_index_owner = qsa;
+    CHECK(vbr_adopt_check_complete_tree(expected, live, { provider }) ==
+          vbr_adopt_status::required_companion_unavailable);
+    vbr_companion_adoption_provider qsa_provider;
+    qsa_provider.kind = vbr_artifact_companion_kind::qsa_index;
+    qsa_provider.target_cookie = qsa;
+    bool qsa_empty_after_prepare = false;
+    qsa_provider.context = &qsa_empty_after_prepare;
+    qsa_provider.target_empty = fake_target_empty;
+    qsa_provider.attention_child_id = 0;
+    // QSA prepares reversibly in-place, so it is expected to be non-empty at
+    // the complete-tree barrier.  Its later recheck authenticates that state.
+    CHECK(vbr_adopt_check_complete_tree(
+              expected, live, { provider, qsa_provider }) ==
+          vbr_adopt_status::adopted);
+    CHECK(vbr_adopt_check_complete_tree(
+              expected, live, { provider, qsa_provider }, true) ==
+          vbr_adopt_status::adopted);
+    CHECK(vbr_adopt_check_complete_tree(
+              expected, live, { provider, qsa_provider, qsa_provider }) ==
+          vbr_adopt_status::required_companion_unavailable);
 }
 
 namespace adoption_fixture {

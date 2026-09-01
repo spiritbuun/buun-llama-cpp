@@ -9,6 +9,7 @@
 #include "ggml.h"
 #include "llama.h"
 
+#include <list>
 #include <set>
 #include <sstream>
 #include <string>
@@ -16,6 +17,7 @@
 #include <vector>
 #include <map>
 #include <algorithm>
+#include <array>
 #include <fstream>
 #include <memory>
 #include <stdexcept>
@@ -75,6 +77,7 @@ struct common_control_vector_load_info;
 
 struct common_cpu_params {
     int      n_threads                   = -1;
+    bool     n_threads_explicit          = false;
     bool     cpumask[GGML_MAX_N_THREADS] = {false}; // CPU affinity mask.
     bool     mask_valid                  = false;   // Default: any CPU
     enum ggml_sched_priority  priority   = GGML_SCHED_PRIO_NORMAL;  // Scheduling prio : (0 - normal, 1 - medium, 2 - high, 3 - realtime)
@@ -84,6 +87,8 @@ struct common_cpu_params {
 
 int32_t common_cpu_get_num_physical_cores();
 int32_t common_cpu_get_num_math();
+int32_t common_cpu_resolve_moe_threads(int32_t physical_cores);
+int32_t common_cpu_get_num_moe_threads();
 
 //
 // Common params
@@ -354,6 +359,11 @@ struct common_params_speculative_draft {
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
 
+    // Combined speculative lists may own both an ordinary external drafter and
+    // an MTP context built from the target model. A standalone MTP sidecar uses
+    // ctx_dft, just like native MTP does when no external drafter is present.
+    llama_context * ctx_mtp = nullptr;
+
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
@@ -393,6 +403,9 @@ struct common_params_speculative_ngram_cache {
 
 struct common_params_speculative {
     std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
+
+    double synth_len = -1.0;
+    std::vector<double> synth_rates;
 
     // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
     common_params_speculative_draft draft;
@@ -436,8 +449,20 @@ struct common_params_speculative {
         return !draft.mparams.empty();
     }
 
+    bool has_non_mtp_model_drafter() const {
+        return has_type(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE) ||
+               has_type(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) ||
+               has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) ||
+               has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) ||
+               has_type(COMMON_SPECULATIVE_TYPE_DFLASH);
+    }
+
     bool has_type(common_speculative_type t) const {
         return std::find(types.begin(), types.end(), t) != types.end();
+    }
+
+    bool has_synth() const {
+        return synth_len != -1.0 || !synth_rates.empty();
     }
 
     uint32_t need_n_rs_seq() const {
@@ -545,6 +570,8 @@ struct common_moe_cache_params {
     int expert_parallel        = 0;
     bool mode_explicit         = false;
     bool fit_selected          = false;
+    bool profile               = true;
+    std::string profile_path;
 };
 
 struct common_params {
@@ -557,6 +584,7 @@ struct common_params {
     int32_t n_parallel            =     1; // number of parallel sequences to decode
     int32_t n_sequences           =     1; // number of sequences to decode
     int32_t n_outputs_max         =     0; // max outputs in a batch (0 = n_batch)
+    int32_t n_outputs_max_per_seq =     1; // max outputs per sequence
     int32_t grp_attn_n            =     1; // group-attention factor
     int32_t grp_attn_w            =   512; // group-attention width
     int32_t n_print               =    -1; // print token count every n tokens (-1 = disabled)
@@ -586,7 +614,10 @@ struct common_params {
     uint64_t fit_params_vbr_growth_headroom_bytes = 0; // 0 = derive from fit_params_target
 
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
-    enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_MMAP; // how to load the model
+    enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_AUTO; // how to load the model
+
+    enum llama_lazy_mode lazy_mode = LLAMA_LAZY_MODE_AUTO; // on-demand reading of tensors marked by the arch
+    enum llama_mmap_prefetch_mode mmap_prefetch = LLAMA_MMAP_PREFETCH_MODE_AUTO;
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
@@ -638,6 +669,8 @@ struct common_params {
     int32_t verbosity                  = 3;  // LOG_LEVEL_INFO
     int32_t control_vector_layer_start = -1; // layer range for control vector
     int32_t control_vector_layer_end   = -1; // layer range for control vector
+    std::array<uint8_t, 32> control_vector_applied_digest = {};
+    bool control_vector_applied_digest_valid = false;
     bool    offline                    = false;
 
     int32_t ppl_stride      = 0;     // stride for perplexity calculations. If left at 0, the pre-existing approach will be used.
@@ -745,13 +778,19 @@ struct common_params {
 
     // multimodal models (see tools/mtmd)
     struct common_params_model mmproj;
-    bool mmproj_use_gpu = true;     // use GPU for multimodal model
-    bool mmproj_gpu_swap = false;   // swap MTP↔mmproj VRAM on vision requests
-    bool no_mmproj = false;         // explicitly disable multimodal model
-    std::vector<std::string> image; // path to image file(s) ; TODO: change the name to "media"
+    bool mmproj_use_gpu = true;                 // use GPU for multimodal model
+    ggml_backend_dev_t mmproj_device = nullptr; // GPU device to use for multimodal model
+    bool mmproj_gpu_swap = false;               // swap MTP↔mmproj VRAM on vision requests
+    bool no_mmproj = false;                     // explicitly disable multimodal model
+    std::vector<std::string> image;             // path to image file(s) ; TODO: change the name to "media"
     int image_min_tokens = -1;
     int image_max_tokens = -1;
     int mtmd_batch_max_tokens = 1024;
+
+    // for video input
+    float       video_fps                   = 4.0f;
+    int64_t     video_timestamp_interval_ms = 5000;
+    std::string video_ffmpeg_bin_dir        = "";
 
     // finetune
     struct lr_opt lr;
@@ -779,6 +818,7 @@ struct common_params {
     bool    vbr_prompt_cache_explicit = false; // whether --[no-]vbr-prompt-cache was provided
     int32_t vbr_anchor_cache_mib = 0;    // optional extra quality-anchor pool for VBR artifacts
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
+    int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
@@ -1113,6 +1153,10 @@ bool fs_is_directory(const std::string & path);
 std::string fs_get_cache_directory();
 std::string fs_get_cache_file(const std::string & filename);
 
+// Stable, versioned cache location for a model family's learned expert heatmap.
+std::string common_moe_cache_profile_file(const uint8_t semantic_digest[32]);
+std::string fs_get_config_directory();
+
 struct common_file_info {
     std::string path;
     std::string name;
@@ -1159,9 +1203,8 @@ using common_init_result_ptr = std::unique_ptr<common_init_result>;
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only = false);
 
-struct llama_model_params     common_model_params_to_llama  (      common_params & params);
-struct llama_context_params   common_context_params_to_llama(const common_params & params);
-struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const common_cpu_params & params);
+struct llama_model_params   common_model_params_to_llama  (      common_params & params);
+struct llama_context_params common_context_params_to_llama(const common_params & params);
 
 // clear LoRA adapters from context, then apply new list of adapters
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora);
@@ -1171,6 +1214,28 @@ std::string common_get_model_endpoint();
 
 // for testing purposes
 char * common_get_model_or_exit(int, char*[]);
+
+//
+// Threadpool utils
+//
+
+struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const common_cpu_params & params);
+
+struct common_threadpools {
+    common_threadpools() = default;
+    ~common_threadpools();
+
+    common_threadpools(const common_threadpools &) = delete;
+    common_threadpools & operator=(const common_threadpools &) = delete;
+
+    void init(llama_context * ctx, const common_params & params);
+
+private:
+    ggml_threadpool * threadpool       = nullptr;
+    ggml_threadpool * threadpool_batch = nullptr;
+
+    decltype(ggml_threadpool_free) * free_fn = nullptr;
+};
 
 //
 // Context utils
@@ -1296,6 +1361,8 @@ struct common_control_vector_data {
 
     // stores data for layers [1, n_layer] where n_layer = data.size() / n_embd
     std::vector<float> data;
+    std::array<uint8_t, 32> applied_digest = {};
+    bool applied_digest_valid = false;
 };
 
 struct common_control_vector_load_info {
@@ -1321,17 +1388,28 @@ const char * const LLM_KV_SPLIT_TENSORS_COUNT = "split.tensors.count";
 }
 
 //
-// MoE utils
+// FFN offload utils
 //
 
 const char * const LLM_FFN_EXPS_REGEX = "\\.ffn_(up|down|gate|gate_up)_(ch|)exps";
 
-inline std::string llm_ffn_exps_block_regex(int idx) {
-    return string_format("blk\\.%d%s", idx, LLM_FFN_EXPS_REGEX);
+const char * const LLM_FFN_DENSE_REGEX = "\\.ffn_(up|down|gate)\\.";
+
+inline std::string llm_ffn_block_regex(int idx, const char * ffn_regex) {
+    return string_format("blk\\.%d%s", idx, ffn_regex);
 }
 
 inline llama_model_tensor_buft_override llm_ffn_exps_cpu_override() {
     return { LLM_FFN_EXPS_REGEX, ggml_backend_cpu_buffer_type() };
+}
+
+inline void llm_add_n_cpu_ffn_overrides(int n, const char * ffn_regex, std::vector<llama_model_tensor_buft_override> & overrides) {
+    // keep strings alive and avoid leaking memory by storing them in a static list
+    static std::list<std::string> buft_override_strings;
+    for (int i = 0; i < n; ++i) {
+        buft_override_strings.push_back(llm_ffn_block_regex(i, ffn_regex));
+        overrides.push_back({buft_override_strings.back().c_str(), ggml_backend_cpu_buffer_type()});
+    }
 }
 
 //
@@ -1512,6 +1590,10 @@ struct common_prompt_checkpoint {
 
     common_shared_byte_buffer data_tgt;
     common_shared_byte_buffer data_dft;
+    // Fixed-F16 Qwen4 QSA index image at the same logical frontier. It is
+    // excluded from PARTIAL_ONLY target state and therefore travels as its
+    // own authenticated VBR companion.
+    common_shared_byte_buffer data_qsa;
     // Draft checkpoints used as VBR companions contain the complete sequence
     // image so they can populate an empty draft context. Legacy speculative
     // checkpoints may contain only PARTIAL_ONLY state. Retain the wire mode

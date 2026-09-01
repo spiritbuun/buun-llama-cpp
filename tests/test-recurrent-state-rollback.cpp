@@ -1,9 +1,11 @@
 #include "arg.h"
 #include "common.h"
 #include "llama-batch.h"
+#include "llama-memory-hybrid-idx.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-recurrent.h"
+#include "llama-memory-tree.h"
 #include "llama-ext.h"
 #include "llama.h"
 
@@ -174,6 +176,196 @@ static bool get_recurrent_epoch(llama_memory_recurrent * recurrent, uint64_t & e
     return true;
 }
 
+static bool test_multi_seq_split_replay(const common_params & params, llama_model * model, const int n_vocab) {
+    constexpr uint32_t  n_seqs     = 2;
+    // Recurrent split keeps the rollback tail together; the ubatch must be
+    // larger than n_rs_seq while remaining smaller than n_replay so this still
+    // exercises multiple ubatches per sequence.
+    constexpr uint32_t  n_ubatch   = 16;
+    constexpr uint32_t  n_prompt   = 19;
+    constexpr uint32_t  n_rollback = 3;
+    constexpr uint32_t  n_replay   = 40; // > n_ubatch so each seq spans multiple ubatches
+    constexpr llama_pos p0         = n_prompt - n_rollback;
+
+    const auto make_ctx_multi = [&]() {
+        auto cparams = common_context_params_to_llama(params);
+        cparams.n_seq_max  = n_seqs;
+        cparams.n_rs_seq   = 8;
+        cparams.n_ctx      = 256;
+        cparams.n_batch    = 256;
+        cparams.n_ubatch   = n_ubatch;
+        cparams.kv_unified = false;
+        return llama_context_ptr(llama_init_from_model(model, cparams));
+    };
+
+    auto ctx_roll = make_ctx_multi();
+    auto ctx_ref  = make_ctx_multi();
+    if (!ctx_roll || !ctx_ref) {
+        fprintf(stderr, "%s : failed to init multi-seq contexts\n", __func__);
+        return false;
+    }
+
+    if (llama_n_rs_seq(ctx_roll.get()) < n_rollback) {
+        fprintf(stderr, "%s : n_rs_seq is too small for split replay\n", __func__);
+        return false;
+    }
+
+    const auto tok = [&](uint32_t seq, llama_pos pos) {
+        return (llama_token) ((7*(uint32_t) pos + 31*seq + 1) % (uint32_t) n_vocab);
+    };
+
+    bool ok = true;
+
+    // both contexts decode the identical [0, p0) prefill; only ctx_roll decodes
+    // the tail, which is then rolled back so its restore is pending at replay
+    for (uint32_t s = 0; s < n_seqs && ok; ++s) {
+        llama_batch batch = llama_batch_init(n_prompt, 0, 1);
+        // The rollback plane retains one prior state per transition within a
+        // decode batch. Decode the rollback context's boundary token together
+        // with its tail so a three-token rollback has three authenticated
+        // snapshots; the reference consumes that boundary token separately.
+        for (llama_pos pos = 0; pos < p0 - 1; ++pos) {
+            common_batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, false);
+        }
+        ok = ok && llama_decode(ctx_roll.get(), batch) == 0;
+        ok = ok && llama_decode(ctx_ref.get(),  batch) == 0;
+
+        common_batch_clear(batch);
+        common_batch_add(batch, tok(s, p0 - 1), p0 - 1, { (llama_seq_id) s }, false);
+        ok = ok && llama_decode(ctx_ref.get(), batch) == 0;
+
+        common_batch_clear(batch);
+        for (llama_pos pos = p0 - 1; pos < (llama_pos) n_prompt; ++pos) {
+            common_batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, false);
+        }
+        ok = ok && llama_decode(ctx_roll.get(), batch) == 0;
+        llama_batch_free(batch);
+
+        ok = ok && llama_memory_seq_rm(llama_get_memory(ctx_roll.get()), (llama_seq_id) s, p0, -1);
+
+        // a second partial removal while one is pending must be refused
+        ok = ok && !llama_memory_seq_rm(llama_get_memory(ctx_roll.get()), (llama_seq_id) s, p0 - 1, -1);
+    }
+    if (!ok) {
+        fprintf(stderr, "%s : multi-seq prefill/rollback failed\n", __func__);
+        return false;
+    }
+
+    llama_batch batch = llama_batch_init(n_seqs*n_replay, 0, 1);
+    for (uint32_t s = 0; s < n_seqs; ++s) {
+        for (uint32_t i = 0; i < n_replay; ++i) {
+            const llama_pos pos = p0 + (llama_pos) i;
+            common_batch_add(batch, tok(s, pos), pos, { (llama_seq_id) s }, true);
+        }
+    }
+    ok = llama_decode(ctx_roll.get(), batch) == 0;
+    ok = ok && llama_decode(ctx_ref.get(), batch) == 0;
+    llama_batch_free(batch);
+    if (!ok) {
+        fprintf(stderr, "%s : multi-seq replay decode failed\n", __func__);
+        return false;
+    }
+
+    // identical ubatch shapes from bit-exact states: a correct implementation
+    // matches bitwise, so eps only allows backend scheduling noise
+    constexpr float eps = 1e-7f;
+
+    float    diff_max  = 0.0f;
+    uint32_t seq_first = 0;
+    int32_t  pos_first = -1;
+    for (uint32_t i = 0; i < n_seqs*n_replay; ++i) {
+        const float * l_roll = llama_get_logits_ith(ctx_roll.get(), i);
+        const float * l_ref  = llama_get_logits_ith(ctx_ref.get(),  i);
+        if (l_roll == nullptr || l_ref == nullptr) {
+            fprintf(stderr, "%s : missing multi-seq logits at index %u\n", __func__, i);
+            return false;
+        }
+        for (int t = 0; t < n_vocab; ++t) {
+            const float diff = std::fabs(l_roll[t] - l_ref[t]);
+            if (diff > eps && pos_first < 0) {
+                seq_first = i/n_replay;
+                pos_first = p0 + (int32_t) (i%n_replay);
+            }
+            diff_max = std::max(diff_max, diff);
+        }
+    }
+
+    if (diff_max > eps) {
+        fprintf(stderr, "%s : multi-seq split replay logits mismatch (max diff %g, first at seq %u pos %d)\n",
+                __func__, (double) diff_max, seq_first, pos_first);
+        return false;
+    }
+
+    fprintf(stderr, "%s : multi-seq split replay matched (max diff %g)\n", __func__, (double) diff_max);
+
+    // seq-1-only decodes must be independent of seq 0's content: diverge seq 0
+    // in ctx_ref only, then compare identical seq-1-only continuations bitwise
+    constexpr uint32_t n_tail = 4;
+
+    {
+        llama_batch batch_tail = llama_batch_init(n_tail, 0, 1);
+        for (uint32_t i = 0; i < n_tail; ++i) {
+            const llama_pos pos = p0 + (llama_pos) (n_replay + i);
+            common_batch_add(batch_tail, tok(0, pos + 7), pos, { 0 }, false);
+        }
+        ok = llama_decode(ctx_ref.get(), batch_tail) == 0;
+        llama_batch_free(batch_tail);
+    }
+
+    float diff_tail = 0.0f;
+    for (uint32_t i = 0; i < n_tail && ok; ++i) {
+        const llama_pos pos = p0 + (llama_pos) (n_replay + i);
+        llama_batch batch_one = llama_batch_init(1, 0, 1);
+        common_batch_add(batch_one, tok(1, pos), pos, { 1 }, true);
+        ok = llama_decode(ctx_roll.get(), batch_one) == 0;
+        ok = ok && llama_decode(ctx_ref.get(), batch_one) == 0;
+        llama_batch_free(batch_one);
+        if (!ok) {
+            break;
+        }
+
+        const float * l_roll = llama_get_logits_ith(ctx_roll.get(), 0);
+        const float * l_ref  = llama_get_logits_ith(ctx_ref.get(),  0);
+        ok = l_roll != nullptr && l_ref != nullptr;
+        for (int t = 0; ok && t < n_vocab; ++t) {
+            diff_tail = std::max(diff_tail, std::fabs(l_roll[t] - l_ref[t]));
+        }
+    }
+
+    if (!ok || diff_tail > eps) {
+        fprintf(stderr, "%s : seq-1-only decode leaked seq 0 state (ok=%d, max diff %g)\n",
+                __func__, ok ? 1 : 0, (double) diff_tail);
+        return false;
+    }
+
+    fprintf(stderr, "%s : seq-1-only decode independent of seq 0 (max diff %g)\n", __func__, (double) diff_tail);
+    return true;
+}
+
+static bool test_indexed_hybrid_tree_refusal(const llama_model & model) {
+    const llama_memory_i::layer_filter_cb reject_all = [](int32_t) { return false; };
+
+    // No Qwen4 fixture is needed to pin the topology decision: empty layer
+    // filters construct only the composite type, without allocating model
+    // payload tensors. The derived-type refusal must run before the generic
+    // llama_memory_hybrid branch or the indexer child would be omitted.
+    llama_memory_hybrid_idx indexed(
+        model,
+        GGML_TYPE_F16, GGML_TYPE_F16, false, 8, 1, 0, LLAMA_SWA_TYPE_NONE,
+        GGML_TYPE_F32, GGML_TYPE_F32, 1,
+        1, 1, false, false,
+        reject_all, reject_all, reject_all);
+
+    std::vector<llama_memory_tree_child> tree = {
+        { 99, nullptr, nullptr, checkpoint_child_dependency_mode::absent },
+    };
+    if (llama_memory_tree_collect(&indexed, tree) || !tree.empty()) {
+        fprintf(stderr, "%s : indexed hybrid topology was accepted or left a partial tree\n", __func__);
+        return false;
+    }
+    return true;
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
     set_resize_test_fault(false);
@@ -214,6 +406,10 @@ int main(int argc, char ** argv) {
     llama_model * model = llama_init->model();
     if (model == nullptr) {
         fprintf(stderr, "%s : failed to init model\n", __func__);
+        return 1;
+    }
+
+    if (!test_indexed_hybrid_tree_refusal(*model)) {
         return 1;
     }
 
@@ -527,6 +723,7 @@ int main(int argc, char ** argv) {
     const auto high_state_before = save_seq(ctx_parallel.get(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
     const auto high_r_before = recurrent_parallel->r_l;
     const auto high_s_before = recurrent_parallel->s_l;
+    const auto high_p_before = recurrent_parallel->p_l;
     uint64_t high_epoch_before = 0;
     uint64_t high_epoch_after = 0;
     if (high_tail < 1 || high_state_before.empty() ||
@@ -536,6 +733,7 @@ int main(int argc, char ** argv) {
         recurrent_parallel->cells[0].tail != high_tail ||
         recurrent_parallel->r_l != high_r_before ||
         recurrent_parallel->s_l != high_s_before ||
+        recurrent_parallel->p_l != high_p_before ||
         save_seq(ctx_parallel.get(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != high_state_before ||
         !get_recurrent_epoch(recurrent_parallel, high_epoch_after) ||
         high_epoch_after != high_epoch_before ||
@@ -589,6 +787,7 @@ int main(int argc, char ** argv) {
     const auto resize_state_before = save_seq(ctx_parallel.get(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
     const auto resize_r_before = recurrent_parallel->r_l;
     const auto resize_s_before = recurrent_parallel->s_l;
+    const auto resize_p_before = recurrent_parallel->p_l;
     const auto resize_rs_idx_before = recurrent_parallel->rs_idx;
     const auto resize_depth_before = recurrent_parallel->rollback_valid_depth;
     const uint32_t resize_size_before = recurrent_parallel->size;
@@ -615,6 +814,7 @@ int main(int argc, char ** argv) {
         recurrent_parallel->rs_z != resize_rs_z_before ||
         recurrent_parallel->r_l != resize_r_before ||
         recurrent_parallel->s_l != resize_s_before ||
+        recurrent_parallel->p_l != resize_p_before ||
         recurrent_parallel->rs_idx != resize_rs_idx_before ||
         recurrent_parallel->rollback_valid_depth != resize_depth_before ||
         save_seq(ctx_parallel.get(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != resize_state_before ||
@@ -648,7 +848,8 @@ int main(int argc, char ** argv) {
     for (size_t i = 0; i < resize_r_before.size(); ++i) {
         tensors_rebound = tensors_rebound ||
             (resize_r_before[i] != nullptr && resize_r_before[i] != recurrent_parallel->r_l[i]) ||
-            (resize_s_before[i] != nullptr && resize_s_before[i] != recurrent_parallel->s_l[i]);
+            (resize_s_before[i] != nullptr && resize_s_before[i] != recurrent_parallel->s_l[i]) ||
+            (resize_p_before[i] != nullptr && resize_p_before[i] != recurrent_parallel->p_l[i]);
     }
     if (recurrent_parallel->size != 2 || !tensors_rebound ||
         !get_recurrent_epoch(recurrent_parallel, resize_epoch_after_success) ||
@@ -678,6 +879,10 @@ int main(int argc, char ** argv) {
     if (abort_result != 2 || !check_depth(ctx_test.get(), 0, 0, "aborted decode")) {
         fprintf(stderr, "%s : aborted decode returned %d or retained positive depth\n",
                 __func__, abort_result);
+        return 1;
+    }
+
+    if (!test_multi_seq_split_replay(params, model, n_vocab)) {
         return 1;
     }
 

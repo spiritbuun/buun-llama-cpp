@@ -1,4 +1,5 @@
 #include "fit.h"
+#include "../ggml/src/ggml-backend-moe-cache.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -27,6 +28,78 @@ static common_moe_cache_fit_shape_input shape(
 int main() {
     constexpr size_t MiB = 1024*1024;
 
+    expect(common_fit_extra_context_size(8192, 2, true, 0) == 4096,
+            "implicit MTP fit must follow target per-sequence context");
+    expect(common_fit_extra_context_size(8192, 2, false, 0) == 8192,
+            "ordinary draft fit must continue following total target context");
+    expect(common_fit_extra_context_size(8192, 2, true, 6144) == 6144,
+            "explicit draft context must remain fixed during fit");
+    expect(common_fit_extra_context_size(8192, 0, true, 0) == 8192,
+            "missing stream inventory must fail closed to one stream");
+    expect(common_fit_extra_context_size(513, 2, true, 0) == 512,
+            "implicit MTP fit must mirror target context padding before splitting");
+    expect(common_fit_extra_context_size(513, 1, true, 0) == 768,
+            "implicit unified MTP fit must mirror target context padding");
+
+    {
+        llama_model_params probe_mparams = llama_model_default_params();
+        llama_context_params probe_cparams[4] = {
+            llama_context_default_params(), llama_context_default_params(),
+            llama_context_default_params(), llama_context_default_params(),
+        };
+        const common_fit_extra_model changing = {
+            "changing", &probe_mparams, &probe_cparams[3], false,
+            true, 0, nullptr, false,
+        };
+        const common_fit_extra_model optional_missing = {
+            "optional", &probe_mparams, &probe_cparams[2], true,
+            true, 0, &changing, true,
+        };
+        const common_fit_extra_model shared = {
+            "shared", &probe_mparams, &probe_cparams[1], true,
+            true, 0, &optional_missing, false,
+        };
+        const common_fit_extra_model fixed = {
+            "fixed", &probe_mparams, &probe_cparams[0], false,
+            false, 1024, &shared, false,
+        };
+        const common_fit_extra_cache_probe_result result = common_fit_extra_cache_probe(
+            &fixed,
+            {8192, 12288}, 2,
+            {
+                // A fixed external context is measured once and retained.
+                {true, {100, 200}},
+                // A target-shared MTP context is remeasured for every candidate placement.
+                {true, {10, 20}},
+                // Missing native MTP is an optional zero contribution.
+                {false, {1000, 2000}},
+                // A non-shared context still refreshes when its inherited size changes.
+                {true, {1, 2}},
+            });
+        expect(result.success, "linked required and optional extras should aggregate");
+        expect(result.measurement_counts == std::vector<size_t>({1, 2, 1, 2}),
+                "fixed extras should cache while shared/size-changing extras refresh and missing optional extras retire");
+        expect(result.aggregate_bytes_by_device == std::vector<size_t>({13423, 13534}),
+                "linked extras should sum every device and host-style destination exactly once");
+
+        llama_context_params required_cparams = llama_context_default_params();
+        const common_fit_extra_model required = {
+            "required", &probe_mparams, &required_cparams, false,
+            false, 1024, nullptr, false,
+        };
+        const common_fit_extra_cache_probe_result required_missing = common_fit_extra_cache_probe(
+            &required, {8192}, 2, {{false, {1, 2}}});
+        expect(!required_missing.success,
+                "a missing required extra must fail instead of being treated as optional");
+    }
+
+    expect(ggml_moe_cache_effective_reserve_bytes(0, 3*MiB, MiB) == MiB &&
+            ggml_moe_cache_effective_reserve_bytes(0, 3*MiB, 3*MiB) == 3*MiB,
+            "automatic runtime reserve must remain per-device");
+    expect(ggml_moe_cache_effective_reserve_bytes(1, 2*MiB, MiB) == 2*MiB &&
+            ggml_moe_cache_effective_reserve_bytes(1, 2*MiB, 3*MiB) == 2*MiB,
+            "explicit runtime reserve must remain uniform");
+
     const std::vector<common_moe_cache_fit_shape_input> one_pool = {
         shape(GGML_TYPE_Q4_0, MiB, 128*MiB, MiB/4, MiB),
     };
@@ -42,6 +115,29 @@ int main() {
         expect(result.devices.size() == 2, "two physical devices should remain distinct");
         expect(result.minimum_device_bytes == 5*MiB/4, "scratch and pool bytes should be combined");
         expect(result.cache_bytes == 8*MiB, "fixed budget should cap each device");
+    }
+
+    {
+        const std::vector<common_moe_cache_fit_device_input> devices = {
+            {0, 860, 10*(int64_t)MiB, 0, MiB},
+            {1, 860, 10*(int64_t)MiB, 0, 3*MiB},
+        };
+        const common_moe_cache_fit_result result = common_moe_cache_plan_fit(
+                devices, one_pool, 0, 0, 2);
+        expect(result.feasible, "heterogeneous automatic reserves should remain per-device");
+        expect(result.devices.size() == 2, "heterogeneous reserve devices should remain distinct");
+        expect(result.devices[0].cache_bytes == 9*MiB,
+                "small device should retain its one-MiB automatic reserve");
+        expect(result.devices[1].cache_bytes == 7*MiB,
+                "large device should retain its three-MiB automatic reserve");
+
+        const common_moe_cache_fit_result explicit_result = common_moe_cache_plan_fit(
+                {{0, 860, 10*(int64_t)MiB, 0}, {1, 860, 10*(int64_t)MiB, 0}},
+                one_pool, 2*MiB, 0, 2);
+        expect(explicit_result.feasible &&
+                explicit_result.devices[0].cache_bytes == 8*MiB &&
+                explicit_result.devices[1].cache_bytes == 8*MiB,
+                "explicit reserve should remain uniform across devices");
     }
 
     {

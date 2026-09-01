@@ -955,9 +955,9 @@ capture_range_digest capture_range_leaf_digest(
         uint64_t index, uint32_t size,
         const capture_range_digest & payload) noexcept {
     llama_sha256_writer hash;
-    static constexpr char DOMAIN[] =
+    static constexpr char digest_domain[] =
         "buun.vbr.capture/range-leaf/v1";
-    hash.string(DOMAIN, sizeof(DOMAIN) - 1);
+    hash.string(digest_domain, sizeof(digest_domain) - 1);
     hash.u64(index);
     hash.u32(size);
     hash.bytes(payload.data(), payload.size());
@@ -968,9 +968,9 @@ capture_range_digest capture_range_node_digest(
         uint32_t level, const capture_range_digest & left,
         const capture_range_digest & right) noexcept {
     llama_sha256_writer hash;
-    static constexpr char DOMAIN[] =
+    static constexpr char digest_domain[] =
         "buun.vbr.capture/range-node/v1";
-    hash.string(DOMAIN, sizeof(DOMAIN) - 1);
+    hash.string(digest_domain, sizeof(digest_domain) - 1);
     hash.u32(level);
     hash.bytes(left.data(), left.size());
     hash.bytes(right.data(), right.size());
@@ -982,9 +982,9 @@ capture_range_digest capture_range_root_digest(
         uint32_t chunk_count, uint32_t padded_count,
         const capture_range_digest & tree_root) noexcept {
     llama_sha256_writer hash;
-    static constexpr char DOMAIN[] =
+    static constexpr char digest_domain[] =
         "buun.vbr.capture/range-root/v1";
-    hash.string(DOMAIN, sizeof(DOMAIN) - 1);
+    hash.string(digest_domain, sizeof(digest_domain) - 1);
     hash.u64(total_bytes);
     hash.u32(chunk_bytes);
     hash.u32(chunk_count);
@@ -2010,9 +2010,9 @@ bool vbr_capture_projected_shard_topology(
                 return lhs->shard_index < rhs->shard_index;
             });
         llama_sha256_writer hash;
-        static constexpr char DOMAIN[] =
+        static constexpr char digest_domain[] =
             "buun.vbr.capture/projected-shard-topology";
-        hash.string(DOMAIN, sizeof(DOMAIN) - 1);
+        hash.string(digest_domain, sizeof(digest_domain) - 1);
         hash.u32(uint32_t(ordered.size()));
         for (uint32_t i = 0; i < ordered.size(); ++i) {
             const auto & source = *ordered[i];

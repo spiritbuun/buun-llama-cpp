@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 struct dflash_tape_gpu;
@@ -17,6 +18,7 @@ struct llama_cparams {
     uint32_t n_seq_max;
     uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
     uint32_t n_outputs_max;   // max outputs supported by the context
+    uint32_t n_outputs_max_per_seq;
     int32_t  n_threads;       // number of threads to use for generation
     int32_t  n_threads_batch; // number of threads to use for batch processing
 
@@ -25,6 +27,7 @@ struct llama_cparams {
     enum llama_moe_cache_mode moe_cache_mode;
     size_t moe_cache_budget_mib;
     int32_t moe_cache_expert_parallel;
+    std::string moe_cache_profile_path;
 
     float rope_freq_base;
     float rope_freq_scale;

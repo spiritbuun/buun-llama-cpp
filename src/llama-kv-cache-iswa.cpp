@@ -381,6 +381,14 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_iswa::memory_breakdo
     return mb;
 }
 
+std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_iswa::memory_breakdown_vbr_managed() const {
+    std::map<ggml_backend_buffer_type_t, size_t> mb = kv_base->memory_breakdown_vbr_managed();
+    for (const auto & buft_size : kv_swa->memory_breakdown_vbr_managed()) {
+        mb[buft_size.first] += buft_size.second;
+    }
+    return mb;
+}
+
 llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     GGML_UNUSED(embd_all);
 
@@ -638,6 +646,10 @@ bool llama_kv_cache_iswa::get_can_shift() const {
     return kv_base->get_can_shift() &&
            kv_swa->get_can_shift() &&
            kv_base->get_size() == kv_swa->get_size();
+}
+
+bool llama_kv_cache_iswa::get_has_shared_cells() const {
+    return kv_base->get_has_shared_cells() || kv_swa->get_has_shared_cells();
 }
 
 void llama_kv_cache_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {

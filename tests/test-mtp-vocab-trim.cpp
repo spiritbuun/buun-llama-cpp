@@ -1,6 +1,7 @@
 #include "ggml.h"
 #include "gguf.h"
 #include "mtp-vocab-trim.h"
+#include "speculative.h"
 
 #include <cassert>
 #include <chrono>
@@ -12,6 +13,85 @@
 #include <vector>
 
 namespace {
+
+void test_mtp_carry_lifecycle() {
+    common_speculative_mtp_carry_lifecycle carry;
+    float                                  pending_h = 12345.0f;
+
+    assert(!carry.draft_ready());
+    assert(carry.draft_carry(&pending_h) == nullptr);
+    assert(carry.target_process_mode(0) ==
+           common_speculative_mtp_carry_lifecycle::process_mode::cold_zero);
+    assert(carry.target_process_mode(1) ==
+           common_speculative_mtp_carry_lifecycle::process_mode::target_only);
+
+    carry.target_process_refreshed();
+    assert(carry.draft_ready());
+    assert(carry.draft_carry(&pending_h) == &pending_h);
+    assert(carry.target_process_mode(17) ==
+           common_speculative_mtp_carry_lifecycle::process_mode::retained_carry);
+
+    const common_speculative_sequence_event transitions[] = {
+        common_speculative_sequence_event::prompt_rewind,
+        common_speculative_sequence_event::target_restored_without_draft,
+        common_speculative_sequence_event::draft_image_restored,
+        common_speculative_sequence_event::composite_image_restored,
+        common_speculative_sequence_event::live_range_shift,
+        common_speculative_sequence_event::target_replaced,
+        common_speculative_sequence_event::full_clear,
+    };
+
+    for (size_t i = 0; i < sizeof(transitions) / sizeof(transitions[0]); ++i) {
+        // Poison the old branch's carry. Every external lifecycle transition,
+        // including the target+draft image used by child clone, must suppress
+        // its consumption until a target process publishes a fresh row.
+        pending_h = 20000.0f + (float) i;
+        carry.sequence_transition(transitions[i]);
+        assert(!carry.draft_ready());
+        assert(carry.draft_carry(&pending_h) == nullptr);
+        assert(carry.target_process_mode(37) ==
+               common_speculative_mtp_carry_lifecycle::process_mode::target_only);
+
+        carry.target_process_skipped();
+        assert(!carry.draft_ready());
+        assert(carry.draft_carry(&pending_h) == nullptr);
+
+        pending_h = 100.0f + (float) i;
+        carry.target_process_refreshed();
+        assert(carry.draft_ready());
+        assert(carry.draft_carry(&pending_h) == &pending_h);
+    }
+
+    std::vector<common_speculative_mtp_carry_lifecycle> batch_carry(2);
+    const std::vector<int32_t> active = { 0, 1 };
+    llama_pos positions[] = { 0, 0 };
+    assert(common_speculative_mtp_process_preflight_resolve(
+               batch_carry, active, positions) ==
+           common_speculative_mtp_process_preflight::cold_or_retained);
+
+    positions[1] = 37;
+    assert(common_speculative_mtp_process_preflight_resolve(
+               batch_carry, active, positions) ==
+           common_speculative_mtp_process_preflight::target_only);
+
+    batch_carry[1].target_process_refreshed();
+    assert(common_speculative_mtp_process_preflight_resolve(
+               batch_carry, active, positions) ==
+           common_speculative_mtp_process_preflight::cold_or_retained);
+
+    batch_carry[0].target_process_refreshed();
+    positions[0] = 91;
+    assert(common_speculative_mtp_process_preflight_resolve(
+               batch_carry, active, positions) ==
+           common_speculative_mtp_process_preflight::cold_or_retained);
+
+    const std::vector<int32_t> only_first = { 0, -1 };
+    batch_carry[0].sequence_transition(
+        common_speculative_sequence_event::prompt_rewind);
+    assert(common_speculative_mtp_process_preflight_resolve(
+               batch_carry, only_first, positions) ==
+           common_speculative_mtp_process_preflight::target_only);
+}
 
 struct files_cleanup {
     std::vector<std::filesystem::path> paths;
@@ -27,6 +107,8 @@ struct files_cleanup {
 }  // namespace
 
 int main() {
+    test_mtp_carry_lifecycle();
+
     std::vector<std::string> digest_tokens = { "!", "hello", "▁world" };
     assert(common_mtp_vocab_trim_tokenizer_digest_for_test(digest_tokens) ==
            "7954b97c711bbcb1c5197e525208e499600bf8e405c2724d8afa8e29e626f119");

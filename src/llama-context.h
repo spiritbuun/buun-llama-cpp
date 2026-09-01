@@ -20,6 +20,37 @@ class llama_batch_allocr;
 class llama_io_read_i;
 class llama_io_write_i;
 
+// Authenticated immutable sequence-file bytes. The pathname is consumed only
+// during prepare; inspection and application use this retained snapshot.
+class llama_state_seq_file_snapshot {
+public:
+    llama_state_seq_file_snapshot() = default;
+    llama_state_seq_file_snapshot(const llama_state_seq_file_snapshot &) = delete;
+    llama_state_seq_file_snapshot & operator=(const llama_state_seq_file_snapshot &) = delete;
+    llama_state_seq_file_snapshot(llama_state_seq_file_snapshot &&) noexcept = default;
+    llama_state_seq_file_snapshot & operator=(llama_state_seq_file_snapshot &&) noexcept = default;
+
+    bool copy_packed_token_bytes(std::vector<uint8_t> & output) const noexcept;
+    size_t packed_token_size() const noexcept;
+    uint32_t token_count() const noexcept;
+    bool valid() const noexcept;
+
+private:
+    friend struct llama_context;
+    friend bool llama_state_seq_file_snapshot_prepare(
+            const char *, llama_state_seq_file_snapshot &) noexcept;
+
+    void clear() noexcept;
+
+    uint64_t total_size_ = 0;
+    uint32_t token_count_ = 0;
+    std::vector<uint8_t> payload_;
+};
+
+bool llama_state_seq_file_snapshot_prepare(
+        const char * filepath,
+        llama_state_seq_file_snapshot & output) noexcept;
+
 // "memory" as in abstract memory for the context
 struct llama_memory_i;
 struct llama_memory_context_i;
@@ -405,6 +436,13 @@ struct llama_context {
     size_t state_seq_load_file(
           llama_seq_id   seq_id,
             const char * filepath,
+           llama_token * tokens_out,
+                size_t   n_token_capacity,
+                size_t * n_token_count_out);
+
+    size_t state_seq_apply_file_snapshot(
+          llama_seq_id   seq_id,
+            const llama_state_seq_file_snapshot & snapshot,
            llama_token * tokens_out,
                 size_t   n_token_capacity,
                 size_t * n_token_count_out);

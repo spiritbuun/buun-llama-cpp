@@ -2,15 +2,19 @@
 #include "common.h"
 #include "log.h"
 #include "llama-cpp.h"
+#include "../src/llama-context.h"
+#include "../src/llama-model.h"
 
 #include <algorithm>
 #include <clocale>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <random>
+#include <string>
 #include <vector>
 
 struct llama_batch_ptr {
@@ -59,7 +63,9 @@ static llama_tokens generate_tokens(llama_context * ctx, llama_sampler * smpl, i
 // - decode the last token
 // - generate n_predict tokens
 static llama_tokens test_baseline(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens) {
-    auto ctx = llama_context_ptr{llama_init_from_model(model, common_context_params_to_llama(params))};
+    auto params_ctx = common_context_params_to_llama(params);
+    params_ctx.n_seq_max = 2;
+    auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
 
     auto sparams = llama_sampler_chain_default_params();
     auto smpl = llama_sampler_ptr{llama_sampler_chain_init(sparams)};
@@ -167,7 +173,9 @@ static bool test_seq_rm_isolated(
 // - replay the last prompt token
 // - generate n_predict tokens and compare against expected result
 static bool test_state_load(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens, const llama_tokens & expected_result) {
-    auto ctx = llama_context_ptr{llama_init_from_model(model, common_context_params_to_llama(params))};
+    auto params_ctx = common_context_params_to_llama(params);
+    params_ctx.n_seq_max = 2;
+    auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
 
     auto sparams = llama_sampler_chain_default_params();
     auto smpl = llama_sampler_ptr{llama_sampler_chain_init(sparams)};
@@ -362,6 +370,137 @@ static bool test_seq_file_integrity(
         const llama_tokens         & tokens) {
     static constexpr size_t SEQ_FILE_HEADER_SIZE = 24;
 
+    std::array<uint8_t, 32> family = {};
+    const bool has_family_identity = llama_model_semantic_family_digest(
+        model, family.data());
+    const auto family_now = [&]() {
+        std::array<uint8_t, 32> value = {};
+        if (!llama_model_semantic_family_digest(model, value.data())) {
+            value.fill(0);
+        }
+        return value;
+    };
+    if (has_family_identity) {
+        const std::string saved_name = model->name;
+        model->name = saved_name + "-renamed-requantized-finetune";
+        bool nonsemantic_stable = family_now() == family;
+        model->name = saved_name;
+
+        // Quantization/file metadata and model labels are deliberately not
+        // part of the semantic family.  The receipt owns the effective
+        // architecture/KV/tokenizer shape below, not model weight identity.
+        static constexpr const char * metadata_keys[] = {
+            "general.file_type",
+            "general.quantization_version",
+        };
+        for (const char * key : metadata_keys) {
+            const auto it = model->gguf_kv.find(key);
+            const bool had_value = it != model->gguf_kv.end();
+            const std::string saved_value = had_value ? it->second : std::string();
+            model->gguf_kv[key] = "different-quant-or-finetune-metadata";
+            nonsemantic_stable = nonsemantic_stable && family_now() == family;
+            if (had_value) {
+                model->gguf_kv[key] = saved_value;
+            } else {
+                model->gguf_kv.erase(key);
+            }
+        }
+        if (!nonsemantic_stable) {
+            LOG_ERR("%s: nonsemantic model/quant metadata changed family identity\n", __func__);
+            return false;
+        }
+    }
+    const auto require_family_mutation = [&](auto & field, auto replacement,
+                                              const char * label) {
+        const auto saved = field;
+        field = replacement;
+        const bool changed = family_now() != family;
+        field = saved;
+        if (!changed) {
+            LOG_ERR("%s: %s did not change semantic-family identity\n",
+                    __func__, label);
+        }
+        return changed;
+    };
+    if (has_family_identity &&
+       (!require_family_mutation(model->arch, LLM_ARCH_UNKNOWN, "architecture") ||
+        !require_family_mutation(model->hparams.n_embd,
+            model->hparams.n_embd + 1, "embedding shape") ||
+        !require_family_mutation(model->hparams.n_head_kv_arr[0],
+            model->hparams.n_head_kv_arr[0] + 1, "KV layout") ||
+        !require_family_mutation(model->hparams.n_ff_arr[0],
+            model->hparams.n_ff_arr[0] + 1, "per-layer FFN shape") ||
+        !require_family_mutation(model->hparams.n_expert,
+            model->hparams.n_expert + 1, "expert count") ||
+        !require_family_mutation(model->hparams.n_expert_used,
+            model->hparams.n_expert_used + 1, "selected expert count") ||
+        !require_family_mutation(model->hparams.n_expert_shared,
+            model->hparams.n_expert_shared + 1, "shared expert topology") ||
+        !require_family_mutation(model->hparams.n_expert_groups,
+            model->hparams.n_expert_groups + 1, "expert group topology") ||
+        !require_family_mutation(model->hparams.expert_group_scale,
+            model->hparams.expert_group_scale + 1.0f, "expert group scale") ||
+        !require_family_mutation(model->hparams.expert_gating_func,
+            model->hparams.expert_gating_func + 1, "expert gating policy") ||
+        !require_family_mutation(model->hparams.f_attn_logit_softcapping,
+            model->hparams.f_attn_logit_softcapping + 1.0f,
+            "attention logit policy") ||
+        !require_family_mutation(model->hparams.f_attention_scale,
+            model->hparams.f_attention_scale + 1.0f,
+            "attention scale") ||
+        !require_family_mutation(model->hparams.rope_finetuned,
+            !model->hparams.rope_finetuned, "RoPE fine-tuned policy") ||
+        !require_family_mutation(model->hparams.n_rot_full,
+            model->hparams.n_rot_full + 1, "RoPE dimensions") ||
+        !require_family_mutation(model->hparams.rope_freq_base_train,
+            model->hparams.rope_freq_base_train + 1.0f, "RoPE base") ||
+        !require_family_mutation(model->hparams.rope_freq_scale_train,
+            model->hparams.rope_freq_scale_train + 1.0f, "RoPE scale") ||
+        !require_family_mutation(model->hparams.rope_sections[0],
+            model->hparams.rope_sections[0] + 1, "RoPE sections") ||
+        !require_family_mutation(model->hparams.rope_pattern[0],
+            model->hparams.rope_pattern[0] ^ 1u, "RoPE layer pattern") ||
+        !require_family_mutation(model->hparams.rope_type,
+            static_cast<llama_rope_type>(uint32_t(model->hparams.rope_type) + 1),
+            "RoPE type") ||
+        !require_family_mutation(model->hparams.rope_scaling_type_train,
+            static_cast<llama_rope_scaling_type>(
+                uint32_t(model->hparams.rope_scaling_type_train) + 1),
+            "RoPE scaling type") ||
+        !require_family_mutation(model->hparams.swa_type,
+            static_cast<llama_swa_type>(uint32_t(model->hparams.swa_type) + 1),
+            "SWA type") ||
+        !require_family_mutation(model->hparams.n_swa,
+            model->hparams.n_swa + 1, "SWA window") ||
+        !require_family_mutation(model->hparams.is_recr_impl[0],
+            model->hparams.is_recr_impl[0] ^ 1u, "recurrent layout") ||
+        !require_family_mutation(model->hparams.ssm_dt_rank,
+            model->hparams.ssm_dt_rank + 1, "SSM rank") ||
+        !require_family_mutation(model->hparams.ssm_n_group,
+            model->hparams.ssm_n_group + 1, "SSM groups") ||
+        !require_family_mutation(model->hparams.ssm_dt_b_c_rms,
+            !model->hparams.ssm_dt_b_c_rms, "SSM normalization") ||
+        !require_family_mutation(model->hparams.dflash2_conv_kernel_size,
+            model->hparams.dflash2_conv_kernel_size + 1,
+            "recurrent convolution shape") ||
+        !require_family_mutation(model->hparams.is_indexer_full_impl[0],
+            model->hparams.is_indexer_full_impl[0] ^ 1u, "index layout"))) {
+        return false;
+    }
+    if (has_family_identity) {
+        auto & token0 = const_cast<llama_vocab::token_data &>(
+            model->vocab.get_token_data(0));
+        const std::string saved_token0 = token0.text;
+        token0.text.push_back('\0');
+        const bool token_mapping_changed = family_now() != family;
+        token0.text = saved_token0;
+        if (!token_mapping_changed) {
+            LOG_ERR("%s: same-size vocabulary mapping mutation was accepted\n",
+                    __func__);
+            return false;
+        }
+    }
+
     auto params_ctx = common_context_params_to_llama(params);
     params_ctx.n_ctx      = 256;
     params_ctx.n_seq_max  = 1;
@@ -431,6 +570,8 @@ static bool test_seq_file_integrity(
                 __func__, file_bytes.size(), saved_size);
         return false;
     }
+    const size_t token_begin = SEQ_FILE_HEADER_SIZE + sizeof(uint32_t);
+    const size_t token_bytes = n_tokens*sizeof(llama_token);
 
     uint64_t declared_size = 0;
     memcpy(&declared_size, file_bytes.data() + 2*sizeof(uint32_t), sizeof(declared_size));
@@ -455,6 +596,97 @@ static bool test_seq_file_integrity(
     std::vector<uint8_t> state_dst;
     if (!get_seq_state(ctx_dst.get(), state_dst) || state_dst != state_src) {
         LOG_ERR("%s: sequence state differs after file round-trip\n", __func__);
+        return false;
+    }
+
+    // Prepare A once, replace the pathname with a separately authenticated B,
+    // and apply A without reopening the path. Then restore A at the path to
+    // mutation-pin A->B->A pathname ABA independently of the retained bytes.
+    llama_state_seq_file_snapshot prepared_a;
+    if (!llama_state_seq_file_snapshot_prepare(seq_path.c_str(), prepared_a)) {
+        LOG_ERR("%s: failed to prepare immutable sequence snapshot A\n", __func__);
+        return false;
+    }
+    std::vector<uint8_t> file_b = file_bytes;
+    file_b[token_begin] ^= 1;
+    static constexpr uint64_t FNV1A64_OFFSET_BASIS = UINT64_C(14695981039346656037);
+    static constexpr uint64_t FNV1A64_PRIME        = UINT64_C(1099511628211);
+    const auto rewrite_checksum = [&](std::vector<uint8_t> & bytes) {
+        uint64_t checksum = FNV1A64_OFFSET_BASIS;
+        for (size_t i = SEQ_FILE_HEADER_SIZE; i < bytes.size(); ++i) {
+            checksum ^= bytes[i];
+            checksum *= FNV1A64_PRIME;
+        }
+        memcpy(bytes.data() + 2*sizeof(uint32_t) + sizeof(uint64_t),
+               &checksum, sizeof(checksum));
+    };
+    rewrite_checksum(file_b);
+    {
+        std::ofstream output(seq_path, std::ios::binary | std::ios::trunc);
+        output.write((const char *) file_b.data(), file_b.size());
+        if (!output) {
+            LOG_ERR("%s: failed to replace snapshot path with B\n", __func__);
+            return false;
+        }
+    }
+    llama_tokens prepared_tokens(n_tokens, LLAMA_TOKEN_NULL);
+    size_t prepared_count = 0;
+    ctx_dst->synchronize();
+    const size_t prepared_read = ctx_dst->state_seq_apply_file_snapshot(
+        0, prepared_a, prepared_tokens.data(), prepared_tokens.size(),
+        &prepared_count);
+    if (prepared_read != saved_size || prepared_count != n_tokens ||
+            !std::equal(tokens.begin(), tokens.begin() + n_tokens,
+                        prepared_tokens.begin()) ||
+            !get_seq_state(ctx_dst.get(), state_dst) || state_dst != state_src) {
+        LOG_ERR("%s: prepared A did not apply exactly after pathname replacement\n", __func__);
+        return false;
+    }
+    {
+        std::ofstream output(seq_path, std::ios::binary | std::ios::trunc);
+        output.write((const char *) file_bytes.data(), file_bytes.size());
+        if (!output) {
+            LOG_ERR("%s: failed to complete A-B-A pathname mutant\n", __func__);
+            return false;
+        }
+    }
+    std::vector<uint8_t> prepared_token_copy;
+    if (!prepared_a.copy_packed_token_bytes(prepared_token_copy) ||
+            prepared_token_copy.size() != n_tokens*sizeof(llama_token) ||
+            std::memcmp(prepared_token_copy.data(), tokens.data(),
+                        prepared_token_copy.size()) != 0) {
+        LOG_ERR("%s: prepared snapshot changed across A-B-A pathname mutation\n", __func__);
+        return false;
+    }
+
+    // The only inspection door returns a copy of the packed token envelope.
+    // Mutating that copy must leave the sealed snapshot and its exact A state
+    // unchanged across the A-B-A pathname replacement above.
+    llama_tokens post_prepare_tokens(n_tokens, LLAMA_TOKEN_NULL);
+    size_t post_prepare_count = 0;
+    std::vector<uint8_t> post_prepare_state_before;
+    if (!get_seq_state(ctx_dst.get(), post_prepare_state_before)) {
+        LOG_ERR("%s: failed to read destination before prepared mutation\n", __func__);
+        return false;
+    }
+    prepared_token_copy[0] ^= 1;
+    const size_t mutated_apply = ctx_dst->state_seq_apply_file_snapshot(
+        0, prepared_a, post_prepare_tokens.data(), post_prepare_tokens.size(),
+        &post_prepare_count);
+    std::vector<uint8_t> prepared_token_copy_after;
+    std::vector<uint8_t> post_prepare_state_after;
+    if (mutated_apply != saved_size ||
+            post_prepare_count != n_tokens ||
+            !std::equal(tokens.begin(), tokens.begin() + n_tokens,
+                        post_prepare_tokens.begin()) ||
+            !prepared_a.copy_packed_token_bytes(prepared_token_copy_after) ||
+            prepared_token_copy_after.size() != n_tokens*sizeof(llama_token) ||
+            std::memcmp(prepared_token_copy_after.data(), tokens.data(),
+                        prepared_token_copy_after.size()) != 0 ||
+            !get_seq_state(ctx_dst.get(), post_prepare_state_after) ||
+            post_prepare_state_after != post_prepare_state_before) {
+        LOG_ERR("%s: packed-token copy mutation changed the sealed snapshot\n",
+                __func__);
         return false;
     }
 
@@ -507,14 +739,15 @@ static bool test_seq_file_integrity(
         }
     }
 
-    const size_t state_offset =
-            SEQ_FILE_HEADER_SIZE + sizeof(uint32_t) + n_tokens*sizeof(llama_token);
-    if (state_offset >= file_bytes.size()) {
-        LOG_ERR("%s: saved sequence state has no raw state payload\n", __func__);
+    // Flip an authenticated token byte rather than assuming every
+    // architecture has a nonempty sequence-memory payload. Diffusion-style
+    // models can validly persist only the token envelope.
+    if (token_bytes == 0 || token_begin + token_bytes > file_bytes.size()) {
+        LOG_ERR("%s: saved sequence state has no token payload\n", __func__);
         return false;
     }
     std::vector<uint8_t> flipped = file_bytes;
-    flipped[state_offset + (flipped.size() - state_offset)/2] ^= 0x80;
+    flipped[token_begin + token_bytes/2] ^= 0x80;
     if (!expect_rejected_unchanged(flipped, "bit-flipped")) {
         return false;
     }
@@ -531,6 +764,49 @@ static bool test_seq_file_integrity(
     memcpy(foreign_magic.data(), &bad_magic, sizeof(bad_magic));
     if (!expect_rejected_unchanged(foreign_magic, "foreign-magic")) {
         return false;
+    }
+
+    // A valid outer envelope must not make a malformed nonempty semantic
+    // state publish either token output. Architectures with no sequence state
+    // have no semantic payload to truncate and are covered by the envelope
+    // mutants above.
+    const size_t state_begin = token_begin + token_bytes;
+    if (state_begin < file_bytes.size()) {
+        std::vector<uint8_t> malformed_state = file_bytes;
+        malformed_state.pop_back();
+
+        const uint64_t malformed_size = malformed_state.size();
+        memcpy(malformed_state.data() + 2*sizeof(uint32_t),
+               &malformed_size, sizeof(malformed_size));
+
+        uint64_t malformed_checksum = FNV1A64_OFFSET_BASIS;
+        for (size_t i = SEQ_FILE_HEADER_SIZE; i < malformed_state.size(); ++i) {
+            malformed_checksum ^= malformed_state[i];
+            malformed_checksum *= FNV1A64_PRIME;
+        }
+        memcpy(malformed_state.data() + 2*sizeof(uint32_t) + sizeof(uint64_t),
+               &malformed_checksum, sizeof(malformed_checksum));
+
+        {
+            std::ofstream output(bad_path, std::ios::binary | std::ios::trunc);
+            output.write((const char *) malformed_state.data(), malformed_state.size());
+            if (!output) {
+                LOG_ERR("%s: failed to write malformed semantic-state test file\n", __func__);
+                return false;
+            }
+        }
+
+        llama_tokens rejected_tokens(n_tokens, LLAMA_TOKEN_NULL);
+        const llama_tokens rejected_tokens_before = rejected_tokens;
+        size_t rejected_count = std::numeric_limits<size_t>::max();
+        if (llama_state_seq_load_file(
+                    ctx_dst.get(), bad_path.c_str(), 0,
+                    rejected_tokens.data(), rejected_tokens.size(), &rejected_count) != 0 ||
+                rejected_tokens != rejected_tokens_before ||
+                rejected_count != std::numeric_limits<size_t>::max()) {
+            LOG_ERR("%s: malformed semantic state changed token outputs or was accepted\n", __func__);
+            return false;
+        }
     }
 
     std::remove(seq_path.c_str());
@@ -581,6 +857,16 @@ static bool test_attn_trim_nonhybrid(
     }
     llama_synchronize(ctx_attn.get());
 
+    llama_memory_t memory_attn = llama_get_memory(ctx_attn.get());
+    if (memory_attn == nullptr) {
+        LOG("\n=== Test 7: non-hybrid attention trim (skipped: model has no sequence memory) ===\n");
+        return true;
+    }
+    if (llama_memory_seq_pos_max(memory_attn, 0) < 0) {
+        LOG_ERR("%s: decoded attention memory contains no sequence positions\n", __func__);
+        return false;
+    }
+
     const llama_pos target = (llama_pos) n_tokens - 2;
 
     std::vector<uint8_t> initial(llama_state_seq_get_size(ctx_attn.get(), 0));
@@ -594,7 +880,7 @@ static bool test_attn_trim_nonhybrid(
     }
 
     if (!llama_memory_seq_rm_attn(
-            llama_get_memory(ctx_attn.get()), 0, target, -1) ||
+            memory_attn, 0, target, -1) ||
         !llama_memory_seq_rm(
             llama_get_memory(ctx_full.get()), 0, target, -1)) {
         LOG_ERR("%s: trim operation failed\n", __func__);
@@ -624,38 +910,18 @@ static bool test_attn_trim_nonhybrid(
 }
 
 
-int main(int argc, char ** argv) {
-    std::setlocale(LC_NUMERIC, "C");
-
-    common_params params;
-    params.prompt = "";
-    params.n_batch = 100;
-    params.out_file = "dump_state.bin";
-    params.sampling.seed = 1234;
-
-    common_init();
-
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
-        return 1;
-    }
-
-    if (params.n_parallel == 1) {
-        LOG_TRC("%s: n_parallel == 1, enabling unified kv cache\n", __func__);
-        params.kv_unified = true;
-    }
-
-    if (params.n_predict < 0) {
-        params.n_predict = 16;
-    }
-
-    ggml_backend_load_all();
+// Run the full save/load test suite (tests 1-7) for a single model.
+// Returns true if all tests pass, false otherwise.
+static bool run_save_load_tests_for_model(const std::string & model_path, const struct common_params & base_params) {
+    struct common_params params = base_params;
+    params.model.path = model_path;
 
     auto llama_init = common_init_from_params(params, true);
     auto * model = llama_init->model();
 
     if (model == nullptr) {
-        LOG_ERR("%s: failed to init\n", __func__);
-        return 1;
+        LOG_ERR("%s: failed to init model '%s'\n", __func__, model_path.c_str());
+        return false;
     }
 
     GGML_ASSERT(llama_init->context() == nullptr);
@@ -688,40 +954,137 @@ int main(int argc, char ** argv) {
     // Test 1: baseline (saves state to disk)
     auto result_baseline = test_baseline(model, params, tokens);
     if (result_baseline.empty()) {
-        return 1;
+        return false;
     }
 
     // Test 2: sequence removal isolation
     if (!test_seq_rm_isolated(model, params, tokens)) {
-        return 1;
+        return false;
     }
 
     // Test 3: state load
     if (!test_state_load(model, params, tokens, result_baseline)) {
-        return 1;
+        return false;
     }
 
     // Test 4: seq copy (host)
     if (!test_seq_cp_host(model, params, tokens, result_baseline)) {
-        return 1;
+        return false;
     }
 
     // Test 5: seq copy (device)
     if (!test_seq_cp_device(model, params, tokens, result_baseline)) {
-        return 1;
+        return false;
     }
 
     // Test 6: checksummed sequence file envelope and staged loading
     if (!test_seq_file_integrity(model, params, tokens)) {
-        return 1;
+        return false;
     }
 
     // Test 7: non-hybrid attention trim equivalence
     if (!test_attn_trim_nonhybrid(model, params, tokens)) {
-        return 1;
+        return false;
     }
 
     LOG("\nAll tests passed.\n");
 
-    return 0;
+    return true;
+}
+
+
+int main(int argc, char ** argv) {
+    std::setlocale(LC_NUMERIC, "C");
+
+    common_params params;
+    params.prompt = "";
+    params.n_batch = 100;
+    params.out_file = "dump_state.bin";
+    params.sampling.seed = 1234;
+
+    common_init();
+
+    // extract our own --models DIR option before handing the rest to the common arg parser
+    std::string models_dir;
+    std::vector<char *> filtered_argv;
+    filtered_argv.push_back(argv[0]);
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--models") == 0) {
+            if (i + 1 >= argc) {
+                LOG_ERR("%s: --models requires a directory argument\n", __func__);
+                return 1;
+            }
+            models_dir = argv[i + 1];
+            i++;
+        } else {
+            filtered_argv.push_back(argv[i]);
+        }
+    }
+    filtered_argv.push_back(nullptr);
+    const int fargc = (int)filtered_argv.size() - 1;
+
+    // in --models mode there is no single model; set a placeholder so the common parser's
+    // "--model is required" check passes (each model is set individually inside the loop)
+    if (!models_dir.empty()) {
+        params.model.path = models_dir;
+    }
+
+    if (!common_params_parse(fargc, filtered_argv.data(), params, LLAMA_EXAMPLE_COMMON)) {
+        return 1;
+    }
+
+    if (params.n_parallel == 1) {
+        LOG_TRC("%s: n_parallel == 1, enabling unified kv cache\n", __func__);
+        params.kv_unified = true;
+    }
+
+    if (params.n_predict < 0) {
+        params.n_predict = 16;
+    }
+
+    ggml_backend_load_all();
+
+    if (!models_dir.empty()) {
+        // run the suite over every dummy model in the directory
+        if (!std::filesystem::exists(models_dir) || !std::filesystem::is_directory(models_dir)) {
+            LOG_ERR("%s: models directory '%s' does not exist\n", __func__, models_dir.c_str());
+            return 1;
+        }
+
+        std::vector<std::string> models;
+        for (const auto & entry : std::filesystem::directory_iterator(models_dir)) {
+            if (entry.is_regular_file() && entry.path().extension() == ".gguf") {
+                models.push_back(entry.path().string());
+            }
+        }
+        std::sort(models.begin(), models.end());
+
+        if (models.empty()) {
+            LOG_ERR("%s: no .gguf models found in '%s'\n", __func__, models_dir.c_str());
+            return 1;
+        }
+
+        LOG_INF("%s: running save/load tests over %zu models in '%s'\n", __func__, models.size(), models_dir.c_str());
+
+        size_t n_pass = 0;
+        size_t n_fail = 0;
+        for (const auto & model_path : models) {
+            LOG("\n================================================================\n");
+            LOG_INF("%s: model %s\n", __func__, model_path.c_str());
+
+            if (run_save_load_tests_for_model(model_path, params)) {
+                n_pass++;
+            } else {
+                n_fail++;
+            }
+        }
+
+        LOG("\n================================================================\n");
+        LOG_INF("%s: summary: %zu passed, %zu failed (of %zu)\n", __func__, n_pass, n_fail, models.size());
+
+        return n_fail == 0 ? 0 : 1;
+    }
+
+    // single-model mode
+    return run_save_load_tests_for_model(params.model.path, params) ? 0 : 1;
 }

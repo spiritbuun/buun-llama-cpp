@@ -25,33 +25,44 @@ def fixture_create_server():
 
 def test_with_and_without_draft():
     global server
+    request = {
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.2,
+        "top_k": 5,
+        "seed": 4242,
+        "n_predict": 16,
+        "return_tokens": True,
+    }
+
     server.model_draft = None  # disable draft model
     server.spec_type = None
     server.start()
-    res = server.make_request("POST", "/completion", data={
-        "prompt": "I believe the meaning of life is",
-        "temperature": 0.0,
-        "top_k": 1,
-        "n_predict": 16,
-    })
+    res = server.make_request("POST", "/completion", data=request)
     assert res.status_code == 200
-    content_no_draft = res.body["content"]
+    tokens_no_draft = res.body["tokens"]
     server.stop()
 
     # create new server with draft model
     create_server()
     server.start()
-    res = server.make_request("POST", "/completion", data={
-        "prompt": "I believe the meaning of life is",
-        "temperature": 0.0,
-        "top_k": 1,
-        "n_predict": 16,
-    })
+    res = server.make_request("POST", "/completion", data=request)
     assert res.status_code == 200
     assert res.body["timings"]["draft_n"] > 0
-    content_draft = res.body["content"]
+    tokens_draft = res.body["tokens"]
 
-    assert content_no_draft == content_draft
+    assert tokens_no_draft == tokens_draft
+
+    server.stop()
+    create_server()
+    assert server.spec_draft_n_max is not None
+    server.spec_synth_rates = [0.0] * server.spec_draft_n_max
+    server.start()
+    res = server.make_request("POST", "/completion", data=request)
+
+    assert res.status_code == 200
+    assert res.body["timings"]["draft_n"] > 0
+    assert res.body["timings"]["draft_n_accepted"] == 0
+    assert res.body["tokens"] == tokens_no_draft
 
 
 def test_different_draft_min_draft_max():
@@ -79,6 +90,66 @@ def test_different_draft_min_draft_max():
         if last_content is not None:
             assert last_content == res.body["content"]
         last_content = res.body["content"]
+
+
+def test_synth_is_deterministic():
+    global server
+    assert server.spec_draft_n_max is not None
+    server.spec_synth_rates = [0.75 ** (i + 1) for i in range(server.spec_draft_n_max)]
+    server.start()
+
+    request = {
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.2,
+        "top_k": 5,
+        "seed": 4242,
+        "n_predict": 32,
+    }
+    responses = [server.make_request("POST", "/completion", data=request) for _ in range(2)]
+
+    for res in responses:
+        assert res.status_code == 200
+        assert res.body["timings"]["draft_n"] > 0
+    assert responses[0].body["timings"]["draft_n"] == responses[1].body["timings"]["draft_n"]
+    assert responses[0].body["timings"]["draft_n_accepted"] == responses[1].body["timings"]["draft_n_accepted"]
+
+
+def test_synth_ignores_target_tokens():
+    global server
+    assert server.spec_draft_n_max is not None
+    server.spec_synth_rates = [1.0] * server.spec_draft_n_max
+    server.start()
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.0,
+        "seed": 4242,
+        "n_predict": 32,
+    })
+
+    assert res.status_code == 200
+    assert res.body["timings"]["draft_n"] > 0
+    assert res.body["timings"]["draft_n_accepted"] == res.body["timings"]["draft_n"]
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.0,
+        "seed": 4242,
+        "n_predict": 6,
+        "grammar": 'root ::= "a"{5,5}',
+    })
+    assert res.status_code == 200, res.body
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "Respond with only: OK",
+        "temperature": 0.0,
+        "seed": 4242,
+        "n_predict": 64,
+        "ignore_eos": True,
+    })
+    assert res.status_code == 200, res.body
+    assert res.body["tokens_predicted"] == 64
+    assert res.body["stop_type"] == "limit"
 
 
 def test_slot_ctx_not_exceeded():
@@ -132,3 +203,71 @@ def test_multi_requests_parallel(n_slots: int, n_requests: int):
     for res in results:
         assert res.status_code == 200
         assert match_regex("(wise|kind|owl|answer)+", res.body["content"])
+
+
+def test_shared_model_free_nonzero_slot():
+    # Shared model-free implementations must draft and accept through the same
+    # per-sequence owner. The legacy single-sequence wrapper always drives seq 0,
+    # which used to abort when a real draft was accepted for another server slot.
+    server.model_draft = None
+    server.spec_type = "ngram-mod"
+    server.spec_ngram_mod_n_min = 4
+    server.spec_ngram_mod_n_max = 8
+    server.spec_ngram_mod_n_match = 4
+    server.spec_synth_rates = [1.0] * 8
+    server.n_slots = 2
+    server.start()
+
+    prefix = "I believe the meaning of life is"
+    training = server.make_request("POST", "/completion", data={
+        "id_slot": 0,
+        "prompt": prefix,
+        "temperature": 0.0,
+        "top_k": 1,
+        "n_predict": 16,
+        "return_tokens": True,
+    })
+    assert training.status_code == 200, training.body
+
+    # Put the observed greedy continuation into the second prompt, followed by
+    # the same prefix. This guarantees a real proposal for the nonzero slot
+    # without depending on a model-specific hard-coded continuation.
+    res = server.make_request("POST", "/completion", data={
+        "id_slot": 1,
+        "prompt": prefix + training.body["content"] + " " + prefix,
+        "temperature": 0.0,
+        "top_k": 1,
+        "n_predict": 16,
+        "logit_bias": [[training.body["tokens"][0], 100.0]],
+    })
+    assert res.status_code == 200, res.body
+    assert res.body["id_slot"] == 1
+    assert res.body["timings"]["draft_n"] > 0
+    assert res.body["timings"]["draft_n_accepted"] > 0
+    assert res.body["tokens_predicted"] == 16
+
+
+def test_combined_external_draft_and_native_mtp_graceful():
+    # The target fixture has no MTP layers. A combined list must keep the
+    # external drafter normally typed, disable only native MTP, and serve the
+    # same greedy tokens as the external-draft-only configuration.
+    server.spec_type = "draft-simple,draft-mtp"
+    server.start()
+    request = {
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.0,
+        "top_k": 1,
+        "n_predict": 16,
+        "return_tokens": True,
+    }
+    res = server.make_request("POST", "/completion", data=request)
+    assert res.status_code == 200, res.body
+    assert len(res.body["content"]) > 0
+    tokens_combined = res.body["tokens"]
+    server.stop()
+
+    create_server()
+    server.start()
+    res = server.make_request("POST", "/completion", data=request)
+    assert res.status_code == 200, res.body
+    assert tokens_combined == res.body["tokens"]

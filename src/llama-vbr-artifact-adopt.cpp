@@ -163,42 +163,71 @@ vbr_adopt_status vbr_adopt_check_complete_tree(
         }
     }
     for (const auto & child : live) {
-        if (!child.recurrent) {
-            continue;
+        if (child.recurrent) {
+            const auto prepared = std::find_if(
+                companions.begin(), companions.end(),
+                [&](const vbr_companion_adoption_provider & value) {
+                    return value.kind == vbr_artifact_companion_kind::recurrent &&
+                           value.target_cookie == child.recurrent;
+                });
+            if (prepared == companions.end() || !prepared->target_empty) {
+                return vbr_adopt_status::required_companion_unavailable;
+            }
+            const auto duplicate = std::find_if(
+                std::next(prepared), companions.end(),
+                [&](const vbr_companion_adoption_provider & value) {
+                    return value.kind == vbr_artifact_companion_kind::recurrent &&
+                           value.target_cookie == child.recurrent;
+                });
+            if (duplicate != companions.end()) {
+                return vbr_adopt_status::required_companion_unavailable;
+            }
+            if (!prepared->target_empty(prepared->context) &&
+                (!occupied_replacement ||
+                 prepared->prepare_replacement == nullptr)) {
+                return vbr_adopt_status::target_drift;
+            }
         }
-        const auto prepared = std::find_if(
-            companions.begin(), companions.end(),
-            [&](const vbr_companion_adoption_provider & value) {
-                return value.kind == vbr_artifact_companion_kind::recurrent &&
-                       value.target_cookie == child.recurrent;
-            });
-        if (prepared == companions.end() || !prepared->target_empty) {
-            return vbr_adopt_status::required_companion_unavailable;
-        }
-        const auto duplicate = std::find_if(
-            std::next(prepared), companions.end(),
-            [&](const vbr_companion_adoption_provider & value) {
-                return value.kind == vbr_artifact_companion_kind::recurrent &&
-                       value.target_cookie == child.recurrent;
-            });
-        if (duplicate != companions.end()) {
-            return vbr_adopt_status::required_companion_unavailable;
-        }
-        if (!prepared->target_empty(prepared->context) &&
-            (!occupied_replacement ||
-             prepared->prepare_replacement == nullptr)) {
-            return vbr_adopt_status::target_drift;
+        if (child.qsa_index_owner) {
+            const auto qsa = std::find_if(
+                companions.begin(), companions.end(),
+                [&](const vbr_companion_adoption_provider & value) {
+                    return value.kind == vbr_artifact_companion_kind::qsa_index &&
+                           value.target_cookie == child.qsa_index_owner &&
+                           value.attention_child_id == child.child_id;
+                });
+            if (qsa == companions.end() || !qsa->target_empty) {
+                return vbr_adopt_status::required_companion_unavailable;
+            }
+            const auto duplicate = std::find_if(
+                std::next(qsa), companions.end(),
+                [&](const vbr_companion_adoption_provider & value) {
+                    return value.kind == vbr_artifact_companion_kind::qsa_index &&
+                           value.target_cookie == child.qsa_index_owner;
+                });
+            if (duplicate != companions.end()) {
+                return vbr_adopt_status::required_companion_unavailable;
+            }
+            // Layout-aware QSA preparation installs reversible state directly
+            // into the target.  The target was checked before preparation and
+            // the prepared image is checked again below, so non-empty state is
+            // expected at this barrier (unlike the off-side recurrent image).
         }
     }
     for (const auto & provider : companions) {
-        if (provider.kind != vbr_artifact_companion_kind::recurrent) {
+        if (provider.kind != vbr_artifact_companion_kind::recurrent &&
+            provider.kind != vbr_artifact_companion_kind::qsa_index) {
             continue;
         }
         const auto child = std::find_if(
             live.begin(), live.end(),
             [&](const llama_memory_tree_child & value) {
-                return value.recurrent != nullptr &&
-                       provider.target_cookie == value.recurrent;
+                return provider.kind == vbr_artifact_companion_kind::recurrent
+                    ? value.recurrent != nullptr &&
+                      provider.target_cookie == value.recurrent
+                    : value.qsa_index_owner != nullptr &&
+                      provider.target_cookie == value.qsa_index_owner &&
+                      provider.attention_child_id == value.child_id;
             });
         if (child == live.end()) {
             return vbr_adopt_status::target_drift;
@@ -1357,6 +1386,30 @@ class vbr_kv_import_session {
 
     llama_kv_cache * cache() const noexcept { return cache_; }
     uint32_t child_id() const noexcept { return child_id_; }
+    bool companion_layout(vbr_companion_attention_layout & output) const noexcept {
+        output = {};
+        output.child_id = child_id_;
+        if (!image_ready_ || !cache_ || final_cells_.size() != cache_->n_stream) {
+            return false;
+        }
+        try {
+            for (uint32_t stream = 0; stream < final_cells_.size(); ++stream) {
+                const auto & cells = final_cells_[stream];
+                for (uint32_t physical = 0; physical < cells.size(); ++physical) {
+                    if (!cells.seq_has(physical, destination_)) {
+                        continue;
+                    }
+                    const auto ext = cells.ext_get(physical);
+                    output.cells.push_back({ stream, physical,
+                        cells.pos_get(physical), ext.x, ext.y, ext.tok });
+                }
+            }
+            return !output.cells.empty();
+        } catch (...) {
+            output = {};
+            return false;
+        }
+    }
     vbr_generation_teardown_state tracker_teardown_state() const noexcept {
         if (test_seam_) {
             return vbr_generation_teardown_state::clean;
@@ -2277,6 +2330,20 @@ vbr_adopt_result vbr_adopt_empty_manifest(
             out.h2d_bytes += stats.bytes;
             out.h2d_chunks += stats.chunks;
         }
+        // The mirrored QSA companion needs the exact off-side attention cell
+        // image. Build every non-replacement image before companion staging;
+        // publication remains in the original no-fail composite terminal.
+        if (!occupied_replacement) {
+            for (auto & entry : children) {
+                const auto * install = tracker_plan(*manifest, entry.first);
+                const auto * source = source_controller(*manifest, entry.first);
+                if (!install || !source ||
+                    !entry.second.session->build_live_image(
+                        entry.second.plans, *install, *source)) {
+                    return fail(vbr_adopt_status::tracker_failed);
+                }
+            }
+        }
         for (auto & plan : manifest->companions_) {
             const auto provider = std::find_if(
                 server_hooks.companions.begin(), server_hooks.companions.end(),
@@ -2285,10 +2352,24 @@ vbr_adopt_result vbr_adopt_empty_manifest(
                            value.target_cookie == plan.target_cookie;
                 });
             const bool replacement = plan.recovery_parsed != nullptr;
+            const bool layout_aware = provider != server_hooks.companions.end() &&
+                provider->attention_child_id != UINT32_MAX;
+            vbr_companion_attention_layout companion_layout;
+            if (layout_aware) {
+                const auto child = children.find(provider->attention_child_id);
+                if (child == children.end() ||
+                    !child->second.session->companion_layout(companion_layout)) {
+                    return fail(vbr_adopt_status::companion_failed);
+                }
+            }
             if (provider == server_hooks.companions.end() ||
                 (replacement
-                    ? provider->prepare_replacement == nullptr
-                    : provider->prepare == nullptr) ||
+                    ? (layout_aware
+                        ? provider->prepare_replacement_with_layout == nullptr
+                        : provider->prepare_replacement == nullptr)
+                    : (layout_aware
+                        ? provider->prepare_with_layout == nullptr
+                        : provider->prepare == nullptr)) ||
                 provider->recheck == nullptr ||
                 provider->publish_swap == nullptr ||
                 provider->target_empty == nullptr ||
@@ -2300,12 +2381,21 @@ vbr_adopt_result vbr_adopt_empty_manifest(
             std::unique_ptr<vbr_prepared_companion_image> image;
             const size_t prepared_before = companions.size();
             const bool prepared = replacement
-                ? provider->prepare_replacement(
-                    provider->context, std::move(plan.parsed),
-                    std::move(plan.recovery_parsed), destination, image)
-                : provider->prepare(
-                    provider->context, std::move(plan.parsed),
-                    destination, image);
+                ? layout_aware
+                    ? provider->prepare_replacement_with_layout(
+                        provider->context, std::move(plan.parsed),
+                        std::move(plan.recovery_parsed), destination,
+                        companion_layout, image)
+                    : provider->prepare_replacement(
+                        provider->context, std::move(plan.parsed),
+                        std::move(plan.recovery_parsed), destination, image)
+                : layout_aware
+                    ? provider->prepare_with_layout(
+                        provider->context, std::move(plan.parsed), destination,
+                        companion_layout, image)
+                    : provider->prepare(
+                        provider->context, std::move(plan.parsed),
+                        destination, image);
             // Replacement providers publish their recovery owner before the
             // first mutation. Retain it even when preparation fails so the
             // common reverse-order rollback can restore the incumbent.
@@ -2325,17 +2415,6 @@ vbr_adopt_result vbr_adopt_empty_manifest(
         out.phase = vbr_adopt_phase::live_image_prepare;
         if (fault_before(server_hooks, out.phase)) {
             return fail(vbr_adopt_status::tracker_failed);
-        }
-        if (!occupied_replacement) {
-            for (auto & entry : children) {
-                const auto * install = tracker_plan(*manifest, entry.first);
-                const auto * source = source_controller(*manifest, entry.first);
-                if (!install || !source ||
-                    !entry.second.session->build_live_image(
-                        entry.second.plans, *install, *source)) {
-                    return fail(vbr_adopt_status::tracker_failed);
-                }
-            }
         }
         if (staged->adoption_committed_ops().empty()) {
             return fail(vbr_adopt_status::accounting_unavailable);

@@ -10,15 +10,19 @@
 #include "mtmd.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <initializer_list>
 #include <iterator>
 #include <limits>
 #include <list>
 #include <numeric>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -127,6 +131,186 @@ void test_idle_capture_session_cancellation() {
         queue.defer(idle_capture_test_task(14));
         CHECK(!queue.try_begin_prompt_boundary_capture());
     }
+}
+
+void test_idle_capture_refuses_active_queue_yield() {
+    server_queue queue;
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool work_entered = false;
+    bool release_work = false;
+    bool yielded_task_seen = false;
+    std::atomic<int> update_calls { 0 };
+    std::atomic<int> normal_tasks { 0 };
+
+    queue.on_new_task([&](server_task &&, bool is_yielding) {
+        if (is_yielding) {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                yielded_task_seen = true;
+            }
+            condition.notify_all();
+            return false;
+        }
+        normal_tasks.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    });
+    queue.on_update_slots([&]() {
+        if (update_calls.fetch_add(1, std::memory_order_relaxed) != 0) {
+            queue.terminate();
+            return;
+        }
+        queue.yield_to_queue([&]() {
+            std::unique_lock<std::mutex> lock(mutex);
+            work_entered = true;
+            condition.notify_all();
+            condition.wait(lock, [&]() { return release_work; });
+        });
+    });
+
+    std::thread loop([&]() { queue.start_loop(); });
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        CHECK(condition.wait_for(lock, std::chrono::seconds(5), [&]() {
+            return work_entered;
+        }));
+    }
+
+    // Both capture doors must observe the real yield worker's busy state, not
+    // merely an empty task queue. Removing either busy guard makes this mutant
+    // acquire capture authority concurrently with decode/speculative work.
+    CHECK(!queue.try_begin_idle_capture());
+    CHECK(!queue.try_begin_prompt_boundary_capture());
+
+    CHECK(queue.post(idle_capture_test_task(20)) == 20);
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        CHECK(condition.wait_for(lock, std::chrono::seconds(5), [&]() {
+            return yielded_task_seen;
+        }));
+        release_work = true;
+    }
+    condition.notify_all();
+    loop.join();
+
+    CHECK(normal_tasks.load(std::memory_order_relaxed) == 1);
+    CHECK(update_calls.load(std::memory_order_relaxed) == 2);
+}
+
+void test_queue_yield_work_exception_precedes_callback_exception() {
+    server_queue queue;
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool work_entered = false;
+    bool callback_entered = false;
+    std::string surfaced;
+
+    queue.on_new_task([&](server_task &&, bool is_yielding) -> bool {
+        CHECK(is_yielding);
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            callback_entered = true;
+        }
+        condition.notify_all();
+        throw std::runtime_error("callback failure");
+    });
+    queue.on_update_slots([&]() {
+        std::exception_ptr delayed_work_exception;
+        try {
+            const std::exception_ptr selected =
+                queue.yield_to_queue_capture_exception([&]() {
+                std::unique_lock<std::mutex> lock(mutex);
+                work_entered = true;
+                condition.notify_all();
+                CHECK(condition.wait_for(lock, std::chrono::seconds(5), [&]() {
+                    return callback_entered;
+                }));
+                delayed_work_exception = std::make_exception_ptr(
+                    std::runtime_error("work failure"));
+                }, delayed_work_exception);
+            CHECK(delayed_work_exception != nullptr);
+            CHECK(selected == delayed_work_exception);
+            std::rethrow_exception(selected);
+        } catch (const std::exception & error) {
+            surfaced = error.what();
+        }
+        queue.terminate();
+    });
+
+    std::thread loop([&]() { queue.start_loop(); });
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        CHECK(condition.wait_for(lock, std::chrono::seconds(5), [&]() {
+            return work_entered;
+        }));
+    }
+    CHECK(queue.post(idle_capture_test_task(21)) == 21);
+    loop.join();
+
+    CHECK(callback_entered);
+    CHECK(surfaced == "work failure");
+}
+
+void test_speculative_decode_terminals() {
+    using terminal = server_speculative_decode_terminal;
+
+    CHECK(server_speculative_decode_terminal_resolve(
+              0, false, false, false, true) == terminal::success);
+    CHECK(server_speculative_decode_terminal_resolve(
+              1, true, false, true, false) == terminal::preserve_hard_seal);
+    CHECK(server_speculative_decode_terminal_resolve(
+              -1, false, false, true, false) == terminal::ordinary_ret_error);
+    CHECK(server_speculative_decode_terminal_resolve(
+              1, false, true, true, false) == terminal::ordinary_ret_error);
+    CHECK(server_speculative_decode_terminal_resolve(
+              1, false, false, true, false) == terminal::retry);
+    CHECK(server_speculative_decode_terminal_resolve(
+              0, false, false, true, true) == terminal::reset_committed_then_throw);
+    CHECK(server_speculative_decode_terminal_resolve(
+              0, false, false, false, false) == terminal::reset_committed_then_throw);
+
+    const auto reset = server_committed_decode_reset_for_test();
+    CHECK(reset.processing_prompt_cleared);
+    CHECK(reset.processing_family_cleared);
+    CHECK(reset.idle_prompt_preserved);
+}
+
+void test_slot_frontier_logits_companion() {
+    const auto result = server_slot_frontier_logits_for_test();
+    CHECK(result.round_trip);
+    CHECK(result.primary_binding_mutation_refused);
+    CHECK(result.runtime_family_mutation_refused);
+    CHECK(result.model_family_mutation_refused);
+    CHECK(result.model_nonsemantic_variation_matches);
+    CHECK(result.unresolved_context_fallback_changes_identity);
+    CHECK(result.explicit_context_override_ignores_training_context);
+    CHECK(result.sequence_geometry_changes_identity);
+    CHECK(result.padding_equivalent_geometry_matches);
+    CHECK(result.control_content_mutation_refused);
+    CHECK(result.missing_family_receipt_disables_hot);
+    CHECK(result.adapter_mutation_refused);
+    CHECK(result.token_count_mutation_refused);
+    CHECK(result.next_position_mutation_refused);
+    CHECK(result.token_digest_mutation_refused);
+    CHECK(result.vocabulary_mutation_refused);
+    CHECK(result.logits_mutation_refused);
+    CHECK(result.serialized_payload_mutation_refused);
+    CHECK(result.nonfinite_logits_refused);
+    CHECK(result.torn_companion_refused);
+    CHECK(result.missing_companion_is_cold);
+    CHECK(result.destination_slot_rebound);
+    CHECK(result.destination_epoch_rebound);
+    CHECK(result.source_process_epoch_not_reused);
+    CHECK(result.exact_hit_skips_decode);
+    CHECK(result.missing_capability_replays);
+    CHECK(result.decode_failure_refuses_publication);
+    CHECK(result.decode_failure_clears_slot);
+    CHECK(result.rollback_decode_allows_cold_save);
+    CHECK(result.partial_decode_requires_reset);
+    CHECK(result.aligned_without_logits_allows_cold_save);
+    CHECK(result.missing_memory_requires_reset);
+    CHECK(result.multi_token_gap_requires_reset);
+    CHECK(result.consumed_logits_release_capacity);
 }
 
 void fill_checkpoint_bytes(
@@ -4965,16 +5149,17 @@ void test_shared_checkpoint_physical_accounting() {
         common_prompt_checkpoint source;
         fill_checkpoint_bytes(source.data_tgt, 64, 1);
         fill_checkpoint_bytes(source.data_dft, 32, 2);
+        fill_checkpoint_bytes(source.data_qsa, 24, 5);
         fill_checkpoint_bytes(source.accel.ring, 16, 3);
         fill_checkpoint_bytes(source.accel.spec, 8, 4);
         std::vector<llama_cache_acct_op_id> source_ops;
         CHECK(authority.admit_live_checkpoint({ 10001 }, source, source_ops));
-        CHECK(source_ops.size() == 4);
+        CHECK(source_ops.size() == 5);
 
         auto snapshot = authority.ledger.snapshot();
-        CHECK(snapshot.allocations.size() == 4);
-        CHECK(resident_bytes(snapshot) == 120);
-        CHECK(snapshot.live_ops == 4);
+        CHECK(snapshot.allocations.size() == 5);
+        CHECK(resident_bytes(snapshot) == 144);
+        CHECK(snapshot.live_ops == 5);
 
         server_prompt prompt;
         prompt.checkpoints.push_back(source);
@@ -4984,7 +5169,16 @@ void test_shared_checkpoint_physical_accounting() {
         bounded.limit_size = 32;
         auto staged = bounded.stage(prompt, 16, 0, "shared-physical");
         CHECK(staged.size() == 1);
-        CHECK(staged.front().size() == 136);
+        CHECK(staged.front().size() == 160);
+        uint64_t snapshot_payload = 0;
+        uint64_t checkpoint_payload = 0;
+        uint64_t accelerator_payload = 0;
+        CHECK(server_prompt_cache::payload_bytes(
+            staged.front(), snapshot_payload, checkpoint_payload,
+            accelerator_payload));
+        CHECK(snapshot_payload == 16);
+        CHECK(checkpoint_payload == 96);
+        CHECK(accelerator_payload == 48);
 
         server_prompt unbound_prompt;
         unbound_prompt.checkpoints.emplace_back();
@@ -5001,15 +5195,15 @@ void test_shared_checkpoint_physical_accounting() {
         }
         CHECK(authority.admit_live_checkpoints(batch));
         snapshot = authority.ledger.snapshot();
-        CHECK(snapshot.allocations.size() == 4);
-        CHECK(resident_bytes(snapshot) == 120);
-        CHECK(snapshot.live_ops == 36);
+        CHECK(snapshot.allocations.size() == 5);
+        CHECK(resident_bytes(snapshot) == 144);
+        CHECK(snapshot.live_ops == 45);
         for (const auto & allocation : snapshot.allocations) {
             CHECK(allocation.committed_refs == 9);
         }
 
         for (const auto & member : batch) {
-            CHECK(member.committed.size() == 4);
+            CHECK(member.committed.size() == 5);
             for (const auto op : member.committed) {
                 CHECK(authority.ledger.release(op));
             }
@@ -5027,6 +5221,7 @@ void test_shared_checkpoint_physical_accounting() {
         common_prompt_checkpoint source;
         fill_checkpoint_bytes(source.data_tgt, 64, 1);
         fill_checkpoint_bytes(source.data_dft, 32, 2);
+        fill_checkpoint_bytes(source.data_qsa, 24, 5);
         fill_checkpoint_bytes(source.accel.ring, 16, 3);
         fill_checkpoint_bytes(source.accel.spec, 8, 4);
         common_prompt_checkpoint detached = source;
@@ -5051,9 +5246,9 @@ void test_shared_checkpoint_physical_accounting() {
         CHECK(authority.admit_live_checkpoint(
             { 11002 }, detached, detached_ops));
         const auto snapshot = authority.ledger.snapshot();
-        CHECK(snapshot.allocations.size() == 5);
-        CHECK(resident_bytes(snapshot) == 184);
-        CHECK(snapshot.live_ops == 8);
+        CHECK(snapshot.allocations.size() == 6);
+        CHECK(resident_bytes(snapshot) == 208);
+        CHECK(snapshot.live_ops == 10);
         for (const auto op : detached_ops) {
             CHECK(authority.ledger.release(op));
         }
@@ -5186,6 +5381,10 @@ int main(int argc, char ** argv) {
     }
     test_lifecycle_full_cache_rotates();
     test_idle_capture_session_cancellation();
+    test_idle_capture_refuses_active_queue_yield();
+    test_queue_yield_work_exception_precedes_callback_exception();
+    test_speculative_decode_terminals();
+    test_slot_frontier_logits_companion();
     test_fixed_host_pressure_shadow_records_counterfactual();
     test_fixed_host_shadow_uses_exact_cross_lineage_prefix();
     test_typed_host_payload_boundary();

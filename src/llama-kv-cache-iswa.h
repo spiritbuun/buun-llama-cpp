@@ -86,6 +86,7 @@ public:
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
+    bool get_has_shared_cells() const override;
     // A bounded SWA cache does not retain enough history for arbitrary partial removal.
     bool can_seq_rm_partial() const override { return swa_full; }
 
@@ -181,6 +182,7 @@ public:
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
+    std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown_vbr_managed() const override;
 
     // state write/load
 

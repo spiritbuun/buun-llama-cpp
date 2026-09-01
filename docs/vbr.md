@@ -61,6 +61,11 @@ Notes:
 - **Unified KV**: dynamic mode needs single-stream KV; with parallel sequences
   (`-np > 1`, perplexity/imatrix multi-sequence batching) unified KV is forced
   automatically, with a warning.
+- **Qwen4 Flash Next**: live static Turbo and dynamic VBR are supported for its ordinary
+  attention child. The QSA index cache remains a separate fixed-F16 allocation and the
+  recurrent child remains fixed-layout. Host prompt artifacts carry both fixed-layout children
+  as authenticated companions and adopt the complete tree atomically. Qwen4 currently uses the
+  generic degradation order; a measured model-specific order is still pending.
 - **Context shift / self-extend** is disabled under dynamic VBR (the shift graph would
   touch unmapped pool pages); generation stops cleanly when the context fills.
 - **Host prompt cache**: supported server topologies use authenticated projected VBR
@@ -101,6 +106,7 @@ The following automatic cases are typed live-only fallbacks today:
 | missing portable topology or pool/lane binding | `artifact_topology_unavailable` | automatic startup continues live-only |
 | incomplete accounting or budget evidence | `accounting_unavailable` | automatic startup continues live-only |
 | pinned-ring/store construction refusal | `artifact_store_unavailable` plus the store failure/status | automatic startup continues live-only |
+| missing, corrupt, or mismatched Qwen4 QSA-index companion | `required_companion_unavailable` | the artifact is refused before publication; the live slot is retained or the prompt replays cold |
 
 Automatic fallback never clears the live source. An explicit `--vbr-prompt-cache`
 request is strict instead: an unsupported global topology or unavailable store fails

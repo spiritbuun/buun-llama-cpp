@@ -17,17 +17,26 @@
 #include "speculative.h"
 #include "server-common.h"
 
-#include <limits>
+#include <nlohmann/json.hpp>
+
 #include <cmath>
+#include <limits>
 #include <new>
+#include <sstream>
 #include <thread>
 #include <tuple>
 #include <type_traits>
 
-using json = nlohmann::ordered_json;
+namespace {
+
+json server_json_from_ordered(nlohmann::ordered_json value) {
+    return json::parse(value.dump());
+}
+
+} // namespace
 
 json server_task_result_cache_control::to_json() {
-    return server_cache_control_json(operation, result);
+    return server_json_from_ordered(server_cache_control_json(operation, result));
 }
 
 //
@@ -271,30 +280,11 @@ common_chat_msg task_result_state::update_chat_msg(
 }
 
 //
-
-// result_timings
+// server_result_stats
 //
 
-json result_timings::to_json() const {
-    json base = {
-        {"cache_n",                cache_n},
-
-        {"prompt_n",               prompt_n},
-        {"prompt_ms",              prompt_ms},
-        {"prompt_per_token_ms",    prompt_per_token_ms},
-        {"prompt_per_second",      prompt_per_second},
-
-        {"predicted_n",            predicted_n},
-        {"predicted_ms",           predicted_ms},
-        {"predicted_per_token_ms", predicted_per_token_ms},
-        {"predicted_per_second",   predicted_per_second},
-    };
-
-    if (draft_n > 0) {
-        base["draft_n"] = draft_n;
-        base["draft_n_accepted"] = draft_n_accepted;
-    }
-
+json server_result_stats::to_json() const {
+    json base = server_slot_stats::to_json();
     if (kv_bpv >= 0.0) {
         base["kv_bpv"] = kv_bpv;
     }
@@ -368,7 +358,7 @@ json completion_token_output::probs_vector_to_json(const std::vector<completion_
 }
 
 float completion_token_output::logarithm(float x) {
-    // nlohmann::json converts -inf to null, so we need to prevent that
+    // the JSON library converts -inf to null, so we need to prevent that
     return x == 0.0f ? std::numeric_limits<float>::lowest() : std::log(x);
 }
 
@@ -420,7 +410,7 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
         {"stop_type",           stop_type_to_str(stop)},
         {"stopping_word",       stopping_word},
         {"tokens_cached",       n_tokens_cached},
-        {"timings",             timings.to_json()},
+        {"timings",             stats.to_json()},
     };
     if (!stream && !probs_output.empty()) {
         res["completion_probabilities"] = completion_token_output::probs_vector_to_json(probs_output, post_sampling_probs);
@@ -473,8 +463,8 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
     if (verbose) {
         res["__verbose"] = to_json_non_oaicompat();
     }
-    if (timings.prompt_n >= 0) {
-        res.push_back({"timings", timings.to_json()});
+    if (stats.is_set()) {
+        res["timings"] = stats.to_json();
     }
 
     return res;
@@ -521,8 +511,8 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
     if (verbose) {
         res["__verbose"] = to_json_non_oaicompat();
     }
-    if (timings.prompt_n >= 0) {
-        res.push_back({"timings", timings.to_json()});
+    if (stats.is_set()) {
+        res["timings"] = stats.to_json();
     }
 
     return res;
@@ -582,8 +572,8 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
         });
     }
 
-    if (timings.prompt_n >= 0) {
-        deltas.back().push_back({"timings", timings.to_json()});
+    if (stats.is_set()) {
+        deltas.back()["timings"] = stats.to_json();
     }
 
     // extra fields for debugging purposes
@@ -775,8 +765,8 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
         }}
     });
 
-    if (timings.prompt_n >= 0) {
-        server_sent_events.back().at("data").push_back({"timings", timings.to_json()});
+    if (stats.is_set()) {
+        server_sent_events.back().at("data")["timings"] = stats.to_json();
     }
 
     return server_sent_events;
@@ -1127,11 +1117,11 @@ json server_task_result_cmpl_partial::to_json_non_oaicompat() {
         {"tokens_evaluated", n_prompt_tokens},
     };
     // populate the timings object when needed (usually for the last response or with timings_per_token enabled)
-    if (timings.prompt_n > 0) {
-        res.push_back({"timings", timings.to_json()});
+    if (stats.is_set()) {
+        res["timings"] = stats.to_json();
     }
     if (is_progress) {
-        res.push_back({"prompt_progress", progress.to_json()});
+        res["prompt_progress"] = progress.to_json();
     }
     if (!prob_output.probs.empty()) {
         res["completion_probabilities"] = completion_token_output::probs_vector_to_json({prob_output}, post_sampling_probs);
@@ -1167,11 +1157,11 @@ json server_task_result_cmpl_partial::to_json_oaicompat() {
     if (verbose) {
         res["__verbose"] = to_json_non_oaicompat();
     }
-    if (timings.prompt_n >= 0) {
-        res.push_back({"timings", timings.to_json()});
+    if (stats.is_set()) {
+        res["timings"] = stats.to_json();
     }
     if (is_progress) {
-        res.push_back({"prompt_progress", progress.to_json()});
+        res["prompt_progress"] = progress.to_json();
     }
 
     return res;
@@ -1221,11 +1211,11 @@ json server_task_result_cmpl_partial::to_json_oaicompat_chat() {
             };
         }
 
-        if (timings.prompt_n >= 0) {
-            last_json.push_back({"timings", timings.to_json()});
+        if (stats.is_set()) {
+            last_json["timings"] = stats.to_json();
         }
         if (is_progress) {
-            last_json.push_back({"prompt_progress", progress.to_json()});
+            last_json["prompt_progress"] = progress.to_json();
         }
     }
 
@@ -1371,11 +1361,11 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
 
     if (!events.empty()) {
         json & data = events.back().at("data");
-        if (timings.prompt_n >= 0) {
-            data.push_back({"timings", timings.to_json()});
+        if (stats.is_set()) {
+            data["timings"] = stats.to_json();
         }
         if (is_progress) {
-            data.push_back({"prompt_progress", progress.to_json()});
+            data["prompt_progress"] = progress.to_json();
         }
     }
 
@@ -1579,35 +1569,110 @@ json server_task_result_error::to_json() {
 //
 // server_task_result_metrics
 //
+json server_task_result_slots::to_json() {
+    return slots_data;
+}
+
 json server_task_result_metrics::to_json() {
-    return json {
-        { "idle",                            n_idle_slots },
-        { "processing",                      n_processing_slots },
-        { "deferred",                        n_tasks_deferred },
-        { "t_start",                         t_start },
+    // not used, /metrics renders prometheus text via to_metrics()
+    return json{};
+}
 
-        { "n_prompt_tokens_processed_total", n_prompt_tokens_processed_total },
-        { "t_tokens_generation_total",       t_tokens_generation_total },
-        { "n_tokens_predicted_total",        n_tokens_predicted_total },
-        { "t_prompt_processing_total",       t_prompt_processing_total },
-
-        { "n_tokens_max",                    n_tokens_max },
-
-        { "n_prompt_tokens_processed",       n_prompt_tokens_processed },
-        { "t_prompt_processing",             t_prompt_processing },
-        { "n_tokens_predicted",              n_tokens_predicted },
-        { "t_tokens_generation",             t_tokens_generation },
-
-        { "n_decode_total",                  n_decode_total },
-        { "n_busy_slots_total",              n_busy_slots_total },
-
-        { "n_draft_tokens_total",            n_draft_tokens_total },
-        { "n_draft_accepted_total",          n_draft_accepted_total },
-        { "n_draft_verif_steps_total",       n_draft_verif_steps_total },
-        { "n_accepted_per_pos_total",        n_accepted_per_pos_total },
-
-        { "slots",                           slots_data },
+// metrics definition: https://prometheus.io/docs/practices/naming/#metric-names
+std::string server_task_result_metrics::to_metrics() {
+    const std::vector<metric_item> counters = {
+        {
+            "prompt_tokens_total",
+            "Number of prompt tokens processed, excluding cached tokens",
+            (double) metrics.prompt.count
+        }, {
+            "prompt_tokens_cached_total",
+            "Number of prompt tokens reused from the cache",
+            (double) metrics.n_prompt_cached
+        }, {
+            "prompt_seconds_total",
+            "Total time spent processing prompts",
+            metrics.prompt.time / 1.e6
+        }, {
+            "tokens_predicted_total",
+            "Number of generation tokens processed",
+            (double) metrics.predict.count
+        }, {
+            "tokens_predicted_seconds_total",
+            "Total time spent generating tokens",
+            metrics.predict.time / 1.e6
+        }, {
+            "n_decode_total",
+            "Total number of llama_decode() calls, excluding speculative decoding and multimodal decoding",
+            (double) metrics.n_decode
+        }, {
+            "n_tokens_max",
+            "Largest observed sequence length (prompt + generation)",
+            (double) metrics.n_tokens_max
+        }, {
+            "spec_decode_num_draft_tokens_total",
+            "Speculative: Total draft tokens generated",
+            (double) metrics.n_draft_tokens
+        }, {
+            "spec_decode_num_accepted_tokens_total",
+            "Speculative: Total draft tokens accepted by the target model",
+            (double) metrics.n_draft_accepted
+        }, {
+            "spec_decode_num_drafts_total",
+            "Speculative: Total speculative decoding verification steps",
+            (double) metrics.n_draft_verif_steps
+        },
     };
+
+    const std::vector<metric_item> gauges = {
+        {
+            "prompt_tokens_seconds",
+            "Average prompt throughput in tokens/s",
+            metrics.prompt_bucket.n_per_second()
+        }, {
+            "predicted_tokens_seconds",
+            "Average generation throughput in tokens/s",
+            metrics.predict_bucket.n_per_second()
+        }, {
+            "requests_processing",
+            "Number of requests processing",
+            (double) n_processing_slots
+        }, {
+            "requests_deferred",
+            "Number of requests deferred",
+            (double) n_tasks_deferred
+        }, {
+            "n_busy_slots_per_decode",
+            "Average number of busy slots per llama_decode() call",
+            (double) metrics.n_busy_slots / std::max((double) metrics.n_decode, 1.0)
+        },
+    };
+
+    std::stringstream prometheus;
+
+    auto add_items = [&prometheus](const char * type, const std::vector<metric_item> & items) {
+        for (const auto & item : items) {
+            prometheus << "# HELP llamacpp:" << item.name << " " << item.description << "\n"
+                       << "# TYPE llamacpp:" << item.name << " " << type             << "\n"
+                       << "llamacpp:"        << item.name << " " << item.value       << "\n";
+        }
+    };
+
+    add_items("counter", counters);
+    add_items("gauge",   gauges);
+
+    // labeled counter: one time series per draft position
+    if (!metrics.n_accepted_per_pos.empty()) {
+        prometheus << "# HELP llamacpp:spec_decode_num_accepted_tokens_per_pos_total"
+                      " Accepted tokens per draft position\n"
+                   << "# TYPE llamacpp:spec_decode_num_accepted_tokens_per_pos_total counter\n";
+        for (size_t i = 0; i < metrics.n_accepted_per_pos.size(); i++) {
+            prometheus << "llamacpp:spec_decode_num_accepted_tokens_per_pos_total{position=\""
+                       << i << "\"} " << metrics.n_accepted_per_pos[i] << "\n";
+        }
+    }
+
+    return prometheus.str();
 }
 
 //
@@ -1726,7 +1791,7 @@ json server_task_result_cache_import::to_json() {
 }
 
 json server_task_result_cache_plan_preflight::to_json() {
-    return server_cache_plan_preflight_json(view);
+    return server_json_from_ordered(server_cache_plan_preflight_json(view));
 }
 
 //
@@ -1823,6 +1888,7 @@ bool server_prompt_cache_measure_fixed_states(
                 shared_plane |=
                     checkpoint.data_tgt.storage_use_count() > 1 ||
                     checkpoint.data_dft.storage_use_count() > 1 ||
+                    checkpoint.data_qsa.storage_use_count() > 1 ||
                     checkpoint.accel.ring.storage_use_count() > 1 ||
                     checkpoint.accel.spec.storage_use_count() > 1;
             }
@@ -2153,6 +2219,7 @@ size_t server_prompt_cache::size() const {
                 has_shared_fixed_plane |=
                     checkpoint.data_tgt.storage_use_count() > 1 ||
                     checkpoint.data_dft.storage_use_count() > 1 ||
+                    checkpoint.data_qsa.storage_use_count() > 1 ||
                     checkpoint.accel.ring.storage_use_count() > 1 ||
                     checkpoint.accel.spec.storage_use_count() > 1;
             }
@@ -2319,6 +2386,7 @@ std::list<server_prompt_cache_state> server_prompt_cache::stage(const server_pro
             for (const auto & ckpt : prompt.checkpoints) {
                 if (!add_plane(ckpt.data_tgt) ||
                     !add_plane(ckpt.data_dft) ||
+                    !add_plane(ckpt.data_qsa) ||
                     !add_plane(ckpt.accel.ring) ||
                     !add_plane(ckpt.accel.spec)) {
                     return {};
@@ -3524,6 +3592,7 @@ bool server_prompt_cache::payload_bytes(
     for (const auto & ckpt : st.prompt.checkpoints) {
         if (!add_checked(checkpoint_bytes, ckpt.data_tgt.size()) ||
             !add_checked(checkpoint_bytes, ckpt.data_dft.size()) ||
+            !add_checked(accelerator_bytes, ckpt.data_qsa.size()) ||
             !add_checked(accelerator_bytes, ckpt.accel.size())) {
             snapshot_bytes = checkpoint_bytes = accelerator_bytes = 0;
             return false;
@@ -4375,8 +4444,8 @@ void emit_checkpoint_destruction(
         return;
     }
     try {
-        json payload = server_cache_destruction_receipt_json(
-            receipt, projected_bytes, "checkpoint_drop");
+        json payload = server_json_from_ordered(server_cache_destruction_receipt_json(
+            receipt, projected_bytes, "checkpoint_drop"));
         payload["price_us"] = price_us;
         payload["retention_weight_milli"] = weight_milli;
         payload["rank_ordinal"] = ordinal;
@@ -4841,6 +4910,7 @@ bool checkpoint_payload_equal(
            a.computation_frontier == b.computation_frontier &&
            a.data_tgt == b.data_tgt &&
            a.data_dft == b.data_dft &&
+           a.data_qsa == b.data_qsa &&
            a.data_dft_full_sequence == b.data_dft_full_sequence &&
            a.accel.ring == b.accel.ring &&
            a.accel.spec == b.accel.spec;
@@ -5030,8 +5100,8 @@ void server_prompt_cache_observe_host_destruction(
     try {
         const json unavailable = common_cache_acct_known_name(
             llama_cache_acct_known::unavailable);
-        json payload = server_cache_destruction_receipt_json(
-            receipt, projected_bytes);
+        json payload = server_json_from_ordered(server_cache_destruction_receipt_json(
+            receipt, projected_bytes));
         payload["price_us"] = ranking && ranking->price_known
             ? json(ranking->price_us) : unavailable;
         payload["retention_weight_milli"] = ranking
@@ -5091,7 +5161,8 @@ void emit_recovery_pin_excluded(
         receipt.effects = common_cache_plan_destruction_effect_bit(
             common_cache_plan_destruction_effect::
                 different_host_source_consumption);
-        json payload = server_cache_destruction_receipt_json(receipt, 0);
+        json payload = server_json_from_ordered(
+            server_cache_destruction_receipt_json(receipt, 0));
         payload["evidence_event"] = "recovery_pin_excluded";
         payload["recovery_pin_excluded"] = {
             { "artifact_id", artifact.v },
@@ -5121,7 +5192,8 @@ void emit_host_pressure_floor_outcome(
         receipt.effects = common_cache_plan_destruction_effect_bit(
             common_cache_plan_destruction_effect::
                 different_host_source_consumption);
-        json payload = server_cache_destruction_receipt_json(receipt, 0);
+        json payload = server_json_from_ordered(
+            server_cache_destruction_receipt_json(receipt, 0));
         payload["evidence_event"] = "floor_outcome";
         payload["recovery_pin_excluded"] = nullptr;
         payload["floor_outcome"] = outcome;
@@ -8947,7 +9019,14 @@ void server_prompt_cache::commit_restore_delivery(
 // off, load() runs the pre-cache-plan observer candidate loop with zero observer branches. Single source —
 // every `if constexpr (Observed)` block vanishes from the <false> instantiation.
 template <bool Observed>
-bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec, int32_t required_source_id, common_cache_family_binding * restored_family) {
+bool server_prompt_cache::load_impl(
+        server_prompt & prompt, const server_tokens & tokens_new,
+        llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+        const std::string & adapter_config_key, common_cache_plan_record * rec,
+        int32_t required_source_id,
+        common_cache_family_binding * restored_family,
+        server_prompt_cache_restore_shape & restore_shape) {
+    restore_shape = server_prompt_cache_restore_shape::none;
     if constexpr (!Observed) {
         (void) rec;
         (void) required_source_id;
@@ -9141,6 +9220,7 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
 
     const auto * fixed = it_best->payload.fixed_state();
     GGML_ASSERT(fixed != nullptr);
+    bool draft_image_restored = false;
     if (ctx_dft && !fixed->drft.empty()) {
         const size_t size_dft = fixed->drft.size();
         const size_t n_dft = llama_state_seq_set_data_ext(
@@ -9155,6 +9235,7 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
             }
             return false;
         }
+        draft_image_restored = true;
     }
 
     // Both sides restored: atomically select the lifecycle retain terminal or
@@ -9167,6 +9248,9 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
     if (restored_family) {
         *restored_family = delivery.cache_family;
     }
+    restore_shape = draft_image_restored
+        ? server_prompt_cache_restore_shape::target_and_draft
+        : server_prompt_cache_restore_shape::target_only;
     commit_restore_delivery(
         it_best, std::move(delivery), prompt, id_slot, obs_source_best,
         uint64_t(std::max(reuse_lcp_best, 0)),
@@ -9175,15 +9259,21 @@ bool server_prompt_cache::load_impl(server_prompt & prompt, const server_tokens 
     return true;
 }
 
-template bool server_prompt_cache::load_impl<false>(server_prompt &, const server_tokens &, llama_context *, llama_context *, int32_t, const std::string &, common_cache_plan_record *, int32_t, common_cache_family_binding *);
-template bool server_prompt_cache::load_impl<true>(server_prompt &, const server_tokens &, llama_context *, llama_context *, int32_t, const std::string &, common_cache_plan_record *, int32_t, common_cache_family_binding *);
+template bool server_prompt_cache::load_impl<false>(server_prompt &, const server_tokens &, llama_context *, llama_context *, int32_t, const std::string &, common_cache_plan_record *, int32_t, common_cache_family_binding *, server_prompt_cache_restore_shape &);
+template bool server_prompt_cache::load_impl<true>(server_prompt &, const server_tokens &, llama_context *, llama_context *, int32_t, const std::string &, common_cache_plan_record *, int32_t, common_cache_family_binding *, server_prompt_cache_restore_shape &);
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec, int32_t required_source_id, common_cache_family_binding * restored_family) {
+bool server_prompt_cache::load(
+        server_prompt & prompt, const server_tokens & tokens_new,
+        llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+        const std::string & adapter_config_key,
+        server_prompt_cache_restore_shape & restore_shape,
+        common_cache_plan_record * rec, int32_t required_source_id,
+        common_cache_family_binding * restored_family) {
     GGML_ASSERT(rec != nullptr || required_source_id < 0);
     // One dispatch outside every loop: the off path is the original loop.
     return rec != nullptr
-        ? load_impl<true>(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, adapter_config_key, rec, required_source_id, restored_family)
-        : load_impl<false>(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, adapter_config_key, nullptr, required_source_id, restored_family);
+        ? load_impl<true>(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, adapter_config_key, rec, required_source_id, restored_family, restore_shape)
+        : load_impl<false>(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, adapter_config_key, nullptr, required_source_id, restored_family, restore_shape);
 }
 
 void server_prompt_cache::update() {
@@ -9526,6 +9616,7 @@ bool server_prompt_cache::update_impl(
                     has_shared_fixed_plane |=
                         checkpoint.data_tgt.storage_use_count() > 1 ||
                         checkpoint.data_dft.storage_use_count() > 1 ||
+                        checkpoint.data_qsa.storage_use_count() > 1 ||
                         checkpoint.accel.ring.storage_use_count() > 1 ||
                         checkpoint.accel.spec.storage_use_count() > 1;
                 }

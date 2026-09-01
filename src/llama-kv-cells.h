@@ -6,14 +6,23 @@
 #include <bitset>
 #include <cassert>
 #include <cstring>
-#include <map>
+#include <iterator>
+#include <limits>
 #include <set>
 #include <vector>
+
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 struct llama_kv_cell_ext {
     // 2D spatial positions, typically used for M-RoPE
     llama_pos x = 0;
     llama_pos y = 0;
+
+    // when tok = LLAMA_TOKEN_NULL when the cell is produced by embedding input (i.e. multimodal)
+    // use case: n-gram embeddings hash
+    llama_token tok = LLAMA_TOKEN_NULL;
 
     // return true if the current 2D spatial position is greater than other
     bool is_2d_gt(llama_pos ox, llama_pos oy) const {
@@ -23,14 +32,106 @@ struct llama_kv_cell_ext {
     void reset() {
         static_assert(std::is_trivially_copyable_v<llama_kv_cell_ext>);
 
-        memset(this, 0, sizeof(*this));
+        *this = llama_kv_cell_ext{};
     }
+};
+
+// Index of the lowest and highest set bit. Callers guarantee x != 0.
+#if defined(_MSC_VER)
+static inline uint32_t llama_kv_ctz64(uint64_t x) {
+    unsigned long r;
+    _BitScanForward64(&r, x);
+    return (uint32_t) r;
+}
+
+static inline uint32_t llama_kv_clz64(uint64_t x) {
+    unsigned long r;
+    _BitScanReverse64(&r, x);
+    return (uint32_t) r;
+}
+#else
+static inline uint32_t llama_kv_ctz64(uint64_t x) {
+    return (uint32_t) __builtin_ctzll(x);
+}
+
+static inline uint32_t llama_kv_clz64(uint64_t x) {
+    return (uint32_t) (63 - __builtin_clzll(x));
+}
+#endif
+
+// Used cache cells are dense enough that a bitmap is both smaller and substantially cheaper to
+// traverse than one tree node per index.
+class llama_kv_idx_set {
+public:
+    void resize(uint32_t n) {
+        bits.assign((n + 63)/64, 0);
+        n_set = 0;
+    }
+
+    void clear() {
+        std::fill(bits.begin(), bits.end(), 0);
+        n_set = 0;
+    }
+
+    void insert(uint32_t i) {
+        uint64_t & w = bits[i/64];
+        const uint64_t b = 1ull << (i%64);
+
+        n_set += (w & b) == 0;
+        w |= b;
+    }
+
+    void erase(uint32_t i) {
+        uint64_t & w = bits[i/64];
+        const uint64_t b = 1ull << (i%64);
+
+        n_set -= (w & b) != 0;
+        w &= ~b;
+    }
+
+    uint32_t size() const { return n_set; }
+    bool empty() const { return n_set == 0; }
+
+    uint32_t first() const {
+        for (size_t w = 0; w < bits.size(); ++w) {
+            if (bits[w]) {
+                return 64*w + llama_kv_ctz64(bits[w]);
+            }
+        }
+        return 0;
+    }
+
+    uint32_t last() const {
+        for (size_t w = bits.size(); w-- > 0;) {
+            if (bits[w]) {
+                return 64*w + llama_kv_clz64(bits[w]);
+            }
+        }
+        return 0;
+    }
+
+    template <class F>
+    void for_each(F && f) const {
+        for (size_t w = 0; w < bits.size(); ++w) {
+            uint64_t m = bits[w];
+            while (m) {
+                f((uint32_t) (64*w + llama_kv_ctz64(m)));
+                m &= m - 1;
+            }
+        }
+    }
+
+private:
+    std::vector<uint64_t> bits;
+    uint32_t n_set = 0;
 };
 
 // meta information about KV cells that can be part of multiple sequences at the same time
 // TODO: add unit tests
 class llama_kv_cells {
 public:
+    using seq_set_t = std::bitset<LLAMA_MAX_SEQ>;
+
     void reset() {
         for (uint32_t i = 0; i < pos.size(); ++i) {
             pos[i]   = -1;
@@ -65,6 +166,7 @@ public:
         ext.resize(n);
         shift.resize(n);
         seq.resize(n);
+        used.resize(n);
 
         reset();
     }
@@ -83,13 +185,13 @@ public:
     // the index of the first cell that is used
     // return 0 if no cells are used
     uint32_t used_min() const {
-        return used.empty() ? 0 : *used.begin();
+        return used.empty() ? 0 : used.first();
     }
 
     // the index of the last cell that is used + 1
     // return 0 if no cells are used
     uint32_t used_max_p1() const {
-        return used.empty() ? 0 : *used.rbegin() + 1;
+        return used.empty() ? 0 : used.last() + 1;
     }
 
     bool get_has_shift() const {
@@ -242,7 +344,7 @@ public:
         assert(seq_id >= 0);
 
         seq[i].reset(seq_id);
-        seq_pos_dec(seq_id, pos[i]);
+        seq_pos_dec(seq_id, i);
 
         if (seq[i].none()) {
             pos[i] = -1;
@@ -266,7 +368,7 @@ public:
             seq[i].reset();
 
             seq[i].set(seq_id);
-            seq_pos_inc(seq_id, pos[i]);
+            seq_pos_inc(seq_id, i);
 
             return false;
         }
@@ -297,6 +399,13 @@ public:
         return seq[i].count();
     }
 
+    // The complete visibility set is part of the QSA block identity in a unified cache.
+    const seq_set_t & seq_get_all(uint32_t i) const {
+        assert(i < pos.size());
+
+        return seq[i];
+    }
+
     // check if the cell contains seq_id
     // Iterate the sequences ACTUALLY occupying cell i — O(occupants), not O(LLAMA_MAX_SEQ).
     // Ownership-index maintenance walks this per touched cell on whole-cache edits.
@@ -324,6 +433,23 @@ public:
         return seq[i].test(seq_id);
     }
 
+    // Token in the sequence cell at the greatest position <= p. When several cells
+    // share a temporal position (M-RoPE), the highest physical index wins, matching
+    // the previous ascending-cell scan. Returns LLAMA_TOKEN_NULL when no predecessor
+    // exists. Used by the PLE n-gram input path.
+    llama_token seq_pos_tok_le(llama_seq_id seq_id, llama_pos p) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        const auto & positions = seq_pos[seq_id];
+        auto it = positions.upper_bound({ p, std::numeric_limits<uint32_t>::max() });
+        if (it == positions.begin()) {
+            return LLAMA_TOKEN_NULL;
+        }
+
+        return ext[(--it)->second].tok;
+    }
+
     // note: call only if the cell is not empty and the seq_id is not in the cell
     void seq_add(uint32_t i, llama_seq_id seq_id) {
         assert(i < pos.size());
@@ -331,7 +457,7 @@ public:
         assert(!seq[i].test(seq_id));
 
         seq[i].set(seq_id);
-        seq_pos_inc(seq_id, pos[i]);
+        seq_pos_inc(seq_id, i);
     }
 
     // return the sequence id of this cell
@@ -358,8 +484,6 @@ public:
             return -1;
         }
 
-        assert(seq_pos[seq_id].begin()->second > 0);
-
         return seq_pos[seq_id].begin()->first;
     }
 
@@ -373,8 +497,6 @@ public:
             return -1;
         }
 
-        assert(seq_pos[seq_id].rbegin()->second > 0);
-
         return seq_pos[seq_id].rbegin()->first;
     }
 
@@ -385,15 +507,9 @@ public:
         assert(seq_id >= 0);
         assert(seq_id < LLAMA_MAX_SEQ);
 
-        uint32_t count = 0;
-        for (auto it = seq_pos[seq_id].begin(); it != seq_pos[seq_id].end() && it->first < frontier; ++it) {
-            assert(it->second > 0);
-            count += static_cast<uint32_t>(it->second);
-        }
-        return count;
+        return static_cast<uint32_t>(std::distance(
+                seq_pos[seq_id].begin(), seq_pos[seq_id].lower_bound({ frontier, 0 })));
     }
-
-    const std::set<uint32_t> & used_indices() const { return used; }
 
     // note: call only if the cell is not empty
     llama_pos pos_get(uint32_t i) const {
@@ -447,29 +563,21 @@ public:
     // sets "has_shift" to true
     // note: call only if the cell is not empty
     bool pos_add(uint32_t i, llama_pos d) {
-        assert(i < pos.size());
-        assert(pos[i] != -1);
+        return pos_add_impl(i, d, true, false);
+    }
 
-        seq_pos_rm(i);
+    // Text-only M-RoPE broadcasts the temporal position into the x/y planes.
+    // Keep all three pieces of metadata coherent while queuing the matching
+    // rotary-key update.
+    bool pos_add_mrope_text(uint32_t i, llama_pos d) {
+        return pos_add_impl(i, d, true, true);
+    }
 
-        pos[i]   += d;
-        shift[i] += d;
-
-        has_shift = true;
-
-        if (pos[i] < 0) {
-            seq[i].reset();
-            pos[i] = -1;
-            shift[i] = 0;
-
-            used.erase(i);
-
-            return true;
-        }
-
-        seq_pos_add(i);
-
-        return false;
+    // Some auxiliary caches (Qwen4 QSA) retain raw, pre-RoPE keys.  Their
+    // block metadata follows the shifted text position, but their key bytes
+    // must never be submitted to the K-shift graph.
+    bool pos_add_mrope_text_raw(uint32_t i, llama_pos d) {
+        return pos_add_impl(i, d, false, true);
     }
 
     // pos[i] = pos[i] / d
@@ -492,10 +600,42 @@ public:
     }
 
 private:
+    bool pos_add_impl(uint32_t i, llama_pos d, bool rotate_key, bool broadcast_text) {
+        assert(i < pos.size());
+        assert(pos[i] != -1);
+
+        seq_pos_rm(i);
+
+        pos[i] += d;
+        if (broadcast_text) {
+            ext[i].x += d;
+            ext[i].y += d;
+        }
+        if (rotate_key) {
+            shift[i] += d;
+        }
+
+        has_shift = has_shift || rotate_key;
+
+        if (pos[i] < 0) {
+            seq[i].reset();
+            pos[i] = -1;
+            shift[i] = 0;
+
+            used.erase(i);
+
+            return true;
+        }
+
+        seq_pos_add(i);
+
+        return false;
+    }
+
     bool has_shift = false;
 
     // set of indices of used cells (i.e. pos[i] != -1, allowed to not have any seq_id)
-    std::set<uint32_t> used;
+    llama_kv_idx_set used;
 
     std::vector<llama_pos> pos;
 
@@ -519,41 +659,34 @@ private:
     //
     std::vector<llama_pos> shift;
 
-    using seq_set_t = std::bitset<LLAMA_MAX_SEQ>;
-
     // the bitset seq[i] tells us which sequences are currently occupying the i-th cell
     std::vector<seq_set_t> seq;
 
-    // the set seq_pos[s][p] tells us how many times the position p is currently present for sequence s
-    // if the position p is not present, seq_pos[s][p] is not set
+    // One (position, physical cell) entry per cell carrying sequence s. Including the
+    // cell index preserves repeated temporal positions and permits logarithmic predecessor
+    // lookup while begin/rbegin remain the min/max position authorities.
     // this way seq_pos[s].begin() and seq_pos[s].rbegin() give us the min/max positions currently in the cache
-    //
-    // note that we cannot a use an std::set because in some cases a position can occur more than once for the same seq:
-    //  - during performing a cache reuse via (rm + add)
-    //  - some vision models have input embeddings with repeating positions
-    //
-    std::map<llama_pos, int> seq_pos[LLAMA_MAX_SEQ];
+    std::set<std::pair<llama_pos, uint32_t>> seq_pos[LLAMA_MAX_SEQ];
 
     // helper functions for updating `seq_pos`, once cell at a time:
 
-    void seq_pos_dec(llama_seq_id s, llama_pos p) {
-        auto it = seq_pos[s].find(p);
-        assert(it != seq_pos[s].end());
-
-        if (--it->second == 0) {
-            seq_pos[s].erase(it);
-        }
+    void seq_pos_dec(llama_seq_id s, uint32_t i) {
+        const size_t n = seq_pos[s].erase({ pos[i], i });
+        assert(n == 1);
+        GGML_UNUSED(n);
     }
 
-    void seq_pos_inc(llama_seq_id s, llama_pos p) {
-        seq_pos[s][p]++;
+    void seq_pos_inc(llama_seq_id s, uint32_t i) {
+        const bool inserted = seq_pos[s].insert({ pos[i], i }).second;
+        assert(inserted);
+        GGML_UNUSED(inserted);
     }
 
     // remove cell i
     void seq_pos_rm(uint32_t i) {
         for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
             if (seq[i].test(s)) {
-                seq_pos_dec(s, pos[i]);
+                seq_pos_dec(s, i);
             }
         }
     }
@@ -562,7 +695,7 @@ private:
     void seq_pos_add(uint32_t i) {
         for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
             if (seq[i].test(s)) {
-                seq_pos_inc(s, pos[i]);
+                seq_pos_inc(s, i);
             }
         }
     }

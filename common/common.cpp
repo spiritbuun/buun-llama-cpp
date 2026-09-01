@@ -7,6 +7,7 @@
 #include "log.h"
 #include "llama.h"
 #include "../src/llama-ext.h"
+#include "../src/llama-sha256.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "unicode.h"
@@ -52,6 +53,7 @@
 #endif
 
 #if defined(__linux__)
+#include <sched.h>
 #include <sys/types.h>
 #include <pwd.h>
 #endif
@@ -88,12 +90,17 @@ int32_t common_cpu_get_num_physical_cores() {
     }
 #elif defined(__linux__)
     // enumerate the set of thread siblings, num entries is num cores
+    cpu_set_t affinity;
+    const bool affinity_known = sched_getaffinity(0, sizeof(affinity), &affinity) == 0;
     std::unordered_set<std::string> siblings;
     for (uint32_t cpu=0; cpu < UINT32_MAX; ++cpu) {
         std::ifstream thread_siblings("/sys/devices/system/cpu/cpu"
             + std::to_string(cpu) + "/topology/thread_siblings");
         if (!thread_siblings.is_open()) {
             break; // no more cpus
+        }
+        if (affinity_known && (cpu >= CPU_SETSIZE || !CPU_ISSET(cpu, &affinity))) {
+            continue;
         }
         std::string line;
         if (std::getline(thread_siblings, line)) {
@@ -226,6 +233,18 @@ int32_t common_cpu_get_num_math() {
     return phy_cpus * std::min(smt_factor, 2);
 #endif
     return common_cpu_get_num_physical_cores();
+}
+
+int32_t common_cpu_resolve_moe_threads(int32_t physical_cores) {
+    // Host-routed expert gathering is predominantly memory-bound. Beyond a
+    // modest physical-core count, additional lockstep workers add scheduling
+    // and cache pressure without increasing memory throughput. This cap keeps
+    // small/hybrid CPUs fully occupied while avoiding large-server oversubscription.
+    return std::max<int32_t>(1, std::min<int32_t>(physical_cores, 12));
+}
+
+int32_t common_cpu_get_num_moe_threads() {
+    return common_cpu_resolve_moe_threads(common_cpu_get_num_physical_cores());
 }
 
 // Helper for setting process priority
@@ -458,10 +477,11 @@ void common_params_print_info(const common_params & params, bool print_devices) 
 #endif
     COM_TRC("%s: build %d (%s) with %s for %s%s\n", __func__, llama_build_number(), llama_commit(), llama_compiler(), llama_build_target(), build_type);
 
-    COM_INF("%s: verbosity = %d (adjust with the `-lv N` CLI arg)\n", __func__, common_log_get_verbosity_thold());
+    const int verbosity = common_log_get_verbosity_thold();
+    COM_INF("%s: verbosity = %d (adjust with the `-lv N` CLI arg)\n", __func__, verbosity);
 
     // device enumeration creates a primary context on CUDA backends, skip it when the caller does not own any device
-    if (print_devices) {
+    if (print_devices && verbosity >= LOG_LEVEL_TRACE) {
         COM_TRC("%s", "device_info:\n");
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             auto * dev = ggml_backend_dev_get(i);
@@ -1075,20 +1095,21 @@ std::string fs_get_cache_directory() {
     std::string cache_directory = "";
     auto ensure_trailing_slash = [](std::string p) {
         // Make sure to add trailing slash
-        if (p.back() != DIRECTORY_SEPARATOR) {
+        if (p.empty() || p.back() != DIRECTORY_SEPARATOR) {
             p += DIRECTORY_SEPARATOR;
         }
         return p;
     };
-    if (getenv("LLAMA_CACHE")) {
-        cache_directory = std::getenv("LLAMA_CACHE");
-    } else {
+    cache_directory = common_get_env("LLAMA_CACHE");
+    if (cache_directory.empty()) {
 #if defined(__linux__) || defined(__FreeBSD__) || defined(_AIX) || \
         defined(__OpenBSD__) || defined(__NetBSD__)
-        if (std::getenv("XDG_CACHE_HOME")) {
-            cache_directory = std::getenv("XDG_CACHE_HOME");
-        } else if (std::getenv("HOME")) {
-            cache_directory = std::getenv("HOME") + std::string("/.cache/");
+        const std::string xdg_cache_home = common_get_env("XDG_CACHE_HOME");
+        const std::string home           = common_get_env("HOME");
+        if (!xdg_cache_home.empty()) {
+            cache_directory = xdg_cache_home;
+        } else if (!home.empty()) {
+            cache_directory = home + "/.cache/";
         } else {
 #if defined(__linux__)
             /* no $HOME is defined, fallback to getpwuid */
@@ -1103,9 +1124,16 @@ std::string fs_get_cache_directory() {
 #endif /* defined(__linux__) */
         }
 #elif defined(__APPLE__)
-        cache_directory = std::getenv("HOME") + std::string("/Library/Caches/");
+        cache_directory = common_get_env("HOME");
+        if (cache_directory.empty()) {
+            throw std::runtime_error("Failed to find $HOME directory");
+        }
+        cache_directory += "/Library/Caches/";
 #elif defined(_WIN32)
-        cache_directory = std::getenv("LOCALAPPDATA");
+        cache_directory = common_get_env("LOCALAPPDATA");
+        if (cache_directory.empty()) {
+            throw std::runtime_error("Failed to find %LOCALAPPDATA% directory");
+        }
 #elif defined(__EMSCRIPTEN__)
         GGML_ABORT("not implemented on this platform");
 #else
@@ -1115,6 +1143,51 @@ std::string fs_get_cache_directory() {
         cache_directory += "llama.cpp";
     }
     return ensure_trailing_slash(cache_directory);
+}
+
+std::string fs_get_config_directory() {
+    std::string config_directory = "";
+    auto ensure_trailing_slash = [](std::string p) {
+        if (p.empty() || p.back() != DIRECTORY_SEPARATOR) {
+            p += DIRECTORY_SEPARATOR;
+        }
+        return p;
+    };
+#if defined(__linux__) || defined(__FreeBSD__) || defined(_AIX) || \
+        defined(__OpenBSD__) || defined(__NetBSD__) || defined(__APPLE__)
+    const std::string xdg_config_home = common_get_env("XDG_CONFIG_HOME");
+    const std::string home            = common_get_env("HOME");
+    if (!xdg_config_home.empty()) {
+        config_directory = xdg_config_home;
+    } else if (!home.empty()) {
+        config_directory = home + "/.config/";
+    } else {
+#if defined(__linux__)
+        /* no $HOME is defined, fallback to getpwuid */
+        struct passwd *pw = getpwuid(getuid());
+        if ((!pw) || (!pw->pw_dir)) {
+            throw std::runtime_error("Failed to find $HOME directory");
+        }
+
+        config_directory = std::string(pw->pw_dir) + std::string("/.config/");
+#else
+        throw std::runtime_error("Failed to find $HOME directory");
+#endif
+    }
+#elif defined(_WIN32)
+    config_directory = common_get_env("APPDATA");
+    if (config_directory.empty()) {
+        throw std::runtime_error("Failed to find %APPDATA% directory");
+    }
+#elif defined(__EMSCRIPTEN__)
+    // caller decides what to do when there is no config directory
+    throw std::runtime_error("not implemented on this platform");
+#else
+#  error Unknown architecture
+#endif
+    config_directory = ensure_trailing_slash(config_directory);
+    config_directory += "llama.cpp";
+    return ensure_trailing_slash(config_directory);
 }
 
 std::string fs_get_cache_file(const std::string & filename) {
@@ -1278,6 +1351,8 @@ struct common_init_result::impl {
 
     // note: the order in which model, context, etc. are declared matters because their destructors will be called bottom-to-top
 
+    common_threadpools threadpools;
+
     llama_model_ptr   model;
     llama_context_ptr context;
 
@@ -1286,6 +1361,18 @@ struct common_init_result::impl {
     std::vector<common_sampler_ptr> samplers;
     std::vector<llama_sampler_seq_config> samplers_seq_config;
 };
+
+std::string common_moe_cache_profile_file(const uint8_t semantic_digest[32]) {
+    if (!semantic_digest) {
+        throw std::invalid_argument("missing model semantic digest");
+    }
+    char hex[65];
+    for (size_t i = 0; i < 32; ++i) {
+        snprintf(hex + 2*i, 3, "%02x", semantic_digest[i]);
+    }
+    hex[64] = '\0';
+    return fs_get_cache_file(string_format("moe-experts-%s.v1", hex));
+}
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
@@ -1305,6 +1392,62 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.tensor_buft_overrides;
         const common_moe_cache_params moe_cache_before = params.moe_cache;
 
+        // the draft context is created from the same base params and follows the main context, fit both together
+        const bool has_draft = params.speculative.has_dft();
+        const bool spec_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+
+        common_params params_dft = common_base_params_to_speculative(params);
+
+        auto mparams_dft = common_model_params_to_llama(params_dft);
+        auto cparams_dft = common_context_params_to_llama(params_dft);
+        const bool extra_is_mtp = spec_mtp &&
+            !params.speculative.has_non_mtp_model_drafter();
+        if (extra_is_mtp) {
+            const auto mtp_context = common_speculative_mtp_context_params_resolve(
+                0, params.speculative.draft.n_ctx,
+                cparams_dft.n_seq_max, cparams_dft.kv_unified);
+            cparams_dft.n_ctx      = mtp_context.n_ctx;
+            cparams_dft.n_seq_max  = mtp_context.n_seq_max;
+            cparams_dft.kv_unified = mtp_context.kv_unified;
+            cparams_dft.ctx_type   = LLAMA_CONTEXT_TYPE_MTP;
+        }
+        cparams_dft.n_rs_seq = 0;
+
+        llama_model_params mparams_mtp = mparams;
+        mparams_mtp.load_mtp = true;
+        llama_context_params cparams_mtp = cparams_dft;
+        const auto mtp_context = common_speculative_mtp_context_params_resolve(
+            0, params.speculative.draft.n_ctx,
+            cparams_mtp.n_seq_max, cparams_mtp.kv_unified);
+        cparams_mtp.n_ctx      = mtp_context.n_ctx;
+        cparams_mtp.n_seq_max  = mtp_context.n_seq_max;
+        cparams_mtp.kv_unified = mtp_context.kv_unified;
+        cparams_mtp.ctx_type   = LLAMA_CONTEXT_TYPE_MTP;
+
+        const common_fit_extra_model extra_mtp = {
+            /*.path_model   =*/ params.model.path.c_str(),
+            /*.mparams      =*/ &mparams_mtp,
+            /*.cparams      =*/ &cparams_mtp,
+            /*.shares_model =*/ true,
+            /*.follows_target_per_sequence =*/ params.speculative.draft.n_ctx <= 0,
+            /*.fixed_n_ctx  =*/ params.speculative.draft.n_ctx > 0
+                ? (uint32_t) params.speculative.draft.n_ctx : 0,
+            /*.next         =*/ nullptr,
+            /*.optional_if_no_mtp =*/ true,
+        };
+
+        const common_fit_extra_model extra_dft = {
+            /*.path_model   =*/ params_dft.model.path.c_str(),
+            /*.mparams      =*/ &mparams_dft,
+            /*.cparams      =*/ &cparams_dft,
+            /*.shares_model =*/ !has_draft, // an MTP context runs on the weights of the main model
+            /*.follows_target_per_sequence =*/ extra_is_mtp && params.speculative.draft.n_ctx <= 0,
+            /*.fixed_n_ctx  =*/ extra_is_mtp && params.speculative.draft.n_ctx > 0
+                ? (uint32_t) params.speculative.draft.n_ctx : 0,
+            /*.next         =*/ spec_mtp && !extra_is_mtp ? &extra_mtp : nullptr,
+        };
+
         const common_params_fit_status fit_status = common_fit_params(
             params.model.path.c_str(), &mparams, &cparams,
             params.tensor_split,
@@ -1312,11 +1455,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             &params.moe_cache,
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
+            has_draft || spec_mtp ? &extra_dft : nullptr,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
-        if (fit_status == COMMON_PARAMS_FIT_STATUS_ERROR) {
-            throw std::runtime_error(
-                "failed to fit parameters to device memory (hard error); retry with -fit off");
-        }
         if (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
             COM_ERR("%s", "fit could not prove a viable placement; restoring the pre-fit parameters\n");
             mparams = mparams_before;
@@ -1328,6 +1468,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             mparams.tensor_split = params.tensor_split;
             mparams.tensor_buft_overrides = params.tensor_buft_overrides.empty()
                 ? nullptr : params.tensor_buft_overrides.data();
+
+            if (fit_status == COMMON_PARAMS_FIT_STATUS_ERROR) {
+                throw std::runtime_error(
+                    "failed to fit parameters to device memory (hard error); retry with -fit off");
+            }
         } else {
             // surface the RESOLVED placement: auto-fit decided the real offload count in
             // mparams, and callers (e.g. the cache-plan calibration profile) must key on the
@@ -1367,6 +1512,37 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     if (model_only) {
         return;
+    }
+
+    if (params.moe_cache.profile && params.moe_cache.profile_path.empty() &&
+            params.moe_cache.mode != COMMON_MOE_CACHE_MODE_OFF) {
+        uint8_t digest[32];
+        if (llama_model_semantic_family_digest(model, digest)) {
+            try {
+                params.moe_cache.profile_path = common_moe_cache_profile_file(digest);
+            } catch (const std::exception & e) {
+                COM_WRN("MoE cache profile disabled: %s\n", e.what());
+            }
+        } else {
+            COM_WRN("%s", "MoE cache profile disabled: model has no semantic identity\n");
+        }
+    }
+
+    if (!params.cpuparams.n_threads_explicit && !params.cpuparams.mask_valid &&
+            llama_model_has_host_moe_weights(model)) {
+        const int resolved = common_cpu_get_num_moe_threads();
+        if (resolved != params.cpuparams.n_threads) {
+            COM_INF("CPU threads: routed experts are host-resident; auto-resolved generation threads %d -> %d\n",
+                    params.cpuparams.n_threads, resolved);
+            params.cpuparams.n_threads = resolved;
+            cparams.n_threads = resolved;
+        }
+        if (!params.cpuparams_batch.n_threads_explicit &&
+                !params.cpuparams_batch.mask_valid &&
+                resolved != params.cpuparams_batch.n_threads) {
+            params.cpuparams_batch.n_threads = resolved;
+            cparams.n_threads_batch = resolved;
+        }
     }
 
     // Coupled-KV models (MLA family: V is a view of the K latent) require matching K/V cache
@@ -1446,6 +1622,10 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }
 
+    // Fitting may replace params.moe_cache while restoring a recoverable
+    // fallback. Rebind the borrowed C pointer after the final policy decision.
+    cparams.moe_cache_profile_path = params.moe_cache.profile_path.empty()
+        ? nullptr : params.moe_cache.profile_path.c_str();
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
@@ -1458,6 +1638,10 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 
     pimpl->context.reset(lctx);
+
+    set_process_priority(params.cpuparams.priority);
+
+    pimpl->threadpools.init(lctx, params);
 }
 
 llama_model * common_init_result::model() {
@@ -1563,6 +1747,8 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         if (err) {
             return res;
         }
+        params.control_vector_applied_digest = cvec.applied_digest;
+        params.control_vector_applied_digest_valid = cvec.applied_digest_valid;
     }
 
     if (llama_pooling_type(lctx) == LLAMA_POOLING_TYPE_RANK) {
@@ -1759,6 +1945,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;
+    mparams.lazy_mode = params.lazy_mode;
+    mparams.mmap_prefetch = params.mmap_prefetch;
     mparams.tensor_split    = params.tensor_split;
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
@@ -1793,6 +1981,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_seq_max         = params.n_parallel;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
+    cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;
     cparams.n_threads         = params.cpuparams.n_threads;
@@ -1846,9 +2035,15 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     }
     cparams.moe_cache_budget_mib = params.moe_cache.budget_mib;
     cparams.moe_cache_expert_parallel = params.moe_cache.expert_parallel;
+    cparams.moe_cache_profile_path = params.moe_cache.profile_path.empty()
+        ? nullptr : params.moe_cache.profile_path.c_str();
 
     return cparams;
 }
+
+//
+// Threadpool utils
+//
 
 struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const common_cpu_params & params) {
     struct ggml_threadpool_params tpp;
@@ -1864,6 +2059,58 @@ struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const commo
     tpp.strict_cpu = params.strict_cpu;
 
     return tpp;
+}
+
+common_threadpools::~common_threadpools() {
+    if (!free_fn) {
+        return;
+    }
+    free_fn(threadpool);
+    free_fn(threadpool_batch);
+}
+
+void common_threadpools::init(llama_context * ctx, const common_params & params) {
+    GGML_ASSERT(!threadpool);
+    GGML_ASSERT(!threadpool_batch);
+
+    COM_INF("llama threadpool init, n_threads = %d\n", (int) params.cpuparams.n_threads);
+
+    auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (!cpu_dev) {
+        COM_WRN("%s", "no CPU backend found\n");
+        return;
+    }
+    auto * reg = ggml_backend_dev_backend_reg(cpu_dev);
+    auto * ggml_threadpool_new_fn = (decltype(ggml_threadpool_new) *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new");
+    free_fn = (decltype(ggml_threadpool_free) *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free");
+
+    struct ggml_threadpool_params tpp_batch =
+            ggml_threadpool_params_from_cpu_params(params.cpuparams_batch);
+    struct ggml_threadpool_params tpp =
+            ggml_threadpool_params_from_cpu_params(params.cpuparams);
+
+    // each pool needs to match the respective n_threads exactly
+    // see: https://github.com/ggml-org/llama.cpp/pull/27138#issuecomment-5332307332
+    if (!ggml_threadpool_params_match(&tpp, &tpp_batch)) {
+        threadpool_batch = ggml_threadpool_new_fn(&tpp_batch);
+        if (!threadpool_batch) {
+            COM_WRN("batch threadpool create failed : n_threads %d\n", tpp_batch.n_threads);
+            return;
+        }
+
+        // start the non-batch threadpool in the paused state
+        tpp.paused = true;
+    }
+
+    threadpool = ggml_threadpool_new_fn(&tpp);
+    if (!threadpool) {
+        COM_WRN("threadpool create failed : n_threads %d\n", tpp.n_threads);
+        free_fn(threadpool_batch);
+        threadpool_batch = nullptr;
+        return;
+    }
+
+    llama_attach_threadpool(ctx, threadpool, threadpool_batch);
 }
 
 //
@@ -2153,6 +2400,16 @@ common_control_vector_data common_control_vector_load(const std::vector<common_c
     if (result.n_embd == -1) {
         COM_ERR("%s", "no valid control vector files passed\n");
         result.data.clear();
+    } else {
+        llama_sha256_writer writer;
+        static constexpr char domain[] =
+            "llama.control-vector.applied-data/v1";
+        writer.string(domain, sizeof(domain) - 1);
+        writer.u32(uint32_t(result.n_embd));
+        writer.u64(uint64_t(result.data.size()));
+        writer.bytes(result.data.data(), result.data.size()*sizeof(float));
+        result.applied_digest = writer.finish();
+        result.applied_digest_valid = true;
     }
 
     return result;
@@ -2439,7 +2696,7 @@ bool common_prompt_checkpoint::empty() const {
 }
 
 size_t common_prompt_checkpoint::size() const {
-    return data_tgt.size() + data_dft.size() + accel.size();
+    return data_tgt.size() + data_dft.size() + data_qsa.size() + accel.size();
 }
 
 void common_prompt_checkpoint::clear() {
@@ -2457,6 +2714,7 @@ void common_prompt_checkpoint::clear() {
 
     data_tgt.clear();
     data_dft.clear();
+    data_qsa.clear();
     data_dft_full_sequence = false;
     accel.clear();
 }
@@ -2559,6 +2817,7 @@ bool common_prompt_checkpoint::try_load_dft(
 
 void common_prompt_checkpoint::clear_tgt() {
     data_tgt.clear();
+    data_qsa.clear();
 }
 
 void common_prompt_checkpoint::clear_dft() {

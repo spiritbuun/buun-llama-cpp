@@ -5,6 +5,29 @@
 static constexpr int DSV4_HC = 4;
 static constexpr int DSV4_HC_POST_TILE_EMBD = 64;
 
+template <bool use_repeated_block>
+static __global__ void hc_combine_f32(
+        const float * residual, const float * block, const float * inject,
+        float * dst, int64_t n_embd, int64_t hc, float inv_hc) {
+    const int64_t e = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= n_embd) {
+        return;
+    }
+
+    const int64_t c = blockIdx.y;
+    const int64_t t = blockIdx.z;
+    const int64_t i = e + n_embd*(c + hc*t);
+    // Preserve the rounding boundaries of SCALE -> SIGMOID -> SCALE -> MUL -> ADD.
+    // SCALE is fma(scale, value, +0). Keep both SCALE store boundaries exact,
+    // including their signed-zero behavior.
+    const float scaled = __fmaf_rn(inv_hc, inject[c + hc*t], 0.0f);
+    const float sigmoid = 1.0f / (1.0f + expf(-scaled));
+    const float weight = __fmaf_rn(2.0f, sigmoid, 0.0f);
+    const int64_t ib = use_repeated_block ? i : e + n_embd*t;
+    const float product = __fmul_rn(block[ib], weight);
+    dst[i] = __fadd_rn(residual[i], product);
+}
+
 
 static __device__ void dsv4_hc_comb_norm_cols(float * comb, float eps) {
     for (int idst = 0; idst < DSV4_HC; ++idst) {
@@ -408,4 +431,43 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             nbp0 / sizeof(float), nbp1 / sizeof(float),
             nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
             nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float));
+}
+
+void ggml_cuda_op_hc_combine_fused(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * residual, const ggml_tensor * block,
+        const ggml_tensor * repeated, const ggml_tensor * inject,
+        ggml_tensor * dst, bool use_repeated_block) {
+    GGML_ASSERT(residual->type == GGML_TYPE_F32);
+    GGML_ASSERT(block->type    == GGML_TYPE_F32);
+    GGML_ASSERT(repeated->type == GGML_TYPE_F32);
+    GGML_ASSERT(inject->type   == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type      == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(residual));
+    GGML_ASSERT(ggml_is_contiguous(block));
+    GGML_ASSERT(ggml_is_contiguous(repeated));
+    GGML_ASSERT(ggml_is_contiguous(inject));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    ggml_cuda_set_device(ctx.device);
+    const int64_t n_embd = residual->ne[0];
+    const int64_t hc = residual->ne[1];
+    const float inv_hc = 1.0f / (float) hc;
+    const int block_size = 256;
+    const dim3 block_dims(block_size, 1, 1);
+    const dim3 grid_dims((n_embd + block_size - 1) / block_size, hc, residual->ne[2]);
+    const ggml_cuda_kernel_launch_params launch_params =
+        ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
+
+    if (use_repeated_block) {
+        ggml_cuda_kernel_launch(hc_combine_f32<true>, launch_params,
+            (const float *) residual->data, (const float *) repeated->data,
+            (const float *) inject->data, (float *) dst->data,
+            n_embd, hc, inv_hc);
+    } else {
+        ggml_cuda_kernel_launch(hc_combine_f32<false>, launch_params,
+            (const float *) residual->data, (const float *) block->data,
+            (const float *) inject->data, (float *) dst->data,
+            n_embd, hc, inv_hc);
+    }
 }

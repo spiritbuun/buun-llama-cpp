@@ -25,7 +25,6 @@
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
 
-using json = nlohmann::ordered_json;
 
 constexpr common_cache_plan_payload_kind server_cache_plan_payload_kind(
         server_prompt_cache_payload_kind kind) noexcept {
@@ -50,6 +49,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_CONTROL,
     SERVER_TASK_TYPE_NEXT_RESPONSE,
     SERVER_TASK_TYPE_METRICS,
+    SERVER_TASK_TYPE_SLOT_GET,
     SERVER_TASK_TYPE_SLOT_SAVE,
     SERVER_TASK_TYPE_SLOT_RESTORE,
     SERVER_TASK_TYPE_SLOT_ERASE,
@@ -340,26 +340,17 @@ struct server_task {
     }
 };
 
-struct result_timings {
-    int32_t cache_n = -1;
-
-    int32_t prompt_n = -1;
-    double prompt_ms = 0.0;
-    double prompt_per_token_ms = 0.0;
-    double prompt_per_second = 0.0;
-
-    int32_t predicted_n = -1;
-    double predicted_ms = 0.0;
-    double predicted_per_token_ms = 0.0;
-    double predicted_per_second = 0.0;
-
-    // Optional speculative metrics - only included when > 0
-    int32_t draft_n = 0;
-    int32_t draft_n_accepted = 0;
-
-    // effective bits/value of the attention KV cache at its current tensor types (moves at
-    // runtime under dynamic VBR); emitted only when >= 0
+// Response-local extension of upstream's slot statistics. Keeping the VBR
+// value here avoids widening every live slot while retaining one timings
+// serializer for cached/prompt/generation/draft and KV representation data.
+struct server_result_stats : server_slot_stats {
     double kv_bpv = -1.0;
+
+    server_result_stats & operator=(const server_slot_stats & other) {
+        static_cast<server_slot_stats &>(*this) = other;
+        kv_bpv = -1.0;
+        return *this;
+    }
 
     json to_json() const;
 };
@@ -428,7 +419,7 @@ struct server_task_result_cmpl_final : server_task_result {
 
     bool stream;
     bool include_usage;
-    result_timings timings;
+    server_result_stats stats;
     std::string prompt;
 
     bool truncated;
@@ -514,7 +505,7 @@ struct server_task_result_cmpl_partial : server_task_result {
     bool is_begin = false; // whether to send 200 status to HTTP client (begin of SSE stream)
                            // ref: https://github.com/ggml-org/llama.cpp/pull/23884
     completion_token_output prob_output;
-    result_timings timings;
+    server_result_stats stats;
     result_prompt_progress progress;
 
     // response formatting
@@ -598,33 +589,27 @@ struct server_task_result_error : server_task_result {
     virtual json to_json() override;
 };
 
+// used by /metrics API
 struct server_task_result_metrics : server_task_result {
-    int n_idle_slots;
-    int n_processing_slots;
-    int n_tasks_deferred;
-    int64_t t_start;
+    // these are immediate stats, not accumulated (server_metrics is cumulative)
+    int n_processing_slots = 0;
+    int n_tasks_deferred = 0;
 
-    // TODO: somehow reuse server_metrics in the future, instead of duplicating the fields
-    uint64_t n_prompt_tokens_processed_total = 0;
-    uint64_t t_prompt_processing_total       = 0;
-    uint64_t n_tokens_predicted_total        = 0;
-    uint64_t t_tokens_generation_total       = 0;
+    server_metrics metrics;
 
-    uint64_t n_tokens_max = 0;
+    virtual json to_json() override;
 
-    uint64_t n_prompt_tokens_processed = 0;
-    uint64_t t_prompt_processing       = 0;
+    struct metric_item {
+        std::string name;
+        std::string description;
+        double value; // prometheus values are always float64
+    };
+    std::string to_metrics();
+};
 
-    uint64_t n_tokens_predicted  = 0;
-    uint64_t t_tokens_generation = 0;
-
-    uint64_t n_decode_total     = 0;
-    uint64_t n_busy_slots_total = 0;
-
-    uint64_t n_draft_tokens_total      = 0;
-    uint64_t n_draft_accepted_total    = 0;
-    uint64_t n_draft_verif_steps_total = 0;
-    std::vector<uint64_t> n_accepted_per_pos_total;
+// used by /slots API
+struct server_task_result_slots : server_task_result {
+    int n_idle_slots = 0;
 
     // while we can also use std::vector<server_slot> this requires copying the slot object which can be quite messy
     // therefore, we use json to temporarily store the slot.to_json() result
@@ -780,6 +765,13 @@ struct server_prompt {
     // It moves with host-cache/child-slot prompt clones and resets whenever
     // the prompt ledger is structurally cleared.
     uint64_t sequence_epoch = 0;
+
+    friend void swap(server_prompt & lhs, server_prompt & rhs) noexcept {
+        using std::swap;
+        swap(lhs.tokens, rhs.tokens);
+        lhs.checkpoints.swap(rhs.checkpoints);
+        swap(lhs.sequence_epoch, rhs.sequence_epoch);
+    }
 
     void clear() {
         tokens.clear();
@@ -1134,6 +1126,12 @@ struct server_prompt_cache_restore_delivery {
     server_prompt prompt;
     common_cache_family_binding cache_family;
     bool retains_source = false;
+};
+
+enum class server_prompt_cache_restore_shape : uint8_t {
+    none = 0,
+    target_only,
+    target_and_draft,
 };
 
 constexpr size_t SERVER_PROMPT_CACHE_SHADOW_MAX_CANDIDATES =
@@ -1590,10 +1588,22 @@ struct server_prompt_cache {
     // off). It only receives values this selection already computes and never triggers a rescan.
     // Dispatches ONCE to an unobserved or observed instantiation, so the disabled path's
     // candidate loop is the original loop with zero observer branches.
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec = nullptr, int32_t required_source_id = -1, common_cache_family_binding * restored_family = nullptr);
+    bool load(server_prompt & prompt, const server_tokens & tokens_new,
+              llama_context * ctx_tgt, llama_context * ctx_dft,
+              int32_t id_slot, const std::string & adapter_config_key,
+              server_prompt_cache_restore_shape & restore_shape,
+              common_cache_plan_record * rec = nullptr,
+              int32_t required_source_id = -1,
+              common_cache_family_binding * restored_family = nullptr);
 
     template <bool Observed>
-    bool load_impl(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, const std::string & adapter_config_key, common_cache_plan_record * rec, int32_t required_source_id, common_cache_family_binding * restored_family);
+    bool load_impl(server_prompt & prompt, const server_tokens & tokens_new,
+                   llama_context * ctx_tgt, llama_context * ctx_dft,
+                   int32_t id_slot, const std::string & adapter_config_key,
+                   common_cache_plan_record * rec,
+                   int32_t required_source_id,
+                   common_cache_family_binding * restored_family,
+                   server_prompt_cache_restore_shape & restore_shape);
 
     // Two-phase immutable host restore. prepare() runs before either
     // target is touched; commit() is called only after main+draft restore.

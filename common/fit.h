@@ -16,6 +16,7 @@ struct common_moe_cache_fit_device_input {
     int compute_capability = 0;
     int64_t free_bytes = 0;
     size_t used_bytes = 0;
+    size_t reserve_bytes = 0;
 };
 
 struct common_moe_cache_fit_shape_input {
@@ -33,6 +34,7 @@ struct common_moe_cache_fit_device {
     int64_t free_bytes = 0;
     int64_t used_bytes = 0;
     size_t cache_bytes = 0;
+    size_t reserve_bytes = 0;
 };
 
 struct common_moe_cache_fit_result {
@@ -58,6 +60,47 @@ enum common_params_fit_status {
     COMMON_PARAMS_FIT_STATUS_ERROR   = 2, // a hard error occurred, e.g. because no model could be found at the specified path
 };
 
+// an additional model/context that shares the devices of the main model, e.g. a draft model
+//   - its context follows the context of the main model, so its memory is measured again whenever that context changes
+//   - shares_model tells the fit that the weights are already counted in the main model, as for an MTP context
+//   - next chains co-resident extras, whose memory is accumulated before each fit decision
+struct common_fit_extra_model {
+    const char * path_model;
+    llama_model_params * mparams;
+    llama_context_params * cparams;
+    bool shares_model;
+    bool follows_target_per_sequence = false;
+    uint32_t fixed_n_ctx = 0;
+    const common_fit_extra_model * next = nullptr;
+    bool optional_if_no_mtp = false;
+};
+
+uint32_t common_fit_extra_context_size(
+        uint32_t target_n_ctx,
+        uint32_t target_n_streams,
+        bool follows_target_per_sequence,
+        uint32_t fixed_n_ctx);
+
+// Deterministic seam for the linked-extra cache policy. The production fitter
+// and this probe share the same refresh, optional-missing, and aggregation
+// implementation; only the measurement callback differs.
+struct common_fit_extra_cache_probe_source {
+    bool available;
+    std::vector<size_t> base_bytes_by_device;
+};
+
+struct common_fit_extra_cache_probe_result {
+    bool success;
+    std::vector<size_t> aggregate_bytes_by_device;
+    std::vector<size_t> measurement_counts;
+};
+
+common_fit_extra_cache_probe_result common_fit_extra_cache_probe(
+        const common_fit_extra_model * extra,
+        const std::vector<uint32_t> & target_n_ctx_steps,
+        uint32_t target_n_streams,
+        const std::vector<common_fit_extra_cache_probe_source> & sources);
+
 // fits mparams and cparams to free device memory (assumes system memory is unlimited)
 //   - returns true if the parameters could be successfully modified to fit device memory
 //   - this function is NOT thread safe because it modifies the global llama logger state
@@ -72,6 +115,7 @@ common_params_fit_status common_fit_params(
            common_moe_cache_params * moe_cache,
                              size_t * margins,               // margins of memory to leave per device in bytes
                            uint32_t   n_ctx_min,             // minimum context size to set when trying to reduce memory use
+      const common_fit_extra_model * extra,                  // model to fit alongside the main one, nullptr if there is none
                      ggml_log_level   log_level);            // minimum log level to print during fitting, lower levels go to debug log
 
 // print estimated memory to stdout

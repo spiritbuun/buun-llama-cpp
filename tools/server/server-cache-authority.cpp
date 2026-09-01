@@ -81,6 +81,10 @@ bool add_checkpoint_payload_claims(
                llama_cache_acct_category::checkpoint_state_payload,
                claims) &&
            add_shared_payload_claim(
+               ledger, checkpoint.data_qsa,
+               llama_cache_acct_category::typed_accelerator_payload,
+               claims) &&
+           add_shared_payload_claim(
                ledger, checkpoint.accel.ring,
                llama_cache_acct_category::typed_accelerator_payload,
                claims) &&

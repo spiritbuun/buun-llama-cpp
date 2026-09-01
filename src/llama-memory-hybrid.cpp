@@ -249,6 +249,12 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdo
     return mb;
 }
 
+std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdown_vbr_managed() const {
+    // Recurrent state is fixed and n_seq_max-sized. Only the attention child follows the KV
+    // representation policy.
+    return mem_attn->memory_breakdown_vbr_managed();
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdown_fixed() const {
     std::map<ggml_backend_buffer_type_t, size_t> mb = mem_attn->memory_breakdown_fixed();
     for (const auto & buft_size : mem_recr->memory_breakdown_fixed()) {
