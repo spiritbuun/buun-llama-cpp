@@ -304,17 +304,15 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
         case llm_dflash_selector_family::none:
             break;
         case llm_dflash_selector_family::fork_dflash2:
+        case llm_dflash_selector_family::upstream_compat:
             if (selector_rank == 0) {
-                throw std::runtime_error("fork DFlash2 selector tensors require selector_rank metadata");
+                throw std::runtime_error("DFlash2 selector tensors require selector_rank metadata");
             }
             hparams.dflash2_conv_kernel_size = selector_conv_kernel_size;
             hparams.dflash2_conv_group_size  = selector_conv_group_size;
             hparams.dflash2_selector_rank    = selector_rank;
             hparams.dflash2_selector_top_k   = selector_top_k;
             break;
-        case llm_dflash_selector_family::upstream_compat:
-            throw std::runtime_error(
-                    "upstream DFlash convolution/selector tensor schema is unsupported; use fork DFlash2 schema");
         case llm_dflash_selector_family::mixed:
             throw std::runtime_error(
                     "DFlash model mixes mutually exclusive fork DFlash2 and upstream selector tensor schemas");
@@ -448,6 +446,13 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
 
     const int64_t n_embd_inp = hparams.n_embd_inp_enc();
 
+    const auto selector_family = llm_dflash_selector_family_from_loader(
+            hparams.dflash2_selector_rank > 0, hparams.n_layer(), *ml);
+    const auto selector_schema = llm_dflash_selector_tensor_schema_for_family(selector_family);
+    if (hparams.dflash2_selector_rank > 0 && !selector_schema.valid) {
+        throw std::runtime_error("DFlash2 tensor schema changed between metadata and tensor loading");
+    }
+
     tok_embd        = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,       "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
 
     // reduced draft vocab (optional): d2t maps draft rows to target token ids
@@ -479,11 +484,14 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
 
     if (hparams.dflash2_selector_rank > 0) {
         const int64_t rank = hparams.dflash2_selector_rank;
-        dflash2_selector_hidden = create_tensor(tn(LLM_TENSOR_DFLASH2_SELECTOR_HIDDEN, "weight"), { n_embd, rank }, 0);
-        dflash2_selector_pred   = create_tensor(tn(LLM_TENSOR_DFLASH2_SELECTOR_PRED), { rank, n_vocab }, 0);
-        dflash2_selector_succ   = create_tensor(tn(LLM_TENSOR_DFLASH2_SELECTOR_SUCC), { rank, n_vocab }, 0);
-        LLAMA_LOG_INFO("%s: DFlash2 selector (rank = %lld, top-k = %u)\n", __func__,
-                (long long) rank, hparams.dflash2_selector_top_k);
+        const char * codebook_suffix = selector_schema.selector_codebooks_have_weight_suffix ? "weight" : nullptr;
+        dflash2_selector_hidden = create_tensor(tn(selector_schema.selector_hidden, "weight"), { n_embd, rank }, 0);
+        dflash2_selector_pred   = create_tensor(tn(selector_schema.selector_pred, codebook_suffix), { rank, n_vocab }, 0);
+        dflash2_selector_succ   = create_tensor(tn(selector_schema.selector_succ, codebook_suffix), { rank, n_vocab }, 0);
+        const char * wire_schema = selector_family == llm_dflash_selector_family::upstream_compat
+                ? "upstream-compatible" : "fork";
+        LLAMA_LOG_INFO("%s: DFlash2 selector (rank = %lld, top-k = %u, wire schema = %s, graph = optimized fork)\n",
+                __func__, (long long) rank, hparams.dflash2_selector_top_k, wire_schema);
     }
 
     fc              = create_tensor(tn(LLM_TENSOR_FC,              "weight"), { n_embd_inp, n_embd }, 0);
@@ -569,13 +577,13 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         if (hparams.dflash2_selector_rank > 0) {
             const int64_t n_groups = n_embd / hparams.dflash2_conv_group_size;
             const int64_t n_coeff  = 2 * hparams.dflash2_conv_kernel_size * n_groups;
-            layer.dflash2_attn_conv_base = create_tensor(tn(LLM_TENSOR_DFLASH2_ATTN_CONV_BASE, nullptr, i),
+            layer.dflash2_attn_conv_base = create_tensor(tn(selector_schema.attn_conv_base, nullptr, i),
                     { n_embd, (int64_t) hparams.dflash2_conv_kernel_size, 2 }, 0);
-            layer.dflash2_attn_conv_proj = create_tensor(tn(LLM_TENSOR_DFLASH2_ATTN_CONV_PROJ, "weight", i),
+            layer.dflash2_attn_conv_proj = create_tensor(tn(selector_schema.attn_conv_proj, "weight", i),
                     { n_embd, n_coeff }, 0);
-            layer.dflash2_ffn_conv_base = create_tensor(tn(LLM_TENSOR_DFLASH2_FFN_CONV_BASE, nullptr, i),
+            layer.dflash2_ffn_conv_base = create_tensor(tn(selector_schema.ffn_conv_base, nullptr, i),
                     { n_embd, (int64_t) hparams.dflash2_conv_kernel_size, 2 }, 0);
-            layer.dflash2_ffn_conv_proj = create_tensor(tn(LLM_TENSOR_DFLASH2_FFN_CONV_PROJ, "weight", i),
+            layer.dflash2_ffn_conv_proj = create_tensor(tn(selector_schema.ffn_conv_proj, "weight", i),
                     { n_embd, n_coeff }, 0);
         }
     }

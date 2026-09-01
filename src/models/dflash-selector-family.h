@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../llama-arch.h"
+
 #include <cstdint>
 #include <string>
 
@@ -10,6 +12,76 @@ enum class llm_dflash_selector_family {
     mixed,
     unidentified,
 };
+
+struct llm_dflash_selector_tensor_schema {
+    bool valid;
+    llm_tensor selector_hidden;
+    llm_tensor selector_pred;
+    llm_tensor selector_succ;
+    llm_tensor attn_conv_base;
+    llm_tensor attn_conv_proj;
+    llm_tensor ffn_conv_base;
+    llm_tensor ffn_conv_proj;
+    bool selector_codebooks_have_weight_suffix;
+};
+
+// Both published schemas describe the same trained DFlash2 tensors and graph.
+// Keep the wire-name translation here so admission, loading, and tests cannot
+// drift into separate compatibility policies.
+constexpr llm_dflash_selector_tensor_schema llm_dflash_selector_tensor_schema_for_family(
+        llm_dflash_selector_family family) {
+    switch (family) {
+        case llm_dflash_selector_family::fork_dflash2:
+            return {
+                true,
+                LLM_TENSOR_DFLASH2_SELECTOR_HIDDEN,
+                LLM_TENSOR_DFLASH2_SELECTOR_PRED,
+                LLM_TENSOR_DFLASH2_SELECTOR_SUCC,
+                LLM_TENSOR_DFLASH2_ATTN_CONV_BASE,
+                LLM_TENSOR_DFLASH2_ATTN_CONV_PROJ,
+                LLM_TENSOR_DFLASH2_FFN_CONV_BASE,
+                LLM_TENSOR_DFLASH2_FFN_CONV_PROJ,
+                false,
+            };
+        case llm_dflash_selector_family::upstream_compat:
+            return {
+                true,
+                LLM_TENSOR_DFLASH_SELECTOR_HIDDEN,
+                LLM_TENSOR_DFLASH_SELECTOR_PREV,
+                LLM_TENSOR_DFLASH_SELECTOR_NEXT,
+                LLM_TENSOR_DFLASH_ATTN_CONV_BASE,
+                LLM_TENSOR_DFLASH_ATTN_CONV_PROJ,
+                LLM_TENSOR_DFLASH_FFN_CONV_BASE,
+                LLM_TENSOR_DFLASH_FFN_CONV_PROJ,
+                true,
+            };
+        case llm_dflash_selector_family::none:
+        case llm_dflash_selector_family::mixed:
+        case llm_dflash_selector_family::unidentified:
+            return {
+                false,
+                LLM_TENSOR_DFLASH2_SELECTOR_HIDDEN,
+                LLM_TENSOR_DFLASH2_SELECTOR_PRED,
+                LLM_TENSOR_DFLASH2_SELECTOR_SUCC,
+                LLM_TENSOR_DFLASH2_ATTN_CONV_BASE,
+                LLM_TENSOR_DFLASH2_ATTN_CONV_PROJ,
+                LLM_TENSOR_DFLASH2_FFN_CONV_BASE,
+                LLM_TENSOR_DFLASH2_FFN_CONV_PROJ,
+                false,
+            };
+    }
+    return {
+        false,
+        LLM_TENSOR_DFLASH2_SELECTOR_HIDDEN,
+        LLM_TENSOR_DFLASH2_SELECTOR_PRED,
+        LLM_TENSOR_DFLASH2_SELECTOR_SUCC,
+        LLM_TENSOR_DFLASH2_ATTN_CONV_BASE,
+        LLM_TENSOR_DFLASH2_ATTN_CONV_PROJ,
+        LLM_TENSOR_DFLASH2_FFN_CONV_BASE,
+        LLM_TENSOR_DFLASH2_FFN_CONV_PROJ,
+        false,
+    };
+}
 
 // The fork and upstream compatibility schemas intentionally share GGUF metadata
 // keys, so metadata alone cannot select a runtime implementation. Their tensor

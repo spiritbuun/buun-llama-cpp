@@ -626,6 +626,32 @@ static void test_dflash_selector_family_contract() {
     GGML_ASSERT(llm_dflash_selector_family_from_identity(true,  false, true)  == family::upstream_compat);
     GGML_ASSERT(llm_dflash_selector_family_from_identity(false, true,  true)  == family::mixed);
     GGML_ASSERT(llm_dflash_selector_family_from_identity(true,  true,  true)  == family::mixed);
+
+    const auto fork_schema = llm_dflash_selector_tensor_schema_for_family(family::fork_dflash2);
+    GGML_ASSERT(fork_schema.valid);
+    GGML_ASSERT(fork_schema.selector_hidden == LLM_TENSOR_DFLASH2_SELECTOR_HIDDEN);
+    GGML_ASSERT(fork_schema.selector_pred   == LLM_TENSOR_DFLASH2_SELECTOR_PRED);
+    GGML_ASSERT(fork_schema.selector_succ   == LLM_TENSOR_DFLASH2_SELECTOR_SUCC);
+    GGML_ASSERT(fork_schema.attn_conv_base  == LLM_TENSOR_DFLASH2_ATTN_CONV_BASE);
+    GGML_ASSERT(fork_schema.attn_conv_proj  == LLM_TENSOR_DFLASH2_ATTN_CONV_PROJ);
+    GGML_ASSERT(fork_schema.ffn_conv_base   == LLM_TENSOR_DFLASH2_FFN_CONV_BASE);
+    GGML_ASSERT(fork_schema.ffn_conv_proj   == LLM_TENSOR_DFLASH2_FFN_CONV_PROJ);
+    GGML_ASSERT(!fork_schema.selector_codebooks_have_weight_suffix);
+
+    const auto upstream_schema = llm_dflash_selector_tensor_schema_for_family(family::upstream_compat);
+    GGML_ASSERT(upstream_schema.valid);
+    GGML_ASSERT(upstream_schema.selector_hidden == LLM_TENSOR_DFLASH_SELECTOR_HIDDEN);
+    GGML_ASSERT(upstream_schema.selector_pred   == LLM_TENSOR_DFLASH_SELECTOR_PREV);
+    GGML_ASSERT(upstream_schema.selector_succ   == LLM_TENSOR_DFLASH_SELECTOR_NEXT);
+    GGML_ASSERT(upstream_schema.attn_conv_base  == LLM_TENSOR_DFLASH_ATTN_CONV_BASE);
+    GGML_ASSERT(upstream_schema.attn_conv_proj  == LLM_TENSOR_DFLASH_ATTN_CONV_PROJ);
+    GGML_ASSERT(upstream_schema.ffn_conv_base   == LLM_TENSOR_DFLASH_FFN_CONV_BASE);
+    GGML_ASSERT(upstream_schema.ffn_conv_proj   == LLM_TENSOR_DFLASH_FFN_CONV_PROJ);
+    GGML_ASSERT(upstream_schema.selector_codebooks_have_weight_suffix);
+
+    GGML_ASSERT(!llm_dflash_selector_tensor_schema_for_family(family::none).valid);
+    GGML_ASSERT(!llm_dflash_selector_tensor_schema_for_family(family::mixed).valid);
+    GGML_ASSERT(!llm_dflash_selector_tensor_schema_for_family(family::unidentified).valid);
 }
 
 static void test_qwen4_qsa_layout_cpu(llama_model * model, size_t seed) {
@@ -2489,7 +2515,7 @@ static void test_dflash_loader_exact_identity() {
         return;
     }
 
-    const auto check = [](const char * stored_name, bool expect_fork, llm_dflash_selector_family expected_family) {
+    const auto check = [](const char * stored_name, bool fork_wire, llm_dflash_selector_family expected_family) {
         file_ptr file = make_dflash_selector_identity_file({ stored_name });
         GGML_ASSERT(file != nullptr);
         std::vector<std::string> splits;
@@ -2509,10 +2535,10 @@ static void test_dflash_loader_exact_identity() {
 
         // Generic tensor lookup must not cross the two wire families. Admission
         // below owns the compatibility decision before any tensor is loaded.
-        GGML_ASSERT((loader.get_tensor_meta("selector.hidden_proj.weight") != nullptr) == expect_fork);
-        GGML_ASSERT((loader.get_tensor_meta("selector_hidden.weight") != nullptr) != expect_fork);
-        GGML_ASSERT((loader.get_tensor_meta_exact("selector.hidden_proj.weight") != nullptr) == expect_fork);
-        GGML_ASSERT((loader.get_tensor_meta_exact("selector_hidden.weight") != nullptr) != expect_fork);
+        GGML_ASSERT((loader.get_tensor_meta("selector.hidden_proj.weight") != nullptr) == fork_wire);
+        GGML_ASSERT((loader.get_tensor_meta("selector_hidden.weight") != nullptr) != fork_wire);
+        GGML_ASSERT((loader.get_tensor_meta_exact("selector.hidden_proj.weight") != nullptr) == fork_wire);
+        GGML_ASSERT((loader.get_tensor_meta_exact("selector_hidden.weight") != nullptr) != fork_wire);
         GGML_ASSERT(llm_dflash_selector_family_from_loader(true, 1, loader) == expected_family);
 
         llama_model_params params = llama_model_default_params();
@@ -2528,17 +2554,13 @@ static void test_dflash_loader_exact_identity() {
             admitted = false;
             refusal = error.what();
         }
-        if (admitted != expect_fork) {
+        if (!admitted) {
             std::fprintf(stderr, "DFlash admission mismatch stored=%s admitted=%d refusal=%s\n",
                     stored_name, int(admitted), refusal.c_str());
         }
-        GGML_ASSERT(admitted == expect_fork);
-        if (expect_fork) {
-            GGML_ASSERT(model->hparams.dflash2_selector_rank == 1);
-        } else {
-            GGML_ASSERT(refusal.find("upstream DFlash convolution/selector tensor schema is unsupported") !=
-                    std::string::npos);
-        }
+        GGML_ASSERT(admitted);
+        GGML_ASSERT(model->hparams.dflash2_selector_rank == 1);
+        GGML_ASSERT(llm_dflash_selector_tensor_schema_for_family(expected_family).valid);
     };
 
     check("selector.hidden_proj.weight", true,  llm_dflash_selector_family::fork_dflash2);
