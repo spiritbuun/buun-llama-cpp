@@ -35,6 +35,8 @@ class llama_safetensors_metadata_sink {
     void set_bool(std::string_view key, bool value);
     void set_f32_array(std::string_view key, const float * values, size_t count);
     void set_i32_array(std::string_view key, const int32_t * values, size_t count);
+    void set_u32_array(std::string_view key, const uint32_t * values, size_t count);
+    void set_u64_array(std::string_view key, const uint64_t * values, size_t count);
     void set_string_array(std::string_view key, const std::vector<std::string> & values);
 
     gguf_context * release();

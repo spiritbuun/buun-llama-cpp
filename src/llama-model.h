@@ -525,6 +525,19 @@ struct llama_layer {
     struct ggml_tensor * indexer_comp_wgate = nullptr;
     struct ggml_tensor * indexer_comp_ape   = nullptr;
     struct ggml_tensor * indexer_comp_norm  = nullptr;
+    // Native block-FP8 sidecars. These are separate tensors because the
+    // published DeepSeek checkpoint keeps 128x128 E8M0 scales out of line.
+    struct ggml_tensor * wq_a_s               = nullptr;
+    struct ggml_tensor * wq_b_s               = nullptr;
+    struct ggml_tensor * wkv_s                = nullptr;
+    struct ggml_tensor * wo_a_s               = nullptr;
+    struct ggml_tensor * wo_b_s               = nullptr;
+    struct ggml_tensor * attn_comp_wkv_s      = nullptr;
+    struct ggml_tensor * attn_comp_wgate_s    = nullptr;
+    struct ggml_tensor * indexer_proj_s        = nullptr;
+    struct ggml_tensor * indexer_attn_q_b_s    = nullptr;
+    struct ggml_tensor * indexer_comp_wkv_s    = nullptr;
+    struct ggml_tensor * indexer_comp_wgate_s  = nullptr;
 
     // cogvlm
     struct ggml_tensor * visexp_attn_wqkv = nullptr;

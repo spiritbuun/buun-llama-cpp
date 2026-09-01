@@ -5056,6 +5056,83 @@ struct test_mul_mat_static_fp8 : public test_case {
     double max_nmse_err() override { return 5e-5; }
 };
 
+struct test_mul_mat_block_fp8 : public test_case {
+    static constexpr int64_t k = 256;
+    static constexpr int64_t n = 256;
+    static constexpr int64_t m = 3;
+    static constexpr int64_t batches = 2;
+
+    explicit test_mul_mat_block_fp8(bool permuted = false) : permuted(permuted) {}
+
+    std::string vars() override {
+        return std::string("k=256,n=256,m=3,batches=2,permuted=") + (permuted ? "true" : "false");
+    }
+    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_BLOCK_FP8"; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * weight = ggml_new_tensor_3d(ctx, GGML_TYPE_F8_E4M3, k, n, batches);
+        ggml_tensor * input;
+        if (permuted) {
+            ggml_tensor * base = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, batches, m);
+            ggml_set_name(base, "block_fp8_input_base");
+            input = ggml_permute(ctx, base, 0, 2, 1, 3);
+        } else {
+            input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, m, batches);
+            ggml_set_name(input, "block_fp8_input");
+        }
+        ggml_tensor * scale  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n * batches / 128, k / 128);
+        ggml_set_name(weight, "block_fp8_weight");
+        ggml_set_name(scale,  "block_fp8_scale");
+        ggml_tensor * out = ggml_mul_mat(ctx, weight, input);
+        out->src[2] = scale;
+        ggml_set_name(out, "block_fp8_out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const ggml_type_traits * f8 = ggml_get_type_traits(GGML_TYPE_F8_E4M3);
+        for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor != nullptr;
+             tensor = ggml_get_next_tensor(ctx, tensor)) {
+            if (strcmp(tensor->name, "block_fp8_weight") == 0) {
+                std::vector<float> values(k * n * batches);
+                for (int64_t batch = 0; batch < batches; ++batch) {
+                    for (int64_t row = 0; row < n; ++row) {
+                        for (int64_t col = 0; col < k; ++col) {
+                            values[(batch * n + row) * k + col] =
+                                0.25f * float((7 * batch + 3 * row + col) % 17 - 8);
+                        }
+                    }
+                }
+                std::vector<uint8_t> packed(values.size());
+                f8->from_float_ref(values.data(), packed.data(), values.size());
+                ggml_backend_tensor_set(tensor, packed.data(), 0, packed.size());
+            } else if (strcmp(tensor->name, permuted ? "block_fp8_input_base" : "block_fp8_input") == 0) {
+                std::vector<float> input(k * m * batches);
+                for (int64_t batch = 0; batch < batches; ++batch) {
+                    for (int64_t token = 0; token < m; ++token) {
+                        for (int64_t col = 0; col < k; ++col) {
+                            input[(batch * m + token) * k + col] =
+                                (float((batch + token + 2) * (col % 23) - 17) + 0.37f) / 9.0f;
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(tensor, input.data(), 0, input.size() * sizeof(float));
+            } else if (strcmp(tensor->name, "block_fp8_scale") == 0) {
+                std::array<float, (n * batches / 128) * (k / 128)> scales{};
+                for (size_t i = 0; i < scales.size(); ++i) {
+                    scales[i] = 0.125f * float(i + 1);
+                }
+                ggml_backend_tensor_set(tensor, scales.data(), 0, sizeof(scales));
+            }
+        }
+    }
+
+    double max_nmse_err() override { return 1e-5; }
+
+  private:
+    bool permuted;
+};
+
 struct test_mul_mat_static_i8 : public test_case {
     static constexpr int64_t k = 32;
     static constexpr int64_t n = 4;
@@ -10323,6 +10400,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F8_E4M3, GGML_TYPE_F32, 32, 1, k, {1, 1}, {1, 1}));
     }
     test_cases.emplace_back(new test_mul_mat_static_fp8());
+    test_cases.emplace_back(new test_mul_mat_block_fp8());
+    test_cases.emplace_back(new test_mul_mat_block_fp8(true));
     test_cases.emplace_back(new test_mul_mat_static_i8());
     test_cases.emplace_back(new test_mul_mat_static_i8(true));
     test_cases.emplace_back(new test_mul_mat_static_i8(false, true));

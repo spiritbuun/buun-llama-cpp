@@ -2596,12 +2596,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         const bool generic_fp8_block = src0->type == GGML_TYPE_F8_E4M3 &&
             !ggml_cuda_humming_fp8_is_repacked(src0) && src1->type == GGML_TYPE_F32 &&
             dst->type == GGML_TYPE_F32 && scale->type == GGML_TYPE_F32 &&
-            src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+            src0->ne[3] == 1 && src1->ne[3] == 1 && src1->ne[2] == src0->ne[2] &&
             src0->ne[0] % 128 == 0 && src0->ne[1] % 128 == 0 &&
-            scale->ne[0] == src0->ne[1] / 128 && scale->ne[1] == src0->ne[0] / 128 &&
+            scale->ne[0] == src0->ne[1] * src0->ne[2] / 128 && scale->ne[1] == src0->ne[0] / 128 &&
             scale->ne[2] == 1 && scale->ne[3] == 1 && src1->ne[0] == src0->ne[0] &&
             dst->ne[0] == src0->ne[1] && dst->ne[1] == src1->ne[1] &&
-            ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
+            ggml_is_contiguous(src0) && src1->nb[0] == sizeof(float) &&
             ggml_is_contiguous(scale) && ggml_is_contiguous(dst);
         if (generic_fp8_block) {
             ggml_cuda_pool_alloc<nv_bfloat16> weight_bf16(ctx.pool(), ggml_nelements(src0));
@@ -7670,11 +7670,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     }
                     return a->type == GGML_TYPE_F8_E4M3 && b->type == GGML_TYPE_F32 &&
                            op->type == GGML_TYPE_F32 && ggml_is_contiguous(a) &&
-                           ggml_is_contiguous(b) && ggml_is_contiguous(scale) &&
+                           b->nb[0] == sizeof(float) && ggml_is_contiguous(scale) &&
                            ggml_is_contiguous(op) && a->ne[0] % 128 == 0 && a->ne[1] % 128 == 0 &&
-                           scale->type == GGML_TYPE_F32 && scale->ne[0] == a->ne[1] / 128 &&
+                           scale->type == GGML_TYPE_F32 && scale->ne[0] == a->ne[1] * a->ne[2] / 128 &&
                            scale->ne[1] == a->ne[0] / 128 && scale->ne[2] == 1 && scale->ne[3] == 1 &&
                            b->ne[0] == a->ne[0] && op->ne[0] == a->ne[1] && op->ne[1] == b->ne[1] &&
+                           a->ne[3] == 1 && b->ne[2] == a->ne[2] && b->ne[3] == 1 &&
                            cc >= GGML_CUDA_CC_AMPERE;
 #endif
                 }

@@ -38,6 +38,7 @@ enum class llama_safetensors_dtype {
     I64,
     F8_E4M3,
     F8_E5M2,
+    F8_E8M0,
     F16,
     BF16,
     F32,
@@ -104,6 +105,8 @@ struct llama_safetensors_quant_group {
     bool                           input_dynamic = true;
     bool                           input_symmetric = true;
     bool                           modelopt = false;
+    bool                           hf_mxfp4 = false;
+    bool                           e8m0_block_scale = false;
     bool                           legacy_fp8_i8_storage = false;
     bool                           act_order = false;
     float                          input_scale_ub = 0.0f;

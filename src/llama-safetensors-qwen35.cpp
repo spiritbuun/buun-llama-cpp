@@ -397,8 +397,10 @@ void validate_transform_plan(const source_spec & spec, const std::string & targe
     const bool packed_affine_rows =
         materialization == llama_safetensors_quant_materialization::AWQ_REPACK ||
         materialization == llama_safetensors_quant_materialization::GPTQ_REPACK;
-    const bool packed_columns =
-        materialization == llama_safetensors_quant_materialization::NVFP4_REPACK || packed_affine_rows;
+    // NVFP4 is repacked before layout transforms. Its 64-value storage blocks
+    // can therefore be permuted directly when the Qwen value-head mapping is
+    // block aligned (validated by apply_quantized_layout_transform()).
+    const bool packed_columns = packed_affine_rows;
     const bool gptq_act_order = spec.quant->target_type == GGML_TYPE_GPTQ_AO ||
         materialization == llama_safetensors_quant_materialization::GPTQ_SCALE_BUNDLE;
     for (transform_kind transform : spec.transforms) {
@@ -1191,11 +1193,14 @@ std::vector<uint8_t> llama_safetensors_qwen35_importer::materialize(const std::s
         bool value_converted = false;
         const bool block_scale = spec.quant &&
             spec.quant->materialization == llama_safetensors_quant_materialization::FP8_BLOCK_SCALE;
+        const bool nvfp4_quant_blocks = spec.quant &&
+            spec.quant->materialization == llama_safetensors_quant_materialization::NVFP4_REPACK;
         const bool canonical_quant_blocks = spec.quant &&
             (spec.quant->materialization == llama_safetensors_quant_materialization::PACKED_INT4_REPACK ||
              spec.quant->materialization == llama_safetensors_quant_materialization::PACKED_INT8_REPACK ||
              spec.quant->materialization == llama_safetensors_quant_materialization::QUARK_W4A16_REPACK ||
-             spec.quant->materialization == llama_safetensors_quant_materialization::TORCHAO_INT4_REPACK);
+             spec.quant->materialization == llama_safetensors_quant_materialization::TORCHAO_INT4_REPACK ||
+             nvfp4_quant_blocks);
         std::vector<int64_t> quant_shape;
         if (spec.quant) {
             quant_shape = spec.quant->target_shape;

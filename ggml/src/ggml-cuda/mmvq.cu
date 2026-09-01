@@ -35,15 +35,19 @@ static __global__ void dequantize_fp8_block_bf16_kernel(
         const float * scale,
         nv_bfloat16 * dst,
         int64_t k,
-        int64_t n) {
+        int64_t n,
+        int64_t batches) {
     const int64_t index = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (index >= k * n) {
+    if (index >= k * n * batches) {
         return;
     }
-    const int64_t row = index / k;
-    const int64_t col = index - row * k;
+    const int64_t batch = index / (k * n);
+    const int64_t local = index - batch * k * n;
+    const int64_t row = local / k;
+    const int64_t col = local - row * k;
     const int64_t n_blocks = n / 128;
-    const float block_scale = scale[(col / 128) * n_blocks + row / 128];
+    const int64_t all_n_blocks = n_blocks * batches;
+    const float block_scale = scale[(col / 128) * all_n_blocks + batch * n_blocks + row / 128];
     dst[index] = __float2bfloat16(ggml_cuda_e4m3_to_fp32(weight[index]) * block_scale);
 }
 
@@ -53,13 +57,14 @@ void ggml_cuda_dequantize_fp8_block_bf16(
         nv_bfloat16 * dst,
         cudaStream_t stream) {
     GGML_ASSERT(weight->type == GGML_TYPE_F8_E4M3 && scale->type == GGML_TYPE_F32);
-    GGML_ASSERT(weight->ne[0] % 128 == 0 && weight->ne[1] % 128 == 0);
-    GGML_ASSERT(scale->ne[0] == weight->ne[1] / 128 && scale->ne[1] == weight->ne[0] / 128);
-    const int64_t count = weight->ne[0] * weight->ne[1];
+    GGML_ASSERT(weight->ne[0] % 128 == 0 && weight->ne[1] % 128 == 0 && weight->ne[3] == 1);
+    GGML_ASSERT(scale->ne[0] == weight->ne[1] * weight->ne[2] / 128 &&
+                scale->ne[1] == weight->ne[0] / 128 && scale->ne[2] == 1 && scale->ne[3] == 1);
+    const int64_t count = weight->ne[0] * weight->ne[1] * weight->ne[2];
     constexpr int threads = 256;
     dequantize_fp8_block_bf16_kernel<<<(count + threads - 1) / threads, threads, 0, stream>>>(
         static_cast<const uint8_t *>(weight->data), static_cast<const float *>(scale->data),
-        dst, weight->ne[0], weight->ne[1]);
+        dst, weight->ne[0], weight->ne[1], weight->ne[2]);
 }
 
 bool ggml_cuda_mul_mat_marlin_q4_a32(

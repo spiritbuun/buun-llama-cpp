@@ -3,6 +3,8 @@
 #include "llama-safetensors-importer.h"
 #include "llama-safetensors-qwen3.h"
 #include "llama-safetensors-qwen35.h"
+#include "llama-safetensors-qwen4exp.h"
+#include "llama-safetensors-deepseek4.h"
 #include "llama-model-source.h"
 #include "llama.h"
 
@@ -42,13 +44,29 @@ std::unique_ptr<llama_safetensors_importer> create_qwen3_importer(
     return std::make_unique<llama_safetensors_qwen3_importer>(model_dir, config, io_mode);
 }
 
+std::unique_ptr<llama_safetensors_importer> create_qwen4exp_importer(
+        const std::filesystem::path & model_dir,
+        const llama_safetensors_json & config,
+        llama_safetensors_io_mode io_mode) {
+    return std::make_unique<llama_safetensors_qwen4exp_importer>(model_dir, config, io_mode);
+}
+
+std::unique_ptr<llama_safetensors_importer> create_deepseek4_importer(
+        const std::filesystem::path & model_dir,
+        const llama_safetensors_json & config,
+        llama_safetensors_io_mode io_mode) {
+    return std::make_unique<llama_safetensors_deepseek4_importer>(model_dir, config, io_mode);
+}
+
 std::unique_ptr<llama_safetensors_importer> select_importer(
         const std::filesystem::path & model_dir,
         llama_safetensors_io_mode io_mode) {
     const llama_safetensors_json config = llama_safetensors_read_model_config(model_dir);
-    static constexpr std::array<importer_registration, 2> importers = { {
+    static constexpr std::array<importer_registration, 4> importers = { {
         { "qwen3", llama_safetensors_qwen3_importer::probe, create_qwen3_importer },
         { "qwen3_5", llama_safetensors_qwen35_importer::probe, create_qwen35_importer },
+        { "qwen4_exp", llama_safetensors_qwen4exp_importer::probe, create_qwen4exp_importer },
+        { "deepseek_v4", llama_safetensors_deepseek4_importer::probe, create_deepseek4_importer },
     } };
 
     const importer_registration * match = nullptr;
@@ -80,6 +98,7 @@ std::unique_ptr<llama_safetensors_importer> select_importer(
 
 llama_safetensors_io_mode source_io_mode(llama_load_mode load_mode) {
     switch (load_mode) {
+        case LLAMA_LOAD_MODE_AUTO:
         case LLAMA_LOAD_MODE_MMAP:
         case LLAMA_LOAD_MODE_MMAP_MLOCK:
             return llama_safetensors_io_mode::MMAP;

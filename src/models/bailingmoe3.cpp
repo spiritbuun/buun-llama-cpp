@@ -64,9 +64,9 @@ void llama_model_bailingmoe3::load_arch_tensors(llama_model_loader & ml) {
     const int64_t qk_head_dim = hparams.n_embd_head_k_mla();
     const int64_t v_head_dim = hparams.n_embd_head_v_mla();
 
-    const bool mtp_only = (hparams.n_layer_nextn > 0) && (ml.get_weight("blk.0.attn_norm.weight") == nullptr);
+    const bool mtp_only = (hparams.n_layer_nextn > 0) && !ml.has_tensor("blk.0.attn_norm.weight");
     const std::string mtp_probe = "blk." + std::to_string(n_layer) + ".nextn.eh_proj.weight";
-    const bool trunk_only = (hparams.n_layer_nextn > 0) && (ml.get_weight(mtp_probe.c_str()) == nullptr);
+    const bool trunk_only = (hparams.n_layer_nextn > 0) && !ml.has_tensor(mtp_probe.c_str());
     const int trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
     int       mtp_flags   = trunk_only ? TENSOR_NOT_REQUIRED : 0;
 

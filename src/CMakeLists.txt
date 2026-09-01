@@ -8,6 +8,18 @@ llama_add_compile_flags()
 
 file(GLOB LLAMA_MODELS_SOURCES "models/*.cpp")
 
+# DeepSeek-V4 checkpoints do not currently ship their canonical chat template.
+# Keep the native safetensors loader and GGUF converter on the same repository
+# asset without requiring that asset to be present beside an installed binary.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/../models/templates/deepseek-ai-DeepSeek-V4.jinja"
+          LLAMA_SAFETENSORS_DEEPSEEK4_CHAT_TEMPLATE)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/../models/templates/deepseek-ai-DeepSeek-V4-Flash-0731.jinja"
+          LLAMA_SAFETENSORS_DEEPSEEK4_0731_CHAT_TEMPLATE)
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/llama-safetensors-templates.h.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/llama-safetensors-templates.h"
+    @ONLY)
+
 add_library(llama
             ../include/llama.h
             llama.cpp
@@ -48,6 +60,8 @@ add_library(llama
             llama-safetensors-tensor.cpp
             llama-safetensors-qwen3.cpp
             llama-safetensors-qwen35.cpp
+    llama-safetensors-qwen4exp.cpp
+    llama-safetensors-deepseek4.cpp
             llama-vocab.cpp
             llama-cache-accounting.cpp
             llama-cache-budget.cpp
@@ -88,7 +102,7 @@ target_compile_definitions(llama PRIVATE
     LLAMA_COMMIT="${LLAMA_BUILD_COMMIT}"
 )
 
-target_include_directories(llama PRIVATE . ../vendor)
+target_include_directories(llama PRIVATE . ../vendor "${CMAKE_CURRENT_BINARY_DIR}")
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 

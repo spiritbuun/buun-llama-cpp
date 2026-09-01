@@ -194,6 +194,8 @@ struct llama_model_loader {
 
     struct ggml_tensor * get_tensor_meta(const char * name) const;
 
+    bool has_tensor(const char * name) const;
+
     bool get_tensor_info(const char * name, ggml_type & type, std::array<int64_t, GGML_MAX_DIMS> & ne) const;
 
     // Exact GGUF wire-name lookup. Unlike get_tensor_meta(), this deliberately

@@ -1782,13 +1782,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 layer.ffn_down_s = load_weight_scale(tn(LLM_TENSOR_FFN_DOWN, "scale", i), layer.ffn_down);
             }
             if (!layer.ffn_gate_shexp_s && layer.ffn_gate_shexp) {
-                layer.ffn_gate_shexp_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ffn_gate_shexp_s = load_weight_scale(
+                    tn(LLM_TENSOR_FFN_GATE_SHEXP, "scale", i), layer.ffn_gate_shexp);
             }
             if (!layer.ffn_down_shexp_s && layer.ffn_down_shexp) {
-                layer.ffn_down_shexp_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ffn_down_shexp_s = load_weight_scale(
+                    tn(LLM_TENSOR_FFN_DOWN_SHEXP, "scale", i), layer.ffn_down_shexp);
             }
             if (!layer.ffn_up_shexp_s && layer.ffn_up_shexp) {
-                layer.ffn_up_shexp_s = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ffn_up_shexp_s = load_weight_scale(
+                    tn(LLM_TENSOR_FFN_UP_SHEXP, "scale", i), layer.ffn_up_shexp);
             }
 
             // MoE expert weight scales (per-expert, shape {n_expert})

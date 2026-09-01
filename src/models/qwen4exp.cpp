@@ -159,8 +159,10 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
     // A PR-compatible standalone MTP artifact contains the trailing draft
     // block and shared embedding/head, but no target trunk or target HC head.
+    ggml_type trunk_type = GGML_TYPE_COUNT;
+    std::array<int64_t, GGML_MAX_DIMS> trunk_shape{};
     const bool mtp_only = ml.load_mtp && hparams.n_layer_nextn > 0 &&
-        ml.get_weight("blk.0.hc_attn_norm.weight") == nullptr;
+        !ml.get_tensor_info("blk.0.hc_attn_norm.weight", trunk_type, trunk_shape);
     const int trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
@@ -178,8 +180,12 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     // flat [ple_head_dim, n_rows] gather target; n_rows is padded, so read it back
     if (hparams.ple_n_heads > 0) {
         const std::string ple_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
-        const auto & ple_w = ml.require_weight(ple_name.c_str());
-        const int64_t ple_rows = ple_w.tensor->ne[1];
+        ggml_type ple_type = GGML_TYPE_COUNT;
+        std::array<int64_t, GGML_MAX_DIMS> ple_shape = {};
+        if (!ml.get_tensor_info(ple_name.c_str(), ple_type, ple_shape) || ple_shape[1] <= 0) {
+            throw std::runtime_error(format("required PLE tensor '%s' has no valid source description", ple_name.c_str()));
+        }
+        const int64_t ple_rows = ple_shape[1];
 
         // sanity check
         for (uint32_t h = 0; h < hparams.ple_n_heads; ++h) {
@@ -244,8 +250,9 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         }
 
         if (hparams.is_ple(il)) {
-            layer.ple_key        = create_tensor(tn(LLM_TENSOR_PLE_KEY,        "weight", il), { n_embd, hc_dim }, trunk_flags);
-            layer.ple_value      = create_tensor(tn(LLM_TENSOR_PLE_VALUE,      "weight", il), { n_embd, n_embd }, trunk_flags);
+            const int64_t ple_dim = hparams.ple_head_dim * hparams.ple_n_heads;
+            layer.ple_key        = create_tensor(tn(LLM_TENSOR_PLE_KEY,        "weight", il), { ple_dim, hc_dim }, trunk_flags);
+            layer.ple_value      = create_tensor(tn(LLM_TENSOR_PLE_VALUE,      "weight", il), { ple_dim, n_embd }, trunk_flags);
             layer.ple_norm_key   = create_tensor(tn(LLM_TENSOR_PLE_NORM_KEY,   "weight", il), { hc_dim }, trunk_flags);
             layer.ple_norm_query = create_tensor(tn(LLM_TENSOR_PLE_NORM_QUERY, "weight", il), { hc_dim }, trunk_flags);
             layer.ple_norm_conv  = create_tensor(tn(LLM_TENSOR_PLE_NORM_CONV,  "weight", il), { hc_dim }, trunk_flags);
@@ -419,10 +426,13 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
             n_embd, hc, n_tokens, 1);
     cb(e_norm, "mtp_enorm", il);
 
+    ggml_tensor * eh_input = ggml_concat(ctx0, e_norm, h_norm, 0);
+    eh_input = ggml_reshape_2d(ctx0, eh_input, 2*n_embd, hc*n_tokens);
     ggml_tensor * inpL = build_lora_mm(
             layer.nextn.eh_proj,
-            ggml_concat(ctx0, e_norm, h_norm, 0),
+            eh_input,
             layer.nextn.eh_proj_s);
+    inpL = ggml_reshape_3d(ctx0, inpL, n_embd, hc, n_tokens);
     cb(inpL, "mtp_eh_proj", il);
 
     ggml_tensor * inject = nullptr;

@@ -273,6 +273,10 @@ bool llama_safetensors_quant_adapters::format_applies(
             }
             [[fallthrough]];
         case llama_safetensors_quant_format::MXFP4_PACK:
+            if (group.hf_mxfp4) {
+                const auto * weight = registry_.find(module + ".weight");
+                return weight != nullptr && weight->dtype == llama_safetensors_dtype::I8;
+            }
             return registry_.find(module + (group.modelopt ? ".weight" : ".weight_packed")) != nullptr;
         case llama_safetensors_quant_format::MXFP8:
         case llama_safetensors_quant_format::FP8_GROUP: {
@@ -537,13 +541,18 @@ std::optional<llama_safetensors_quant_binding> llama_safetensors_quant_adapters:
             result.target_type    = GGML_TYPE_NVFP4;
             result.materialization = llama_safetensors_quant_materialization::NVFP4_REPACK;
             const auto & source = require_tensor(registry_, result.primary);
-            if (source.shape.size() != 2 || source.shape[1] > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) / 2) {
+            if ((source.shape.size() != 2 && source.shape.size() != 3) ||
+                source.shape.back() > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) / 2) {
                 throw std::runtime_error("invalid packed NVFP4 dimensions for '" + result.primary + "'");
             }
-            result.target_shape = {
-                static_cast<int64_t>(source.shape[1] * 2),
-                static_cast<int64_t>(source.shape[0]),
-            };
+            result.target_shape.reserve(source.shape.size());
+            result.target_shape.push_back(static_cast<int64_t>(source.shape.back() * 2));
+            for (auto it = source.shape.rbegin() + 1; it != source.shape.rend(); ++it) {
+                if (*it > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+                    throw std::runtime_error("packed NVFP4 dimension exceeds runtime limits for '" + result.primary + "'");
+                }
+                result.target_shape.push_back(static_cast<int64_t>(*it));
+            }
         } else if (role == llama_safetensors_quant_role::WEIGHT_SCALE) {
             result.primary = module + (group->modelopt ? ".weight_scale_2" : ".weight_global_scale");
             result.target_type     = GGML_TYPE_F32;
@@ -570,14 +579,14 @@ std::optional<llama_safetensors_quant_binding> llama_safetensors_quant_adapters:
             return std::nullopt;
         }
         if (role == llama_safetensors_quant_role::INPUT_SCALE) {
-            result.primary         = module + (group->modelopt ? ".weight" : ".weight_packed");
+            result.primary         = module + (group->modelopt || group->hf_mxfp4 ? ".weight" : ".weight_packed");
             result.target_type     = GGML_TYPE_I32;
             result.target_shape    = { 1 };
             result.materialization = llama_safetensors_quant_materialization::DYNAMIC_MXFP4_MARKER;
             return result;
         }
-        result.primary         = module + (group->modelopt ? ".weight" : ".weight_packed");
-        result.auxiliaries     = { module + ".weight_scale" };
+        result.primary         = module + (group->modelopt || group->hf_mxfp4 ? ".weight" : ".weight_packed");
+        result.auxiliaries     = { module + (group->hf_mxfp4 ? ".scale" : ".weight_scale") };
         result.target_type     = GGML_TYPE_MXFP4;
         result.materialization = llama_safetensors_quant_materialization::MXFP4_REPACK;
         const auto & source = require_tensor(registry_, result.primary);
@@ -886,7 +895,9 @@ std::optional<llama_safetensors_quant_binding> llama_safetensors_quant_adapters:
             static_cast<int64_t>(scale.shape[0]),
             static_cast<int64_t>(scale.shape[1]),
         };
-        result.materialization = llama_safetensors_quant_materialization::FP8_BLOCK_SCALE;
+        result.materialization = group->e8m0_block_scale ?
+            llama_safetensors_quant_materialization::FP8_BLOCK_SCALE_E8M0 :
+            llama_safetensors_quant_materialization::FP8_BLOCK_SCALE;
     }
     return result;
 }
@@ -894,7 +905,7 @@ std::optional<llama_safetensors_quant_binding> llama_safetensors_quant_adapters:
 std::string llama_safetensors_quant_adapters::weight_scale_name(const std::string & module) const {
     const llama_safetensors_quant_group * group = match(module);
     if (group != nullptr && group->format == llama_safetensors_quant_format::FP8_BLOCK && !group->modelopt) {
-        return module + ".weight_scale_inv";
+        return module + (group->e8m0_block_scale ? ".scale" : ".weight_scale_inv");
     }
     return module + ".weight_scale";
 }
@@ -1079,7 +1090,8 @@ void llama_safetensors_quant_adapters::validate() {
                 expected = group->format;
                 ++summary_.nvfp4;
             } else if (group != nullptr && group->format == llama_safetensors_quant_format::MXFP4_PACK &&
-                    group->modelopt && tensor.dtype == llama_safetensors_dtype::U8) {
+                    ((group->modelopt && tensor.dtype == llama_safetensors_dtype::U8) ||
+                     (group->hf_mxfp4 && tensor.dtype == llama_safetensors_dtype::I8))) {
                 expected = group->format;
                 ++summary_.mxfp4;
             } else if (group != nullptr &&
@@ -1557,11 +1569,15 @@ void llama_safetensors_quant_adapters::validate() {
                 throw std::runtime_error("invalid W4A8 group-128 contract for source tensor '" + tensor.name + "'");
             }
         } else if (expected == llama_safetensors_quant_format::MXFP4_PACK) {
-            const std::string scale_name = module + ".weight_scale";
+            const std::string scale_name = module + (group->hf_mxfp4 ? ".scale" : ".weight_scale");
             const auto & scale = require_tensor(registry_, scale_name);
             dependencies_[tensor.name] = { scale_name };
-            if (tensor.dtype != llama_safetensors_dtype::U8 || tensor.shape.size() != 2 ||
-                tensor.shape[1] % 16 != 0 || scale.dtype != llama_safetensors_dtype::U8 ||
+            const bool bytes_ok = group->hf_mxfp4 ? tensor.dtype == llama_safetensors_dtype::I8 :
+                                                    tensor.dtype == llama_safetensors_dtype::U8;
+            const bool scale_ok = group->hf_mxfp4 ? scale.dtype == llama_safetensors_dtype::F8_E8M0 :
+                                                    scale.dtype == llama_safetensors_dtype::U8;
+            if (!bytes_ok || tensor.shape.size() != 2 ||
+                tensor.shape[1] % 16 != 0 || !scale_ok ||
                 scale.shape != std::vector<uint64_t>({ tensor.shape[0], tensor.shape[1] / 16 })) {
                 throw std::runtime_error("invalid packed MXFP4 group-32 contract for source tensor '" + tensor.name + "'");
             }
@@ -1624,7 +1640,8 @@ void llama_safetensors_quant_adapters::validate() {
                 throw std::runtime_error("invalid channel-scale contract for source tensor '" + tensor.name + "'");
             }
         } else if (expected == llama_safetensors_quant_format::FP8_BLOCK) {
-            const std::string scale_name = module + (group->modelopt ? ".weight_scale" : ".weight_scale_inv");
+            const std::string scale_name = module + (group->modelopt ? ".weight_scale" :
+                group->e8m0_block_scale ? ".scale" : ".weight_scale_inv");
             const auto & scale = require_tensor(registry_, scale_name);
             dependencies_[tensor.name] = { scale_name };
             if (tensor.shape.size() != 2 || tensor.shape[0] % 128 != 0 || tensor.shape[1] % 128 != 0) {
@@ -1633,6 +1650,9 @@ void llama_safetensors_quant_adapters::validate() {
             const bool source_scale_valid = group->modelopt ?
                 scale.dtype == llama_safetensors_dtype::F32 && scale.shape == std::vector<uint64_t>({
                     tensor.shape[0] / 128, 1, tensor.shape[1] / 128, 1 }) :
+                group->e8m0_block_scale ?
+                scale.dtype == llama_safetensors_dtype::F8_E8M0 && scale.shape == std::vector<uint64_t>({
+                    tensor.shape[0] / 128, tensor.shape[1] / 128 }) :
                 scale.dtype == llama_safetensors_dtype::BF16 && scale.shape == std::vector<uint64_t>({
                     tensor.shape[0] / 128, tensor.shape[1] / 128 });
             if (!source_scale_valid) {
@@ -1648,10 +1668,14 @@ void llama_safetensors_quant_adapters::validate() {
                 dependencies_[tensor.name].push_back(
                     module + (group->modelopt ? ".input_scale" : ".input_global_scale"));
             }
-            if (tensor.shape.size() != 2 || tensor.dtype != llama_safetensors_dtype::U8 ||
-                scale.dtype != llama_safetensors_dtype::F8_E4M3 || scale.shape.size() != 2 ||
-                scale.shape[0] != tensor.shape[0] || tensor.shape[1] % 8 != 0 ||
-                tensor.shape[1] / 8 != scale.shape[1] || scale.shape[1] % 4 != 0) {
+            const bool ranks_valid = (tensor.shape.size() == 2 || tensor.shape.size() == 3) &&
+                scale.shape.size() == tensor.shape.size();
+            const bool leading_dims_match = ranks_valid && std::equal(
+                tensor.shape.begin(), tensor.shape.end() - 1, scale.shape.begin());
+            if (!ranks_valid || tensor.dtype != llama_safetensors_dtype::U8 ||
+                scale.dtype != llama_safetensors_dtype::F8_E4M3 || !leading_dims_match ||
+                tensor.shape.back() % 8 != 0 || tensor.shape.back() / 8 != scale.shape.back() ||
+                scale.shape.back() % 4 != 0) {
                 throw std::runtime_error("invalid packed NVFP4 scale contract for source tensor '" + tensor.name + "'");
             }
             require_positive_f32_scalar(registry_, weight_global);
@@ -1676,13 +1700,21 @@ std::vector<uint8_t> llama_safetensors_quant_adapters::repack_nvfp4(
         const uint8_t * scale,
         size_t scale_size) const {
     if (weight_desc.dtype != llama_safetensors_dtype::U8 || scale_desc.dtype != llama_safetensors_dtype::F8_E4M3 ||
-        weight_desc.shape.size() != 2 || scale_desc.shape.size() != 2) {
+        (weight_desc.shape.size() != 2 && weight_desc.shape.size() != 3) ||
+        scale_desc.shape.size() != weight_desc.shape.size() ||
+        !std::equal(weight_desc.shape.begin(), weight_desc.shape.end() - 1, scale_desc.shape.begin())) {
         throw std::runtime_error("invalid NVFP4 source tensor contract");
     }
-    const size_t rows        = weight_desc.shape[0];
-    const size_t packed_cols = weight_desc.shape[1];
-    const size_t blocks      = scale_desc.shape[1];
-    if (scale_desc.shape[0] != rows || packed_cols != blocks * 8 || blocks % 4 != 0 ||
+    size_t rows = 1;
+    for (size_t i = 0; i + 1 < weight_desc.shape.size(); ++i) {
+        if (weight_desc.shape[i] > std::numeric_limits<size_t>::max() / rows) {
+            throw std::runtime_error("NVFP4 source tensor is too large");
+        }
+        rows *= static_cast<size_t>(weight_desc.shape[i]);
+    }
+    const size_t packed_cols = weight_desc.shape.back();
+    const size_t blocks      = scale_desc.shape.back();
+    if (packed_cols != blocks * 8 || blocks % 4 != 0 ||
         weight_size != rows * packed_cols || scale_size != rows * blocks) {
         throw std::runtime_error("inconsistent NVFP4 source tensor shapes");
     }
@@ -2072,9 +2104,11 @@ std::vector<uint8_t> llama_safetensors_quant_adapters::repack_mxfp4(
     constexpr size_t values_per_block = 32;
     constexpr size_t packed_per_block = values_per_block / 2;
     constexpr size_t block_size = 1 + packed_per_block;
-    if (weight_desc.dtype != llama_safetensors_dtype::U8 || weight_desc.shape.size() != 2 ||
+    if ((weight_desc.dtype != llama_safetensors_dtype::U8 && weight_desc.dtype != llama_safetensors_dtype::I8) ||
+        weight_desc.shape.size() != 2 ||
         weight_desc.shape[1] % packed_per_block != 0 ||
-        scale_desc.dtype != llama_safetensors_dtype::U8 ||
+        (scale_desc.dtype != llama_safetensors_dtype::U8 &&
+         scale_desc.dtype != llama_safetensors_dtype::F8_E8M0) ||
         scale_desc.shape != std::vector<uint64_t>({
             weight_desc.shape[0], weight_desc.shape[1] / packed_per_block })) {
         throw std::runtime_error("inconsistent compressed-tensors MXFP4 source tensors");
@@ -2093,13 +2127,14 @@ std::vector<uint8_t> llama_safetensors_quant_adapters::repack_mxfp4(
             uint8_t * out = result.data() + block_index * block_size;
             out[0] = scale[block_index];
             const uint8_t * in = weight + row * packed_cols + block * packed_per_block;
-            uint8_t codes[values_per_block];
-            for (size_t i = 0; i < packed_per_block; ++i) {
-                codes[2 * i + 0] = in[i] & 0x0f;
-                codes[2 * i + 1] = in[i] >> 4;
-            }
-            for (size_t i = 0; i < packed_per_block; ++i) {
-                out[1 + i] = codes[i] | (codes[i + packed_per_block] << 4);
+            // The source packs adjacent values in each byte. GGML packs the
+            // first and second 16-value halves together. Move two output
+            // bytes per iteration without expanding the block to nibbles.
+            for (size_t i = 0; i < packed_per_block / 2; ++i) {
+                const uint8_t lo = in[i];
+                const uint8_t hi = in[i + packed_per_block / 2];
+                out[1 + 2 * i + 0] = (lo & 0x0f) | (hi << 4);
+                out[1 + 2 * i + 1] = (lo >> 4) | (hi & 0xf0);
             }
         }
     }
@@ -3260,6 +3295,18 @@ std::vector<uint8_t> llama_safetensors_quant_adapters::finalize(
     if (binding.materialization == llama_safetensors_quant_materialization::FP8_BLOCK_SCALE_MODELOPT) {
         const llama_safetensors_tensor & source = require_tensor(registry_, binding.primary);
         return transpose_2d(data, source.shape[0], source.shape[2], sizeof(float));
+    }
+    if (binding.materialization == llama_safetensors_quant_materialization::FP8_BLOCK_SCALE_E8M0) {
+        const llama_safetensors_tensor & source = require_tensor(registry_, binding.primary);
+        std::vector<uint8_t> converted(data.size() * sizeof(float));
+        for (size_t i = 0; i < data.size(); ++i) {
+            if (data[i] == 0xff) {
+                throw std::runtime_error("E8M0 scale uses the reserved NaN encoding: '" + binding.primary + "'");
+            }
+            const float value = std::ldexp(1.0f, static_cast<int>(data[i]) - 127);
+            std::memcpy(converted.data() + i * sizeof(value), &value, sizeof(value));
+        }
+        return transpose_2d(converted, source.shape[0], source.shape[1], sizeof(float));
     }
     if (binding.materialization != llama_safetensors_quant_materialization::FP8_BLOCK_SCALE) {
         return data;

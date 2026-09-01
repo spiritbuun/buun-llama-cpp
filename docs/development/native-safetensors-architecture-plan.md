@@ -807,6 +807,56 @@ Release proof for each large MoE requires:
 - Qwen4 text and multimodal/PLE paths, including bounded loading of the large
   n-gram table.
 
+Current architecture proof (2026-09-01):
+
+- The source contracts are pinned at Qwen revision
+  `de4b8e4d43b917e7706784d8bb445c9af86a3540` and DeepSeek revision
+  `60d8d70770c6776ff598c94bb586a859a38244f1`.
+- The official 149 GiB DeepSeek checkpoint loads directly with all 43 trunk
+  layers assigned to CUDA, while its 129 trunk routed-expert roots stay in
+  `CUDA_Host` under `-ot 'exps=CPU'`. The final buffers are 7418.32 MiB on CUDA
+  and 141362.00 MiB in pinned host storage. Greedy chat generation completed
+  coherently (`The capital of France is` -> `Paris.`) through the existing
+  DeepSeek graph. This end-to-end proof caught a source-boundary bug in
+  `load_arch_hparams()`: its MTP-presence probe used GGUF-only `get_weight()`,
+  reset `n_layer_nextn` to zero for a valid direct source, and executed the MTP
+  block as a 44th trunk layer. The source-aware `has_tensor()` probe now
+  preserves `n_layer=43`, `n_layer_all=44`; the same reusable existence check
+  replaces GGUF-only MTP/trunk probes in the other MTP-capable model classes.
+  Disabling the optimized block-FP8
+  executor did not repair the pre-fix output, which independently excluded that
+  kernel as the cause. Parallel mmap-backed expert repacking reduces end-to-end
+  load time from roughly 10--11 minutes to about 4.5 minutes on the 40 GiB A100
+  proof host.
+- The same source passed an initial adaptive-cache gate with
+  `--moe-cache auto -ot 'exps=CPU'`: a cold France request and a subsequent
+  Germany request both generated correct answers, at 5.60 and 5.74 t/s
+  respectively. GPU residency rose from roughly 7.8 GiB without the cache to
+  9.34 GiB after the two requests, confirming that the native canonical expert
+  roots participate in runtime promotion rather than merely falling through to
+  host execution. The wider cache mode, budget, eviction, and multi-GPU matrix
+  remains pending.
+- Native MTP now passes initialization and generation against the same source.
+  Its first production gate generated the correct `Paris.` answer at 8.00 t/s,
+  drafting 48 tokens and accepting 26. The gate exposed a backend-contract seam
+  in the MTP `e_proj+h_proj` projection: DeepSeek's hyper-connection streams
+  presented a 3-D activation to the otherwise valid block-FP8 2-D projection.
+  Flattening the independent stream/token axes for that matmul and restoring
+  the hidden layout afterward preserves the broadcasted numerical operation
+  while making the existing scaled-FP8 executor applicable. The same shape fix
+  is applied to Qwen4's equivalent hyper-connection MTP projection.
+- The text-only Qwen4 fixture at revision
+  `d49cb5156b0dad4016f33b55e142a390da88e9fa` exercises recurrent attention,
+  QSA/indexer splitting, PLE, hyper-connections, separate-expert aggregation,
+  and the existing Qwen4 CUDA graph. Its native source path and an independent
+  F32 GGUF conversion produced the same 16-token greedy continuation. This
+  proof found and fixed a reversed grouped-to-tiled V-head permutation, a
+  GGUF-only PLE shape probe, two production PLE dimension assumptions, and
+  incorrect canonical indexer suffixes.
+- The full production Qwen binary, multimodal path, split placement, adaptive
+  expert cache, MTP/VBR, long-context, and KLD gates remain required. The tiny
+  fixture is an architecture/transform proof, not a quality model.
+
 ## 7. Test matrix
 
 ### Structural tests

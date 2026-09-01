@@ -64,7 +64,7 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         ratio = hp["indexer_compress_ratio"]
         layer_types = hp["layer_types"]
         self.gguf_writer.add_attention_compress_ratios(
-            [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
+            [ratio if layer_types[i] in ("full_attention", "qwen_sparse_attention") else 0 for i in range(n_layer)]
         )
 
         # ple_layer_ids is 1-based in the HF config; empty means no n-gram table,

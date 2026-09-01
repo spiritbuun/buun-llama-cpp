@@ -75,6 +75,7 @@ std::pair<llama_safetensors_dtype, uint32_t> parse_dtype(const std::string & nam
         { "I64",     { llama_safetensors_dtype::I64, 64 }    },
         { "F8_E4M3", { llama_safetensors_dtype::F8_E4M3, 8 } },
         { "F8_E5M2", { llama_safetensors_dtype::F8_E5M2, 8 } },
+        { "F8_E8M0", { llama_safetensors_dtype::F8_E8M0, 8 } },
         { "F16",     { llama_safetensors_dtype::F16, 16 }    },
         { "BF16",    { llama_safetensors_dtype::BF16, 16 }   },
         { "F32",     { llama_safetensors_dtype::F32, 32 }    },
@@ -247,6 +248,7 @@ size_t llama_safetensors_dtype_size(llama_safetensors_dtype dtype) {
         case llama_safetensors_dtype::I8:
         case llama_safetensors_dtype::F8_E4M3:
         case llama_safetensors_dtype::F8_E5M2:
+        case llama_safetensors_dtype::F8_E8M0:
             return 1;
         case llama_safetensors_dtype::U16:
         case llama_safetensors_dtype::I16:
@@ -445,6 +447,19 @@ llama_safetensors_quant_config llama_safetensors_quant_config::from_json(const l
     }
 
     if (quant_method == "fp8") {
+        if (root.value("expert_dtype", std::string()) == "fp4") {
+            llama_safetensors_quant_group experts;
+            experts.name            = "hf-expert-mxfp4";
+            experts.format          = llama_safetensors_quant_format::MXFP4_PACK;
+            experts.num_bits        = 4;
+            experts.group_size      = 32;
+            experts.input_quantized = true;
+            experts.input_dynamic   = true;
+            experts.hf_mxfp4        = true;
+            result.groups_.push_back(std::move(experts));
+            result.rules_.push_back(make_rule(
+                R"(re:(layers\.[0-9]+|mtp\.[0-9]+)\.ffn\.experts\.[0-9]+\.w[123]$)", 0));
+        }
         llama_safetensors_quant_group group;
         const std::string activation_scheme =
             require_json_value(quant, "activation_scheme", "quantization_config").get<std::string>();
@@ -459,6 +474,7 @@ llama_safetensors_quant_config llama_safetensors_quant_config::from_json(const l
             group.format          = llama_safetensors_quant_format::FP8_BLOCK;
             group.group_size      = 128;
             group.block_structure = { 128, 128 };
+            group.e8m0_block_scale = quant.value("scale_fmt", std::string()) == "ue8m0";
         } else {
             if (activation_scheme != "dynamic" && activation_scheme != "static") {
                 throw std::runtime_error("unsupported native legacy FP8 activation scheme");
@@ -470,8 +486,9 @@ llama_safetensors_quant_config llama_safetensors_quant_config::from_json(const l
             group.modelopt               = true;
             group.legacy_fp8_i8_storage  = true;
         }
+        const uint32_t group_index = static_cast<uint32_t>(result.groups_.size());
         result.groups_.push_back(std::move(group));
-        result.rules_.push_back(make_rule("re:.*", 0));
+        result.rules_.push_back(make_rule("re:.*", group_index));
 
         if (quant.contains("modules_to_not_convert")) {
             const json & ignored = quant.at("modules_to_not_convert");
@@ -1539,12 +1556,13 @@ llama_safetensors_registry llama_safetensors_registry::load(
         for (auto & tensor : parsed.tensors) {
             if (!expected_shards.empty()) {
                 const auto expected = expected_shards.find(tensor.name);
-                if (expected == expected_shards.end()) {
-                    throw std::runtime_error("tensor '" + tensor.name +
-                                             "' is present in a shard but absent from weight_map");
-                }
-                if (expected->second != shard_name) {
-                    throw std::runtime_error("weight_map assigns tensor '" + tensor.name + "' to the wrong shard");
+                // The index is authoritative. Sidecar shards can legally
+                // carry duplicated base-model tensors which are not assigned
+                // to that shard; only the indexed copy belongs to this model.
+                // The completeness pass below still rejects an assignment
+                // whose named shard does not actually contain the tensor.
+                if (expected == expected_shards.end() || expected->second != shard_name) {
+                    continue;
                 }
             }
             if (!result.tensor_index_.emplace(tensor.name, result.tensors_.size()).second) {

@@ -1518,6 +1518,52 @@ static void ggml_compute_forward_mul_mat_f8_quantized_input(
     }
 }
 
+static void ggml_compute_forward_mul_mat_f8_block_scale(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    const struct ggml_tensor * weight = dst->src[0];
+    const struct ggml_tensor * input  = dst->src[1];
+    const struct ggml_tensor * scale  = dst->src[2];
+    GGML_ASSERT(weight->type == GGML_TYPE_F8_E4M3 && input->type == GGML_TYPE_F32 &&
+                scale != NULL && scale->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+                weight->ne[0] % 128 == 0 && weight->ne[1] % 128 == 0 &&
+                weight->ne[3] == 1 && input->ne[2] == weight->ne[2] && input->ne[3] == 1 &&
+                scale->ne[0] == weight->ne[1] * weight->ne[2] / 128 &&
+                scale->ne[1] == weight->ne[0] / 128 && scale->ne[2] == 1 && scale->ne[3] == 1);
+
+    const int64_t k       = weight->ne[0];
+    const int64_t n       = weight->ne[1];
+    const int64_t batches = weight->ne[2];
+    const int64_t m       = input->ne[1];
+    const int64_t total   = n * m * batches;
+    const int64_t n_blocks = n / 128;
+    const int64_t all_n_blocks = n_blocks * batches;
+    const float * scales = (const float *) scale->data;
+
+    for (int64_t index = params->ith; index < total; index += params->nth) {
+        int64_t rem = index;
+        const int64_t row = rem % n; rem /= n;
+        const int64_t token = rem % m; rem /= m;
+        const int64_t batch = rem;
+        const uint8_t * w = (const uint8_t *) weight->data +
+            row * weight->nb[1] + batch * weight->nb[2];
+        const float * x = (const float *) ((const char *) input->data +
+            token * input->nb[1] + batch * input->nb[2]);
+
+        float sum = 0.0f;
+        for (int64_t col = 0; col < k; ++col) {
+            const float block_scale = scales[
+                (col / 128) * all_n_blocks + batch * n_blocks + row / 128];
+            const float dequant = ggml_bf16_to_fp32(ggml_fp32_to_bf16(
+                ggml_e4m3_to_fp32(w[col]) * block_scale));
+            sum += dequant * x[col];
+        }
+        float * out = (float *) ((char *) dst->data +
+            row * dst->nb[0] + token * dst->nb[1] + batch * dst->nb[2]);
+        *out = sum;
+    }
+}
+
 static void ggml_compute_forward_mul_mat_mxfp8_quantized_input(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1878,6 +1924,16 @@ void ggml_compute_forward_mul_mat(
             dst->src[2]->type == GGML_TYPE_BF16 && dst->src[3] != NULL &&
             dst->src[3]->type == GGML_TYPE_I16) {
         ggml_compute_forward_mul_mat_grouped_fp8_quantized_input(params, dst);
+        return;
+    }
+    if (src0->type == GGML_TYPE_F8_E4M3 && dst->src[2] != NULL &&
+            dst->src[2]->type == GGML_TYPE_F32 && dst->src[3] == NULL &&
+            src0->ne[0] % 128 == 0 && src0->ne[1] % 128 == 0 &&
+            src0->ne[3] == 1 && src1->ne[2] == src0->ne[2] && src1->ne[3] == 1 &&
+            dst->src[2]->ne[0] == src0->ne[1] * src0->ne[2] / 128 &&
+            dst->src[2]->ne[1] == src0->ne[0] / 128 &&
+            dst->src[2]->ne[2] == 1 && dst->src[2]->ne[3] == 1) {
+        ggml_compute_forward_mul_mat_f8_block_scale(params, dst);
         return;
     }
     if (src0->type == GGML_TYPE_F8_E4M3 && dst->src[3] != NULL) {

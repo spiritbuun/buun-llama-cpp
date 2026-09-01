@@ -81,6 +81,7 @@ enum class llama_safetensors_quant_materialization {
     BROADCAST_BF16_SCALAR,
     RECIPROCAL_F32,
     FP8_BLOCK_SCALE,
+    FP8_BLOCK_SCALE_E8M0,
     FP8_BLOCK_SCALE_MODELOPT,
 };
 

@@ -506,6 +506,19 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                     op->src[2]->ne[0] == src0->ne[0] / 32 && op->src[2]->ne[1] == src0->ne[1]) {
                 return true;
             }
+            if (op->src[2] != nullptr && op->src[3] == nullptr &&
+                    src0->type == GGML_TYPE_F8_E4M3 && src1->type == GGML_TYPE_F32 &&
+                    op->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_F32 &&
+                    src0->ne[0] % 128 == 0 && src0->ne[1] % 128 == 0 &&
+                    src0->ne[3] == 1 && src1->ne[2] == src0->ne[2] && src1->ne[3] == 1 &&
+                    op->src[2]->ne[0] == src0->ne[1] * src0->ne[2] / 128 &&
+                    op->src[2]->ne[1] == src0->ne[0] / 128 &&
+                    op->src[2]->ne[2] == 1 && op->src[2]->ne[3] == 1) {
+                return ggml_is_contiguous(src0) && src1->nb[0] == sizeof(float) &&
+                    ggml_is_contiguous(op->src[2]) && ggml_is_contiguous(op) &&
+                    src1->ne[0] == src0->ne[0] && op->ne[0] == src0->ne[1] &&
+                    op->ne[1] == src1->ne[1];
+            }
             if (op->src[3] != nullptr &&
                     (src0->type == GGML_TYPE_F8_E4M3 || src0->type == GGML_TYPE_Q4_A32 ||
                      src0->type == GGML_TYPE_MXFP4)) {

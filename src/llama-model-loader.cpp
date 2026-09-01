@@ -1264,6 +1264,12 @@ struct ggml_tensor * llama_model_loader::get_tensor_meta(const char * name) cons
     return weight->tensor;
 }
 
+bool llama_model_loader::has_tensor(const char * name) const {
+    ggml_type type = GGML_TYPE_COUNT;
+    std::array<int64_t, GGML_MAX_DIMS> ne{};
+    return get_tensor_info(name, type, ne);
+}
+
 bool llama_model_loader::get_tensor_info(
         const char * name, ggml_type & type, std::array<int64_t, GGML_MAX_DIMS> & ne) const {
     if (const llama_tensor_weight * weight = get_weight(name)) {

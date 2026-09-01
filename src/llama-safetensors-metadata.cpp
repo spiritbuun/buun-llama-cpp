@@ -166,6 +166,16 @@ void llama_safetensors_metadata_sink::set_i32_array(std::string_view key, const 
     gguf_set_arr_data(context_, key_string.c_str(), GGUF_TYPE_INT32, values, count);
 }
 
+void llama_safetensors_metadata_sink::set_u32_array(std::string_view key, const uint32_t * values, size_t count) {
+    const std::string key_string(key);
+    gguf_set_arr_data(context_, key_string.c_str(), GGUF_TYPE_UINT32, values, count);
+}
+
+void llama_safetensors_metadata_sink::set_u64_array(std::string_view key, const uint64_t * values, size_t count) {
+    const std::string key_string(key);
+    gguf_set_arr_data(context_, key_string.c_str(), GGUF_TYPE_UINT64, values, count);
+}
+
 void llama_safetensors_metadata_sink::set_string_array(std::string_view key, const std::vector<std::string> & values) {
     std::vector<const char *> pointers(values.size());
     for (size_t i = 0; i < values.size(); ++i) {

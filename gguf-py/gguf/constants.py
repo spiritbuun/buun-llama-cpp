@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from enum import Enum, IntEnum, auto
+from enum import Enum, IntEnum, auto, unique
 from typing import Any
 
 #
@@ -643,6 +643,7 @@ class VISION_PROJECTOR_TYPE(IntEnum):
     COGVLM    = auto()
 
 
+@unique
 class MODEL_TENSOR(IntEnum):
     TOKEN_EMBD           = auto()
     TOKEN_EMBD_NORM      = auto()
@@ -657,10 +658,10 @@ class MODEL_TENSOR(IntEnum):
     HC_HEAD_FN           = auto()
     HC_HEAD_BASE         = auto()
     HC_HEAD_SCALE        = auto()
-    HC_HEAD_NORM         = 512 # qwen4exp
-    HC_HEAD_DOWN         = 513 # qwen4exp
-    HC_HEAD_UP           = 514 # qwen4exp
-    ROPE_FREQS           = 14
+    HC_HEAD_NORM         = auto() # qwen4exp
+    HC_HEAD_DOWN         = auto() # qwen4exp
+    HC_HEAD_UP           = auto() # qwen4exp
+    ROPE_FREQS           = auto()
     ROPE_FACTORS_LONG    = auto()
     ROPE_FACTORS_SHORT   = auto()
     ATTN_Q               = auto()
@@ -743,14 +744,14 @@ class MODEL_TENSOR(IntEnum):
     SSM_BETA             = auto() # Kimi Linear qwen3.5
     SSM_G_A              = auto() # Kimi Linear
     SSM_G_B              = auto() # Kimi Linear
-    SSM_G                = 515 # Kimi K3 (full-rank KDA gate, replaces SSM_G_A/SSM_G_B)
-    ATTN_RES_SCORE       = 516 # Kimi K3 (fused res_norm * res_proj, pre-attention)
-    FFN_RES_SCORE        = 517 # Kimi K3 (fused res_norm * res_proj, pre-FFN)
-    OUTPUT_RES_SCORE     = 518 # Kimi K3 (fused res_norm * res_proj, final)
-    FFN_ROUTED_DOWN      = 519 # Kimi K3 (latent MoE: hidden -> latent)
-    FFN_ROUTED_UP        = 520 # Kimi K3 (latent MoE: latent -> hidden)
-    FFN_ROUTED_NORM      = 521 # Kimi K3 (latent MoE: norm on expert output)
-    TIME_MIX_W0          = 97
+    SSM_G                = auto() # Kimi K3 (full-rank KDA gate, replaces SSM_G_A/SSM_G_B)
+    ATTN_RES_SCORE       = auto() # Kimi K3 (fused res_norm * res_proj, pre-attention)
+    FFN_RES_SCORE        = auto() # Kimi K3 (fused res_norm * res_proj, pre-FFN)
+    OUTPUT_RES_SCORE     = auto() # Kimi K3 (fused res_norm * res_proj, final)
+    FFN_ROUTED_DOWN      = auto() # Kimi K3 (latent MoE: hidden -> latent)
+    FFN_ROUTED_UP        = auto() # Kimi K3 (latent MoE: latent -> hidden)
+    FFN_ROUTED_NORM      = auto() # Kimi K3 (latent MoE: norm on expert output)
+    TIME_MIX_W0          = auto()
     TIME_MIX_W1          = auto()
     TIME_MIX_W2          = auto()
     TIME_MIX_A0          = auto()
@@ -804,21 +805,21 @@ class MODEL_TENSOR(IntEnum):
     HC_FFN_FN            = auto()
     HC_FFN_BASE          = auto()
     HC_FFN_SCALE         = auto()
-    HC_ATTN_NORM         = 522 # qwen4exp
-    HC_ATTN_DOWN         = 523 # qwen4exp
-    HC_ATTN_UP           = 524 # qwen4exp
-    HC_ATTN_INJECT       = 525 # qwen4exp
-    HC_FFN_NORM          = 526 # qwen4exp
-    HC_FFN_DOWN          = 527 # qwen4exp
-    HC_FFN_UP            = 528 # qwen4exp
-    HC_FFN_INJECT        = 529 # qwen4exp
-    PLE_KEY              = 530 # qwen4exp
-    PLE_VALUE            = 531 # qwen4exp
-    PLE_NORM_KEY         = 532 # qwen4exp
-    PLE_NORM_QUERY       = 533 # qwen4exp
-    PLE_NORM_CONV        = 534 # qwen4exp
-    PLE_CONV1D           = 535 # qwen4exp
-    ATTN_COMPRESSOR_WKV  = 151
+    HC_ATTN_NORM         = auto() # qwen4exp
+    HC_ATTN_DOWN         = auto() # qwen4exp
+    HC_ATTN_UP           = auto() # qwen4exp
+    HC_ATTN_INJECT       = auto() # qwen4exp
+    HC_FFN_NORM          = auto() # qwen4exp
+    HC_FFN_DOWN          = auto() # qwen4exp
+    HC_FFN_UP            = auto() # qwen4exp
+    HC_FFN_INJECT        = auto() # qwen4exp
+    PLE_KEY              = auto() # qwen4exp
+    PLE_VALUE            = auto() # qwen4exp
+    PLE_NORM_KEY         = auto() # qwen4exp
+    PLE_NORM_QUERY       = auto() # qwen4exp
+    PLE_NORM_CONV        = auto() # qwen4exp
+    PLE_CONV1D           = auto() # qwen4exp
+    ATTN_COMPRESSOR_WKV  = auto()
     ATTN_COMPRESSOR_WGATE = auto()
     ATTN_COMPRESSOR_APE  = auto()
     ATTN_COMPRESSOR_NORM = auto()
@@ -914,12 +915,12 @@ class MODEL_TENSOR(IntEnum):
     V_ENC_FFN_UP         = auto()
     V_ENC_FFN_GATE       = auto()
     V_ENC_FFN_DOWN       = auto()
-    V_ENC_FFN_GATE_INP   = 536 # dots3note vision MoE router
-    V_ENC_FFN_GATE_EXPS  = 537
-    V_ENC_FFN_UP_EXPS    = 538
-    V_ENC_FFN_DOWN_EXPS  = 539
-    V_ENC_FFN_EXP_PROBS_B = 540
-    V_ENC_ATTN_POST_NORM = 246 # gemma4
+    V_ENC_FFN_GATE_INP   = auto() # dots3note vision MoE router
+    V_ENC_FFN_GATE_EXPS  = auto()
+    V_ENC_FFN_UP_EXPS    = auto()
+    V_ENC_FFN_DOWN_EXPS  = auto()
+    V_ENC_FFN_EXP_PROBS_B = auto()
+    V_ENC_ATTN_POST_NORM = auto() # gemma4
     V_ENC_FFN_POST_NORM  = auto()
     V_LAYER_SCALE_1      = auto()
     V_LAYER_SCALE_2      = auto()
@@ -1120,38 +1121,38 @@ class MODEL_TENSOR(IntEnum):
     A_GEN_WAV_DAC_POST_SNAKE       = auto() # DAC final SnakeBeta
     A_GEN_WAV_DAC_POST_CONV        = auto() # DAC conv_post -> 1-channel PCM
     # pocket-tts: SEANet encoder (speaker path) and decoder (a.gen.wav path)
-    A_ENC_SEANET_CONV_IN     = 541
-    A_ENC_SEANET_CONV_OUT    = 542
-    A_ENC_SEANET_RES_CONV1   = 543 # residual unit, dilated conv
-    A_ENC_SEANET_RES_CONV2   = 544 # residual unit, pointwise conv
-    A_ENC_SEANET_SCALE_CONV  = 545 # strided downsample conv
-    A_ENC_ATTN_SCALE         = 546 # layer scale (gamma) on the attn output
-    A_ENC_FFN_SCALE_LS       = 547 # layer scale (gamma) on the FFN output
-    A_ENC_SPEAKER_PROJ       = 548 # voice latent -> backbone embd
-    A_GEN_FLOW_INPUT_PROJ    = 549
-    A_GEN_FLOW_COND_EMBD     = 550
-    A_GEN_FLOW_TIME_FREQS    = 551 # timestep embedder, stored cos/sin frequencies
-    A_GEN_FLOW_TIME_UP       = 552
-    A_GEN_FLOW_TIME_DOWN     = 553
-    A_GEN_FLOW_TIME_NORM     = 554 # RMSNorm alpha
-    A_GEN_FLOW_BLK_NORM      = 555 # AdaLN res block, in_ln
-    A_GEN_FLOW_BLK_UP        = 556
-    A_GEN_FLOW_BLK_DOWN      = 557
-    A_GEN_FLOW_BLK_ADA       = 558 # AdaLN modulation, -> shift/scale/gate
-    A_GEN_FLOW_FINAL_ADA     = 559 # final layer AdaLN modulation, -> shift/scale
-    A_GEN_FLOW_FINAL_PROJ    = 560
-    A_GEN_OUT_EOS            = 561 # end-of-speech head on the backbone hidden state
-    A_GEN_INPUT_LINEAR       = 562 # generated latent -> backbone embd
-    A_GEN_EMB_MEAN           = 563 # latent denormalization stats
-    A_GEN_EMB_STD            = 564
-    A_GEN_WAV_QUANT_OUT      = 565 # DummyQuantizer output_proj, latent -> decoder dim
-    A_GEN_WAV_UPSAMPLE       = 566 # frame rate -> encoder frame rate, depthwise convtr
-    A_GEN_WAV_SEANET_CONV_IN   = 567
-    A_GEN_WAV_SEANET_CONV_OUT  = 568 # -> 1-channel PCM
-    A_GEN_WAV_SEANET_RES_CONV1 = 569
-    A_GEN_WAV_SEANET_RES_CONV2 = 570
-    A_GEN_WAV_SEANET_SCALE_CONV = 571 # strided upsample convtr
-    A_MMPROJ              = 439
+    A_ENC_SEANET_CONV_IN     = auto()
+    A_ENC_SEANET_CONV_OUT    = auto()
+    A_ENC_SEANET_RES_CONV1   = auto() # residual unit, dilated conv
+    A_ENC_SEANET_RES_CONV2   = auto() # residual unit, pointwise conv
+    A_ENC_SEANET_SCALE_CONV  = auto() # strided downsample conv
+    A_ENC_ATTN_SCALE         = auto() # layer scale (gamma) on the attn output
+    A_ENC_FFN_SCALE_LS       = auto() # layer scale (gamma) on the FFN output
+    A_ENC_SPEAKER_PROJ       = auto() # voice latent -> backbone embd
+    A_GEN_FLOW_INPUT_PROJ    = auto()
+    A_GEN_FLOW_COND_EMBD     = auto()
+    A_GEN_FLOW_TIME_FREQS    = auto() # timestep embedder, stored cos/sin frequencies
+    A_GEN_FLOW_TIME_UP       = auto()
+    A_GEN_FLOW_TIME_DOWN     = auto()
+    A_GEN_FLOW_TIME_NORM     = auto() # RMSNorm alpha
+    A_GEN_FLOW_BLK_NORM      = auto() # AdaLN res block, in_ln
+    A_GEN_FLOW_BLK_UP        = auto()
+    A_GEN_FLOW_BLK_DOWN      = auto()
+    A_GEN_FLOW_BLK_ADA       = auto() # AdaLN modulation, -> shift/scale/gate
+    A_GEN_FLOW_FINAL_ADA     = auto() # final layer AdaLN modulation, -> shift/scale
+    A_GEN_FLOW_FINAL_PROJ    = auto()
+    A_GEN_OUT_EOS            = auto() # end-of-speech head on the backbone hidden state
+    A_GEN_INPUT_LINEAR       = auto() # generated latent -> backbone embd
+    A_GEN_EMB_MEAN           = auto() # latent denormalization stats
+    A_GEN_EMB_STD            = auto()
+    A_GEN_WAV_QUANT_OUT      = auto() # DummyQuantizer output_proj, latent -> decoder dim
+    A_GEN_WAV_UPSAMPLE       = auto() # frame rate -> encoder frame rate, depthwise convtr
+    A_GEN_WAV_SEANET_CONV_IN   = auto()
+    A_GEN_WAV_SEANET_CONV_OUT  = auto() # -> 1-channel PCM
+    A_GEN_WAV_SEANET_RES_CONV1 = auto()
+    A_GEN_WAV_SEANET_RES_CONV2 = auto()
+    A_GEN_WAV_SEANET_SCALE_CONV = auto() # strided upsample convtr
+    A_MMPROJ              = auto()
     A_MMPROJ_FC           = auto()
     A_MM_NORM_PRE         = auto()
     A_MM_NORM_MID         = auto()
@@ -1199,15 +1200,15 @@ class MODEL_TENSOR(IntEnum):
     DFLASH2_ATTN_CONV_PROJ  = auto() # per-layer attention convolution coefficient projection
     DFLASH2_FFN_CONV_BASE   = auto() # per-layer MLP convolution base kernel
     DFLASH2_FFN_CONV_PROJ   = auto() # per-layer MLP convolution coefficient projection
-    DFLASH_ATTN_CONV_BASE  = 572
-    DFLASH_ATTN_CONV_PROJ  = 573
-    DFLASH_FFN_CONV_BASE   = 574
-    DFLASH_FFN_CONV_PROJ   = 575
-    DFLASH_SELECTOR_PREV   = 576
-    DFLASH_SELECTOR_NEXT   = 577
-    DFLASH_SELECTOR_HIDDEN = 578
+    DFLASH_ATTN_CONV_BASE  = auto()
+    DFLASH_ATTN_CONV_PROJ  = auto()
+    DFLASH_FFN_CONV_BASE   = auto()
+    DFLASH_FFN_CONV_PROJ   = auto()
+    DFLASH_SELECTOR_PREV   = auto()
+    DFLASH_SELECTOR_NEXT   = auto()
+    DFLASH_SELECTOR_HIDDEN = auto()
     # lfm2 audio
-    A_ENC_NORM_CONV        = 480
+    A_ENC_NORM_CONV        = auto()
     A_ENC_LINEAR_POS       = auto()
     A_ENC_POS_BIAS_U       = auto()
     A_ENC_POS_BIAS_V       = auto()

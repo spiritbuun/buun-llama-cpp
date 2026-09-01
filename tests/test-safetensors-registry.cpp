@@ -109,6 +109,9 @@ const char * fp8_static_tensor_config =
 const char * fp8_block_config =
     R"({"quantization_config":{"quant_method":"fp8","fmt":"e4m3","activation_scheme":"dynamic","weight_block_size":[128,128]}})";
 
+const char * deepseek4_mixed_fp8_config =
+    R"({"expert_dtype":"fp4","quantization_config":{"quant_method":"fp8","fmt":"e4m3","scale_fmt":"ue8m0","activation_scheme":"dynamic","weight_block_size":[128,128]}})";
+
 const char * legacy_fp8_static_config =
     R"({"quantization_config":{"quant_method":"fp8","activation_scheme":"static"}})";
 
@@ -1490,6 +1493,44 @@ int main(int argc, char ** argv) {
         const auto registry = llama_safetensors_registry::load(path);
         require_rejected([&] { (void) llama_safetensors_quant_adapters(llama_safetensors_read_json(path / "config.json"), registry); },
                          "FP8 block contract accepted the wrong scale grid");
+    }
+    {
+        const auto path = dir.path / "deepseek4-mixed-fp8";
+        const std::string expert = "layers.0.ffn.experts.0.w1";
+        write_single_shard_model(path, {
+            { "module.weight",       "F8_E4M3", { 256, 256 }, std::vector<uint8_t>(256 * 256) },
+            { "module.scale",        "F8_E8M0", { 2, 2 },     { 127, 128, 129, 130 }             },
+            { expert + ".weight",    "I8",      { 2, 16 },    std::vector<uint8_t>(32)           },
+            { expert + ".scale",     "F8_E8M0", { 2, 1 },     { 127, 128 }                       },
+        });
+        write_text(path / "config.json", deepseek4_mixed_fp8_config);
+        const auto registry = llama_safetensors_registry::load(path);
+        llama_safetensors_quant_adapters adapters(
+            llama_safetensors_read_json(path / "config.json"), registry);
+
+        const auto weight = adapters.bind("module", llama_safetensors_quant_role::WEIGHT);
+        const auto scale = adapters.bind("module", llama_safetensors_quant_role::WEIGHT_SCALE);
+        require(weight.has_value() && scale.has_value() &&
+                    scale->materialization == llama_safetensors_quant_materialization::FP8_BLOCK_SCALE_E8M0,
+                "DeepSeek block-FP8 E8M0 binding is wrong");
+        const auto converted = adapters.finalize(*scale, adapters.read(*scale));
+        std::array<float, 4> values{};
+        std::memcpy(values.data(), converted.data(), converted.size());
+        require(values == std::array<float, 4>({ 1.0f, 4.0f, 2.0f, 8.0f }),
+                "DeepSeek block-FP8 E8M0 grid was not transposed and decoded exactly");
+
+        const auto expert_weight = adapters.bind(expert, llama_safetensors_quant_role::WEIGHT);
+        const auto expert_input = adapters.bind(expert, llama_safetensors_quant_role::INPUT_SCALE);
+        require(expert_weight.has_value() && expert_weight->target_type == GGML_TYPE_MXFP4 &&
+                    expert_weight->target_shape == std::vector<int64_t>({ 32, 2 }) &&
+                    adapters.read(*expert_weight).size() == 34 && expert_input.has_value() &&
+                    expert_input->materialization == llama_safetensors_quant_materialization::DYNAMIC_MXFP4_MARKER,
+                "DeepSeek routed-expert MXFP4 binding is wrong");
+        adapters.consume(*weight);
+        adapters.consume(*scale);
+        adapters.consume(*expert_weight);
+        adapters.consume(*expert_input);
+        adapters.validate_complete();
     }
     {
         const auto path = dir.path / "modelopt-fp8-pb-wo";
@@ -3640,6 +3681,28 @@ int main(int argc, char ** argv) {
         adapters.validate_complete();
     }
     {
+        const auto path = dir.path / "modelopt-w4a16-nvfp4-experts";
+        write_single_shard_model(path, {
+            { "module.weight",         "U8",       { 2, 2, 32 }, std::vector<uint8_t>(128) },
+            { "module.weight_scale",   "F8_E4M3", { 2, 2, 4 },  std::vector<uint8_t>(16, 0x38) },
+            { "module.weight_scale_2", "F32",      {},           f32_bytes(0.125f) },
+        });
+        write_text(path / "config.json", modelopt_w4a16_nvfp4_config);
+        const auto registry = llama_safetensors_registry::load(path);
+        llama_safetensors_quant_adapters adapters(
+            llama_safetensors_read_json(path / "config.json"), registry);
+        const auto weight = adapters.bind("module", llama_safetensors_quant_role::WEIGHT);
+        require(weight.has_value() && weight->target_type == GGML_TYPE_NVFP4 &&
+                    weight->target_shape == std::vector<int64_t>({ 64, 2, 2 }) &&
+                    adapters.read(*weight).size() == 144,
+                "ModelOpt W4A16 NVFP4 expert aggregate binding is wrong");
+        const auto scale = adapters.bind("module", llama_safetensors_quant_role::WEIGHT_SCALE);
+        require(scale.has_value(), "ModelOpt W4A16 NVFP4 expert aggregate scale is missing");
+        adapters.consume(*weight);
+        adapters.consume(*scale);
+        adapters.validate_complete();
+    }
+    {
         const auto path = dir.path / "quark-nvfp4";
         write_single_shard_model(path, {
             { "module.weight",         "U8",       { 2, 32 }, std::vector<uint8_t>(64) },
@@ -3769,9 +3832,9 @@ int main(int argc, char ** argv) {
     const std::string shard_a_header =
         R"({"a":{"dtype":"BF16","shape":[2],"data_offsets":[0,4]},"packed":{"dtype":"U8","shape":[2],"data_offsets":[4,6]}})";
     const std::string shard_b_header =
-        R"({"fp8":{"dtype":"F8_E4M3","shape":[2,2],"data_offsets":[0,4]},"__metadata__":{"format":"pt"}})";
+        R"({"fp8":{"dtype":"F8_E4M3","shape":[2,2],"data_offsets":[0,4]},"a":{"dtype":"BF16","shape":[2],"data_offsets":[4,8]},"__metadata__":{"format":"pt"}})";
     write_shard(dir.path / "model-00001-of-00002.safetensors", shard_a_header, { 1, 2, 3, 4, 5, 6 });
-    write_shard(dir.path / "model-00002-of-00002.safetensors", shard_b_header, { 7, 8, 9, 10 });
+    write_shard(dir.path / "model-00002-of-00002.safetensors", shard_b_header, { 7, 8, 9, 10, 11, 12, 13, 14 });
     const auto plain_quant = llama_safetensors_quant_config::from_json(llama_safetensors_json::parse(R"({})"));
     require(plain_quant.match("model.layers.0.self_attn.q_proj") == nullptr,
             "plain safetensors config unexpectedly selected a quantization adapter");
@@ -3895,18 +3958,30 @@ int main(int argc, char ** argv) {
     }
     write_text(dir.path / "config.json", valid_config);
 
-    // The index is authoritative; a tensor assigned to another shard must be
-    // rejected before any model allocation begins.
+    // Sidecars may duplicate base-model tensors. The index selects the live
+    // copy and the registry must ignore the unassigned duplicate.
     write_text(
         dir.path / "model.safetensors.index.json",
         R"({"weight_map":{"a":"model-00002-of-00002.safetensors","packed":"model-00001-of-00002.safetensors","fp8":"model-00002-of-00002.safetensors"}})");
+    const auto sidecar_registry = llama_safetensors_registry::load(
+        dir.path, llama_safetensors_io_mode::BUFFERED);
+    const auto * sidecar_a = sidecar_registry.find("a");
+    require(sidecar_a != nullptr &&
+                sidecar_registry.read(*sidecar_a) == std::vector<uint8_t>({ 11, 12, 13, 14 }),
+            "registry did not select the weight_map copy of a duplicated sidecar tensor");
+
+    // The index is authoritative; a tensor missing from its assigned shard
+    // must still be rejected before any model allocation begins.
+    write_text(
+        dir.path / "model.safetensors.index.json",
+        R"({"weight_map":{"a":"model-00001-of-00002.safetensors","packed":"model-00002-of-00002.safetensors","fp8":"model-00002-of-00002.safetensors"}})");
     bool rejected = false;
     try {
         (void) llama_safetensors_registry::load(dir.path);
     } catch (const std::runtime_error &) {
         rejected = true;
     }
-    require(rejected, "registry accepted a tensor from the wrong indexed shard");
+    require(rejected, "registry accepted a tensor missing from its indexed shard");
 
     // A valid safetensors container is not sufficient: the architecture and
     // quantization contract must be one the direct importer actually supports.
