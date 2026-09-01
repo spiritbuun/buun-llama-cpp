@@ -698,12 +698,20 @@ int main(int argc, char ** argv) {
               { 0x80, 0x3f, 0x00, 0x40 } },
             { "model.layers.0.linear_attn.conv1d.weight", "BF16", { 8, 3 },
               std::vector<uint8_t>(8 * 3 * sizeof(uint16_t), 0) },
+            { "mtp.pre_fc_norm_embedding.weight", "BF16", { 4 },
+              std::vector<uint8_t>(4 * sizeof(uint16_t), 0) },
+            { "mtp.fc_embedding.weight", "BF16", { 4, 4 },
+              std::vector<uint8_t>(4 * 4 * sizeof(uint16_t), 0) },
+            { "mtp.fc_hidden.weight", "BF16", { 4, 4 },
+              std::vector<uint8_t>(4 * 4 * sizeof(uint16_t), 0) },
+            { "mtp.layers.0.attn_hyper_connection.hc_norm.weight", "BF16", { 8 },
+              std::vector<uint8_t>(8 * sizeof(uint16_t), 0) },
         });
         write_text(path / "tokenizer.json", "{}");
         const json config = {
             { "model_type", "qwen4_exp" },
             { "num_hidden_layers", 1 },
-            { "mtp_num_hidden_layers", 0 },
+            { "mtp_num_hidden_layers", 1 },
             { "linear_num_key_heads", 1 },
             { "linear_num_value_heads", 2 },
             { "linear_key_head_dim", 2 },
@@ -749,6 +757,18 @@ int main(int argc, char ** argv) {
         std::memcpy(&a1, a_log.data() + sizeof(a0), sizeof(a1));
         require(std::isfinite(a0) && std::isfinite(a1) && a0 < 0.0f && a1 < 0.0f,
                 "Qwen4 A_log permutation/conversion produced invalid values");
+
+        require(importer.describe("blk.1.nextn.enorm.weight", type, ne) &&
+                    type == GGML_TYPE_F32 && ne[0] == 4,
+                "Qwen4 embedded MTP norm did not map to the draft block");
+        require(importer.describe("blk.1.nextn.eh_proj.weight", type, ne) &&
+                    type == GGML_TYPE_BF16 && ne[0] == 8 && ne[1] == 4,
+                "Qwen4 embedded MTP input projections were not concatenated");
+        require(importer.materialize("blk.1.nextn.eh_proj.weight", type, 64).size() == 64,
+                "Qwen4 embedded MTP input projection has the wrong byte size");
+        require(importer.describe("blk.1.hc_attn_norm.weight", type, ne) &&
+                    type == GGML_TYPE_F32 && ne[0] == 8,
+                "Qwen4 embedded MTP layer did not use the mtp.layers.0 prefix");
     }
 
     {
