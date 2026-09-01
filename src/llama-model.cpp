@@ -2896,6 +2896,10 @@ int32_t llama_model_n_layer_nextn(const llama_model * model) {
     return model->hparams.n_layer_nextn;
 }
 
+bool llama_model_has_mtp(const llama_model * model) {
+    return model->hparams.has_mtp();
+}
+
 int32_t llama_model_dflash_selector_top_k(const llama_model * model) {
     return model->hparams.dflash_selector_top_k;
 }
@@ -3557,7 +3561,11 @@ bool llama_model_semantic_family_digest(
     for (uint32_t il = 0; il < hp.n_layer_all; ++il) {
         writer.u32(hp.is_recr(il) ? 1u : 0u);
         writer.u32(hp.is_swa(il) ? 1u : 0u);
-        writer.u32(hp.is_indexer_full(il) ? 1u : 0u);
+        // The indexer role is defined only for target layers. Integrated MTP
+        // artifacts append next-token layers to n_layer_all; those layers are
+        // already bound by n_layer_nextn and their remaining per-layer fields,
+        // but must not be passed to the target-only indexer accessor.
+        writer.u32(il < hp.n_layer() && hp.is_indexer_full(il) ? 1u : 0u);
         writer.u32(hp.rope_pattern[il]);
         writer.u32(hp.n_head(il));
         writer.u32(hp.n_head_kv(il));

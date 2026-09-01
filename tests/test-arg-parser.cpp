@@ -43,6 +43,37 @@ static void test(void) {
             std::numeric_limits<int32_t>::max());
 
     {
+        const auto implicit = common_speculative_mtp_context_params_resolve(
+            4096, 0, 2, false);
+        assert(implicit.n_ctx == 4096);
+        assert(implicit.n_seq_max == 2);
+        assert(implicit.kv_unified);
+
+        const auto explicit_split = common_speculative_mtp_context_params_resolve(
+            4096, 8192, 3, false);
+        assert(explicit_split.n_ctx == 8192);
+        assert(explicit_split.n_seq_max == 3);
+        assert(!explicit_split.kv_unified);
+
+        const auto explicit_unified = common_speculative_mtp_context_params_resolve(
+            4096, 8192, 4, true);
+        assert(explicit_unified.n_ctx == 8192);
+        assert(explicit_unified.n_seq_max == 4);
+        assert(explicit_unified.kv_unified);
+
+        common_params_speculative pure_mtp;
+        pure_mtp.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+        pure_mtp.draft.ctx_dft = reinterpret_cast<llama_context *>(uintptr_t(1));
+        assert(common_speculative_mtp_context_available(pure_mtp));
+
+        common_params_speculative combined = pure_mtp;
+        combined.types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
+        assert(!common_speculative_mtp_context_available(combined));
+        combined.draft.ctx_mtp = reinterpret_cast<llama_context *>(uintptr_t(2));
+        assert(common_speculative_mtp_context_available(combined));
+    }
+
+    {
         common_params_speculative spec;
         spec.synth_len = 3.4;
 

@@ -5409,7 +5409,13 @@ private:
         // Auto-fit mutates the target's llama_context_params, not params_base.  Reuse the
         // realized target width here; otherwise n_ctx=0 expands the MTP cache to n_ctx_train even
         // when the fitted target is much smaller.
-        cparams.n_ctx         = llama_n_ctx_seq(ctx_tgt);
+        const auto mtp_context = common_speculative_mtp_context_params_resolve(
+            llama_n_ctx_seq(ctx_tgt), params_base.speculative.draft.n_ctx,
+            cparams.n_seq_max,
+            cparams.kv_unified);
+        cparams.n_ctx         = mtp_context.n_ctx;
+        cparams.n_seq_max     = mtp_context.n_seq_max;
+        cparams.kv_unified    = mtp_context.kv_unified;
         cparams.ctx_type      = LLAMA_CONTEXT_TYPE_MTP;
         cparams.type_k        = params_base.speculative.draft.cache_type_k;
         cparams.type_v        = params_base.speculative.draft.cache_type_v;
@@ -6726,6 +6732,7 @@ private:
         // fixed point.
         const bool has_mtp = params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
         if (params_base.mmproj_gpu_swap && has_mtp && has_mmproj
+                && !params_base.speculative.has_non_mtp_model_drafter()
                 && params_base.fit_params && params_base.n_ctx == 0) {
             std::vector<size_t> margins_base = params_base.fit_params_target;
             GGML_ASSERT(!margins_base.empty());
@@ -6786,6 +6793,13 @@ private:
                 params_mtp.n_parallel = n_parallel_user;
                 auto mparams_mtp = common_model_params_to_llama(params_mtp);
                 auto cparams_mtp = common_context_params_to_llama(params_mtp);
+                const auto mtp_context = common_speculative_mtp_context_params_resolve(
+                    0, params_base.speculative.draft.n_ctx,
+                    cparams_mtp.n_seq_max,
+                    cparams_mtp.kv_unified);
+                cparams_mtp.n_ctx      = mtp_context.n_ctx;
+                cparams_mtp.n_seq_max  = mtp_context.n_seq_max;
+                cparams_mtp.kv_unified = mtp_context.kv_unified;
                 cparams_mtp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
                 cparams_mtp.n_rs_seq = 0;
                 cparams_mtp.n_outputs_max = n_parallel_user;
@@ -6794,6 +6808,9 @@ private:
                     &mparams_mtp,
                     &cparams_mtp,
                     true,
+                    params_base.speculative.draft.n_ctx <= 0,
+                    params_base.speculative.draft.n_ctx > 0
+                        ? (uint32_t) params_base.speculative.draft.n_ctx : 0,
                 };
 
                 const auto fit_status = common_fit_params(
@@ -6808,12 +6825,18 @@ private:
                 if (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
                     return false;
                 }
-                // n_ctx stays 0 when the fit needed no changes: the model default fits as-is.
-                // 0 also means "default" to the memory measurement below; resolve it to the
-                // trained context (hp_nct) afterwards so the caller gets a concrete value.
+                // common_fit_params updates the extra's cparams on every target candidate.
+                // The final interpolation can select a context between measured candidates,
+                // so resolve the extra once more from the returned target before the
+                // phase-residency comparison below.
+                const uint32_t n_streams_fit = cparams_fit.kv_unified ? 1 :
+                    std::max<uint32_t>(1, cparams_fit.n_seq_max);
+                cparams_mtp.n_ctx = common_fit_extra_context_size(
+                    cparams_fit.n_ctx, n_streams_fit,
+                    params_base.speculative.draft.n_ctx <= 0,
+                    params_base.speculative.draft.n_ctx > 0
+                        ? (uint32_t) params_base.speculative.draft.n_ctx : 0);
 
-                params_mtp.n_ctx = cparams_fit.n_ctx;
-                cparams_mtp.n_ctx = cparams_fit.n_ctx;
                 const bool load_mtp = mparams_mtp.load_mtp;
                 mparams_mtp = mparams_fit;
                 mparams_mtp.load_mtp = load_mtp;
@@ -7282,9 +7305,16 @@ private:
             // external drafter keeps ctx_dft and native MTP gets ctx_mtp.
             if (spec_mtp && !combined_external_and_mtp) {
                 auto cparams = common_context_params_to_llama(params_dft);
-                cparams.ctx_type  = LLAMA_CONTEXT_TYPE_MTP;
-                cparams.n_rs_seq  = 0;
-                cparams.ctx_other = ctx_tgt;
+                const auto mtp_context = common_speculative_mtp_context_params_resolve(
+                    llama_n_ctx_seq(ctx_tgt), params_base.speculative.draft.n_ctx,
+                    params_base.n_parallel,
+                    cparams.kv_unified);
+                cparams.n_ctx      = mtp_context.n_ctx;
+                cparams.n_seq_max  = mtp_context.n_seq_max;
+                cparams.kv_unified = mtp_context.kv_unified;
+                cparams.ctx_type   = LLAMA_CONTEXT_TYPE_MTP;
+                cparams.n_rs_seq   = 0;
+                cparams.ctx_other  = ctx_tgt;
                 ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
                 if (ctx_dft == nullptr) {
                     SRV_ERR("%s", "failed to create draft context\n");

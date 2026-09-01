@@ -2965,6 +2965,15 @@ static file_ptr make_qwen4_mtp_combined(
 }
 
 static void test_qwen4_mtp_sidecar_contract(const size_t seed) {
+    {
+        llama_hparams predicate_hparams = {};
+        predicate_hparams.n_layer_nextn = 1;
+        predicate_hparams.router_layer = 0;
+        GGML_ASSERT(!predicate_hparams.has_mtp());
+        predicate_hparams.router_layer = -1;
+        GGML_ASSERT(predicate_hparams.has_mtp());
+    }
+
     // The target load must ignore the attached draft block entirely. This pins
     // TENSOR_SKIP for both split and optional fused-expert representations.
     {
@@ -2978,6 +2987,7 @@ static void test_qwen4_mtp_sidecar_contract(const size_t seed) {
         llama_model_ptr target_model(llama_model_load_from_file_ptr(
                 integrated_file.get(), target_model_params));
         GGML_ASSERT(target_model != nullptr);
+        GGML_ASSERT(llama_model_has_mtp(target_model.get()));
         GGML_ASSERT(target_model->layers[1].nextn.eh_proj == nullptr);
         GGML_ASSERT(target_model->layers[1].nextn.hc_head_norm == nullptr);
         GGML_ASSERT(target_model->layers[1].ffn_gate_exps == nullptr);
@@ -3063,6 +3073,7 @@ static void test_qwen4_mtp_sidecar_contract(const size_t seed) {
     }
     GGML_ASSERT(model->hparams.n_layer() == 1);
     GGML_ASSERT(model->hparams.n_layer_nextn == 1);
+    GGML_ASSERT(llama_model_has_mtp(model.get()));
     GGML_ASSERT(model->hc_head_norm == nullptr);
     GGML_ASSERT(model->layers[0].hc_attn_norm == nullptr);
     GGML_ASSERT(model->layers[1].nextn.eh_proj != nullptr);
@@ -3079,8 +3090,9 @@ static void test_qwen4_mtp_sidecar_contract(const size_t seed) {
     ctx_params.n_ctx = 8;
     ctx_params.n_batch = 8;
     ctx_params.n_ubatch = 8;
-    ctx_params.n_seq_max = 1;
-    ctx_params.n_outputs_max = 1;
+    ctx_params.n_seq_max = 2;
+    ctx_params.kv_unified = true;
+    ctx_params.n_outputs_max = 2;
     ctx_params.n_threads = 1;
     ctx_params.n_threads_batch = 1;
 
@@ -3097,6 +3109,13 @@ static void test_qwen4_mtp_sidecar_contract(const size_t seed) {
     llama_model_ptr target_model(llama_model_load_from_file_ptr(
             target_file.get(), target_model_params));
     GGML_ASSERT(target_model != nullptr);
+    uint8_t semantic_digest[32] = {};
+    // This synthetic fixture intentionally has no production vocabulary, so
+    // semantic identity is unavailable. It must nevertheless traverse the
+    // appended MTP layer without calling a target-only layer accessor out of
+    // bounds (the real integrated model used to abort here).
+    (void) llama_model_semantic_family_digest(
+            target_model.get(), semantic_digest);
     llama_context_params target_ctx_params = ctx_params;
     target_ctx_params.ctx_type = LLAMA_CONTEXT_TYPE_DEFAULT;
     llama_context_ptr target_ctx(llama_init_from_model(target_model.get(), target_ctx_params));
@@ -3110,6 +3129,8 @@ static void test_qwen4_mtp_sidecar_contract(const size_t seed) {
     GGML_ASSERT(dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(ctx.get())) == nullptr);
     GGML_ASSERT(llama_get_ctx_other(ctx.get()) == target_ctx.get());
     GGML_ASSERT(!llama_memory_has_shared_cells(llama_get_memory(ctx.get())));
+    GGML_ASSERT(llama_n_ctx(ctx.get()) >= 8);
+    GGML_ASSERT(llama_n_ctx_seq(ctx.get()) == llama_n_ctx(ctx.get()));
 
     llama_set_embeddings_nextn(ctx.get(), true, true);
     ggml_cgraph * gf = llama_graph_reserve(ctx.get(), 2, 1, 1);
@@ -3144,9 +3165,10 @@ static void test_qwen4_mtp_sidecar_contract(const size_t seed) {
     GGML_ASSERT(draft_h_graph->ne[0] == model->hparams.n_embd_out());
     GGML_ASSERT(draft_h_graph->ne[1] == 1);
 
-    // Feed the exact target-published HC state together with a proposed token.
-    // This exercises both token and hidden inputs, the dense draft KV cache,
-    // the one-layer graph, and chained t_h_nextn publication.
+    // Feed the exact target-published HC state together with one proposed token
+    // for each logical sequence. This exercises both token and hidden inputs,
+    // multi-slot unified draft KV, the one-layer graph, and chained t_h_nextn
+    // publication.
     llama_batch batch = llama_batch_init(2, (int32_t) target_h.size(), 1);
     batch.token = (llama_token *) malloc(2 * sizeof(llama_token));
     GGML_ASSERT(batch.token != nullptr);
@@ -3156,25 +3178,27 @@ static void test_qwen4_mtp_sidecar_contract(const size_t seed) {
     memcpy(batch.embd, target_h.data(), target_h.size() * sizeof(float));
     memcpy(batch.embd + target_h.size(), target_h.data(), target_h.size() * sizeof(float));
     batch.pos[0] = 0;
-    batch.pos[1] = 1;
+    batch.pos[1] = 0;
     batch.n_seq_id[0] = 1;
     batch.n_seq_id[1] = 1;
     batch.seq_id[0][0] = 0;
-    batch.seq_id[1][0] = 0;
-    batch.logits[0] = 0;
+    batch.seq_id[1][0] = 1;
+    batch.logits[0] = 1;
     batch.logits[1] = 1;
     GGML_ASSERT(llama_decode(ctx.get(), batch) == 0);
     llama_synchronize(ctx.get());
 
-    const float * logits = llama_get_logits_ith(ctx.get(), 1);
-    GGML_ASSERT(logits != nullptr);
-    for (int32_t i = 0; i < llama_vocab_n_tokens(llama_model_get_vocab(model.get())); ++i) {
-        GGML_ASSERT(std::isfinite(logits[i]));
-    }
-    const float * next_h = llama_get_embeddings_nextn_ith(ctx.get(), 1);
-    GGML_ASSERT(next_h != nullptr);
-    for (size_t i = 0; i < target_h.size(); ++i) {
-        GGML_ASSERT(std::isfinite(next_h[i]));
+    for (int32_t out = 0; out < 2; ++out) {
+        const float * logits = llama_get_logits_ith(ctx.get(), out);
+        GGML_ASSERT(logits != nullptr);
+        for (int32_t i = 0; i < llama_vocab_n_tokens(llama_model_get_vocab(model.get())); ++i) {
+            GGML_ASSERT(std::isfinite(logits[i]));
+        }
+        const float * next_h = llama_get_embeddings_nextn_ith(ctx.get(), out);
+        GGML_ASSERT(next_h != nullptr);
+        for (size_t i = 0; i < target_h.size(); ++i) {
+            GGML_ASSERT(std::isfinite(next_h[i]));
+        }
     }
     llama_batch_free(batch);
 

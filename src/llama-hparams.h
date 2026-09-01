@@ -456,6 +456,12 @@ struct llama_hparams {
     // number of effective layers (excludes nextn layers)
     uint32_t n_layer() const;
 
+    // Granite Switch repurposes n_layer_nextn for its router KV layer; that is
+    // not an MTP draft head.
+    bool has_mtp() const {
+        return n_layer_nextn > 0 && router_layer < 0;
+    }
+
     // note that this function uses different SWA parameters from those in the hparams
     // note: inlined on purpose for performance reasons
     // TODO: think of a better place for this function

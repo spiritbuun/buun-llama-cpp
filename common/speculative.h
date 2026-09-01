@@ -57,6 +57,25 @@ const std::vector<double> & common_speculative_get_synth_probs(const common_spec
 
 common_params common_base_params_to_speculative(const common_params & params);
 
+struct common_speculative_mtp_context_params {
+    uint32_t n_ctx;
+    uint32_t n_seq_max;
+    bool kv_unified;
+};
+
+// Native and sidecar MTP contexts must expose the target's realized context
+// width per sequence. An implicit draft context can do that without multiplying
+// its KV allocation by the number of server slots by using unified KV. An
+// explicit -cd remains an exact user override, including the requested KV
+// topology.
+common_speculative_mtp_context_params common_speculative_mtp_context_params_resolve(
+        uint32_t target_n_ctx_seq,
+        int32_t explicit_draft_n_ctx,
+        uint32_t requested_n_seq_max,
+        bool requested_kv_unified);
+
+bool common_speculative_mtp_context_available(const common_params_speculative & params);
+
 struct common_speculative_output_limits {
     int32_t total;
     int32_t per_seq;

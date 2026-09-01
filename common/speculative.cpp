@@ -5480,6 +5480,26 @@ common_params common_base_params_to_speculative(const common_params & params) {
     return result;
 }
 
+common_speculative_mtp_context_params common_speculative_mtp_context_params_resolve(
+        uint32_t target_n_ctx_seq,
+        int32_t explicit_draft_n_ctx,
+        uint32_t requested_n_seq_max,
+        bool requested_kv_unified) {
+    if (explicit_draft_n_ctx > 0) {
+        return { (uint32_t) explicit_draft_n_ctx, requested_n_seq_max, requested_kv_unified };
+    }
+
+    return { target_n_ctx_seq, requested_n_seq_max, true };
+}
+
+bool common_speculative_mtp_context_available(const common_params_speculative & params) {
+    if (params.has_non_mtp_model_drafter()) {
+        return params.draft.ctx_mtp != nullptr;
+    }
+
+    return params.draft.ctx_mtp != nullptr || params.draft.ctx_dft != nullptr;
+}
+
 struct common_speculative_init_result::impl {
     impl() = default;
     ~impl() = default;
@@ -5506,7 +5526,7 @@ common_speculative_init_result::common_speculative_init_result(
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
-    // the draft context holds as many tokens per sequence as the target context
+    // Non-MTP drafters retain the established full target-context geometry.
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
 
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
@@ -5515,6 +5535,13 @@ common_speculative_init_result::common_speculative_init_result(
     cparams.ctx_other = ctx_tgt;
 
     auto cparams_mtp = cparams;
+    const auto mtp_context = common_speculative_mtp_context_params_resolve(
+        llama_n_ctx_seq(ctx_tgt), params.speculative.draft.n_ctx,
+        cparams_mtp.n_seq_max,
+        cparams_mtp.kv_unified);
+    cparams_mtp.n_ctx      = mtp_context.n_ctx;
+    cparams_mtp.n_seq_max  = mtp_context.n_seq_max;
+    cparams_mtp.kv_unified = mtp_context.kv_unified;
     cparams_mtp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
 
     std::string model_path;
@@ -5661,7 +5688,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP,
-                params.draft.ctx_mtp != nullptr || params.draft.ctx_dft != nullptr);
+                common_speculative_mtp_context_available(params));
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, params.draft.ctx_dft != nullptr);
     }

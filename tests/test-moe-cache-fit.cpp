@@ -28,6 +28,71 @@ static common_moe_cache_fit_shape_input shape(
 int main() {
     constexpr size_t MiB = 1024*1024;
 
+    expect(common_fit_extra_context_size(8192, 2, true, 0) == 4096,
+            "implicit MTP fit must follow target per-sequence context");
+    expect(common_fit_extra_context_size(8192, 2, false, 0) == 8192,
+            "ordinary draft fit must continue following total target context");
+    expect(common_fit_extra_context_size(8192, 2, true, 6144) == 6144,
+            "explicit draft context must remain fixed during fit");
+    expect(common_fit_extra_context_size(8192, 0, true, 0) == 8192,
+            "missing stream inventory must fail closed to one stream");
+    expect(common_fit_extra_context_size(513, 2, true, 0) == 512,
+            "implicit MTP fit must mirror target context padding before splitting");
+    expect(common_fit_extra_context_size(513, 1, true, 0) == 768,
+            "implicit unified MTP fit must mirror target context padding");
+
+    {
+        llama_model_params probe_mparams = llama_model_default_params();
+        llama_context_params probe_cparams[4] = {
+            llama_context_default_params(), llama_context_default_params(),
+            llama_context_default_params(), llama_context_default_params(),
+        };
+        const common_fit_extra_model changing = {
+            "changing", &probe_mparams, &probe_cparams[3], false,
+            true, 0, nullptr, false,
+        };
+        const common_fit_extra_model optional_missing = {
+            "optional", &probe_mparams, &probe_cparams[2], true,
+            true, 0, &changing, true,
+        };
+        const common_fit_extra_model shared = {
+            "shared", &probe_mparams, &probe_cparams[1], true,
+            true, 0, &optional_missing, false,
+        };
+        const common_fit_extra_model fixed = {
+            "fixed", &probe_mparams, &probe_cparams[0], false,
+            false, 1024, &shared, false,
+        };
+        const common_fit_extra_cache_probe_result result = common_fit_extra_cache_probe(
+            &fixed,
+            {8192, 12288}, 2,
+            {
+                // A fixed external context is measured once and retained.
+                {true, {100, 200}},
+                // A target-shared MTP context is remeasured for every candidate placement.
+                {true, {10, 20}},
+                // Missing native MTP is an optional zero contribution.
+                {false, {1000, 2000}},
+                // A non-shared context still refreshes when its inherited size changes.
+                {true, {1, 2}},
+            });
+        expect(result.success, "linked required and optional extras should aggregate");
+        expect(result.measurement_counts == std::vector<size_t>({1, 2, 1, 2}),
+                "fixed extras should cache while shared/size-changing extras refresh and missing optional extras retire");
+        expect(result.aggregate_bytes_by_device == std::vector<size_t>({13423, 13534}),
+                "linked extras should sum every device and host-style destination exactly once");
+
+        llama_context_params required_cparams = llama_context_default_params();
+        const common_fit_extra_model required = {
+            "required", &probe_mparams, &required_cparams, false,
+            false, 1024, nullptr, false,
+        };
+        const common_fit_extra_cache_probe_result required_missing = common_fit_extra_cache_probe(
+            &required, {8192}, 2, {{false, {1, 2}}});
+        expect(!required_missing.success,
+                "a missing required extra must fail instead of being treated as optional");
+    }
+
     expect(ggml_moe_cache_effective_reserve_bytes(0, 3*MiB, MiB) == MiB &&
             ggml_moe_cache_effective_reserve_bytes(0, 3*MiB, 3*MiB) == 3*MiB,
             "automatic runtime reserve must remain per-device");

@@ -1401,16 +1401,51 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
         auto mparams_dft = common_model_params_to_llama(params_dft);
         auto cparams_dft = common_context_params_to_llama(params_dft);
-        if (spec_mtp) {
-            cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        const bool extra_is_mtp = spec_mtp &&
+            !params.speculative.has_non_mtp_model_drafter();
+        if (extra_is_mtp) {
+            const auto mtp_context = common_speculative_mtp_context_params_resolve(
+                0, params.speculative.draft.n_ctx,
+                cparams_dft.n_seq_max, cparams_dft.kv_unified);
+            cparams_dft.n_ctx      = mtp_context.n_ctx;
+            cparams_dft.n_seq_max  = mtp_context.n_seq_max;
+            cparams_dft.kv_unified = mtp_context.kv_unified;
+            cparams_dft.ctx_type   = LLAMA_CONTEXT_TYPE_MTP;
         }
         cparams_dft.n_rs_seq = 0;
 
-        const common_fit_extra_model extra = {
+        llama_model_params mparams_mtp = mparams;
+        mparams_mtp.load_mtp = true;
+        llama_context_params cparams_mtp = cparams_dft;
+        const auto mtp_context = common_speculative_mtp_context_params_resolve(
+            0, params.speculative.draft.n_ctx,
+            cparams_mtp.n_seq_max, cparams_mtp.kv_unified);
+        cparams_mtp.n_ctx      = mtp_context.n_ctx;
+        cparams_mtp.n_seq_max  = mtp_context.n_seq_max;
+        cparams_mtp.kv_unified = mtp_context.kv_unified;
+        cparams_mtp.ctx_type   = LLAMA_CONTEXT_TYPE_MTP;
+
+        const common_fit_extra_model extra_mtp = {
+            /*.path_model   =*/ params.model.path.c_str(),
+            /*.mparams      =*/ &mparams_mtp,
+            /*.cparams      =*/ &cparams_mtp,
+            /*.shares_model =*/ true,
+            /*.follows_target_per_sequence =*/ params.speculative.draft.n_ctx <= 0,
+            /*.fixed_n_ctx  =*/ params.speculative.draft.n_ctx > 0
+                ? (uint32_t) params.speculative.draft.n_ctx : 0,
+            /*.next         =*/ nullptr,
+            /*.optional_if_no_mtp =*/ true,
+        };
+
+        const common_fit_extra_model extra_dft = {
             /*.path_model   =*/ params_dft.model.path.c_str(),
             /*.mparams      =*/ &mparams_dft,
             /*.cparams      =*/ &cparams_dft,
             /*.shares_model =*/ !has_draft, // an MTP context runs on the weights of the main model
+            /*.follows_target_per_sequence =*/ extra_is_mtp && params.speculative.draft.n_ctx <= 0,
+            /*.fixed_n_ctx  =*/ extra_is_mtp && params.speculative.draft.n_ctx > 0
+                ? (uint32_t) params.speculative.draft.n_ctx : 0,
+            /*.next         =*/ spec_mtp && !extra_is_mtp ? &extra_mtp : nullptr,
         };
 
         const common_params_fit_status fit_status = common_fit_params(
@@ -1420,7 +1455,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             &params.moe_cache,
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
-            has_draft || spec_mtp ? &extra : nullptr,
+            has_draft || spec_mtp ? &extra_dft : nullptr,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
         if (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
             COM_ERR("%s", "fit could not prove a viable placement; restoring the pre-fit parameters\n");

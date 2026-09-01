@@ -33,6 +33,179 @@ class common_params_fit_exception : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+uint32_t common_fit_extra_context_size(
+        uint32_t target_n_ctx,
+        uint32_t target_n_streams,
+        bool follows_target_per_sequence,
+        uint32_t fixed_n_ctx) {
+    if (fixed_n_ctx > 0) {
+        return fixed_n_ctx;
+    }
+    if (!follows_target_per_sequence) {
+        return target_n_ctx;
+    }
+
+    const uint32_t n_streams = std::max<uint32_t>(1, target_n_streams);
+    const uint32_t n_ctx     = GGML_PAD(target_n_ctx, 256);
+    return GGML_PAD(n_ctx / n_streams, 256);
+}
+
+using common_fit_extra_mapped_memory = std::vector<llama_memory_breakdown_data>;
+
+struct common_fit_extra_cache_state {
+    common_fit_extra_mapped_memory mapped;
+    uint32_t n_ctx = 0;
+    bool unavailable = false;
+};
+
+struct common_fit_extra_cache_request {
+    uint32_t n_ctx;
+    bool refresh_always;
+    bool optional;
+};
+
+struct common_fit_extra_measurement {
+    bool available;
+    common_fit_extra_mapped_memory mapped;
+};
+
+static std::vector<const common_fit_extra_model *> common_fit_extra_model_chain(
+        const common_fit_extra_model * extra) {
+    std::vector<const common_fit_extra_model *> result;
+    for (const common_fit_extra_model * current = extra; current != nullptr; current = current->next) {
+        result.push_back(current);
+    }
+    return result;
+}
+
+static void common_fit_add_breakdown(
+        llama_memory_breakdown_data & dst,
+        const llama_memory_breakdown_data & src) {
+    dst.model               += src.model;
+    dst.context             += src.context;
+    dst.compute             += src.compute;
+    dst.context_fixed       += src.context_fixed;
+    dst.context_vbr_managed += src.context_vbr_managed;
+}
+
+template <typename Measure>
+static bool common_fit_extra_cache_update(
+        std::vector<common_fit_extra_cache_state> & states,
+        const std::vector<common_fit_extra_cache_request> & requests,
+        size_t n_destinations,
+        Measure && measure,
+        common_fit_extra_mapped_memory & aggregate) {
+    GGML_ASSERT(states.size() == requests.size());
+
+    for (size_t i = 0; i < requests.size(); ++i) {
+        auto & state = states[i];
+        const auto & request = requests[i];
+        const bool refresh = !state.unavailable &&
+            (state.mapped.empty() || state.n_ctx != request.n_ctx || request.refresh_always);
+        if (!refresh) {
+            continue;
+        }
+
+        common_fit_extra_measurement measured = measure(i, request.n_ctx);
+        if (!measured.available) {
+            if (!request.optional) {
+                return false;
+            }
+            state.mapped.clear();
+            state.n_ctx = request.n_ctx;
+            state.unavailable = true;
+            continue;
+        }
+        if (measured.mapped.size() != n_destinations) {
+            return false;
+        }
+
+        state.mapped = std::move(measured.mapped);
+        state.n_ctx = request.n_ctx;
+    }
+
+    aggregate.assign(n_destinations, {});
+    for (const auto & state : states) {
+        if (state.unavailable) {
+            continue;
+        }
+        if (state.mapped.size() != n_destinations) {
+            return false;
+        }
+        for (size_t id = 0; id < n_destinations; ++id) {
+            common_fit_add_breakdown(aggregate[id], state.mapped[id]);
+        }
+    }
+    return true;
+}
+
+common_fit_extra_cache_probe_result common_fit_extra_cache_probe(
+        const common_fit_extra_model * extra,
+        const std::vector<uint32_t> & target_n_ctx_steps,
+        uint32_t target_n_streams,
+        const std::vector<common_fit_extra_cache_probe_source> & sources) {
+    common_fit_extra_cache_probe_result result = {
+        /*.success =*/ true,
+        /*.aggregate_bytes_by_device =*/ {},
+        /*.measurement_counts =*/ std::vector<size_t>(sources.size(), 0),
+    };
+    const auto models = common_fit_extra_model_chain(extra);
+    if (models.size() != sources.size()) {
+        result.success = false;
+        return result;
+    }
+    if (models.empty()) {
+        return result;
+    }
+
+    const size_t n_destinations = sources.front().base_bytes_by_device.size();
+    std::vector<common_fit_extra_cache_state> states(sources.size());
+    common_fit_extra_mapped_memory aggregate;
+
+    for (uint32_t target_n_ctx : target_n_ctx_steps) {
+        std::vector<common_fit_extra_cache_request> requests;
+        requests.reserve(sources.size());
+        for (size_t i = 0; i < sources.size(); ++i) {
+            const auto & source = sources[i];
+            const auto * model = models[i];
+            if (source.base_bytes_by_device.size() != n_destinations) {
+                result.success = false;
+                return result;
+            }
+            requests.push_back({
+                common_fit_extra_context_size(
+                    target_n_ctx, target_n_streams,
+                    model->follows_target_per_sequence, model->fixed_n_ctx),
+                model->shares_model,
+                model->optional_if_no_mtp,
+            });
+        }
+
+        result.success = common_fit_extra_cache_update(
+            states, requests, n_destinations,
+            [&](size_t i, uint32_t n_ctx) {
+                result.measurement_counts[i]++;
+                if (!sources[i].available) {
+                    return common_fit_extra_measurement { false, {} };
+                }
+                common_fit_extra_mapped_memory mapped(n_destinations);
+                for (size_t id = 0; id < n_destinations; ++id) {
+                    mapped[id].context = sources[i].base_bytes_by_device[id] + n_ctx;
+                }
+                return common_fit_extra_measurement { true, std::move(mapped) };
+            }, aggregate);
+        if (!result.success) {
+            return result;
+        }
+    }
+
+    result.aggregate_bytes_by_device.resize(aggregate.size());
+    for (size_t id = 0; id < aggregate.size(); ++id) {
+        result.aggregate_bytes_by_device[id] = aggregate[id].total();
+    }
+    return result;
+}
+
 // floor-true KV pricing inputs/outputs for dynamic VBR (see common_params_fit_impl): the dry
 // context is created with PRICE-tier types (the movable swap in common_fit_params), while the
 // runtime floor clamp lands on a discrete tier MIX along the degrade order — capacity math must
@@ -315,7 +488,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         bool plan_hint = false,
         std::vector<llama_moe_tensor_info> * moe_tensors = nullptr,
         llama_context * ctx_parent = nullptr,
-        bool share_parent_tensors = false) {
+        bool share_parent_tensors = false,
+        bool optional_if_no_mtp = false) {
     common_fit_logger_guard logger_guard(log_level);
 
     llama_model_params mparams_copy = *mparams;
@@ -325,6 +499,9 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     llama_model_ptr model(llama_model_load_from_file(path_model, mparams_copy));
     if (model == nullptr) {
         throw std::runtime_error("failed to load model");
+    }
+    if (optional_if_no_mtp && !llama_model_has_mtp(model.get())) {
+        return {};
     }
 
     llama_context_params cparams_copy = *cparams;
@@ -601,8 +778,9 @@ static void common_params_fit_impl(
     const uint32_t n_streams  = cparams->kv_unified ? 1 : std::max<uint32_t>(1, cparams->n_seq_max);
     const bool     n_ctx_auto = cparams->n_ctx == 0;
 
-    dmds_t   dmds_extra;       // memory of the extra model, laid out on the devices of the main model
-    uint32_t n_ctx_extra = 0;  // context that memory was measured at
+    const auto extra_models = common_fit_extra_model_chain(extra);
+    std::vector<common_fit_extra_cache_state> extra_caches(extra_models.size());
+    dmds_t dmds_extra; // latest aggregate, laid out on the target devices
 
     // the extra model competes for the same memory as the main model, add it to every measurement
     // its memory is measured again whenever the context it follows changes. A shared-model MTP
@@ -613,82 +791,108 @@ static void common_params_fit_impl(
             return;
         }
 
-        if (dmds_extra.empty() || n_ctx_extra != cparams->n_ctx || extra->shares_model) {
-            std::vector<ggml_backend_dev_t> devs_extra;
-            uint32_t ngl_extra = 0;
-            uint32_t nct_extra = 0;
-            uint32_t nex_extra = 0;
-
-            extra->cparams->n_ctx = cparams->n_ctx;
-
-            llama_model_params mparams_extra = *extra->mparams;
-            if (extra->shares_model) {
-                GGML_ASSERT(target_mparams != nullptr);
-                const bool load_mtp = mparams_extra.load_mtp;
-                mparams_extra = *target_mparams;
-                // The target candidate owns placement, but the extra probe still has to load
-                // the native MTP tensors selected by the speculative configuration.
-                mparams_extra.load_mtp = load_mtp;
-            }
-
-            LOG_TRC("%s: getting device memory data for the extra model at a context size of %" PRIu32 ":\n",
-                __func__, cparams->n_ctx);
-
-            dmds_t measured;
-            try {
-                measured = common_get_device_memory_data_impl(
-                    extra->path_model, &mparams_extra, extra->cparams,
-                    devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
-            } catch (const std::runtime_error & e) {
-                throw common_params_fit_exception(string_format(
-                    "failed to measure the required speculative model/context: %s", e.what()));
-            }
-
-            if (measured.size() != devs_extra.size() + 1) {
-                throw common_params_fit_exception(
-                    "required speculative model/context returned an invalid device inventory");
-            }
-
-            dmds_extra = dmds_t(devs.size() + 1);
-            dmds_extra.back().mb = measured.back().mb;
-            if (extra->shares_model) {
-                dmds_extra.back().mb.model = 0;
-            }
-            for (size_t je = 0; je < devs_extra.size(); je++) {
-                llama_memory_breakdown_data mb_extra = measured[je].mb;
-                if (extra->shares_model) {
-                    mb_extra.model = 0;
-                }
-
-                bool mapped = false;
-                for (size_t id = 0; id < devs.size(); id++) {
-                    if (devs_extra[je] == devs[id]) {
-                        dmds_extra[id].mb.model         += mb_extra.model;
-                        dmds_extra[id].mb.context       += mb_extra.context;
-                        dmds_extra[id].mb.compute       += mb_extra.compute;
-                        dmds_extra[id].mb.context_fixed += mb_extra.context_fixed;
-                        dmds_extra[id].mb.context_vbr_managed += mb_extra.context_vbr_managed;
-                        mapped = true;
-                        break;
-                    }
-                }
-
-                if (!mapped && mb_extra.total() != 0) {
-                    throw common_params_fit_exception(string_format(
-                        "required speculative model/context uses device %s outside the target fit authority",
-                        ggml_backend_dev_name(devs_extra[je])));
-                }
-            }
-
-            n_ctx_extra = cparams->n_ctx;
+        std::vector<common_fit_extra_cache_request> requests;
+        requests.reserve(extra_models.size());
+        for (const common_fit_extra_model * current : extra_models) {
+            const uint32_t n_ctx_current = common_fit_extra_context_size(
+                cparams->n_ctx, n_streams,
+                current->follows_target_per_sequence, current->fixed_n_ctx);
+            current->cparams->n_ctx = n_ctx_current;
+            requests.push_back({
+                n_ctx_current,
+                current->shares_model,
+                current->optional_if_no_mtp,
+            });
         }
 
+        common_fit_extra_mapped_memory aggregate;
+        const bool extra_ok = common_fit_extra_cache_update(
+            extra_caches, requests, devs.size() + 1,
+            [&](size_t iextra, uint32_t) {
+                const common_fit_extra_model * current = extra_models[iextra];
+                std::vector<ggml_backend_dev_t> devs_extra;
+                uint32_t ngl_extra = 0;
+                uint32_t nct_extra = 0;
+                uint32_t nex_extra = 0;
+
+                llama_model_params mparams_extra = *current->mparams;
+                if (current->shares_model) {
+                    GGML_ASSERT(target_mparams != nullptr);
+                    const bool load_mtp = mparams_extra.load_mtp;
+                    mparams_extra = *target_mparams;
+                    // The target candidate owns placement, but the extra probe still has to load
+                    // the native MTP tensors selected by the speculative configuration.
+                    mparams_extra.load_mtp = load_mtp;
+                }
+
+                LOG_TRC("%s: getting device memory data for an extra model at a context size of %" PRIu32 ":\n",
+                    __func__, current->cparams->n_ctx);
+
+                dmds_t measured;
+                try {
+                    measured = common_get_device_memory_data_impl(
+                        current->path_model, &mparams_extra, current->cparams,
+                        devs_extra, ngl_extra, nct_extra, nex_extra, log_level,
+                        /* vbr_costs = */ nullptr,
+                        /* plan_hint = */ false,
+                        /* moe_tensors = */ nullptr,
+                        /* ctx_parent = */ nullptr,
+                        /* share_parent_tensors = */ false,
+                        current->optional_if_no_mtp);
+                } catch (const std::runtime_error & e) {
+                    throw common_params_fit_exception(string_format(
+                        "failed to measure a required speculative model/context: %s", e.what()));
+                }
+
+                if (measured.empty() && current->optional_if_no_mtp) {
+                    return common_fit_extra_measurement { false, {} };
+                }
+
+                if (measured.size() != devs_extra.size() + 1) {
+                    throw common_params_fit_exception(
+                        "required speculative model/context returned an invalid device inventory");
+                }
+
+                common_fit_extra_mapped_memory mapped(devs.size() + 1);
+                llama_memory_breakdown_data mb_host = measured.back().mb;
+                if (current->shares_model) {
+                    mb_host.model = 0;
+                }
+                common_fit_add_breakdown(mapped.back(), mb_host);
+
+                for (size_t je = 0; je < devs_extra.size(); je++) {
+                    llama_memory_breakdown_data mb_extra = measured[je].mb;
+                    if (current->shares_model) {
+                        mb_extra.model = 0;
+                    }
+
+                    bool mapped_device = false;
+                    for (size_t id = 0; id < devs.size(); id++) {
+                        if (devs_extra[je] == devs[id]) {
+                            common_fit_add_breakdown(mapped[id], mb_extra);
+                            mapped_device = true;
+                            break;
+                        }
+                    }
+
+                    if (!mapped_device && mb_extra.total() != 0) {
+                        throw common_params_fit_exception(string_format(
+                            "required speculative model/context uses device %s outside the target fit authority",
+                            ggml_backend_dev_name(devs_extra[je])));
+                    }
+                }
+                return common_fit_extra_measurement { true, std::move(mapped) };
+            }, aggregate);
+
+        if (!extra_ok) {
+            throw common_params_fit_exception(
+                "required speculative model/context returned no usable memory inventory");
+        }
+
+        dmds_extra.assign(aggregate.size(), {});
         for (size_t id = 0; id < dmds.size(); id++) {
-            dmds[id].mb.model   += dmds_extra[id].mb.model;
-            dmds[id].mb.context += dmds_extra[id].mb.context;
-            dmds[id].mb.compute += dmds_extra[id].mb.compute;
-            dmds[id].mb.context_fixed += dmds_extra[id].mb.context_fixed;
-            dmds[id].mb.context_vbr_managed += dmds_extra[id].mb.context_vbr_managed;
+            dmds_extra[id].mb = aggregate[id];
+            common_fit_add_breakdown(dmds[id].mb, aggregate[id]);
         }
     };
 
