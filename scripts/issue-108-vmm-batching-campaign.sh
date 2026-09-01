@@ -20,7 +20,7 @@ Useful environment overrides:
   ISSUE108_GPU_LAYERS          default 99
 
 Pass hardware-specific options after --, for example:
-  ... -- -sm tensor --tensor-split 12,16
+  ... -- -sm tensor --tensor-split 1/1
 
 The script controls -ctk/-ctv, -p, -n, -b, -ub, -t, -ngl, -fa, -r, and -o.
 EOF
