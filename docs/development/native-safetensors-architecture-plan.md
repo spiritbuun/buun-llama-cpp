@@ -241,7 +241,7 @@ Qwen3.8-Flash-Next (`qwen4exp`) and DeepSeek-V4-Flash architectures.
 - [ ] Record exact revisions for the representative Qwen3.8-27B release set:
   official block-FP8, Unsloth NVFP4, AWQ INT4, GPTQ INT4, AutoRound W4A16,
   W8A16 INT8, SmoothQuant W8A8, and BitsAndBytes NF4.
-- [ ] Pin the official Qwen3.8-Flash-Next and DeepSeek-V4-Flash safetensors
+- [x] Pin the official Qwen3.8-Flash-Next and DeepSeek-V4-Flash safetensors
   revisions. Inventory their complete tensor contracts, including Qwen PLE
   shards and DeepSeek's mixed FP4/FP8 expert representation, before describing
   either source format as supported.
@@ -845,6 +845,49 @@ Current architecture proof (2026-09-01):
   the hidden layout afterward preserves the broadcasted numerical operation
   while making the existing scaled-FP8 executor applicable. The same shape fix
   is applied to Qwen4's equivalent hyper-connection MTP projection.
+- A native-source VBR invocation also initializes and generates coherently
+  (`Germany` -> `Berlin`), but it does not constitute a dynamic-tier proof.
+  The existing DeepSeek-V4 cache explicitly pins its concatenated raw/CSA/HCA
+  children to static `q8_0` under `-ctk/-ctv vbr`; runtime logging names the
+  missing contract as per-child tier ganging. Native loading reaches the same
+  documented fallback as GGUF. Dynamic DeepSeek-V4 VBR remains a runtime-cache
+  project rather than an importer defect or completed release gate.
+- Partial dense-layer offload also crosses the native source/backend seam
+  successfully. With `-ngl 20 -ot 'exps=CPU'`, 20/45 layers occupied a
+  3700.14 MiB CUDA model buffer and the remaining weights occupied
+  145080.18 MiB of pinned host storage. The mixed CUDA/CPU graph initialized,
+  executed prompt and decode tokens through the block-FP8 CPU path, returned
+  finite coherent reasoning text, and tore down cleanly. At roughly 0.21 t/s
+  this is a placement-correctness proof, not a useful serving configuration.
+- The official DeepSeek source now passes both four-GPU placement modes on RTX
+  3090s with routed experts held in host memory. Layer split placed 1765.35,
+  1653.95, 1633.68, and 2365.33 MiB of model data on the four devices. Tensor
+  split held 3547.37 MiB in the meta model buffer and used 4387 MiB per device
+  after context/compute allocation. Both generated the exact one-word answer
+  `Paris`; the short decode probes measured 3.49 and 5.39 t/s respectively.
+  The tensor-split gate found two shared runtime defects rather than an importer
+  byte error: source-less `ARANGE` was not classified as mirrored by the meta
+  backend, and DeepSeek's block-FP8 Q-B, grouped output, and shared-expert scale
+  grids were mirrored instead of sharded along their weights' block axes. The
+  focused synthetic DeepSeek architecture test now passes the complete CUDA,
+  CPU, and meta-device graph with NMSE `8.71e-08` on CUDA/meta versus CPU.
+  One non-fatal checkpoint-publication warning remains on the production tensor-
+  split request; checkpoint persistence under tensor split is not claimed by
+  this gate.
+- Four-GPU adaptive expert caching also consumes the native MXFP4 expert roots
+  directly. `auto` selected three-way expert parallelism and allocated 18.09,
+  20.46, 20.48, and 19.75 GiB pools. Five cold/warm requests generated correct
+  answers or coherent code; repeated code decode rose from 8.11 to 9.25 t/s.
+  Clean teardown reported 86.3--87.4% residency-probe hits, 16,521 successful
+  fills, and zero fill, dispatch, or collection failures. This proves `auto`
+  plus expert-parallel operation; `on`, `soft`, fixed budgets, eviction, and
+  multi-slot behavior remain separate gates.
+- The same regression pass restored the legacy `llama_model_init_from_user()`
+  callback contract. Callback-backed models synthesize the canonical tensor
+  requests because their GGUF metadata is not a complete tensor manifest;
+  strict describe/bind/load completeness remains exclusive to real tensor
+  sources. This also restores compilation and execution of the architecture
+  fixture after the tensor-source interface addition.
 - The text-only Qwen4 fixture at revision
   `d49cb5156b0dad4016f33b55e142a390da88e9fa` exercises recurrent attention,
   QSA/indexer splitting, PLE, hyper-connections, separate-expert aggregation,

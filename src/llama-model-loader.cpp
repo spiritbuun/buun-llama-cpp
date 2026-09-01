@@ -1515,6 +1515,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             int max_n_tensors = tensor_capacity;
             max_n_tensors += 1;                   // duplicated output tensor
             max_n_tensors += hparams.n_layer()*2; // duplicated rope freq tensors
+            if (files.empty() && tensor_source == nullptr) {
+                // Legacy callback sources have no complete tensor manifest.
+                max_n_tensors += hparams.n_layer()*256;
+            }
             const size_t ctx_size = ggml_tensor_overhead()*max_n_tensors;
 
             ggml_init_params params = {
@@ -1675,13 +1679,27 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         if (flags & TENSOR_SKIP_IF_VIRTUAL) {
             return nullptr;
         }
-        ggml_type type;
+        ggml_type type = GGML_TYPE_F32;
         std::array<int64_t, GGML_MAX_DIMS> source_ne;
-        if (!get_tensor_info(tn.str().c_str(), type, source_ne)) {
-            if (flags & TENSOR_NOT_REQUIRED) {
-                return nullptr;
+        if (tensor_source != nullptr) {
+            if (!get_tensor_info(tn.str().c_str(), type, source_ne)) {
+                if (flags & TENSOR_NOT_REQUIRED) {
+                    return nullptr;
+                }
+                throw std::runtime_error(format("missing tensor '%s'", tn.str().c_str()));
             }
-            throw std::runtime_error(format("missing tensor '%s'", tn.str().c_str()));
+        } else {
+            // The legacy callback API synthesizes tensors from the model's
+            // canonical request. GGUF metadata may override the dtype, but it
+            // is not a complete source manifest and must not make unspecified
+            // callback-provided tensors disappear.
+            const int64_t tid = gguf_find_tensor(metadata, tn.str().c_str());
+            if (tid >= 0) {
+                type = gguf_get_tensor_type(metadata, tid);
+            }
+            for (size_t dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+                source_ne[dim] = dim < ne.size() ? ne.begin()[dim] : 1;
+            }
         }
 
         // Optional tensors can have architecture-dependent dimensions that
@@ -1753,12 +1771,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         if (tensor_source != nullptr) {
             tensor_source->bind(tn.str());
         }
-        if (!(flags & TENSOR_DUPLICATED)) {
+        if (tensor_source != nullptr && !(flags & TENSOR_DUPLICATED)) {
             n_created++;
-            if (tensor_source != nullptr) {
-                n_elements += ggml_nelements(ret);
-                n_bytes    += ggml_nbytes(ret);
-            }
+            n_elements += ggml_nelements(ret);
+            n_bytes    += ggml_nbytes(ret);
         }
         size_data += ggml_nbytes(ret);
         return ret;
@@ -1832,7 +1848,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 }
 
 void llama_model_loader::done_getting_tensors(bool partial) const {
-    if (tensor_source == nullptr) {
+    if (!files.empty()) {
         if (n_created > n_tensors) {
             throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_created));
         }

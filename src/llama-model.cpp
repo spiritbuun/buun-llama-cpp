@@ -403,6 +403,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_attn_out_a_weight("blk\\.\\d*\\.attn_output_a\\.weight");
     static const std::regex pattern_attn_out_b_weight("blk\\.\\d*\\.attn_output_b\\.weight");
     static const std::regex pattern_attn_q_b_weight ("blk\\.\\d*\\.attn_q_b\\.weight");
+    static const std::regex pattern_attn_out_a_scale ("blk\\.\\d*\\.attn_output_a\\.scale");
+    static const std::regex pattern_attn_out_b_scale ("blk\\.\\d*\\.attn_output_b\\.scale");
+    static const std::regex pattern_attn_q_b_scale   ("blk\\.\\d*\\.attn_q_b\\.scale");
     static const std::regex pattern_attn_gate_weight("blk\\.\\d*\\.attn_gate.weight");
     static const std::regex pattern_attn_gate_scale ("blk\\.\\d*\\.attn_gate.scale");
 
@@ -439,6 +442,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_ffn_up_shexp_weight   ("blk\\.\\d*\\.ffn_up_shexp.weight");
     static const std::regex pattern_ffn_gate_shexp_weight ("blk\\.\\d*\\.ffn_gate_shexp.weight");
     static const std::regex pattern_ffn_down_shexp_weight ("blk\\.\\d*\\.ffn_down_shexp.weight");
+    static const std::regex pattern_ffn_up_shexp_scale    ("blk\\.\\d*\\.ffn_up_shexp.scale");
+    static const std::regex pattern_ffn_gate_shexp_scale  ("blk\\.\\d*\\.ffn_gate_shexp.scale");
+    static const std::regex pattern_ffn_down_shexp_scale  ("blk\\.\\d*\\.ffn_down_shexp.scale");
 
     static const std::regex pattern_output_weight("output\\.weight");
     static const std::regex pattern_output_scale ("output\\.scale");
@@ -510,18 +516,34 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             if (std::regex_match(tensor_name, pattern_attn_q_b_weight)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output_a.weight");
             }
+            if (ggml_nelements(tensor) > 1 && std::regex_match(tensor_name, pattern_attn_q_b_scale)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_q_b.weight");
+            }
             if (std::regex_match(tensor_name, pattern_attn_out_a_weight)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
             }
+            if (ggml_nelements(tensor) > 1 && std::regex_match(tensor_name, pattern_attn_out_a_scale)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output_a.weight");
+            }
             if (std::regex_match(tensor_name, pattern_attn_out_b_weight)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+            }
+            if (ggml_nelements(tensor) > 1 && std::regex_match(tensor_name, pattern_attn_out_b_scale)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output_b.weight");
             }
             if (std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
                     std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down_shexp.weight");
             }
+            if (ggml_nelements(tensor) > 1 && (std::regex_match(tensor_name, pattern_ffn_up_shexp_scale) ||
+                    std::regex_match(tensor_name, pattern_ffn_gate_shexp_scale))) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down_shexp.weight");
+            }
             if (std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down_shexp.weight");
+            }
+            if (ggml_nelements(tensor) > 1 && std::regex_match(tensor_name, pattern_ffn_down_shexp_scale)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down_shexp.weight");
             }
         }
 

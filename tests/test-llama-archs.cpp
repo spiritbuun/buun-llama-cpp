@@ -2488,6 +2488,7 @@ static void test_dflash_loader_exact_identity() {
                 /* metadata        */ nullptr,
                 /* set_tensor_data */ nullptr,
                 /* user_data       */ nullptr,
+                /* tensor_source   */ nullptr,
                 /* fname           */ "",
                 splits,
                 file.get(),
@@ -2542,7 +2543,7 @@ static void test_dflash_loader_exact_identity() {
     GGML_ASSERT(mixed_file != nullptr);
     std::vector<std::string> splits;
     llama_model_loader mixed_loader(
-            nullptr, nullptr, nullptr, "", splits, mixed_file.get(), LLAMA_LOAD_MODE_NONE,
+            nullptr, nullptr, nullptr, nullptr, "", splits, mixed_file.get(), LLAMA_LOAD_MODE_NONE,
             false, true, false, nullptr, nullptr);
     GGML_ASSERT(llm_dflash_selector_family_from_loader(true, 1, mixed_loader) ==
             llm_dflash_selector_family::mixed);
@@ -2568,7 +2569,7 @@ static void test_dflash_loader_exact_identity() {
     GGML_ASSERT(partial_mixed_file != nullptr);
     splits.clear();
     llama_model_loader partial_mixed_loader(
-            nullptr, nullptr, nullptr, "", splits, partial_mixed_file.get(), LLAMA_LOAD_MODE_NONE,
+            nullptr, nullptr, nullptr, nullptr, "", splits, partial_mixed_file.get(), LLAMA_LOAD_MODE_NONE,
             false, true, false, nullptr, nullptr);
     GGML_ASSERT(llm_dflash_selector_family_from_loader(true, 1, partial_mixed_loader) ==
             llm_dflash_selector_family::mixed);
@@ -2591,7 +2592,7 @@ static void test_dflash_loader_exact_identity() {
     GGML_ASSERT(unidentified_file != nullptr);
     splits.clear();
     llama_model_loader unidentified_loader(
-            nullptr, nullptr, nullptr, "", splits, unidentified_file.get(), LLAMA_LOAD_MODE_NONE,
+            nullptr, nullptr, nullptr, nullptr, "", splits, unidentified_file.get(), LLAMA_LOAD_MODE_NONE,
             false, true, false, nullptr, nullptr);
     {
         llama_model_params params = llama_model_default_params();
