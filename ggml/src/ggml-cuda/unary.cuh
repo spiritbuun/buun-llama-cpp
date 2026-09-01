@@ -91,7 +91,54 @@ void ggml_cuda_op_geglu_quick(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
 void ggml_cuda_op_xielu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
-void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node);
+void ggml_cuda_fp8_static_fake_quant(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src,
+        const ggml_tensor * scale,
+        float * dst);
+
+void ggml_cuda_fp8_dynamic_fake_quant(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src,
+        const ggml_tensor * marker,
+        float * dst);
+
+void ggml_cuda_int8_static_fake_quant(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src,
+        const ggml_tensor * scale,
+        float * dst);
+
+void ggml_cuda_int8_dynamic_fake_quant(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src,
+    float * dst);
+
+void ggml_cuda_mxfp4_dynamic_fake_quant(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src,
+        float * dst);
+
+bool ggml_cuda_mul_mat_mxfp8(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * weight,
+        const ggml_tensor * input,
+    ggml_tensor * dst);
+
+bool ggml_cuda_mul_mat_bnb4(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * weight,
+        const ggml_tensor * input,
+        ggml_tensor * dst);
+
+bool ggml_cuda_mul_mat_gptq_ao(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * weight,
+        const ggml_tensor * input,
+        ggml_tensor * dst);
+
+void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node,
+                            const ggml_tensor * bf16_activation = nullptr);
 
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
 

@@ -33,6 +33,7 @@ class llama_safetensors_metadata_sink {
     void set_i32(std::string_view key, int32_t value);
     void set_f32(std::string_view key, float value);
     void set_bool(std::string_view key, bool value);
+    void set_f32_array(std::string_view key, const float * values, size_t count);
     void set_i32_array(std::string_view key, const int32_t * values, size_t count);
     void set_string_array(std::string_view key, const std::vector<std::string> & values);
 
@@ -77,5 +78,14 @@ void llama_safetensors_emit_bpe_tokenizer(llama_safetensors_metadata_sink &    s
                                           const llama_safetensors_json &       tokenizer,
                                           const llama_safetensors_bpe_policy & policy,
                                           const std::optional<std::string> &   chat_template);
+
+void llama_safetensors_emit_spm_tokenizer(llama_safetensors_metadata_sink &  sink,
+                                          const std::filesystem::path &       tokenizer_model,
+                                          uint32_t                            vocab_size,
+                                          uint32_t                            bos_token_id,
+                                          uint32_t                            eos_token_id,
+                                          std::optional<uint32_t>             padding_token_id,
+                                          bool                                add_bos_token,
+                                          const std::optional<std::string> & chat_template);
 
 uint32_t llama_safetensors_first_token_id(const llama_safetensors_json & value, std::string_view context);

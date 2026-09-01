@@ -331,12 +331,17 @@ static void ggml_cuda_op_gated_delta_net_impl(
 
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     if (ggml_cuda_gdn_fla_ptx_supported(cc, kda, keep_rs, S_v, H, neqk1, n_tokens, n_seqs)) {
-        ggml_cuda_gdn_fla_ptx(ctx, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-                              sq1, sq2, sq3, sv1, sv2, sv3,
+        ggml_cuda_gdn_fla_ptx(ctx, cc, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+                              n_tokens, sq1, sq2, sq3, sv1, sv2, sv3,
+                              nullptr,
                               l2_eps,
                               cache != nullptr ? cache->rms_weight : nullptr,
                               cache != nullptr ? cache->rms_gate : nullptr,
+                              cache != nullptr ? cache->rms_gate_bf16 : false,
                               cache != nullptr ? cache->rms_output : nullptr,
+                              cache != nullptr ? cache->rms_output_bf16 : false,
+                              cache != nullptr ? cache->rms_output_int8 : false,
+                              cache != nullptr ? cache->rms_output_scale : nullptr,
                               cache != nullptr ? cache->rms_eps : 0.0f);
         return;
     }

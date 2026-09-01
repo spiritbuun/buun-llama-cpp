@@ -31,6 +31,18 @@ struct source_spec {
     std::string name;
     std::vector<transform_kind> transforms;
     std::optional<llama_safetensors_quant_binding> quant;
+    size_t row_offset = 0;
+    size_t row_count  = 0;
+    std::string hqq_scale;
+
+    source_spec() = default;
+    source_spec(
+            std::string source_name,
+            std::vector<transform_kind> source_transforms,
+            std::optional<llama_safetensors_quant_binding> source_quant) :
+        name(std::move(source_name)),
+        transforms(std::move(source_transforms)),
+        quant(std::move(source_quant)) {}
 };
 
 class unsupported_target : public std::runtime_error {
@@ -46,11 +58,20 @@ struct qwen_geometry {
     uint32_t n_value_heads;
     uint32_t key_head_dim;
     uint32_t value_head_dim;
+    uint32_t full_attention_interval;
+    bool     text_only;
+    bool     moe;
+    bool     executorch_flat;
 
     uint32_t values_per_key() const {
         return n_value_heads / n_key_heads;
     }
 };
+
+bool is_recurrent_layer(int layer, const qwen_geometry & geometry) {
+    return static_cast<uint32_t>(layer) < geometry.n_layer &&
+           (static_cast<uint32_t>(layer) + 1) % geometry.full_attention_interval != 0;
+}
 
 bool has_transform(const source_spec & spec, transform_kind transform) {
     return std::find(spec.transforms.begin(), spec.transforms.end(), transform) != spec.transforms.end();
@@ -70,7 +91,11 @@ const llama_safetensors_tensor & require_tensor(const llama_safetensors_registry
 
 std::string layer_source_prefix(int layer, const qwen_geometry & geometry) {
     if (layer >= 0 && static_cast<uint32_t>(layer) < geometry.n_layer) {
-        return "model.language_model.layers." + std::to_string(layer) + ".";
+        if (geometry.executorch_flat) {
+            return "layers." + std::to_string(layer) + ".";
+        }
+        return (geometry.text_only ? "model.layers." : "model.language_model.layers.") +
+               std::to_string(layer) + ".";
     }
     if (layer >= 0 && static_cast<uint32_t>(layer) < geometry.n_layer + geometry.n_mtp) {
         return "mtp.layers." + std::to_string(static_cast<uint32_t>(layer) - geometry.n_layer) + ".";
@@ -93,6 +118,19 @@ source_spec quantized_or_plain(
     return { plain_name, std::move(transforms), std::nullopt };
 }
 
+source_spec sliced_quantized(
+        const llama_safetensors_quant_adapters & quant,
+        const std::string & module,
+        size_t row_offset,
+        size_t row_count,
+        std::vector<transform_kind> transforms = {}) {
+    source_spec result = quantized_or_plain(
+        quant, module, llama_safetensors_quant_role::WEIGHT, std::move(transforms), module + ".weight");
+    result.row_offset = row_offset;
+    result.row_count  = row_count;
+    return result;
+}
+
 source_spec bind_source_name(
         const llama_safetensors_quant_adapters & quant,
         llama_safetensors_source_name source,
@@ -104,15 +142,120 @@ source_spec bind_source_name(
     return { std::move(source.source), std::move(transforms), std::nullopt };
 }
 
+std::optional<source_spec> map_executorch_moe_target(
+        const llama_safetensors_quant_adapters & quant,
+        const qwen_geometry & geometry,
+        int layer,
+        const std::string & suffix,
+        const std::string & prefix) {
+    const auto projection = [&](std::string_view source, std::vector<transform_kind> transforms = {}) {
+        const std::string module = prefix + std::string(source);
+        return quantized_or_plain(
+            quant, module, llama_safetensors_quant_role::WEIGHT, std::move(transforms), module + ".weight");
+    };
+    const auto plain = [&](std::string_view source, std::vector<transform_kind> transforms = {}) {
+        return source_spec{ prefix + std::string(source), std::move(transforms), std::nullopt };
+    };
+
+    if (suffix == "attn_norm.weight") {
+        return plain("ln_1.weight", { transform_kind::OFFSET_NORM });
+    }
+    if (suffix == "post_attention_norm.weight") {
+        return plain("ln_2.weight", { transform_kind::OFFSET_NORM });
+    }
+    if (suffix == "ffn_gate_inp.weight") {
+        return projection("mlp.gate");
+    }
+    if (suffix == "ffn_gate_inp_shexp.weight") {
+        return projection("mlp.shared_expert_gate");
+    }
+    if (suffix == "ffn_gate_shexp.weight") {
+        return sliced_quantized(quant, prefix + "mlp.shared_expert.gate_up_proj", 0, 512);
+    }
+    if (suffix == "ffn_up_shexp.weight") {
+        return sliced_quantized(quant, prefix + "mlp.shared_expert.gate_up_proj", 512, 512);
+    }
+    if (suffix == "ffn_down_shexp.weight") {
+        return projection("mlp.shared_expert.down_proj");
+    }
+    if (suffix == "ffn_gate_up_exps.weight" || suffix == "ffn_down_exps.weight") {
+        const bool gate_up = suffix == "ffn_gate_up_exps.weight";
+        source_spec result;
+        result.name      = prefix + "mlp.experts." + (gate_up ? "w1" : "w2");
+        result.hqq_scale = result.name + "_scale";
+        return result;
+    }
+
+    if (!is_recurrent_layer(layer, geometry)) {
+        if (suffix == "attn_qkv.weight") {
+            return projection("attn.qkv_proj");
+        }
+        if (suffix == "attn_output.weight") {
+            return projection("attn.o_proj");
+        }
+        if (suffix == "attn_q_norm.weight") {
+            return plain("attn.q_norm.weight", { transform_kind::OFFSET_NORM });
+        }
+        if (suffix == "attn_k_norm.weight") {
+            return plain("attn.k_norm.weight", { transform_kind::OFFSET_NORM });
+        }
+        return std::nullopt;
+    }
+
+    const std::string in_proj = prefix + "attn.in_proj";
+    const size_t key_dim      = geometry.n_key_heads * geometry.key_head_dim;
+    const size_t value_dim    = geometry.n_value_heads * geometry.value_head_dim;
+    const size_t qkv_rows     = 2 * key_dim + value_dim;
+    if (suffix == "attn_qkv.weight") {
+        return sliced_quantized(
+            quant, in_proj, 0, qkv_rows, { transform_kind::QKV_ROWS });
+    }
+    if (suffix == "attn_gate.weight") {
+        return sliced_quantized(
+            quant, in_proj, qkv_rows, value_dim, { transform_kind::V_ROWS });
+    }
+    if (suffix == "ssm_beta.weight") {
+        return sliced_quantized(
+            quant, in_proj, qkv_rows + value_dim, geometry.n_value_heads,
+            { transform_kind::HEAD_ROWS });
+    }
+    if (suffix == "ssm_alpha.weight") {
+        return sliced_quantized(
+            quant, in_proj, qkv_rows + value_dim + geometry.n_value_heads,
+            geometry.n_value_heads, { transform_kind::HEAD_ROWS });
+    }
+    if (suffix == "ssm_norm.weight") {
+        return plain("attn.norm.weight");
+    }
+    if (suffix == "ssm_conv1d.weight") {
+        return plain("attn.conv1d.weight", { transform_kind::CONV_ROWS });
+    }
+    if (suffix == "ssm_a") {
+        return plain("attn.A_log", { transform_kind::A_LOG, transform_kind::HEAD_ROWS });
+    }
+    if (suffix == "ssm_dt.bias") {
+        return plain("attn.dt_bias", { transform_kind::HEAD_ROWS });
+    }
+    if (suffix == "ssm_out.weight") {
+        return projection("attn.out_proj", { transform_kind::V_COLUMNS });
+    }
+    return std::nullopt;
+}
+
 source_spec map_target_unchecked(
         const llama_safetensors_quant_adapters & quant,
         const qwen_geometry & geometry,
         const std::string & target_name) {
     if (target_name == "token_embd.weight") {
-        return { "model.language_model.embed_tokens.weight", {}, std::nullopt };
+        const std::string module = geometry.executorch_flat ? "embed_tokens" :
+            (geometry.text_only ? "model.embed_tokens" : "model.language_model.embed_tokens");
+        return quantized_or_plain(
+            quant, module, llama_safetensors_quant_role::WEIGHT, {}, module + ".weight");
     }
     if (target_name == "output_norm.weight") {
-        return { "model.language_model.norm.weight", { transform_kind::OFFSET_NORM }, std::nullopt };
+        return { geometry.executorch_flat ? "norm.weight" :
+                 (geometry.text_only ? "model.norm.weight" : "model.language_model.norm.weight"),
+                 { transform_kind::OFFSET_NORM }, std::nullopt };
     }
     if (target_name == "output.weight") {
         return quantized_or_plain(
@@ -139,6 +282,12 @@ source_spec map_target_unchecked(
     const std::string suffix = match[2].str();
     const std::string prefix = layer_source_prefix(layer, geometry);
 
+    if (geometry.moe && geometry.executorch_flat) {
+        if (auto mapped = map_executorch_moe_target(quant, geometry, layer, suffix, prefix)) {
+            return std::move(*mapped);
+        }
+    }
+
     if (auto ordinary = llama_safetensors_map_decoder_tensor(prefix, suffix)) {
         std::vector<transform_kind> transforms;
         if (suffix == "attn_norm.weight" || suffix == "post_attention_norm.weight" ||
@@ -153,20 +302,27 @@ source_spec map_target_unchecked(
         std::string_view source;
         transform_kind transform;
     };
-    static constexpr std::array<recurrent_name, 12> recurrent = {
+    static constexpr std::array<recurrent_name, 19> recurrent = {
         {
          { "attn_gate.weight", "linear_attn.in_proj_z.weight",       transform_kind::V_ROWS },
          { "attn_gate.scale",  "linear_attn.in_proj_z.weight_scale", transform_kind::V_ROWS },
+         { "attn_gate.input_scale", "linear_attn.in_proj_z.input_scale", transform_kind::NONE },
          { "attn_qkv.weight",  "linear_attn.in_proj_qkv.weight",     transform_kind::QKV_ROWS },
          { "attn_qkv.scale",   "linear_attn.in_proj_qkv.weight_scale", transform_kind::QKV_ROWS },
+         { "attn_qkv.input_scale", "linear_attn.in_proj_qkv.input_scale", transform_kind::NONE },
          { "ssm_norm.weight",  "linear_attn.norm.weight",            transform_kind::NONE },
          { "ssm_conv1d.weight", "linear_attn.conv1d.weight",         transform_kind::CONV_ROWS },
          { "ssm_alpha.weight", "linear_attn.in_proj_a.weight",       transform_kind::HEAD_ROWS },
+         { "ssm_alpha.scale",  "linear_attn.in_proj_a.weight_scale", transform_kind::HEAD_ROWS },
+         { "ssm_alpha.input_scale", "linear_attn.in_proj_a.input_scale", transform_kind::NONE },
          { "ssm_beta.weight",  "linear_attn.in_proj_b.weight",       transform_kind::HEAD_ROWS },
+         { "ssm_beta.scale",   "linear_attn.in_proj_b.weight_scale", transform_kind::HEAD_ROWS },
+         { "ssm_beta.input_scale", "linear_attn.in_proj_b.input_scale", transform_kind::NONE },
          { "ssm_a",            "linear_attn.A_log",                  transform_kind::A_LOG },
          { "ssm_dt.bias",      "linear_attn.dt_bias",                transform_kind::HEAD_ROWS },
          { "ssm_out.weight",   "linear_attn.out_proj.weight",        transform_kind::V_COLUMNS },
          { "ssm_out.scale",    "linear_attn.out_proj.weight_scale",  transform_kind::NONE },
+         { "ssm_out.input_scale", "linear_attn.out_proj.input_scale", transform_kind::NONE },
          }
     };
     for (const recurrent_name & name : recurrent) {
@@ -174,7 +330,11 @@ source_spec map_target_unchecked(
             llama_safetensors_source_name source {
                 prefix + std::string(name.source), {}, std::nullopt,
             };
-            if (ends_with(name.target, ".scale")) {
+            if (ends_with(name.target, ".input_scale")) {
+                source.module = source.source.substr(
+                    0, source.source.size() - std::string_view(".input_scale").size());
+                source.quant_role = llama_safetensors_quant_role::INPUT_SCALE;
+            } else if (ends_with(name.target, ".scale")) {
                 source.module = source.source.substr(
                     0, source.source.size() - std::string_view(".weight_scale").size());
                 source.quant_role = llama_safetensors_quant_role::WEIGHT_SCALE;
@@ -238,9 +398,15 @@ void validate_transform_plan(const source_spec & spec, const std::string & targe
         materialization == llama_safetensors_quant_materialization::AWQ_REPACK ||
         materialization == llama_safetensors_quant_materialization::GPTQ_REPACK;
     const bool packed_columns =
-        materialization == llama_safetensors_quant_materialization::NVFP4_REPACK ||
-        materialization == llama_safetensors_quant_materialization::W8A8_REPACK || packed_affine_rows;
+        materialization == llama_safetensors_quant_materialization::NVFP4_REPACK || packed_affine_rows;
+    const bool gptq_act_order = spec.quant->target_type == GGML_TYPE_GPTQ_AO ||
+        materialization == llama_safetensors_quant_materialization::GPTQ_SCALE_BUNDLE;
     for (transform_kind transform : spec.transforms) {
+        if (gptq_act_order && transform != transform_kind::NONE) {
+            throw std::runtime_error(
+                "native safetensors cannot apply a Qwen3.5 recurrent layout transform to GPTQ act-order tensor '" +
+                spec.name + "' for '" + target_name + "'");
+        }
         if ((is_row_transform(transform) && packed_affine_rows) ||
             (transform == transform_kind::V_COLUMNS && packed_columns)) {
             throw std::runtime_error(
@@ -263,6 +429,9 @@ ggml_type target_type_for(
         const llama_safetensors_registry & registry,
         const source_spec & spec,
         const std::string & target_name) {
+    if (!spec.hqq_scale.empty()) {
+        return GGML_TYPE_Q4_0;
+    }
     if (spec.quant) {
         return spec.quant->target_type;
     }
@@ -280,6 +449,13 @@ ggml_type target_type_for(
                 return GGML_TYPE_BF16;
             }
             return GGML_TYPE_F32;
+        case llama_safetensors_dtype::F16:
+            if (ends_with(target_name, ".scale") || target_name == "token_embd.weight" ||
+                (source.shape.size() >= 2 && target_name.find("ssm_conv1d.weight") == std::string::npos &&
+                 !has_transform(spec, transform_kind::OFFSET_NORM))) {
+                return GGML_TYPE_F16;
+            }
+            return GGML_TYPE_F32;
         case llama_safetensors_dtype::F32:
             return GGML_TYPE_F32;
         default:
@@ -292,8 +468,28 @@ std::vector<int64_t> target_shape_for(
         const source_spec & spec,
         const std::string & target_name) {
     const llama_safetensors_tensor & source = require_tensor(registry, spec.name);
+    if (!spec.hqq_scale.empty()) {
+        if (source.shape.size() != 3) {
+            throw std::runtime_error("HQQ expert weight must be rank three: '" + source.name + "'");
+        }
+        return {
+            static_cast<int64_t>(source.shape[2] * 2),
+            static_cast<int64_t>(source.shape[1]),
+            static_cast<int64_t>(source.shape[0]),
+        };
+    }
     if (spec.quant) {
-        return spec.quant->target_shape;
+        std::vector<int64_t> shape = spec.quant->target_shape;
+        if (spec.row_count != 0) {
+            if (shape.size() != 2) {
+                throw std::runtime_error("row-sliced quantized tensor must be rank two");
+            }
+            shape[1] = static_cast<int64_t>(spec.row_count);
+        }
+        while (shape.size() > 1 && shape.back() == 1) {
+            shape.pop_back();
+        }
+        return shape;
     }
     if (ends_with(target_name, ".scale")) {
         return { static_cast<int64_t>(source.shape[0]) };
@@ -309,6 +505,82 @@ std::vector<int64_t> target_shape_for(
     }
     if (result.empty()) {
         result.push_back(1);
+    }
+    return result;
+}
+
+std::vector<uint8_t> slice_quantized_rows(
+        ggml_type type,
+        const std::vector<int64_t> & full_shape,
+        size_t row_offset,
+        size_t row_count,
+        const std::vector<uint8_t> & source) {
+    if (full_shape.size() != 2 || full_shape[0] <= 0 || full_shape[1] <= 0 || row_count == 0 ||
+        row_offset + row_count > static_cast<size_t>(full_shape[1])) {
+        throw std::runtime_error("invalid quantized row slice");
+    }
+    const size_t row_size = ggml_row_size(type, full_shape[0]);
+    if (source.size() != row_size * static_cast<size_t>(full_shape[1])) {
+        throw std::runtime_error("quantized row slice source size mismatch");
+    }
+    return std::vector<uint8_t>(
+        source.begin() + row_offset * row_size,
+        source.begin() + (row_offset + row_count) * row_size);
+}
+
+std::vector<uint8_t> repack_hqq_experts_q4_0(
+        const llama_safetensors_registry & registry,
+        const source_spec & spec) {
+    const llama_safetensors_tensor & weight_desc = require_tensor(registry, spec.name);
+    const llama_safetensors_tensor & scale_desc  = require_tensor(registry, spec.hqq_scale);
+    if (weight_desc.dtype != llama_safetensors_dtype::I8 || weight_desc.shape.size() != 3 ||
+        scale_desc.dtype != llama_safetensors_dtype::BF16 || scale_desc.shape.size() != 3) {
+        throw std::runtime_error("invalid HQQ expert tensor dtype or rank");
+    }
+    const size_t experts = weight_desc.shape[0];
+    const size_t rows    = weight_desc.shape[1];
+    const size_t cols    = weight_desc.shape[2] * 2;
+    constexpr size_t group_size = 128;
+    constexpr size_t block_size = 32;
+    constexpr size_t block_bytes = sizeof(ggml_fp16_t) + block_size / 2;
+    if (cols % group_size != 0 || scale_desc.shape[0] != experts || scale_desc.shape[1] != rows ||
+        scale_desc.shape[2] != cols / group_size) {
+        throw std::runtime_error("invalid HQQ expert scale shape");
+    }
+
+    const std::vector<uint8_t> packed = registry.read(weight_desc);
+    const std::vector<uint8_t> scale_bf16 = registry.read(scale_desc);
+    const std::vector<uint8_t> scale_f32 = llama_safetensors_bf16_to_f32(scale_bf16);
+    const float * scales = reinterpret_cast<const float *>(scale_f32.data());
+    const size_t blocks_per_row = cols / block_size;
+    const size_t groups_per_row = cols / group_size;
+    std::vector<uint8_t> result(experts * rows * blocks_per_row * block_bytes);
+
+    for (size_t expert = 0; expert < experts; ++expert) {
+        for (size_t row = 0; row < rows; ++row) {
+            const size_t source_row = (expert * rows + row) * (cols / 2);
+            const size_t scale_row  = (expert * rows + row) * groups_per_row;
+            const size_t target_row = (expert * rows + row) * blocks_per_row * block_bytes;
+            for (size_t block = 0; block < blocks_per_row; ++block) {
+                const float scale = scales[scale_row + block / (group_size / block_size)];
+                if (!(scale > 0.0f) || !std::isfinite(scale)) {
+                    throw std::runtime_error("HQQ expert scale must be finite and positive");
+                }
+                const ggml_fp16_t scale_f16 = ggml_fp32_to_fp16(scale);
+                if (!std::isfinite(ggml_fp16_to_fp32(scale_f16))) {
+                    throw std::runtime_error("HQQ expert scale is not representable in FP16");
+                }
+                uint8_t * target = result.data() + target_row + block * block_bytes;
+                std::memcpy(target, &scale_f16, sizeof(scale_f16));
+                const uint8_t * source = packed.data() + source_row + block * (block_size / 2);
+                const auto code = [&](size_t index) {
+                    return uint8_t((source[index / 2] >> (4 * (index % 2))) & 0x0f);
+                };
+                for (size_t lane = 0; lane < block_size / 2; ++lane) {
+                    target[sizeof(scale_f16) + lane] = code(lane) | (code(lane + block_size / 2) << 4);
+                }
+            }
+        }
     }
     return result;
 }
@@ -391,6 +663,16 @@ std::vector<uint8_t> apply_quantized_layout_transform(
             return permute_rows(
                 source, source.size() / rows, 0,
                 v_head_row_permutation(geometry, geometry.value_head_dim));
+        case transform_kind::HEAD_ROWS:
+            return permute_rows(
+                source, source.size() / rows, 0,
+                v_head_row_permutation(geometry, 1));
+        case transform_kind::CONV_ROWS: {
+            const size_t qk_rows = 2 * geometry.n_key_heads * geometry.key_head_dim;
+            return permute_rows(
+                source, source.size() / rows, qk_rows,
+                v_head_row_permutation(geometry, geometry.value_head_dim));
+        }
         case transform_kind::V_COLUMNS: {
             const std::vector<size_t> element_permutation =
                 v_head_row_permutation(geometry, geometry.value_head_dim);
@@ -414,8 +696,6 @@ std::vector<uint8_t> apply_quantized_layout_transform(
         }
         case transform_kind::NONE:
             return source;
-        case transform_kind::HEAD_ROWS:
-        case transform_kind::CONV_ROWS:
         case transform_kind::OFFSET_NORM:
         case transform_kind::A_LOG:
             throw std::runtime_error("unsupported transform for a packed quantized Qwen projection");
@@ -528,6 +808,20 @@ std::vector<uint8_t> negate_exp_bf16_to_f32(const std::vector<uint8_t> & source)
     return result;
 }
 
+std::vector<uint8_t> negate_exp_f16_to_f32(const std::vector<uint8_t> & source) {
+    if (source.size() % sizeof(ggml_fp16_t) != 0) {
+        throw std::runtime_error("invalid F16 byte count for Qwen A_log transform");
+    }
+    std::vector<uint8_t> result(source.size() * 2);
+    for (size_t i = 0; i < source.size() / sizeof(ggml_fp16_t); ++i) {
+        ggml_fp16_t bits;
+        std::memcpy(&bits, source.data() + i * sizeof(bits), sizeof(bits));
+        const float value = -static_cast<float>(std::exp(static_cast<double>(ggml_fp16_to_fp32(bits))));
+        std::memcpy(result.data() + i * sizeof(value), &value, sizeof(value));
+    }
+    return result;
+}
+
 std::vector<uint8_t> apply_layout_transform(
         transform_kind transform,
         const qwen_geometry & geometry,
@@ -592,27 +886,24 @@ std::vector<uint8_t> apply_layout_transform(
     return source;
 }
 
-std::vector<uint8_t> bf16_to_f32(const std::vector<uint8_t> & source) {
-    if (source.size() % 2 != 0) {
-        throw std::runtime_error("invalid BF16 byte count");
-    }
-    std::vector<uint8_t> result(source.size() * 2);
-    for (size_t i = 0; i < source.size() / 2; ++i) {
-        uint16_t bits16;
-        std::memcpy(&bits16, source.data() + 2 * i, sizeof(bits16));
-        const uint32_t bits32 = uint32_t(bits16) << 16;
-        std::memcpy(result.data() + 4 * i, &bits32, sizeof(bits32));
-    }
-    return result;
-}
-
 std::vector<uint8_t> bf16_add_one_to_f32(const std::vector<uint8_t> & source) {
-    std::vector<uint8_t> result = bf16_to_f32(source);
+    std::vector<uint8_t> result = llama_safetensors_bf16_to_f32(source);
     for (size_t i = 0; i < result.size() / sizeof(float); ++i) {
         float value;
         std::memcpy(&value, result.data() + i * sizeof(float), sizeof(value));
         value += 1.0f;
         std::memcpy(result.data() + i * sizeof(float), &value, sizeof(value));
+    }
+    return result;
+}
+
+std::vector<uint8_t> f16_add_one_to_f32(const std::vector<uint8_t> & source) {
+    std::vector<uint8_t> result = llama_safetensors_f16_to_f32(source);
+    for (size_t i = 0; i < result.size() / sizeof(float); ++i) {
+        float value;
+        std::memcpy(&value, result.data() + i * sizeof(value), sizeof(value));
+        value += 1.0f;
+        std::memcpy(result.data() + i * sizeof(value), &value, sizeof(value));
     }
     return result;
 }
@@ -631,12 +922,18 @@ std::vector<uint8_t> add_one_f32(std::vector<uint8_t> source) {
 }
 
 qwen_geometry validate_model_contract(const json & root) {
-    if (root.value("model_type", std::string()) != "qwen3_5") {
-        throw std::runtime_error("native Qwen3.5 importer requires model_type 'qwen3_5'");
+    const std::string model_type = root.value("model_type", std::string());
+    const bool text_only = model_type == "qwen3_5_text";
+    const bool moe = model_type == "qwen3_5_moe" || model_type == "qwen3_5_moe_text";
+    if (!text_only && !moe && model_type != "qwen3_5") {
+        throw std::runtime_error(
+            "native Qwen3.5 importer requires a qwen3_5 or qwen3_5_moe model_type");
     }
-    const json & text = root.at("text_config");
-    if (text.value("model_type", std::string()) != "qwen3_5_text") {
-        throw std::runtime_error("native Qwen3.5 importer requires text model_type 'qwen3_5_text'");
+    const bool root_is_text = text_only || model_type == "qwen3_5_moe_text";
+    const json & text = root_is_text ? root : root.at("text_config");
+    const std::string expected_text_type = moe ? "qwen3_5_moe_text" : "qwen3_5_text";
+    if (text.value("model_type", std::string()) != expected_text_type) {
+        throw std::runtime_error("native Qwen3.5 importer has an incompatible text model_type");
     }
 
     const qwen_geometry geometry {
@@ -646,12 +943,17 @@ qwen_geometry validate_model_contract(const json & root) {
         text.value("linear_num_value_heads", 0U),
         text.value("linear_key_head_dim", 0U),
         text.value("linear_value_head_dim", 0U),
+        text.value("full_attention_interval", 4U),
+        root_is_text,
+        moe,
+        false,
     };
-    constexpr std::array<uint32_t, 3> supported_layers = { 24, 32, 64 };
+    constexpr std::array<uint32_t, 4> supported_layers = { 24, 32, 40, 64 };
     if (std::find(supported_layers.begin(), supported_layers.end(), geometry.n_layer) == supported_layers.end() ||
         geometry.n_mtp > 1 || geometry.n_key_heads == 0 || geometry.n_value_heads == 0 ||
         geometry.n_value_heads % geometry.n_key_heads != 0 || geometry.key_head_dim == 0 ||
-        geometry.value_head_dim == 0 || geometry.key_head_dim != geometry.value_head_dim) {
+        geometry.value_head_dim == 0 || geometry.key_head_dim != geometry.value_head_dim ||
+        geometry.full_attention_interval == 0 || (geometry.n_layer == 40) != geometry.moe) {
         throw std::runtime_error("native Qwen3.5 importer does not support this tensor geometry");
     }
     return geometry;
@@ -672,10 +974,40 @@ llama_safetensors_qwen35_importer::llama_safetensors_qwen35_importer(
     n_value_heads_  = geometry.n_value_heads;
     key_head_dim_   = geometry.key_head_dim;
     value_head_dim_ = geometry.value_head_dim;
-    generation_    = llama_safetensors_read_json(model_dir_ / "generation_config.json");
+    full_attention_interval_ = geometry.full_attention_interval;
+    text_only_      = geometry.text_only;
+    moe_            = geometry.moe;
+    const auto generation_path = model_dir_ / "generation_config.json";
+    generation_    = std::filesystem::is_regular_file(generation_path) ?
+        llama_safetensors_read_json(generation_path) : llama_safetensors_json::object();
     tokenizer_     = llama_safetensors_read_json(model_dir_ / "tokenizer.json");
     chat_template_ = llama_safetensors_read_optional_text(model_dir_ / "chat_template.jinja");
     registry_      = llama_safetensors_registry::load(model_dir_, io_mode);
+    if (n_mtp_ != 0) {
+        const bool has_mtp_tensors = std::any_of(
+            registry_.tensors().begin(), registry_.tensors().end(), [](const llama_safetensors_tensor & tensor) {
+                return tensor.name.rfind("mtp.", 0) == 0;
+            });
+        if (!has_mtp_tensors) {
+            n_mtp_ = 0;
+        }
+    }
+    const auto has_source = [&](const std::string & module) {
+        return registry_.find(module + ".weight") != nullptr ||
+               registry_.find(module + ".weight.__qdata") != nullptr;
+    };
+    const bool has_wrapped_embedding = has_source("model.language_model.embed_tokens");
+    const bool has_flat_embedding    = has_source("model.embed_tokens");
+    const bool has_executorch_embedding = has_source("embed_tokens");
+    if (has_executorch_embedding) {
+        executorch_flat_ = true;
+    }
+    if (has_wrapped_embedding != has_flat_embedding) {
+        // Some text-only exports retain the wrapped conditional-generation
+        // tensor namespace. The registry, not the config wrapper, is the
+        // authoritative source-name contract.
+        text_only_ = has_flat_embedding;
+    }
     quant_         = std::make_unique<llama_safetensors_quant_adapters>(config_, registry_);
     if (quant_->summary().fp8_block != 0 &&
         (key_head_dim_ % 128 != 0 || value_head_dim_ % 128 != 0)) {
@@ -685,16 +1017,22 @@ llama_safetensors_qwen35_importer::llama_safetensors_qwen35_importer(
 }
 
 bool llama_safetensors_qwen35_importer::probe(const llama_safetensors_json & config) {
-    return config.value("model_type", std::string()) == "qwen3_5";
+    const std::string model_type = config.value("model_type", std::string());
+    return model_type == "qwen3_5" || model_type == "qwen3_5_text" ||
+           model_type == "qwen3_5_moe" || model_type == "qwen3_5_moe_text";
 }
 
 gguf_context * llama_safetensors_qwen35_importer::build_metadata() const {
-    const json & text = config_.at("text_config");
+    const std::string model_type = config_.value("model_type", std::string());
+    const bool root_is_text = model_type == "qwen3_5_text" || model_type == "qwen3_5_moe_text";
+    const json & text = root_is_text ?
+        config_ : config_.at("text_config");
     const llama_safetensors_rope_config rope = llama_safetensors_parse_rope(
         text.at("rope_parameters"), { 11, 11, 10, 0 }, 0.25f);
 
     llama_safetensors_metadata_sink sink;
-    sink.set_string("general.architecture", "qwen35");
+    const std::string arch = moe_ ? "qwen35moe" : "qwen35";
+    sink.set_string("general.architecture", arch);
     sink.set_string("general.type", "model");
     sink.set_string(
         "general.name",
@@ -704,39 +1042,54 @@ gguf_context * llama_safetensors_qwen35_importer::build_metadata() const {
     llama_safetensors_emit_sampling_defaults(sink, generation_);
 
     const uint32_t n_layer = text.at("num_hidden_layers").get<uint32_t>();
-    const uint32_t n_mtp   = text.value("mtp_num_hidden_layers", config_.value("mtp_num_hidden_layers", 0U));
-    sink.set_u32("qwen35.block_count", n_layer + n_mtp);
-    sink.set_u32("qwen35.context_length", text.at("max_position_embeddings").get<uint32_t>());
-    sink.set_u32("qwen35.embedding_length", text.at("hidden_size").get<uint32_t>());
-    sink.set_u32("qwen35.feed_forward_length", text.at("intermediate_size").get<uint32_t>());
-    sink.set_u32("qwen35.attention.head_count", text.at("num_attention_heads").get<uint32_t>());
-    sink.set_u32("qwen35.attention.head_count_kv", text.at("num_key_value_heads").get<uint32_t>());
+    const uint32_t n_mtp   = n_mtp_;
+    sink.set_u32(arch + ".block_count", n_layer + n_mtp);
+    sink.set_u32(arch + ".context_length", text.at("max_position_embeddings").get<uint32_t>());
+    sink.set_u32(arch + ".embedding_length", text.at("hidden_size").get<uint32_t>());
+    sink.set_u32(
+        arch + ".feed_forward_length",
+        text.value("intermediate_size", text.value("shared_expert_intermediate_size", 0U)));
+    sink.set_u32(arch + ".attention.head_count", text.at("num_attention_heads").get<uint32_t>());
+    sink.set_u32(arch + ".attention.head_count_kv", text.at("num_key_value_heads").get<uint32_t>());
     sink.set_i32_array(
-        "qwen35.rope.dimension_sections", rope.mrope_sections.data(), rope.mrope_sections.size());
-    sink.set_f32("qwen35.rope.freq_base", rope.theta);
-    sink.set_f32("qwen35.attention.layer_norm_rms_epsilon", text.at("rms_norm_eps").get<float>());
-    sink.set_u32("qwen35.attention.key_length", text.at("head_dim").get<uint32_t>());
-    sink.set_u32("qwen35.attention.value_length", text.at("head_dim").get<uint32_t>());
+        arch + ".rope.dimension_sections", rope.mrope_sections.data(), rope.mrope_sections.size());
+    sink.set_f32(arch + ".rope.freq_base", rope.theta);
+    sink.set_f32(arch + ".attention.layer_norm_rms_epsilon", text.at("rms_norm_eps").get<float>());
+    sink.set_u32(arch + ".attention.key_length", text.at("head_dim").get<uint32_t>());
+    sink.set_u32(arch + ".attention.value_length", text.at("head_dim").get<uint32_t>());
     if (n_mtp != 0) {
-        sink.set_u32("qwen35.nextn_predict_layers", n_mtp);
+        sink.set_u32(arch + ".nextn_predict_layers", n_mtp);
     }
-    sink.set_u32("qwen35.ssm.conv_kernel", text.at("linear_conv_kernel_dim").get<uint32_t>());
-    sink.set_u32("qwen35.ssm.state_size", text.at("linear_key_head_dim").get<uint32_t>());
-    sink.set_u32("qwen35.ssm.group_count", text.at("linear_num_key_heads").get<uint32_t>());
-    sink.set_u32("qwen35.ssm.time_step_rank", text.at("linear_num_value_heads").get<uint32_t>());
+    sink.set_u32(arch + ".ssm.conv_kernel", text.at("linear_conv_kernel_dim").get<uint32_t>());
+    sink.set_u32(arch + ".ssm.state_size", text.at("linear_key_head_dim").get<uint32_t>());
+    sink.set_u32(arch + ".ssm.group_count", text.at("linear_num_key_heads").get<uint32_t>());
+    sink.set_u32(arch + ".ssm.time_step_rank", text.at("linear_num_value_heads").get<uint32_t>());
     sink.set_u32(
-        "qwen35.ssm.inner_size",
+        arch + ".ssm.inner_size",
         text.at("linear_num_value_heads").get<uint32_t>() * text.at("linear_value_head_dim").get<uint32_t>());
-    sink.set_u32("qwen35.full_attention_interval", text.value("full_attention_interval", 4U));
+    sink.set_u32(arch + ".full_attention_interval", text.value("full_attention_interval", 4U));
     sink.set_u32(
-        "qwen35.rope.dimension_count",
+        arch + ".rope.dimension_count",
         static_cast<uint32_t>(text.at("head_dim").get<float>() * rope.partial_rotary_factor));
+    if (moe_) {
+        sink.set_u32(arch + ".expert_count", text.at("num_experts").get<uint32_t>());
+        sink.set_u32(arch + ".expert_used_count", text.at("num_experts_per_tok").get<uint32_t>());
+        sink.set_u32(arch + ".expert_feed_forward_length", text.at("moe_intermediate_size").get<uint32_t>());
+        sink.set_u32(
+            arch + ".expert_shared_feed_forward_length",
+            text.at("shared_expert_intermediate_size").get<uint32_t>());
+    }
 
+    const json & eos_value = generation_.contains("eos_token_id") ?
+        generation_.at("eos_token_id") : text.at("eos_token_id");
+    const uint32_t eos_token_id = llama_safetensors_first_token_id(eos_value, "eos_token_id");
+    const uint32_t bos_token_id = generation_.contains("bos_token_id") && !generation_.at("bos_token_id").is_null() ?
+        llama_safetensors_first_token_id(generation_.at("bos_token_id"), "bos_token_id") : eos_token_id;
     llama_safetensors_bpe_policy tokenizer_policy {
         "qwen35",
         text.at("vocab_size").get<uint32_t>(),
-        llama_safetensors_first_token_id(generation_.at("bos_token_id"), "bos_token_id"),
-        llama_safetensors_first_token_id(generation_.at("eos_token_id"), "eos_token_id"),
+        bos_token_id,
+        eos_token_id,
         std::string("<|vision_pad|>"),
         true,
         { "<tts_" },
@@ -749,16 +1102,21 @@ bool llama_safetensors_qwen35_importer::describe(
         const std::string & target_name,
         ggml_type & type,
         std::array<int64_t, GGML_MAX_DIMS> & ne) const {
+    const qwen_geometry geometry {
+        n_layer_, n_mtp_, n_key_heads_, n_value_heads_, key_head_dim_, value_head_dim_,
+        full_attention_interval_, text_only_, moe_, executorch_flat_,
+    };
     source_spec spec;
     try {
-        spec = map_target(
-            *quant_, { n_layer_, n_mtp_, n_key_heads_, n_value_heads_, key_head_dim_, value_head_dim_ },
-            target_name);
+        spec = map_target(*quant_, geometry, target_name);
     } catch (const unsupported_target &) {
         return false;
     }
     if (registry_.find(spec.name) == nullptr) {
         return false;
+    }
+    if (!spec.hqq_scale.empty() && registry_.find(spec.hqq_scale) == nullptr) {
+        throw std::runtime_error("missing HQQ expert scale tensor '" + spec.hqq_scale + "'");
     }
 
     type = target_type_for(registry_, spec, target_name);
@@ -779,9 +1137,11 @@ size_t llama_safetensors_qwen35_importer::tensor_capacity_hint() const {
 }
 
 void llama_safetensors_qwen35_importer::bind(const std::string & target_name) const {
-    const source_spec spec = map_target(
-        *quant_, { n_layer_, n_mtp_, n_key_heads_, n_value_heads_, key_head_dim_, value_head_dim_ },
-        target_name);
+    const qwen_geometry geometry {
+        n_layer_, n_mtp_, n_key_heads_, n_value_heads_, key_head_dim_, value_head_dim_,
+        full_attention_interval_, text_only_, moe_, executorch_flat_,
+    };
+    const source_spec spec = map_target(*quant_, geometry, target_name);
     if (spec.quant) {
         quant_->consume(*spec.quant);
     }
@@ -791,9 +1151,10 @@ bool llama_safetensors_qwen35_importer::load(
         const std::string & target_name, ggml_tensor * destination, bool check_tensor) const {
     const qwen_geometry geometry {
         n_layer_, n_mtp_, n_key_heads_, n_value_heads_, key_head_dim_, value_head_dim_,
+        full_attention_interval_, text_only_, moe_, executorch_flat_,
     };
     const source_spec spec = map_target(*quant_, geometry, target_name);
-    if (!spec.transforms.empty()) {
+    if (!spec.transforms.empty() || spec.row_count != 0 || !spec.hqq_scale.empty()) {
         return false;
     }
     return llama_safetensors_load_tensor_direct(
@@ -810,17 +1171,38 @@ std::vector<uint8_t> llama_safetensors_qwen35_importer::materialize(const std::s
     try {
         const qwen_geometry geometry {
             n_layer_, n_mtp_, n_key_heads_, n_value_heads_, key_head_dim_, value_head_dim_,
+            full_attention_interval_, text_only_, moe_, executorch_flat_,
         };
         const source_spec spec = map_target(*quant_, geometry, target_name);
         const llama_safetensors_tensor & source_desc = require_tensor(registry_, spec.name);
-        std::vector<uint8_t> result = spec.quant ? quant_->read(*spec.quant) : registry_.read(source_desc);
+        std::vector<uint8_t> result = !spec.hqq_scale.empty() ?
+            repack_hqq_experts_q4_0(registry_, spec) :
+            (spec.quant ? quant_->read(*spec.quant) : registry_.read(source_desc));
+
+        if (spec.row_count != 0) {
+            if (!spec.quant) {
+                throw std::runtime_error("row-sliced source is not quantized");
+            }
+            result = slice_quantized_rows(
+                spec.quant->target_type, spec.quant->target_shape,
+                spec.row_offset, spec.row_count, result);
+        }
 
         bool value_converted = false;
         const bool block_scale = spec.quant &&
             spec.quant->materialization == llama_safetensors_quant_materialization::FP8_BLOCK_SCALE;
-        const bool canonical_packed_int = spec.quant &&
+        const bool canonical_quant_blocks = spec.quant &&
             (spec.quant->materialization == llama_safetensors_quant_materialization::PACKED_INT4_REPACK ||
-             spec.quant->materialization == llama_safetensors_quant_materialization::PACKED_INT8_REPACK);
+             spec.quant->materialization == llama_safetensors_quant_materialization::PACKED_INT8_REPACK ||
+             spec.quant->materialization == llama_safetensors_quant_materialization::QUARK_W4A16_REPACK ||
+             spec.quant->materialization == llama_safetensors_quant_materialization::TORCHAO_INT4_REPACK);
+        std::vector<int64_t> quant_shape;
+        if (spec.quant) {
+            quant_shape = spec.quant->target_shape;
+            if (spec.row_count != 0) {
+                quant_shape.at(1) = static_cast<int64_t>(spec.row_count);
+            }
+        }
         for (transform_kind transform : spec.transforms) {
             if (transform == transform_kind::OFFSET_NORM) {
                 if (target_type != GGML_TYPE_F32) {
@@ -828,6 +1210,8 @@ std::vector<uint8_t> llama_safetensors_qwen35_importer::materialize(const std::s
                 }
                 if (source_desc.dtype == llama_safetensors_dtype::BF16) {
                     result = bf16_add_one_to_f32(result);
+                } else if (source_desc.dtype == llama_safetensors_dtype::F16) {
+                    result = f16_add_one_to_f32(result);
                 } else if (source_desc.dtype == llama_safetensors_dtype::F32) {
                     result = add_one_f32(std::move(result));
                 } else {
@@ -837,6 +1221,8 @@ std::vector<uint8_t> llama_safetensors_qwen35_importer::materialize(const std::s
             } else if (transform == transform_kind::A_LOG) {
                 if (source_desc.dtype == llama_safetensors_dtype::BF16) {
                     result = negate_exp_bf16_to_f32(result);
+                } else if (source_desc.dtype == llama_safetensors_dtype::F16) {
+                    result = negate_exp_f16_to_f32(result);
                 } else if (source_desc.dtype == llama_safetensors_dtype::F32) {
                     result = negate_exp_f32(std::move(result));
                 } else {
@@ -844,9 +1230,9 @@ std::vector<uint8_t> llama_safetensors_qwen35_importer::materialize(const std::s
                 }
                 value_converted = true;
             } else {
-                result = canonical_packed_int ?
+                result = canonical_quant_blocks ?
                     apply_quantized_layout_transform(
-                        transform, geometry, target_type, spec.quant->target_shape, std::move(result)) :
+                        transform, geometry, target_type, quant_shape, std::move(result)) :
                     apply_layout_transform(
                         transform, geometry, source_desc, block_scale, std::move(result));
             }
@@ -855,7 +1241,10 @@ std::vector<uint8_t> llama_safetensors_qwen35_importer::materialize(const std::s
             result = quant_->finalize(*spec.quant, std::move(result));
         } else if (!value_converted && target_type == GGML_TYPE_F32 &&
                    source_desc.dtype == llama_safetensors_dtype::BF16) {
-            result = bf16_to_f32(result);
+            result = llama_safetensors_bf16_to_f32(result);
+        } else if (!value_converted && target_type == GGML_TYPE_F32 &&
+                   source_desc.dtype == llama_safetensors_dtype::F16) {
+            result = llama_safetensors_f16_to_f32(result);
         }
 
         if (result.size() != target_size) {

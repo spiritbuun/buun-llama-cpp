@@ -12,7 +12,11 @@ struct ggml_cuda_gated_delta_net_fused_cache {
     // rms_gate is set, its SiLU gate and final multiply are folded in too.
     const float * rms_weight = nullptr;
     const float * rms_gate   = nullptr;
+    bool          rms_gate_bf16 = false;
     float *       rms_output = nullptr;
+    bool          rms_output_bf16 = false;
+    bool          rms_output_int8 = false;
+    float *       rms_output_scale = nullptr;
     float         rms_eps    = 0.0f;
 };
 

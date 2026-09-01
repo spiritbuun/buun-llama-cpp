@@ -27,6 +27,9 @@ bool llama_safetensors_describe_tensor(const llama_safetensors_registry &       
 void llama_safetensors_consume_tensor(const llama_safetensors_quant_adapters & quant,
                                       const llama_safetensors_tensor_binding & binding);
 
+std::vector<uint8_t> llama_safetensors_bf16_to_f32(const std::vector<uint8_t> & source);
+std::vector<uint8_t> llama_safetensors_f16_to_f32(const std::vector<uint8_t> & source);
+
 // Uploads source bytes directly from a mapped shard when the source and
 // canonical runtime layouts are identical. Returns false when materialization
 // or an architecture transform is still required.

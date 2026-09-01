@@ -160,10 +160,10 @@ static __global__ void rms_norm_f32(const float * x,
 // general rms_norm_f32 loses), and indexing mul[col] directly drops the per-element
 // fastmodulo. Reduction is the identical block_reduce<SUM> as the general kernel, so output
 // is bit-for-bit the same in this case.
-template <int block_size>
+template <int block_size, typename dst_t = float>
 static __global__ void rms_norm_mul_bcast_f32(const float * __restrict__ x,
                                               const float * __restrict__ mul,
-                                              float       * __restrict__ dst,
+                                              dst_t       * __restrict__ dst,
                                               const int     ncols,
                                               const int64_t stride_row,
                                               const int64_t stride_channel,
@@ -234,6 +234,27 @@ static __global__ void rms_norm_mul_grouped_f32(
         dst[col] = __fmul_rn(normalized, gamma[col]);
     }
 }
+static void rms_norm_mul_bcast_bf16_cuda(
+        const float * x, const float * mul, nv_bfloat16 * dst,
+        int ncols, int nrows, int nchannels, int nsamples,
+        int64_t stride_row, int64_t stride_channel, int64_t stride_sample,
+        float eps, cudaStream_t stream) {
+    const dim3 blocks_num(nrows, nchannels, nsamples);
+    const int block_size = ncols <= 128 ? 128 : ncols < 1024 ? 256 : 1024;
+    const dim3 block_dims(block_size, 1, 1);
+    const size_t nbytes_shared = block_size > WARP_SIZE ? 32 * sizeof(float) : 0;
+    if (block_size == 128) {
+        rms_norm_mul_bcast_f32<128, nv_bfloat16><<<blocks_num, block_dims, nbytes_shared, stream>>>(
+            x, mul, dst, ncols, stride_row, stride_channel, stride_sample, eps);
+    } else if (block_size == 256) {
+        rms_norm_mul_bcast_f32<256, nv_bfloat16><<<blocks_num, block_dims, nbytes_shared, stream>>>(
+            x, mul, dst, ncols, stride_row, stride_channel, stride_sample, eps);
+    } else {
+        rms_norm_mul_bcast_f32<1024, nv_bfloat16><<<blocks_num, block_dims, nbytes_shared, stream>>>(
+            x, mul, dst, ncols, stride_row, stride_channel, stride_sample, eps);
+    }
+}
+
 
 template <int block_size>
 static __global__ void rms_norm_bf16(const nv_bfloat16 * x,
@@ -711,7 +732,11 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }
 }
 
-void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
+void ggml_cuda_op_rms_norm_fused(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * dst,
+        ggml_tensor * mul_tensor,
+        bool retain_bf16_output) {
     const ggml_tensor * rms_norm_src = (ggml_tensor *) dst->src[0];
     float eps = 0.0f;
 
@@ -760,6 +785,14 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int mul_nrows     = mul_src->ne[1];
     const int mul_nchannels = mul_src->ne[2];
     const int mul_nsamples  = mul_src->ne[3];
+
+    if (retain_bf16_output) {
+        GGML_ASSERT(mul_nrows == 1 && mul_nchannels == 1 && mul_nsamples == 1 && mul_ncols == ne00);
+        rms_norm_mul_bcast_bf16_cuda(
+            src0_d, mul_d, static_cast<nv_bfloat16 *>(mul_tensor->data),
+            ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+        return;
+    }
 
     rms_norm_mul_f32_cuda(src0_d, mul_d, nullptr, dst_d,
                           ne00, ne01, ne02, ne03,

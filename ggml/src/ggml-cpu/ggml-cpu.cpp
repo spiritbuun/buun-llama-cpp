@@ -451,8 +451,93 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 op->type != GGML_TYPE_IQ1_S   &&
                 op->type != GGML_TYPE_IQ1_M; // missing type_traits.from_float
         case GGML_OP_MUL_MAT:
+            if (op->src[2] != nullptr &&
+                    (src0->type == GGML_TYPE_I8 || src0->type == GGML_TYPE_F8_E4M3) &&
+                    op->src[2]->type == GGML_TYPE_I8 &&
+                    op->src[2]->ne[0] == static_cast<int64_t>(sizeof(ggml_w8a16_scale_header) +
+                        src0->ne[1] * sizeof(ggml_bf16_t))) {
+                return src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                    ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
+                    ggml_is_contiguous(op->src[2]);
+            }
+            if (op->src[2] != nullptr && src0->type == GGML_TYPE_Q4_1 &&
+                    op->src[2]->type == GGML_TYPE_I8 && ggml_nelements(op->src[2]) == 1) {
+                return src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+            }
+            if (op->src[2] != nullptr &&
+                    (src0->type == GGML_TYPE_BNB_NF4 || src0->type == GGML_TYPE_BNB_FP4)) {
+                return src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                    op->src[2]->type == GGML_TYPE_I8 &&
+                    ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
+                    ggml_is_contiguous(op->src[2]) && src0->ne[2] == 1 && src0->ne[3] == 1 &&
+                    src1->ne[2] == 1 && src1->ne[3] == 1 && src1->ne[0] == src0->ne[0];
+            }
+            if (op->src[2] != nullptr && src0->type == GGML_TYPE_GPTQ_AO) {
+                return src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                    op->src[2]->type == GGML_TYPE_I8 && ggml_is_contiguous(src0) &&
+                    ggml_is_contiguous(src1) && ggml_is_contiguous(op->src[2]) &&
+                    src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 &&
+                    src1->ne[3] == 1 && src1->ne[0] == src0->ne[0];
+            }
+            if (op->src[2] == nullptr &&
+                    (src0->type == GGML_TYPE_BNB_NF4 || src0->type == GGML_TYPE_BNB_FP4)) {
+                // Model placement probes precede graph attachment of the
+                // required BitsAndBytes scale bundle.
+                return src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                    ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
+                    src1->ne[0] == src0->ne[0];
+            }
+            if (op->src[2] == nullptr && src0->type == GGML_TYPE_GPTQ_AO) {
+                return src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                    ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
+                    src1->ne[0] == src0->ne[0];
+            }
+            if (op->src[2] != nullptr && op->src[3] != nullptr &&
+                    src0->type == GGML_TYPE_F8_E4M3 && src0->ne[2] == 1 && src0->ne[3] == 1 &&
+                    src1->type == GGML_TYPE_F32 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+                    op->src[2]->type == GGML_TYPE_I8 && op->src[3]->type == GGML_TYPE_I32 &&
+                    op->src[2]->ne[0] == src0->ne[0] / 32 && op->src[2]->ne[1] == src0->ne[1]) {
+                return true;
+            }
+            if (op->src[2] != nullptr && op->src[3] != nullptr &&
+                    src0->type == GGML_TYPE_F8_E4M3 && src0->ne[2] == 1 && src0->ne[3] == 1 &&
+                    src1->type == GGML_TYPE_F32 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+                    op->src[2]->type == GGML_TYPE_BF16 && op->src[3]->type == GGML_TYPE_I16 &&
+                    op->src[2]->ne[0] == src0->ne[0] / 32 && op->src[2]->ne[1] == src0->ne[1]) {
+                return true;
+            }
+            if (op->src[3] != nullptr &&
+                    (src0->type == GGML_TYPE_F8_E4M3 || src0->type == GGML_TYPE_Q4_A32 ||
+                     src0->type == GGML_TYPE_MXFP4)) {
+                const bool valid_fp8_weight_scale = src0->type != GGML_TYPE_F8_E4M3 ||
+                    op->src[2] == nullptr ||
+                    (op->src[2]->type == GGML_TYPE_BF16 && ggml_is_contiguous(op->src[2]) &&
+                     op->src[2]->ne[0] == src0->ne[1] && op->src[2]->ne[1] == 1 &&
+                     op->src[2]->ne[2] == 1 && op->src[2]->ne[3] == 1);
+                const bool valid_input_scale = src0->type == GGML_TYPE_MXFP4 ?
+                    op->src[3]->type == GGML_TYPE_I32 :
+                    (op->src[3]->type == GGML_TYPE_F32 || op->src[3]->type == GGML_TYPE_I32 ||
+                     (src0->type == GGML_TYPE_Q4_A32 && op->src[3]->type == GGML_TYPE_I16));
+                return src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                    ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
+                    ggml_is_contiguous(op->src[3]) &&
+                    valid_fp8_weight_scale && valid_input_scale &&
+                    ggml_nelements(op->src[3]) == 1;
+            }
             if (op->src[2] != nullptr) {
-                return false;
+                const ggml_tensor * scale = op->src[2];
+                const ggml_tensor * input_scale = op->src[3];
+                return src0->type == GGML_TYPE_I8 && src1->type == GGML_TYPE_F32 &&
+                    op->type == GGML_TYPE_F32 && ggml_is_contiguous(src0) &&
+                    ggml_is_contiguous(src1) && ggml_is_contiguous(scale) &&
+                    (scale->type == GGML_TYPE_F32 || scale->type == GGML_TYPE_F16 ||
+                     scale->type == GGML_TYPE_BF16) && scale->ne[0] == src0->ne[1] &&
+                    scale->ne[1] == 1 && scale->ne[2] == 1 && scale->ne[3] == 1 &&
+                    (input_scale == nullptr ||
+                     ((input_scale->type == GGML_TYPE_F32 || input_scale->type == GGML_TYPE_I32 ||
+                       input_scale->type == GGML_TYPE_I64) &&
+                      ggml_is_contiguous(input_scale) &&
+                      ggml_nelements(input_scale) == 1));
             }
             return src1->type == GGML_TYPE_F32 || src1->type == ggml_get_type_traits_cpu(src0->type)->vec_dot_type;
         case GGML_OP_SOFT_MAX_BACK: {

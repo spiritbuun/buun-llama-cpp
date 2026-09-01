@@ -6,6 +6,26 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 bool ggml_cuda_q8_0_mmv_post_silu_supported(int cc, int64_t ncols_x);
 
 #if !defined(GGML_USE_HIP)
+nv_bfloat16 * ggml_cuda_prepare_bf16_input(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * src,
+    size_t count,
+    cudaStream_t stream);
+
+const nv_bfloat16 * ggml_cuda_get_cached_bf16_input(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * src,
+    size_t count);
+
+bool ggml_cuda_humming_finish_residual_rms(
+    ggml_backend_cuda_context & ctx,
+    const ggml_cuda_mm_fusion_args_host * fusion,
+    const nv_bfloat16 * output,
+    ggml_tensor * dst,
+    int64_t n,
+    int64_t m,
+    cudaStream_t stream);
+
 bool ggml_cuda_mul_mat_humming_fp8(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0,
@@ -20,6 +40,12 @@ bool ggml_cuda_mul_mat_humming_fp8_block(
     const ggml_tensor * src1,
     ggml_tensor * dst);
 
+void ggml_cuda_dequantize_fp8_block_bf16(
+    const ggml_tensor * weight,
+    const ggml_tensor * scale,
+    nv_bfloat16 * dst,
+    cudaStream_t stream);
+
 bool ggml_cuda_mul_mat_humming_fp8_block_fused(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0,
@@ -33,7 +59,8 @@ bool ggml_cuda_mul_mat_humming_fp8_block_swiglu(
     const ggml_tensor * up,
     const ggml_tensor * gate,
     const ggml_tensor * src1,
-    ggml_tensor * dst);
+    ggml_tensor * dst,
+    bool retain_bf16_output);
 
 bool ggml_cuda_mul_mat_humming_nvfp4(
     ggml_backend_cuda_context & ctx,

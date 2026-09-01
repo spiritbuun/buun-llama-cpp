@@ -721,6 +721,24 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_q4_a32,
         .from_float_ref           = (ggml_from_float_t) quantize_row_q4_a32_ref,
     },
+    [GGML_TYPE_BNB_NF4] = {
+        .type_name                = "bnb_nf4",
+        .blck_size                = 2,
+        .type_size                = 1,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_BNB_FP4] = {
+        .type_name                = "bnb_fp4",
+        .blck_size                = 2,
+        .type_size                = 1,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_GPTQ_AO] = {
+        .type_name                = "gptq_ao",
+        .blck_size                = 2,
+        .type_size                = 1,
+        .is_quantized             = true,
+    },
     [4] = { // GGML_TYPE_Q4_2
         .type_name                = "DEPRECATED",
         .blck_size                = 0,

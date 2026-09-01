@@ -117,10 +117,10 @@ if (CUDAToolkit_FOUND)
 
     file(GLOB   GGML_SOURCES_CUDA "*.cu")
     list(FILTER GGML_SOURCES_CUDA EXCLUDE REGEX "bsa_.*\\.cu$")
-    if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/marlin-q4-a32.cu")
-        set_source_files_properties(marlin-q4-a32.cu PROPERTIES
-            COMPILE_OPTIONS "--expt-relaxed-constexpr")
-    endif()
+    set_source_files_properties(marlin-q4-a32.cu PROPERTIES
+        COMPILE_OPTIONS "--expt-relaxed-constexpr")
+    set_source_files_properties(int8-channel.cu PROPERTIES
+        COMPILE_OPTIONS "--expt-relaxed-constexpr")
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     option(GGML_CUDA_TURBO_FA "Build Turbo flash-attention template instances" ON)
@@ -165,8 +165,9 @@ if (CUDAToolkit_FOUND)
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}
                             )
+    target_include_directories(ggml-cuda PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/bsa_vendor")
 
-    # vLLM's exact-shape FLA kernels are shipped as SM86 cubins. On ELF
+    # vLLM's exact-shape FLA kernels are shipped as SM80/SM86 cubins. On ELF
     # x86-64, wrap them in read-only relocatable objects so ggml-cuda remains
     # self-contained and needs no Triton/Python cache at runtime. Other host
     # platforms retain the portable GDN fallback.
@@ -181,27 +182,35 @@ if (CUDAToolkit_FOUND)
             chunk_gated_delta_rule_fwd_kernel_h_blockdim64
             chunk_fwd_kernel_o)
         set(GGML_CUDA_GDN_FLA_OBJECTS "")
-        foreach(KERNEL IN LISTS GGML_CUDA_GDN_FLA_CUBINS)
-            set(CUBIN_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/gdn-fla-sm86/${KERNEL}.cubin")
-            set(CUBIN_OBJECT "${CMAKE_CURRENT_BINARY_DIR}/${KERNEL}.cubin.o")
-            add_custom_command(
-                OUTPUT "${CUBIN_OBJECT}"
-                COMMAND "${CMAKE_LINKER}" -r -b binary -o "${CUBIN_OBJECT}" "${KERNEL}.cubin"
-                COMMAND "${CMAKE_OBJCOPY}" --rename-section
-                        .data=.rodata,alloc,load,readonly,data,contents "${CUBIN_OBJECT}"
-                COMMAND "${CMAKE_OBJCOPY}" --add-section .note.GNU-stack=/dev/null
-                        --set-section-flags .note.GNU-stack=noload,readonly "${CUBIN_OBJECT}"
-                DEPENDS "${CUBIN_SOURCE}"
-                WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/gdn-fla-sm86"
-                VERBATIM)
-            set_source_files_properties("${CUBIN_OBJECT}" PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
-            list(APPEND GGML_CUDA_GDN_FLA_OBJECTS "${CUBIN_OBJECT}")
+        foreach(GDN_ARCH IN ITEMS sm80 sm86)
+            if (GDN_ARCH STREQUAL "sm80")
+                set(GDN_CUBIN_PREFIX "sm80_")
+            else()
+                set(GDN_CUBIN_PREFIX "")
+            endif()
+            foreach(KERNEL IN LISTS GGML_CUDA_GDN_FLA_CUBINS)
+                set(CUBIN_FILE "${GDN_CUBIN_PREFIX}${KERNEL}.cubin")
+                set(CUBIN_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/gdn-fla-${GDN_ARCH}/${CUBIN_FILE}")
+                set(CUBIN_OBJECT "${CMAKE_CURRENT_BINARY_DIR}/${CUBIN_FILE}.o")
+                add_custom_command(
+                    OUTPUT "${CUBIN_OBJECT}"
+                    COMMAND "${CMAKE_LINKER}" -r -b binary -o "${CUBIN_OBJECT}" "${CUBIN_FILE}"
+                    COMMAND "${CMAKE_OBJCOPY}" --rename-section
+                            .data=.rodata,alloc,load,readonly,data,contents "${CUBIN_OBJECT}"
+                    COMMAND "${CMAKE_OBJCOPY}" --add-section .note.GNU-stack=/dev/null
+                            --set-section-flags .note.GNU-stack=noload,readonly "${CUBIN_OBJECT}"
+                    DEPENDS "${CUBIN_SOURCE}"
+                    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/gdn-fla-${GDN_ARCH}"
+                    VERBATIM)
+                set_source_files_properties("${CUBIN_OBJECT}" PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+                list(APPEND GGML_CUDA_GDN_FLA_OBJECTS "${CUBIN_OBJECT}")
+            endforeach()
         endforeach()
         target_sources(ggml-cuda PRIVATE ${GGML_CUDA_GDN_FLA_OBJECTS})
         target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_GDN_FLA_EMBEDDED)
     endif()
 
-    set_source_files_properties(humming-fp8.cu humming-fp8-block.cu humming-nvfp4.cu humming-q4_1.cu PROPERTIES
+    set_source_files_properties(humming-fp8.cu humming-fp8-block.cu humming-nvfp4.cu PROPERTIES
         CUDA_ARCHITECTURES "80-virtual;86-real"
         COMPILE_OPTIONS "--expt-relaxed-constexpr"
         INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/humming-vendor/include")

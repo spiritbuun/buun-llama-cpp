@@ -23,6 +23,9 @@ std::optional<llama_safetensors_source_name> map_projection(std::string_view pre
     if (tail == ".weight") {
         result.source     = result.module + ".weight";
         result.quant_role = llama_safetensors_quant_role::WEIGHT;
+    } else if (tail == ".bias") {
+        result.source = result.module + ".bias";
+        result.module.clear();
     } else if (tail == ".scale") {
         result.source     = result.module + ".weight_scale";
         result.quant_role = llama_safetensors_quant_role::WEIGHT_SCALE;

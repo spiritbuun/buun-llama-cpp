@@ -1,6 +1,7 @@
 #include "llama-safetensors-metadata.h"
 
 #include <algorithm>
+#include <cstring>
 #include <fstream>
 #include <iterator>
 #include <stdexcept>
@@ -13,6 +14,81 @@ bool ends_with(std::string_view value, std::string_view suffix) {
 
 bool starts_with(std::string_view value, std::string_view prefix) {
     return value.size() >= prefix.size() && value.substr(0, prefix.size()) == prefix;
+}
+
+uint64_t read_varint(std::string_view data, size_t & offset, std::string_view context) {
+    uint64_t result = 0;
+    for (unsigned shift = 0; shift < 64 && offset < data.size(); shift += 7) {
+        const uint8_t byte = static_cast<uint8_t>(data[offset++]);
+        result |= uint64_t(byte & 0x7f) << shift;
+        if ((byte & 0x80) == 0) {
+            return result;
+        }
+    }
+    throw std::runtime_error("invalid protobuf varint in " + std::string(context));
+}
+
+std::string_view read_message(std::string_view data, size_t & offset, std::string_view context) {
+    const uint64_t length = read_varint(data, offset, context);
+    if (length > data.size() - offset) {
+        throw std::runtime_error("truncated protobuf message in " + std::string(context));
+    }
+    const std::string_view result = data.substr(offset, static_cast<size_t>(length));
+    offset += static_cast<size_t>(length);
+    return result;
+}
+
+void skip_protobuf_field(std::string_view data, size_t & offset, uint32_t wire, std::string_view context) {
+    switch (wire) {
+        case 0: (void) read_varint(data, offset, context); return;
+        case 1:
+            if (data.size() - offset < 8) break;
+            offset += 8;
+            return;
+        case 2: (void) read_message(data, offset, context); return;
+        case 5:
+            if (data.size() - offset < 4) break;
+            offset += 4;
+            return;
+        default: break;
+    }
+    throw std::runtime_error("unsupported or truncated protobuf field in " + std::string(context));
+}
+
+struct spm_piece {
+    std::string token;
+    float       score = 0.0f;
+    int32_t     type  = 1;
+};
+
+spm_piece parse_spm_piece(std::string_view data) {
+    spm_piece result;
+    size_t offset = 0;
+    while (offset < data.size()) {
+        const uint64_t tag   = read_varint(data, offset, "SentencePiece");
+        const uint32_t field = tag >> 3;
+        const uint32_t wire  = tag & 7;
+        if (field == 1 && wire == 2) {
+            result.token = std::string(read_message(data, offset, "SentencePiece.piece"));
+        } else if (field == 2 && wire == 5) {
+            if (data.size() - offset < sizeof(float)) {
+                throw std::runtime_error("truncated SentencePiece score");
+            }
+            std::memcpy(&result.score, data.data() + offset, sizeof(float));
+            offset += sizeof(float);
+        } else if (field == 3 && wire == 0) {
+            result.type = static_cast<int32_t>(read_varint(data, offset, "SentencePiece.type"));
+        } else {
+            skip_protobuf_field(data, offset, wire, "SentencePiece");
+        }
+    }
+    if (result.token.empty()) {
+        throw std::runtime_error("SentencePiece entry is missing its token");
+    }
+    if (result.type < 1 || result.type > 6) {
+        throw std::runtime_error("SentencePiece entry has an unsupported type");
+    }
+    return result;
 }
 
 }  // namespace
@@ -78,6 +154,11 @@ void llama_safetensors_metadata_sink::set_f32(std::string_view key, float value)
 void llama_safetensors_metadata_sink::set_bool(std::string_view key, bool value) {
     const std::string key_string(key);
     gguf_set_val_bool(context_, key_string.c_str(), value);
+}
+
+void llama_safetensors_metadata_sink::set_f32_array(std::string_view key, const float * values, size_t count) {
+    const std::string key_string(key);
+    gguf_set_arr_data(context_, key_string.c_str(), GGUF_TYPE_FLOAT32, values, count);
 }
 
 void llama_safetensors_metadata_sink::set_i32_array(std::string_view key, const int32_t * values, size_t count) {
@@ -219,6 +300,59 @@ void llama_safetensors_emit_bpe_tokenizer(llama_safetensors_metadata_sink &    s
         }
         sink.set_u32("tokenizer.ggml.padding_token_id", static_cast<uint32_t>(it - tokens.begin()));
     }
+    if (chat_template) {
+        sink.set_string("tokenizer.chat_template", *chat_template);
+    }
+}
+
+void llama_safetensors_emit_spm_tokenizer(llama_safetensors_metadata_sink &  sink,
+                                          const std::filesystem::path &       tokenizer_model,
+                                          uint32_t                            vocab_size,
+                                          uint32_t                            bos_token_id,
+                                          uint32_t                            eos_token_id,
+                                          std::optional<uint32_t>             padding_token_id,
+                                          bool                                add_bos_token,
+                                          const std::optional<std::string> & chat_template) {
+    const std::string data = llama_safetensors_read_text(tokenizer_model);
+    std::vector<spm_piece> pieces;
+    size_t offset = 0;
+    while (offset < data.size()) {
+        const uint64_t tag   = read_varint(data, offset, "SentencePiece ModelProto");
+        const uint32_t field = tag >> 3;
+        const uint32_t wire  = tag & 7;
+        if (field == 1 && wire == 2) {
+            pieces.push_back(parse_spm_piece(read_message(data, offset, "ModelProto.pieces")));
+        } else {
+            skip_protobuf_field(data, offset, wire, "SentencePiece ModelProto");
+        }
+    }
+    if (pieces.size() != vocab_size) {
+        throw std::runtime_error("tokenizer.model vocabulary does not match model vocab_size");
+    }
+
+    std::vector<std::string> tokens;
+    std::vector<float>       scores;
+    std::vector<int32_t>     types;
+    tokens.reserve(pieces.size());
+    scores.reserve(pieces.size());
+    types.reserve(pieces.size());
+    for (spm_piece & piece : pieces) {
+        tokens.push_back(std::move(piece.token));
+        scores.push_back(piece.score);
+        types.push_back(piece.type);
+    }
+
+    sink.set_string("tokenizer.ggml.model", "llama");
+    sink.set_string("tokenizer.ggml.pre", "default");
+    sink.set_string_array("tokenizer.ggml.tokens", tokens);
+    sink.set_f32_array("tokenizer.ggml.scores", scores.data(), scores.size());
+    sink.set_i32_array("tokenizer.ggml.token_type", types.data(), types.size());
+    sink.set_u32("tokenizer.ggml.bos_token_id", bos_token_id);
+    sink.set_u32("tokenizer.ggml.eos_token_id", eos_token_id);
+    if (padding_token_id) {
+        sink.set_u32("tokenizer.ggml.padding_token_id", *padding_token_id);
+    }
+    sink.set_bool("tokenizer.ggml.add_bos_token", add_bos_token);
     if (chat_template) {
         sink.set_string("tokenizer.chat_template", *chat_template);
     }

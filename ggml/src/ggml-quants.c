@@ -5778,6 +5778,14 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                     }
                 }
             } break;
+        case GGML_TYPE_BNB_NF4:
+        case GGML_TYPE_BNB_FP4:
+        case GGML_TYPE_GPTQ_AO:
+            // Every packed nibble is a valid code. The scale bundle is a
+            // separate tensor and is validated by the safetensors adapter.
+            GGML_UNUSED(data);
+            GGML_UNUSED(nb);
+            break;
         case GGML_TYPE_Q2_K:
             {
                 VALIDATE_ROW_DATA_DM_F16_IMPL(block_q2_K, data, nb, d, dmin);

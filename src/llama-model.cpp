@@ -1624,17 +1624,28 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
         const auto load_weight_scale = [&](const LLM_TN_IMPL & scale_name, ggml_tensor * weight) {
             const std::string scale_tensor_name = scale_name.str();
-            const bool f8_channel = weight->type == GGML_TYPE_F8_E4M3;
+            const bool f8_scaled = weight->type == GGML_TYPE_F8_E4M3;
+            const bool i8_scaled = weight->type == GGML_TYPE_I8;
+            const bool bnb_scaled = weight->type == GGML_TYPE_BNB_NF4 || weight->type == GGML_TYPE_BNB_FP4;
+            const bool gptq_ao_scaled = weight->type == GGML_TYPE_GPTQ_AO;
             ggml_type scale_type = GGML_TYPE_COUNT;
             std::array<int64_t, GGML_MAX_DIMS> scale_ne{};
-            const bool has_scale = f8_channel && ml.get_tensor_info(scale_tensor_name.c_str(), scale_type, scale_ne);
-            const bool f8_block = has_scale && scale_type == GGML_TYPE_F32;
+            const bool quant_scaled = f8_scaled || i8_scaled || bnb_scaled || gptq_ao_scaled;
+            const bool has_scale = quant_scaled &&
+                ml.get_tensor_info(scale_tensor_name.c_str(), scale_type, scale_ne);
+            const bool weight_only_8bit = has_scale && scale_type == GGML_TYPE_I8 &&
+                scale_ne[0] == static_cast<int64_t>(sizeof(ggml_w8a16_scale_header) +
+                    weight->ne[1] * sizeof(uint16_t));
+            const bool f8_block = f8_scaled && has_scale && scale_type == GGML_TYPE_F32;
+            const bool f8_mxfp8 = f8_scaled && has_scale && scale_type == GGML_TYPE_I8 && !weight_only_8bit;
+            const bool f8_group = f8_scaled && has_scale && scale_type == GGML_TYPE_BF16 && scale_ne[1] > 1;
             ggml_tensor * scale = create_tensor(
                 scale_name,
-                f8_block ? std::initializer_list<int64_t>{ scale_ne[0], scale_ne[1] } :
-                           std::initializer_list<int64_t>{ f8_channel ? weight->ne[1] : 1 },
-                f8_channel ? 0 : TENSOR_NOT_REQUIRED);
-            if (f8_channel && !f8_block && scale->type != GGML_TYPE_BF16) {
+                (f8_block || f8_mxfp8 || f8_group) ?
+                    std::initializer_list<int64_t>{ scale_ne[0], scale_ne[1] } :
+                    std::initializer_list<int64_t>{ has_scale ? scale_ne[0] : 1 },
+                quant_scaled ? 0 : TENSOR_NOT_REQUIRED);
+            if (f8_scaled && !f8_block && !f8_mxfp8 && !weight_only_8bit && scale->type != GGML_TYPE_BF16) {
                 throw std::runtime_error(format(
                     "channel scale '%s' for F8 weight '%s' must be BF16", scale->name, weight->name));
             }
@@ -1644,23 +1655,92 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 throw std::runtime_error(format(
                     "block scale '%s' does not match the 128x128 F8 weight '%s'", scale->name, weight->name));
             }
+            if (f8_mxfp8 && (weight->ne[0] % 32 != 0 ||
+                             scale->ne[0] != weight->ne[0] / 32 || scale->ne[1] != weight->ne[1])) {
+                throw std::runtime_error(format(
+                    "MXFP8 scale '%s' does not match the 32-value groups of weight '%s'", scale->name, weight->name));
+            }
+            if (f8_group && (weight->ne[0] % 32 != 0 ||
+                             scale->ne[0] != weight->ne[0] / 32 || scale->ne[1] != weight->ne[1])) {
+                throw std::runtime_error(format(
+                    "grouped FP8 scale '%s' does not match the 32-value groups of weight '%s'", scale->name, weight->name));
+            }
+            const bool w8a16_scale = (i8_scaled || f8_scaled) && scale->type == GGML_TYPE_I8 &&
+                scale->ne[0] >= static_cast<int64_t>(sizeof(ggml_w8a16_scale_header));
+            if (i8_scaled && !w8a16_scale && scale->type != GGML_TYPE_F32 &&
+                    scale->type != GGML_TYPE_F16 && scale->type != GGML_TYPE_BF16) {
+                throw std::runtime_error(format(
+                    "channel scale '%s' for I8 weight '%s' must be F32, F16, or BF16", scale->name, weight->name));
+            }
+            if (bnb_scaled && (scale->type != GGML_TYPE_I8 || scale->ne[0] <
+                    static_cast<int64_t>(sizeof(ggml_bnb_scale_header)))) {
+                throw std::runtime_error(format(
+                    "BitsAndBytes weight '%s' requires its packed scale bundle", weight->name));
+            }
+            if (gptq_ao_scaled && (scale->type != GGML_TYPE_I8 || scale->ne[0] <
+                    static_cast<int64_t>(sizeof(ggml_gptq_ao_header)))) {
+                throw std::runtime_error(format(
+                    "GPTQ act-order weight '%s' requires its packed auxiliary bundle", weight->name));
+            }
             return scale;
         };
         const auto validate_weight_scale = [&](ggml_tensor * weight, ggml_tensor * scale) {
-            if (weight == nullptr || weight->type != GGML_TYPE_F8_E4M3) {
+            if (weight == nullptr ||
+                    (weight->type != GGML_TYPE_F8_E4M3 && weight->type != GGML_TYPE_I8 &&
+                     weight->type != GGML_TYPE_BNB_NF4 && weight->type != GGML_TYPE_BNB_FP4 &&
+                     weight->type != GGML_TYPE_GPTQ_AO)) {
                 return;
             }
-            const bool channel = scale != nullptr && scale->type == GGML_TYPE_BF16 &&
+            if (weight->type == GGML_TYPE_BNB_NF4 || weight->type == GGML_TYPE_BNB_FP4) {
+                if (scale == nullptr || scale->type != GGML_TYPE_I8 ||
+                    scale->ne[0] < static_cast<int64_t>(sizeof(ggml_bnb_scale_header))) {
+                    throw std::runtime_error(format(
+                        "BitsAndBytes weight '%s' has no compatible scale bundle", weight->name));
+                }
+                return;
+            }
+            if (weight->type == GGML_TYPE_GPTQ_AO) {
+                if (scale == nullptr || scale->type != GGML_TYPE_I8 ||
+                    scale->ne[0] < static_cast<int64_t>(sizeof(ggml_gptq_ao_header))) {
+                    throw std::runtime_error(format(
+                        "GPTQ act-order weight '%s' has no compatible auxiliary bundle", weight->name));
+                }
+                return;
+            }
+            const bool channel_type = weight->type == GGML_TYPE_F8_E4M3 ?
+                scale != nullptr && scale->type == GGML_TYPE_BF16 :
+                scale != nullptr && (scale->type == GGML_TYPE_F32 ||
+                                     scale->type == GGML_TYPE_F16 || scale->type == GGML_TYPE_BF16);
+            const bool w8a16 = (weight->type == GGML_TYPE_I8 || weight->type == GGML_TYPE_F8_E4M3) &&
+                               scale != nullptr &&
+                               scale->type == GGML_TYPE_I8 &&
+                               scale->ne[0] == static_cast<int64_t>(sizeof(ggml_w8a16_scale_header) +
+                                   weight->ne[1] * sizeof(uint16_t));
+            const bool channel = channel_type &&
                                  scale->ne[0] == weight->ne[1] && scale->ne[1] == 1 &&
                                  scale->ne[2] == 1 && scale->ne[3] == 1;
-            const bool block = scale != nullptr && scale->type == GGML_TYPE_F32 &&
+            const bool tensor = weight->type == GGML_TYPE_F8_E4M3 &&
+                                scale != nullptr && scale->type == GGML_TYPE_BF16 &&
+                                scale->ne[0] == 1 && scale->ne[1] == 1 &&
+                                scale->ne[2] == 1 && scale->ne[3] == 1;
+            const bool block = weight->type == GGML_TYPE_F8_E4M3 &&
+                               scale != nullptr && scale->type == GGML_TYPE_F32 &&
                                weight->ne[0] % 128 == 0 && weight->ne[1] % 128 == 0 &&
                                scale->ne[0] == weight->ne[1] / 128 && scale->ne[1] == weight->ne[0] / 128 &&
                                scale->ne[2] == 1 && scale->ne[3] == 1;
-            if (!channel && !block) {
+            const bool mxfp8 = weight->type == GGML_TYPE_F8_E4M3 &&
+                               scale != nullptr && scale->type == GGML_TYPE_I8 &&
+                               weight->ne[0] % 32 == 0 &&
+                               scale->ne[0] == weight->ne[0] / 32 && scale->ne[1] == weight->ne[1] &&
+                               scale->ne[2] == 1 && scale->ne[3] == 1;
+            const bool group = weight->type == GGML_TYPE_F8_E4M3 &&
+                               scale != nullptr && scale->type == GGML_TYPE_BF16 &&
+                               weight->ne[0] % 32 == 0 &&
+                               scale->ne[0] == weight->ne[0] / 32 && scale->ne[1] == weight->ne[1] &&
+                               scale->ne[2] == 1 && scale->ne[3] == 1;
+            if (!tensor && !channel && !block && !mxfp8 && !group && !w8a16) {
                 throw std::runtime_error(format(
-                    "F8 weight '%s' requires either a BF16 channel scale with %" PRId64
-                    " values or a matching F32 128x128 block scale",
+                    "channel-scaled weight '%s' requires a compatible scale with %" PRId64 " values",
                     weight->name, weight->ne[1]));
             }
         };
@@ -1695,11 +1775,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (!layer.ffn_gate_s && layer.ffn_gate) {
                 layer.ffn_gate_s = load_weight_scale(tn(LLM_TENSOR_FFN_GATE, "scale", i), layer.ffn_gate);
             }
-            if (!layer.ffn_down_s && layer.ffn_down) {
-                layer.ffn_down_s = load_weight_scale(tn(LLM_TENSOR_FFN_DOWN, "scale", i), layer.ffn_down);
-            }
             if (!layer.ffn_up_s && layer.ffn_up) {
                 layer.ffn_up_s = load_weight_scale(tn(LLM_TENSOR_FFN_UP, "scale", i), layer.ffn_up);
+            }
+            if (!layer.ffn_down_s && layer.ffn_down) {
+                layer.ffn_down_s = load_weight_scale(tn(LLM_TENSOR_FFN_DOWN, "scale", i), layer.ffn_down);
             }
             if (!layer.ffn_gate_shexp_s && layer.ffn_gate_shexp) {
                 layer.ffn_gate_shexp_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "scale", i), {1}, TENSOR_NOT_REQUIRED);
@@ -1830,7 +1910,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
         // output scales
-        if (output && (output->type == GGML_TYPE_NVFP4 || output->type == GGML_TYPE_F8_E4M3)) {
+        if (output && (output->type == GGML_TYPE_NVFP4 || output->type == GGML_TYPE_F8_E4M3 ||
+                       output->type == GGML_TYPE_I8)) {
             // weight scale
             if (!output_s) {
                 output_s = load_weight_scale(tn(LLM_TENSOR_OUTPUT, "scale"), output);
@@ -3967,9 +4048,12 @@ void llama_model_base::create_tensor_qkv(llama_layer & layer, int bid,
         return;
     }
 
-    layer.wqkv = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "weight", bid), {n_embd_, n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
+    // A virtual source may expose either a fused QKV tensor or the three
+    // canonical projections. Probe the fused form first just like GGUF; a
+    // source that does not provide it naturally falls back below.
+    layer.wqkv = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "weight", bid), {n_embd_, n_embd_qkv}, TENSOR_NOT_REQUIRED);
     if (layer.wqkv) {
-        layer.wqkv_b = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "bias", bid), {n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
+        layer.wqkv_b = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "bias", bid), {n_embd_qkv}, TENSOR_NOT_REQUIRED);
     } else {
         layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", bid), {n_embd_, n_embd_q_}, flags);
         layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K, "weight", bid), {n_embd_, n_embd_k_}, flags);

@@ -15,7 +15,7 @@
 #include <string>
 #include <vector>
 
-// Importer for Qwen3.5 dense compressed-tensors checkpoints. It maps the
+// Importer for Qwen3.5 dense and MoE safetensors checkpoints. It maps the
 // logical GGUF tensor names used by the runtime back to their safetensors
 // groups and materializes exactly one final tensor at a time.
 class llama_safetensors_qwen35_importer final : public llama_safetensors_importer {
@@ -58,4 +58,8 @@ class llama_safetensors_qwen35_importer final : public llama_safetensors_importe
     uint32_t n_value_heads_   = 0;
     uint32_t key_head_dim_    = 0;
     uint32_t value_head_dim_  = 0;
+    uint32_t full_attention_interval_ = 4;
+    bool     text_only_       = false;
+    bool     moe_             = false;
+    bool     executorch_flat_ = false;
 };

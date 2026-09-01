@@ -232,18 +232,29 @@ Ambiguous matches and unsupported architectures must report the detected `model_
 
 ## 5. Implementation phases
 
-Each phase should be independently reviewable and should preserve a runnable Qwen3.6 path.
+Each phase should be independently reviewable and should preserve the runnable
+Qwen3.6 path. The initial release targets are Qwen3.8-27B plus the large-MoE
+Qwen3.8-Flash-Next (`qwen4exp`) and DeepSeek-V4-Flash architectures.
 
 ### Phase 0 — Freeze trustworthy baselines
 
-- [ ] Record the exact Qwen3.6 NVFP4 and official block-FP8 model revisions.
-- [ ] Record A6000 PP, TG, peak VRAM, load time, and first-token correctness.
+- [ ] Record exact revisions for the representative Qwen3.8-27B release set:
+  official block-FP8, Unsloth NVFP4, AWQ INT4, GPTQ INT4, AutoRound W4A16,
+  W8A16 INT8, SmoothQuant W8A8, and BitsAndBytes NF4.
+- [ ] Pin the official Qwen3.8-Flash-Next and DeepSeek-V4-Flash safetensors
+  revisions. Inventory their complete tensor contracts, including Qwen PLE
+  shards and DeepSeek's mixed FP4/FP8 expert representation, before describing
+  either source format as supported.
+- [ ] Record PP, TG, peak VRAM, peak host memory, load time, and first-token
+  correctness on the reference hardware used for each external-engine comparison.
 - [ ] Preserve direct projection correctness tests for every supported shape.
 - [ ] Preserve same-process reference-vs-reference anchor tests; the anchor must be exactly zero.
 - [ ] Disable or reject experimental backend paths that are known to produce incorrect output.
 - [ ] Save vLLM commands, versions, and corresponding baselines.
 
-Gate: both source models load and produce coherent greedy output, and the recorded performance is reproducible within the chosen thermal/clock tolerance.
+Gate: every representative Phase-0 source loads and produces coherent greedy
+output, and the recorded performance is reproducible within the chosen
+thermal/clock tolerance.
 
 Current known exception: explicitly enabling the experimental Humming NVFP4
 path produced incoherent greedy output on the A6000 while the ordinary NVFP4
@@ -420,15 +431,21 @@ scale into existing Q8_0 blocks. Against an exactly dequantized BF16 control on
 the canonical 16K WikiText panel it measured median KLD 0.000106, mean 0.000564,
 p99 0.006248, and 99.219% same-top.
 
-AWQ and non-act-order GPTQ are intentionally reference adapters, not the final
-competitive executors. Both unpack their producer-specific INT32 layout and
-fold group-128 affine parameters into Q4_1. This preserves the 4-bit codes and
-works through existing placement and backend machinery, but costs 5.0 bpw and
-uses W4A8 arithmetic. The authoritative AWQ packing permutation is
+AWQ and identity-map GPTQ currently unpack their producer-specific INT32 layout
+and fold affine parameters into Q4_1. This preserves the 4-bit codes and works
+through existing placement and backend machinery, but costs 5.0 bpw and uses
+W4A8 arithmetic. The authoritative AWQ packing permutation is
 `[0,4,1,5,2,6,3,7]`; GPTQ uses ordinary nibble order and its v1 stored-zero
-`+1` convention. GPTQ additionally requires an identity group map. A real
-`desc_act=true` configuration or non-identity `g_idx` fails during adapter
-validation, before model allocation.
+`+1` convention.
+
+Act-order GPTQ is a distinct native representation: it keeps packed I4 weights,
+unpacked group zero codes, original F16/BF16 scales, and a compact per-column
+`g_idx`. CPU and CUDA reference executors index the arbitrary group map during
+the dot product. On the real
+`chieunq/Qwen3-1.7B-gptq-v2-4bit-gsm8k2048` checkpoint, the prompt `The capital
+of France is` matched GPTQModel's argmax and all top-10 tokens with last-logit
+KLD 0.000679. The scrambled group map is therefore exercised end to end rather
+than inferred from a synthetic identity fixture.
 
 Qwen3.5 recurrent projections add row/column layout transforms. The reference
 AWQ/GPTQ repacks cannot apply those transforms after unpacking without also
@@ -457,7 +474,10 @@ oracle for that kernel work.
 | raw BF16/F32 and channel-scaled F8 | canonical backend support | canonical backend support | canonical backend support | yes | yes |
 | NVFP4 | existing NVFP4 type | existing NVFP4 type | existing NVFP4 type | yes | no (repack) |
 | W8A8 -> Q8_0 | existing Q8_0 type | existing Q8_0 type | existing Q8_0 type | yes | no (repack) |
-| AWQ/GPTQ -> Q4_1 | existing Q4_1 type | existing Q4_1 type | existing Q4_1 type | yes | no (repack) |
+| AWQ/identity-GPTQ -> Q4_1 | existing Q4_1 type | existing Q4_1 type | existing Q4_1 type | yes | no (repack) |
+| GPTQ act-order | scalar reference | scalar reference | explicit reject | CPU/CUDA placement | yes |
+| BitsAndBytes NF4/FP4 | scalar reference | scalar reference | explicit reject | CPU/CUDA placement | yes |
+| BitsAndBytes INT8 | channel-INT8 fallback | channel-INT8 executor | explicit reject | CPU/CUDA placement | yes |
 
 The A6000 gates include CUDA execution for all three new adapters and an
 all-CPU GPTQ smoke test (2.0 PP t/s, 1.5 TG t/s). A raw channel-FP8 model also
@@ -604,7 +624,190 @@ versus 1707.59 t/s (+0.37%) with pairing enabled in both arms. Batch-one uses
 MMVQ and declines both paths. The combined logits file remained byte-identical
 to SHA-256 `8a2ea9c88341c96c593821f2c9c920844f95e5eb48c8d7aaead5e20ccc181833`.
 
-## 6. Test matrix
+## 6. Broad quantization coverage
+
+Native loading is not considered support unless the source representation,
+every correctness-critical auxiliary tensor, the graph operation, and the
+selected backend agree on the same numerical contract. Metadata recognition
+alone is not support. Unsupported combinations must fail before model buffers
+are allocated rather than silently converting to a different quantizer.
+
+The implementation order is deliberately shared-contract-first:
+
+| Family | Source contract | Current state | Next proof |
+|---|---|---|---|
+| BF16/F16/F32 | plain tensors | direct upload | second-architecture and placement matrix |
+| NVFP4 | packed E2M1, group-16 E4M3 scales, two global scales | native importer and CUDA executor | freeze KLD/perf baselines; HIP is an explicit reject |
+| FP8 W8A8 dynamic | E4M3 weights, channel or 128x128 weight scales, dynamic token activations | native channel/block paths; compressed-tensors `naive-quantized`, bounded FBGEMM FP8, and Quark PTPC schemas recognized | retain exact backend capability gates and add HIP implementations |
+| Grouped FP8 W8A8 | E4M3 weights and BF16 scales per 32 values, dynamic group-32 activations | native importer plus scalar CPU/CUDA reference execution | real-model KLD and optimized CUDA kernel |
+| FP8 W8A8 static | E4M3 weights, tensor weight scale, tensor input scale | native CUDA scalar-scale path; real ModelOpt mixed checkpoint executes | freeze KLD against its framework reference; reject unsupported backends early |
+| INT8 W8A8 dynamic | I8 weights, channel scale, dynamic token activations | native CUDA executor; compact/current compressed-tensors schemas and real SmoothQuant+GPTQ and Quark checkpoints execute | complete CPU/HIP/partial-placement policy |
+| INT8 W8A8 static | I8 weights, tensor/channel weight scale, tensor input scale, optional activation zero point | symmetric and asymmetric CUDA paths; real asymmetric checkpoint executes | add a public full-model fixture and placement matrix |
+| EETQ W8A16 | transposed I8 weights and one FP16 scale per output channel | exact load-time transpose into Q8_0; preserves every code and scale with 6.25% block-scale overhead | real-model logits proof and native weight-only CUDA fast path if demand justifies it |
+| Quanto W8A16 | I8 or E4M3 weights and one BF16/F16 scale per output channel (`qint8`, `qfloat8_e4m3fn`) | native raw-code loading with a self-describing scale sidecar; CPU reference and CUDA execution; real qint8/qfloat8 full-model logits proven | add HIP execution and large-model performance gates |
+| Quanto W4A16 | packed qint4 data plus per-group scale and shift | load-time Q4_1 repack and CPU/CUDA execution | replace the correctness-first repack with an exact native executor before claiming parity with Quanto |
+| AWQ/GPTQ W4A16 | packed I4 plus group scale/zero | exact Q4_1 repack for AWQ and identity-map GPTQ at group sizes divisible by 32, including per-channel; F16/BF16 scales; AutoRound GPTQ sidecar configs and per-module precision exceptions | widen real-model coverage for g32/g64 and architecture transforms |
+| W4A8 INT8 | group-128 I4 weights and dynamic/static INT8 activations | exact Q4-A32 repack plus scaled CUDA executor | full-model KLD/perf and unsupported-backend gates |
+| W4A8 FP8 | group-128 I4 weights and dynamic FP8 activations | exact repack plus CUDA executor | Hopper/Blackwell real-model KLD/perf |
+| MXFP4/MXFP8 | microscaled weights/activations and E8M0 sidecars | native compressed-tensors importer and CUDA execution; Quark MXFP4 schema and real checkpoint proven | real-model KLD/perf on each supported architecture |
+| AutoRound/INC MXFP4/MXFP8 | the same group-32 MX values and E8M0 scales, declared by the compact AutoRound schema | maps onto the existing MXFP contracts, including exact per-module FP16 exceptions and the optional `quantization_config.json` sidecar | real small-model full-load proof; current public LLM checkpoints are very large MoEs |
+| TorchAO tiled INT4 / unpacked INT8 | `Int4TilePackedTo4dTensor` and `IntxUnpackedToInt8Tensor` safetensors subclasses | exact load-time repack into Q4_1/Q8_0; all tiled lanes and INT8 rows covered | native execution formats if load time or repack precision becomes material |
+| Transformers HQQ INT4 | flattened axis-1 `4bit_u8` codes with learned F16 scale/zero per group | exact code-preserving Q4_1 repack for unquantized metadata at group sizes divisible by 32; public Llama-3.2-1B checkpoint loads and generates coherently | external-reference KLD and a native metadata-preserving executor |
+| ExecuTorch HQQ experts | packed signed INT4 expert rows plus one BF16 scale per 128 values | exact nibble-preserving Q4_0 repack for the public Qwen3.5-MoE export; every expert/row/lane covered | external-reference KLD and a native scale-preserving executor |
+| WNA16 | packed 2--8-bit weights, group scales/zeros | exact 4-bit group-32 and 8-bit group-128 subsets cover the current mainstream releases | defer native 2/3/5/6-bit layouts until a real checkpoint and user demand justify them |
+| BitsAndBytes | NF4/FP4 codes with block absmax and optional nested scale quantization; INT8 rows with SCB absmax | native packed 4-bit types and exact nested-scale bundle plus serialized INT8/SCB loading; real NF4 and INT8 models load and generate coherently | optimize 4-bit CUDA, add HIP, and add LLM.int8 outlier decomposition where its threshold materially changes fidelity |
+| GPTQ act-order | packed I4 plus non-identity `g_idx` | native packed type and compact scale/zero/group bundle; real-model CPU/CUDA reference execution and external KLD proof | optimize CUDA and add HIP; transformed Qwen3.5 recurrent projections reject early |
+| ModelOpt W4A4 NVFP4 | NVFP4 weights and NVFP4 activations | explicitly rejected; W4A16 and mixed W4A16/FP8 are supported | Blackwell activation-quantization executor and real-model fidelity/perf |
+
+Producer names are not treated as numerical formats. Quark W4A16, static FP8,
+PTPC FP8, INT8, NVFP4, and MXFP4 all map onto the same canonical contracts as
+their compressed-tensors/ModelOpt counterparts. FBGEMM's
+`activation_scale_ub` is preserved in the dynamic-FP8 marker and applied before
+the row scale is chosen. SmoothQuant checkpoints need no special runtime
+operator when smoothing has already been folded into the stored weights; their
+remaining INT8 or FP8 tensor contract is handled normally.
+
+That distinction is now backed by a public FP8 checkpoint rather than config
+inspection alone. `MLliu6/Qwen3-VL-4B-Instruct-SmoothQuant-W8A8-FP8` loaded
+directly, selected the shared channel-FP8 path, and generated a coherent Paris
+answer. The smoothing operation had already been folded by the producer; no
+runtime smoothing tensor or extra graph multiply was present.
+
+The Quanto `qint8` proof is at the independently dequantized BF16 control
+floor: last-token KLD 0.00039238 against the official Quanto execution versus
+0.00039069 for the BF16 control, with the same argmax. Quanto `qfloat8_e4m3fn`
+measures 0.00020709 against official Quanto on the shared token sequence; the
+plain BF16 engine/reference floor is 0.00016884. The qint4 Q4_1 repack improves
+substantially over an ordinary Q4_1 interpretation (0.00045605 versus
+0.00113866 KLD), but remains above its dequantized-BF16 control floor
+(0.00012797), so it is usable coverage rather than exact format parity.
+
+Still outside the release coverage are genuinely different numerical/layout
+families rather than config aliases: ModelOpt W4A4 NVFP4 activation execution,
+EXL2/EXL3, AQLM, SpQR, VPTQ, HIGGS, SINQ, HQQ 1/2/3/8-bit, axis-0,
+float-view, or metadata-quantized variants, Quanto qint2, sparse TorchAO
+layouts, and native 2/3/5/6-bit WNA16. They must not be advertised as
+supported or silently requantized.
+
+MLX is also intentionally outside this project phase. Although MLX checkpoints
+use safetensors as a container, their tensor layouts target the separate MLX and
+Metal execution ecosystem. This fork does not yet have Metal implementations of
+its KV codec families, so MLX import would not provide a coherent supported
+backend. Revisit it only as part of a broader Metal project.
+
+### 6.1 Release scope informed by Qwen3.8-27B
+
+A 2026-09-01 Hugging Face inventory found 933 repositories attached as
+quantizations of `Qwen/Qwen3.8-27B`. Name/tag counts overlap, but their relative
+prevalence is useful: 342 GGUF, 344 MLX, 110 NVFP4, 76 FP8, 56 GPTQ, 42 AWQ,
+41 AutoRound, 24 EXL3, four BitsAndBytes, and one direct SmoothQuant base-model
+release. No HQQ or Quanto release for this model surfaced in the same search.
+
+The native-safetensors release boundary is therefore:
+
+1. official block-FP8;
+2. mixed NVFP4/FP8/BF16 checkpoints;
+3. AWQ, GPTQ, and AutoRound W4A16;
+4. W8A16 INT8;
+5. SmoothQuant W8A8; and
+6. BitsAndBytes NF4.
+
+WNA16 is an execution umbrella, not a checkpoint format that is commonly named
+as such. Qwen3.8 has ordinary W4A16 and W8A16 releases, which are in scope, but
+only isolated INT5/INT6 AutoRound experiments and effectively no ordinary
+W2A16/W3A16 publication ecosystem. Native 2/3/5/6-bit WNA16 is consequently a
+demand-driven post-release project, not a release requirement.
+
+EXL3 is a real but separate ecosystem. Its trellis/codebook representation needs
+a new executor rather than another metadata alias, so its presence does not
+expand the initial native-safetensors release boundary.
+
+Generic ModelOpt W4A4 NVFP4 activation execution remains on the near-term
+post-release roadmap. DeepSeek-V4-Flash is a separate release target whose
+official configuration declares FP4 experts inside a block-FP8 model. Its exact
+stored expert layout and activation contract must be inventoried from the shard
+headers and execution reference. If that contract is not already represented
+canonically, the narrowly required DeepSeek executor becomes a release blocker;
+it must not be assumed to be identical to ModelOpt W4A4 from metadata alone.
+
+The public `SocialLocalMobile/Qwen3.5-35B-A3B-HQQ-INT4` checkpoint provides a
+different, fully serialized path: tiled TorchAO INT4 dense projections,
+TorchAO unpacked-INT8 embeddings, and scale-only HQQ routed experts under the
+flat ExecuTorch Qwen3.5-MoE namespace. The native loader now maps that namespace,
+reuses the existing runtime architecture, supports its fused full-attention QKV
+projection, and generates coherently. This is not a claim of generic HQQ
+support: it is separate from the now-supported Transformers `4bit_u8`/axis-1
+contract, and other HQQ bit widths and metadata modes remain distinct.
+
+The generic HQQ proof uses the public
+`nm-testing/Llama-3.2-1B-Instruct-HQQ` checkpoint. Its 112 projections retain
+the producer's code lanes and learned affine parameters during load-time Q4_1
+repacking; with F16 KV (the model's 64-dimensional heads do not satisfy this
+fork's default Turbo4 KV block contract), it generated `The capital of France
+is Paris.` at 2075.4 prompt and 393.2 generation tokens/s on the A100 test box.
+An all-CPU load and generation arm also passed, confirming that the portable
+Q4_1 materialization is not CUDA-placement-only.
+
+Architecture coverage is a separate axis. Qwen2, Qwen3, Qwen3.5, Qwen3-VL,
+Llama, and classic Mistral currently exercise the generic importer seam. TinyLlama
+with a serialized BitsAndBytes INT8 checkpoint provides the Llama-family proof:
+154 quantized matrices were recognized, the full model loaded without a whole-
+model conversion, and greedy generation returned a coherent Paris answer.
+For Mistral-7B-Instruct-v0.3, all 291 native tensors (14,496,579,584 bytes)
+matched a fresh BF16 GGUF conversion exactly. Native safetensors and GGUF now
+produce bit-identical CUDA logits; against the Transformers BF16 reference the
+last-token KLD is 0.0000894 (the CPU GGUF control is 0.0000938). This proof also
+caught and closed an unrelated CUDA integration bug: the Qwen-specific hidden-
+BF16 GLU handoff had been admitted for Mistral's 14,336-wide FFN even though its
+producer contract is the Qwen 17,408-wide path.
+
+### 6.2 Initial large-MoE architecture boundary
+
+The initial architecture boundary includes both current flagship large MoEs:
+
+1. `Qwen/Qwen3.8-Flash-Next`, whose source identifies as `qwen4_exp`; and
+2. `deepseek-ai/DeepSeek-V4-Flash`, whose source identifies as `deepseek_v4`.
+
+Both ordinary runtime architectures already exist on current master. Qwen4 is
+`LLM_ARCH_QWEN4EXP` with `src/models/qwen4exp.cpp`; it is not the older
+`LLM_ARCH_QWEN3NEXT` path. DeepSeek uses `LLM_ARCH_DEEPSEEK4` and
+`src/models/deepseek4.cpp`. Native safetensors adapters must therefore translate
+source metadata, names, auxiliary quant tensors, and the few required layout
+transforms into those existing model classes. They must not duplicate QSA,
+PLE, hyper-connection, compressed-attention, MTP, VBR, or multimodal graph
+logic inside the importer.
+
+The existing Qwen4 converter is the mapping oracle. In particular, its PLE
+hash constants remain exact integers, its 128 n-gram embedding shards remain
+bounded/chunked rather than concatenated into a second whole-model allocation,
+its combined indexer Q/K projection is split into the canonical runtime tensors,
+and its Qwen3-VL vision tower continues through the established vision model.
+The direct importer must express the same contracts through bounded source
+bindings instead of producing an intermediate GGUF.
+
+DeepSeek-V4 already requests routed expert weights as canonical 3-D
+`ffn_{gate,down,up}_exps` tensors. That representation is also a runtime
+offload contract: `--cpu-moe` and `--n-cpu-moe` place those tensors in host
+memory, while the adaptive cache discovers host `WEIGHTS` buffers by canonical
+`_exps`/`_chexps` names, three-dimensional shape, and backend-supported expert
+stride. The safetensors path must preserve those allocation roots, names,
+dimensions, buffer usage, and per-expert addressability. An opaque importer-
+owned packed aggregate that happens to execute on one GPU is not acceptable.
+
+Release proof for each large MoE requires:
+
+- bounded direct load without a temporary GGUF or a second resident model;
+- coherent generation and reference KLD for the exact source quant contract;
+- layer split and tensor split across multiple GPUs;
+- partial expert placement with `--cpu-moe` and `--n-cpu-moe`;
+- `--moe-cache auto`, `on`, `soft`, explicit budget, and multi-GPU expert-
+  parallel cache paths, including cold/warm correctness and stable residency;
+- agreement between fit-time placement/accounting and the final loaded buffers;
+- MTP, VBR, long-context, and teardown gates; and
+- Qwen4 text and multimodal/PLE paths, including bounded loading of the large
+  n-gram table.
+
+## 7. Test matrix
 
 ### Structural tests
 
@@ -631,6 +834,8 @@ to SHA-256 `8a2ea9c88341c96c593821f2c9c920844f95e5eb48c8d7aaead5e20ccc181833`.
 - Single CUDA GPU.
 - CUDA layer split and tensor split.
 - Partial CPU offload.
+- Large-MoE `--cpu-moe`, `--n-cpu-moe`, and every retained `--moe-cache`
+  policy, including expert-parallel caching on multiple GPUs.
 - CPU-only or a precise early rejection for unsupported formats.
 - HIP/RDNA or a precise early rejection for unsupported formats.
 - Model load cancellation and teardown.
@@ -645,7 +850,7 @@ to SHA-256 `8a2ea9c88341c96c593821f2c9c920844f95e5eb48c8d7aaead5e20ccc181833`.
 - Kernel-level comparison against the corresponding GGUF/runtime type.
 - External-engine comparison only under equivalent model, quant contract, device count, batching, graph mode, and sampling behavior.
 
-## 7. Review checkpoints
+## 8. Review checkpoints
 
 Run a focused design/code review after Phases 2, 3, and 6.
 
@@ -660,30 +865,61 @@ Questions reviewers must answer:
 7. Is the source/importer lifetime valid until the final upload and all asynchronous copies complete?
 8. Can cancellation or an exception leave partially registered/repacked tensor state behind?
 
-## 8. Recommended next order
+## 9. Recommended next order
 
 The architecture bridge, bounded loader, second-model proof, and first format
 adapters have working implementations. Before describing the branch as
 release-ready:
 
-1. run the remaining real-machine HIP and multi-device placement gates;
-2. perform the planned simplification and correctness review over the complete
-   source/importer/adapter diff;
-3. freeze reproducible commands and baselines for the retained NVFP4 and FP8
-   executors;
-4. implement native group-128 W4A16 execution before presenting AWQ or GPTQ as
-   performance-competitive support;
-5. add act-order GPTQ only with an exact activation-gather/runtime contract.
+1. finish the current simplification/correctness pass, remove abandoned
+   experiments, and split the working tree into reviewable commits;
+2. add source adapters for the existing `LLM_ARCH_QWEN4EXP` and
+   `LLM_ARCH_DEEPSEEK4` model classes, using their converters only as mapping
+   oracles and keeping all graph/runtime policy in the model implementations;
+3. run the representative Qwen3.8-27B acceptance matrix from Phase 0, including
+   exact-zero anchors, reference KLD, coherent generation, resident VRAM, peak
+   host memory, PP, and TG;
+4. run the Qwen4/DeepSeek large-MoE matrix from section 6.2 before calling the
+   architecture boundary complete;
+5. run the real-machine placement matrix for every retained family: single CUDA,
+   layer split, tensor split, partial CPU offload, CPU-only or precise early
+   rejection, HIP or precise early rejection, cancellation, and teardown;
+6. close the measured compact W4A16 prompt-processing gap with a native MMQ/GEMM
+   path that consumes the canonical allocation without a second resident copy;
+7. freeze reproducible commands and baselines for BF16, NVFP4, FP8, W8A8,
+   BitsAndBytes, and normal/act-order GPTQ, then optimize only the paths with a
+   measured material gap;
+8. verify MTP, VBR, and multimodal integration on representative Qwen3.8 models;
+9. publish a user-facing format/backend/architecture support matrix, invocation
+   examples, memory behavior, performance baselines, and precise limitations;
+10. widen the architecture bridge only when a real checkpoint proves the
+   canonical name/layout mapping.
 
-## 9. Definition of done
+Post-release, in priority order:
+
+1. implement and prove ModelOpt W4A4 NVFP4 activation execution on Blackwell;
+2. replace correctness-first BitsAndBytes and act-order GPTQ paths only where
+   profiling demonstrates a worthwhile performance gap;
+3. add optimized HIP executors for formats that have demonstrated user demand;
+4. add new architectures only from real checkpoint fixtures; and
+5. consider EXL3 or unusual WNA16 widths only as separately scoped projects.
+
+## 10. Definition of done
 
 This architecture project is complete when:
 
 - Qwen3.5 safetensors no longer maintains a parallel tensor manifest;
 - format-generic quant code is absent from the Qwen adapter;
-- at least two existing llama.cpp architectures load native safetensors through their original model classes;
+- Qwen3.8-27B, Qwen3.8-Flash-Next/Qwen4, and DeepSeek-V4-Flash load native
+  safetensors through their existing model classes;
 - equivalent GGUF and safetensors tensors reach the same backend kernels;
 - unsupported format/backend combinations fail before large allocations;
 - no temporary GGUF or whole-model duplicate is created;
+- every format in the Qwen3.8 release boundary has a pinned, reproducible
+  correctness, KLD, memory, PP, and TG record;
+- single-GPU, split, offload, and unsupported-backend behavior is documented and
+  proven rather than inferred;
+- both large MoEs pass layer/tensor split plus CPU-expert and adaptive-cache
+  gates without changing their canonical expert ownership;
 - correctness, KLD, placement, load-memory, PP, and TG gates pass; and
 - adding a third already-supported architecture demonstrably requires only metadata/name/layout policy unless it introduces a genuinely new operation or quantization format.

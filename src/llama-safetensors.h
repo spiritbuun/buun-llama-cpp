@@ -14,6 +14,13 @@
 struct llama_model;
 struct llama_model_params;
 
+// Read config.json and merge the producer-specific quantization sidecars that
+// are part of the native safetensors model contract. Keeping this resolution
+// in one place prevents architecture selection and quantization binding from
+// observing different configurations.
+llama_safetensors_json llama_safetensors_read_model_config(
+    const std::filesystem::path & model_dir);
+
 // Internal source-loader seam. Architecture probing belongs behind this
 // boundary so the public model-loading entry point remains format-agnostic.
 llama_model * llama_model_load_from_safetensors_dir(
@@ -62,12 +69,29 @@ struct llama_safetensors_tensor {
 
 enum class llama_safetensors_quant_format {
     NVFP4_PACK,
+    MXFP4_PACK,
+    MXFP8,
+    FP8_GROUP,
+    FP8_TENSOR,
     FP8_CHANNEL,
     FP8_BLOCK,
     INT8_CHANNEL,
-    AWQ_G128,
-    GPTQ_G128,
+    INT4_GROUP,
+    AWQ_GROUP,
+    QUARK_W4A16,
+    GPTQ_GROUP,
+    EETQ_INT8,
+    QUANTO_INT4,
+    QUANTO_INT8,
+    QUANTO_FP8,
+    TORCHAO_INT4,
+    TORCHAO_INTX,
+    HQQ_INT4,
+    BNB_INT8,
+    BNB_NF4,
+    BNB_FP4,
     PACKED_INT,
+    PACKED_INT4_FP8,
 };
 
 struct llama_safetensors_quant_group {
@@ -76,7 +100,16 @@ struct llama_safetensors_quant_group {
     uint32_t                       num_bits  = 0;
     uint32_t                       group_size = 0;
     bool                           symmetric = true;
+    bool                           input_quantized = false;
+    bool                           input_dynamic = true;
+    bool                           input_symmetric = true;
+    bool                           modelopt = false;
+    bool                           legacy_fp8_i8_storage = false;
+    bool                           act_order = false;
+    float                          input_scale_ub = 0.0f;
+    float                          outlier_threshold = 0.0f;
     std::vector<uint32_t>          block_structure;
+    std::vector<int64_t>           target_shape;
 };
 
 // Parsed compressed-tensors contracts from config.json. Matching preserves the
@@ -126,11 +159,13 @@ class llama_safetensors_registry {
 
     const std::vector<llama_safetensors_shard> &  shards() const;
     const std::vector<llama_safetensors_tensor> & tensors() const;
+    const std::string *                            metadata(const std::string & key) const;
 
   private:
     std::vector<llama_safetensors_shard>    shards_;
     std::vector<llama_safetensors_tensor>   tensors_;
     std::unordered_map<std::string, size_t> tensor_index_;
+    std::unordered_map<std::string, std::string> metadata_;
     llama_files                             files_;
     llama_mmaps                             mappings_;
 };

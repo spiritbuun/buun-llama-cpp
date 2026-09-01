@@ -1519,14 +1519,7 @@ struct ggml_cuda_humming_fp8_cache_entry {
     size_t scale_size  = 0;
 };
 
-struct ggml_cuda_humming_nvfp4_cache_entry {
-    void * weight = nullptr;
-    void * scale  = nullptr;
-    size_t weight_size = 0;
-    size_t scale_size  = 0;
-};
-
-struct ggml_cuda_marlin_q4_a32_cache_entry {
+struct ggml_cuda_marlin_q4_a32_layout {
     void * weight = nullptr;
     void * scale  = nullptr;
     void * zero   = nullptr;
@@ -1567,6 +1560,7 @@ struct ggml_cuda_q8_activation_storage {
     char * ptr = nullptr;
     size_t bytes = 0;
     const ggml_tensor * source = nullptr;
+    size_t source_count = 0;
     std::vector<char *> retired;
 };
 
@@ -1594,20 +1588,22 @@ struct ggml_backend_cuda_context {
     ggml_cuda_vbr_transcode_workspace vbr_transcode_workspace;
 
 #if !defined(GGML_USE_HIP)
-    // Proof-stage cache for the Ampere channel-E4M3 tensor-core executor. The
-    // final implementation will move this same-size derived representation
-    // into a repacking CUDA buffer so canonical and derived weights are never
-    // simultaneously resident. Keeping ownership context-local makes the
-    // prototype safe across independent llama contexts and CUDA devices.
+    // Context-owned workspaces and derived channel-FP8 scales. Marlin weights
+    // use buffer-owned in-place repacks instead.
     std::unordered_map<const void *, ggml_cuda_humming_fp8_cache_entry> humming_fp8_cache;
-    std::unordered_map<const void *, ggml_cuda_humming_nvfp4_cache_entry> humming_nvfp4_cache;
-    std::unordered_map<const void *, ggml_cuda_marlin_q4_a32_cache_entry> marlin_q4_a32_cache;
     ggml_cuda_humming_fp8_lock_storage humming_fp8_locks[GGML_CUDA_MAX_STREAMS];
     ggml_cuda_humming_input_storage humming_inputs[GGML_CUDA_MAX_STREAMS];
+    ggml_cuda_humming_input_storage humming_outputs[GGML_CUDA_MAX_STREAMS];
     ggml_cuda_q8_activation_storage mmq_q8_activations[GGML_CUDA_MAX_STREAMS];
     std::unordered_map<const ggml_tensor *, int> mmq_q8_reuse_requests;
     std::unordered_set<const ggml_tensor *> humming_bf16_activations;
-    std::unordered_set<const void *> humming_deferred_bf16;
+    std::unordered_map<const ggml_tensor *, int> humming_bf16_activation_uses;
+    // Graph-proven single-consumer recurrent outputs may be normalized,
+    // gated, and row-quantized directly into their F32-sized allocation.
+    std::unordered_set<const ggml_tensor *> int8_channel_activations;
+    // Graph-proven single-consumer GLU outputs may be written as BF16 directly
+    // into their F32-sized allocation and consumed by the following BF16 GEMM.
+    std::unordered_set<const ggml_tensor *> bf16_glu_outputs;
     // Qwen recurrent prefill can defer its paired L2 outputs to the FLA input
     // packer, which applies the same reduction while writing BF16 directly.
     // Entries are produced and consumed within one graph evaluation.
@@ -1619,6 +1615,22 @@ struct ggml_backend_cuda_context {
     // SSM_CONV node is then a graph-order marker only. Entries live for one
     // graph evaluation/capture and are consumed exactly once.
     std::unordered_set<const ggml_tensor *> precomputed_ssm_convs;
+
+    bool consume_bf16_activation(const ggml_tensor * tensor) {
+        auto it = humming_bf16_activation_uses.find(tensor);
+        if (it != humming_bf16_activation_uses.end()) {
+            GGML_ASSERT(it->second > 0);
+            if (--it->second == 0) {
+                humming_bf16_activation_uses.erase(it);
+            }
+            return true;
+        }
+        return humming_bf16_activations.erase(tensor) != 0;
+    }
+
+    bool consume_int8_channel_activation(const ggml_tensor * tensor) {
+        return int8_channel_activations.erase(tensor) != 0;
+    }
 #endif
 
 #ifdef USE_CUDA_GRAPH
@@ -1741,6 +1753,7 @@ struct ggml_cuda_mm_fusion_args_host {
     ggml_tensor * residual_out = nullptr;
     const ggml_tensor * rms_weight = nullptr;
     bool materialize_rms_output = true;
+    bool retain_bf16_output = false;
     float rms_eps = 0.0f;
     ggml_glu_op glu_op;
 };

@@ -138,12 +138,22 @@ __device__ __forceinline__ float ssm_conv_split_load<nv_bfloat16>(const nv_bfloa
     return __bfloat162float(src[i]);
 }
 
-template <typename body_t, int d_conv, int split_n_t>
+template <typename out_t>
+static __device__ __forceinline__ void ssm_conv_split_store(out_t * dst, int64_t i, float value) {
+    dst[i] = value;
+}
+
+template <>
+__device__ __forceinline__ void ssm_conv_split_store<nv_bfloat16>(nv_bfloat16 * dst, int64_t i, float value) {
+    dst[i] = __float2bfloat16_rn(value);
+}
+
+template <typename body_t, typename out_t, int d_conv, int split_n_t>
 static __global__ void ssm_conv_split_input(
         const float * __restrict__ prefix,
         const body_t * __restrict__ body,
         const float * __restrict__ weight,
-        float * __restrict__ dst,
+        out_t * __restrict__ dst,
         int64_t channels,
         int64_t n_t,
         int64_t prefix_seq_stride,
@@ -158,7 +168,7 @@ static __global__ void ssm_conv_split_input(
 
     const float * prefix_seq = prefix + seq * prefix_seq_stride;
     const body_t * body_seq  = body   + seq * body_seq_stride;
-    float *       dst_seq    = dst    + seq * dst_seq_stride;
+    out_t *       dst_seq    = dst    + seq * dst_seq_stride;
 
     float w[d_conv];
 #pragma unroll
@@ -185,7 +195,8 @@ static __global__ void ssm_conv_split_input(
         for (int j = 0; j < d_conv; ++j) {
             sum += x[t + j] * w[j];
         }
-        dst_seq[(token0 + t) * channels + channel] = ggml_cuda_op_silu_single(sum);
+        ssm_conv_split_store(dst_seq, (token0 + t) * channels + channel,
+                             ggml_cuda_op_silu_single(sum));
     }
 }
 
@@ -433,7 +444,8 @@ void ggml_cuda_op_ssm_conv_split_input(
         const ggml_tensor * weight,
         ggml_tensor * silu_dst,
         int64_t tail_start,
-        bool body_bf16) {
+        bool body_bf16,
+        bool output_bf16) {
     GGML_ASSERT(prefix->type == GGML_TYPE_F32 && body_transposed->type == GGML_TYPE_F32);
     GGML_ASSERT(concat_dst->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F32);
     GGML_ASSERT(silu_dst->type == GGML_TYPE_F32);
@@ -455,33 +467,42 @@ void ggml_cuda_op_ssm_conv_split_input(
         const char * value = std::getenv("GGML_CUDA_SSM_SPLIT_T");
         return value ? std::atoi(value) : 8;
     }();
-    auto launch_conv = [&](auto split, auto body_type) {
+    auto launch_conv = [&](auto split, auto body_type, auto output_type) {
         constexpr int split_n_t = decltype(split)::value;
         using body_t = decltype(body_type);
+        using out_t  = decltype(output_type);
         const dim3 conv_blocks(n_s, (channels + threads - 1) / threads, (n_t + split_n_t - 1) / split_n_t);
-        ssm_conv_split_input<body_t, 4, split_n_t><<<conv_blocks, threads, 0, stream>>>(
+        ssm_conv_split_input<body_t, out_t, 4, split_n_t><<<conv_blocks, threads, 0, stream>>>(
             static_cast<const float *>(prefix->data),
             static_cast<const body_t *>(body_transposed->data),
             static_cast<const float *>(weight->data),
-            static_cast<float *>(silu_dst->data),
+            static_cast<out_t *>(silu_dst->data),
             channels, n_t,
             prefix->nb[2] / sizeof(float),
             body_transposed->nb[2] / sizeof(float),
-            silu_dst->nb[2] / sizeof(float));
+            n_t * channels);
     };
-    auto launch_for_type = [&](auto body_type) {
+    auto launch_for_type = [&](auto body_type, auto output_type) {
         if (requested_split == 32) {
-            launch_conv(std::integral_constant<int, 32>{}, body_type);
+            launch_conv(std::integral_constant<int, 32>{}, body_type, output_type);
         } else if (requested_split == 16) {
-            launch_conv(std::integral_constant<int, 16>{}, body_type);
+            launch_conv(std::integral_constant<int, 16>{}, body_type, output_type);
         } else {
-            launch_conv(std::integral_constant<int, 8>{}, body_type);
+            launch_conv(std::integral_constant<int, 8>{}, body_type, output_type);
         }
     };
     if (body_bf16) {
-        launch_for_type(nv_bfloat16{});
+        if (output_bf16) {
+            launch_for_type(nv_bfloat16{}, nv_bfloat16{});
+        } else {
+            launch_for_type(nv_bfloat16{}, float{});
+        }
     } else {
-        launch_for_type(float{});
+        if (output_bf16) {
+            launch_for_type(float{}, nv_bfloat16{});
+        } else {
+            launch_for_type(float{}, float{});
+        }
     }
 
     if (tail_start < concat_dst->ne[0]) {

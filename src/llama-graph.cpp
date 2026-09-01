@@ -1874,14 +1874,48 @@ ggml_tensor * llm_graph_context::build_cvec(
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
-          ggml_tensor * w_s) const {
+          ggml_tensor * w_s,
+          ggml_tensor * in_s) const {
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
 
+    if (in_s) {
+        const bool fp8_scale = w->type == GGML_TYPE_F8_E4M3 &&
+            (in_s->type == GGML_TYPE_F32 || in_s->type == GGML_TYPE_I32 || in_s->type == GGML_TYPE_I16);
+        const bool i8_scale = w->type == GGML_TYPE_I8 &&
+            (in_s->type == GGML_TYPE_F32 || in_s->type == GGML_TYPE_I32 || in_s->type == GGML_TYPE_I64);
+        const bool i4_scale = w->type == GGML_TYPE_Q4_A32 &&
+            (in_s->type == GGML_TYPE_F32 || in_s->type == GGML_TYPE_I32 || in_s->type == GGML_TYPE_I16);
+        const bool mxfp4_scale = w->type == GGML_TYPE_MXFP4 && in_s->type == GGML_TYPE_I32;
+        if ((!fp8_scale && !i8_scale && !i4_scale && !mxfp4_scale) ||
+            ggml_nelements(in_s) != 1) {
+            throw std::runtime_error(format(
+                "unsupported static activation scale '%s' for weight '%s'", in_s->name, w->name));
+        }
+        // Static compressed-tensors W8A8 quantizes the activation before the
+        // dot product. Keep the scalar as an explicit MUL_MAT source so the
+        // backend cannot mistake it for a post-matmul output scale.
+        res->src[3] = in_s;
+    }
+
     if (w_s) {
-        if (w->type == GGML_TYPE_F8_E4M3 && w_s->type == GGML_TYPE_F32) {
+        const bool fp8_group_scale = w->type == GGML_TYPE_F8_E4M3 &&
+            w_s->type == GGML_TYPE_BF16 && w_s->ne[1] > 1;
+        const bool bnb_scale = (w->type == GGML_TYPE_BNB_NF4 || w->type == GGML_TYPE_BNB_FP4) &&
+            w_s->type == GGML_TYPE_I8;
+        const bool gptq_ao_scale = w->type == GGML_TYPE_GPTQ_AO && w_s->type == GGML_TYPE_I8;
+        const bool quanto_w4a16 = w->type == GGML_TYPE_Q4_1 && w_s->type == GGML_TYPE_I8 &&
+            ggml_nelements(w_s) == 1;
+        const bool w8a16_scale = w->type == GGML_TYPE_I8 && w_s->type == GGML_TYPE_I8 &&
+            w_s->ne[0] >= static_cast<int64_t>(sizeof(ggml_w8a16_scale_header));
+        if ((w->type == GGML_TYPE_F8_E4M3 &&
+             (w_s->type == GGML_TYPE_F32 || w_s->type == GGML_TYPE_I8 || fp8_group_scale)) ||
+            (w->type == GGML_TYPE_I8 &&
+             (w_s->type == GGML_TYPE_F32 || w_s->type == GGML_TYPE_F16 || w_s->type == GGML_TYPE_BF16)) ||
+            bnb_scale || gptq_ao_scale || quanto_w4a16 || w8a16_scale) {
             // A 128x128 FP8 block scale participates inside the dot-product and
-            // cannot be represented as an output broadcast. Keep it as an
-            // explicit third MUL_MAT source for block-aware backends.
+            // INT8's per-token activation scale also participates inside the
+            // dot-product. Keep either contract as an explicit third MUL_MAT
+            // source for scale-aware backends.
             res->src[2] = w_s;
         } else {
             res = ggml_mul(ctx0, res, w_s);
@@ -1997,7 +2031,7 @@ llm_graph_qkv llm_graph_context::build_qkv(
 
     if (layer.wqkv) {
         // fused QKV path
-        ggml_tensor * qkv = build_lora_mm(layer.wqkv, cur, layer.wqkv_s);
+        ggml_tensor * qkv = build_lora_mm(layer.wqkv, cur, layer.wqkv_s, layer.wqkv_in_s);
         cb(qkv, "wqkv", il);
         if (layer.wqkv_b) {
             qkv = ggml_add(ctx0, qkv, layer.wqkv_b);
@@ -2017,7 +2051,7 @@ llm_graph_qkv llm_graph_context::build_qkv(
             ggml_row_size(qkv->type, n_embd_q + n_embd_kv));
     } else {
         // separate Q/K/V path
-        Qcur = build_lora_mm(layer.wq, cur, layer.wq_s);
+        Qcur = build_lora_mm(layer.wq, cur, layer.wq_s, layer.wq_in_s);
         cb(Qcur, "Qcur", il);
         if (layer.wq_b) {
             Qcur = ggml_add(ctx0, Qcur, layer.wq_b);
@@ -2027,7 +2061,7 @@ llm_graph_qkv llm_graph_context::build_qkv(
             Qcur = ggml_clamp(ctx0, Qcur, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
             cb(Qcur, "Qcur_clamped", il);
         }
-        Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
+        Kcur = build_lora_mm(layer.wk, cur, layer.wk_s, layer.wk_in_s);
         cb(Kcur, "Kcur", il);
         if (layer.wk_b) {
             Kcur = ggml_add(ctx0, Kcur, layer.wk_b);
@@ -2037,7 +2071,7 @@ llm_graph_qkv llm_graph_context::build_qkv(
             Kcur = ggml_clamp(ctx0, Kcur, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
             cb(Kcur, "Kcur_clamped", il);
         }
-        Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
+        Vcur = build_lora_mm(layer.wv, cur, layer.wv_s, layer.wv_in_s);
         cb(Vcur, "Vcur", il);
         if (layer.wv_b) {
             Vcur = ggml_add(ctx0, Vcur, layer.wv_b);
@@ -2074,7 +2108,10 @@ ggml_tensor * llm_graph_context::build_ffn(
          ggml_tensor * act_scales,
      llm_ffn_op_type   type_op,
    llm_ffn_gate_type   type_gate,
-                 int   il) const {
+                 int   il,
+         ggml_tensor * up_in_s,
+         ggml_tensor * gate_in_s,
+         ggml_tensor * down_in_s) const {
     // NVFP4 support is currently restricted to
     // 1) LORA absence (*_s would be applied after LORA residual, which is incorrect)
     // 2) bias absense (*_s would be applied after bias addition, which is incorrect)
@@ -2098,15 +2135,27 @@ ggml_tensor * llm_graph_context::build_ffn(
     GGML_ASSERT(!gate_s || !gate || gate->type != GGML_TYPE_NVFP4 || !has_lora(gate));
     GGML_ASSERT(!down_s || !down || down->type != GGML_TYPE_NVFP4 || !has_lora(down));
 
-    const auto is_block_fp8_scale = [](ggml_tensor * weight, ggml_tensor * scale) {
-        return weight && scale && weight->type == GGML_TYPE_F8_E4M3 && scale->type == GGML_TYPE_F32;
+    const auto is_dot_product_scale = [](ggml_tensor * weight, ggml_tensor * scale) {
+        return weight && scale &&
+            ((weight->type == GGML_TYPE_F8_E4M3 &&
+              (scale->type == GGML_TYPE_F32 || scale->type == GGML_TYPE_I8)) ||
+             (weight->type == GGML_TYPE_I8 &&
+              (scale->type == GGML_TYPE_F32 || scale->type == GGML_TYPE_F16 ||
+               scale->type == GGML_TYPE_BF16 ||
+               (scale->type == GGML_TYPE_I8 && scale->ne[0] >=
+                    static_cast<int64_t>(sizeof(ggml_w8a16_scale_header))))) ||
+             ((weight->type == GGML_TYPE_BNB_NF4 || weight->type == GGML_TYPE_BNB_FP4) &&
+              scale->type == GGML_TYPE_I8) ||
+             (weight->type == GGML_TYPE_GPTQ_AO && scale->type == GGML_TYPE_I8) ||
+             (weight->type == GGML_TYPE_Q4_1 && scale->type == GGML_TYPE_I8 &&
+              ggml_nelements(scale) == 1));
     };
 
-    const bool up_block_scale   = is_block_fp8_scale(up, up_s);
-    const bool gate_block_scale = is_block_fp8_scale(gate, gate_s);
-    const bool down_block_scale = is_block_fp8_scale(down, down_s);
+    const bool up_dot_scale   = is_dot_product_scale(up, up_s);
+    const bool gate_dot_scale = is_dot_product_scale(gate, gate_s);
+    const bool down_dot_scale = is_dot_product_scale(down, down_s);
 
-    ggml_tensor * tmp = up ? build_lora_mm(up, cur, up_block_scale ? up_s : nullptr) : cur;
+    ggml_tensor * tmp = up ? build_lora_mm(up, cur, up_dot_scale ? up_s : nullptr, up_in_s) : cur;
     cb(tmp, "ffn_up", il);
 
     if (up_b) {
@@ -2114,7 +2163,7 @@ ggml_tensor * llm_graph_context::build_ffn(
         cb(tmp, "ffn_up_b", il);
     }
 
-    if (up_s && !up_block_scale) {
+    if (up_s && !up_dot_scale) {
         tmp = ggml_mul(ctx0, tmp, up_s);
         cb(tmp, "ffn_up_s", il);
     }
@@ -2123,12 +2172,12 @@ ggml_tensor * llm_graph_context::build_ffn(
         switch (type_gate) {
             case LLM_FFN_SEQ:
                 {
-                    cur = build_lora_mm(gate, tmp, gate_block_scale ? gate_s : nullptr);
+                    cur = build_lora_mm(gate, tmp, gate_dot_scale ? gate_s : nullptr, gate_in_s);
                     cb(cur, "ffn_gate", il);
                 } break;
             case LLM_FFN_PAR:
                 {
-                    cur = build_lora_mm(gate, cur, gate_block_scale ? gate_s : nullptr);
+                    cur = build_lora_mm(gate, cur, gate_dot_scale ? gate_s : nullptr, gate_in_s);
                     cb(cur, "ffn_gate", il);
                 } break;
         }
@@ -2138,7 +2187,7 @@ ggml_tensor * llm_graph_context::build_ffn(
             cb(cur, "ffn_gate_b", il);
         }
 
-        if (gate_s && !gate_block_scale) {
+        if (gate_s && !gate_dot_scale) {
             cur = ggml_mul(ctx0, cur, gate_s);
             cb(cur, "ffn_gate_s", il);
         }
@@ -2249,7 +2298,7 @@ ggml_tensor * llm_graph_context::build_ffn(
     }
 
     if (down) {
-        cur = build_lora_mm(down, cur, down_block_scale ? down_s : nullptr);
+    cur = build_lora_mm(down, cur, down_dot_scale ? down_s : nullptr, down_in_s);
         if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2) {
             // GLM4, GLM4_MOE, and JAIS2 seem to have numerical issues with half-precision accumulators
             ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
@@ -2264,7 +2313,7 @@ ggml_tensor * llm_graph_context::build_ffn(
         cur = ggml_add(ctx0, cur, down_b);
     }
 
-    if (down_s && !down_block_scale) {
+    if (down_s && !down_dot_scale) {
         cur = ggml_mul(ctx0, cur, down_s);
         cb(cur, "ffn_down_s", il);
     }
@@ -3228,7 +3277,8 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * sinks,
         ggml_tensor * v_mla, // TODO: remove
             float     kq_scale,
-            int       il) const {
+            int       il,
+        ggml_tensor * wo_in_s) const {
     GGML_ASSERT(v_mla == nullptr);
 
     if (inp->self_k_rot) {
@@ -3303,7 +3353,7 @@ ggml_tensor * llm_graph_context::build_attn(
                 cur = ggml_mul(ctx0, cur, wo_s);
             }
         } else {
-            cur = build_lora_mm(wo, cur, wo_s);
+            cur = build_lora_mm(wo, cur, wo_s, wo_in_s);
         }
     }
 

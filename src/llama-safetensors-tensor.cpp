@@ -20,6 +20,8 @@ ggml_type plain_target_type(const llama_safetensors_tensor & source) {
             return GGML_TYPE_F8_E4M3;
         case llama_safetensors_dtype::BF16:
             return source.shape.size() >= 2 ? GGML_TYPE_BF16 : GGML_TYPE_F32;
+        case llama_safetensors_dtype::F16:
+            return source.shape.size() >= 2 ? GGML_TYPE_F16 : GGML_TYPE_F32;
         case llama_safetensors_dtype::F32:
             return GGML_TYPE_F32;
         default:
@@ -44,7 +46,9 @@ std::vector<int64_t> reverse_shape(const llama_safetensors_tensor & source) {
     return result;
 }
 
-std::vector<uint8_t> bf16_to_f32(const std::vector<uint8_t> & source) {
+}  // namespace
+
+std::vector<uint8_t> llama_safetensors_bf16_to_f32(const std::vector<uint8_t> & source) {
     if (source.size() % sizeof(uint16_t) != 0) {
         throw std::runtime_error("invalid BF16 byte count");
     }
@@ -58,7 +62,19 @@ std::vector<uint8_t> bf16_to_f32(const std::vector<uint8_t> & source) {
     return result;
 }
 
-}  // namespace
+std::vector<uint8_t> llama_safetensors_f16_to_f32(const std::vector<uint8_t> & source) {
+    if (source.size() % sizeof(ggml_fp16_t) != 0) {
+        throw std::runtime_error("invalid F16 byte count");
+    }
+    std::vector<uint8_t> result(source.size() * 2);
+    for (size_t i = 0; i < source.size() / sizeof(ggml_fp16_t); ++i) {
+        ggml_fp16_t bits;
+        std::memcpy(&bits, source.data() + i * sizeof(bits), sizeof(bits));
+        const float value = ggml_fp16_to_fp32(bits);
+        std::memcpy(result.data() + i * sizeof(value), &value, sizeof(value));
+    }
+    return result;
+}
 
 llama_safetensors_tensor_binding llama_safetensors_bind_tensor(const llama_safetensors_quant_adapters & quant,
                                                                llama_safetensors_source_name            source) {
@@ -137,7 +153,9 @@ std::vector<uint8_t> llama_safetensors_materialize_tensor(const llama_safetensor
     if (binding.quant) {
         result = quant.finalize(*binding.quant, std::move(result));
     } else if (source->dtype == llama_safetensors_dtype::BF16 && target_type == GGML_TYPE_F32) {
-        result = bf16_to_f32(result);
+        result = llama_safetensors_bf16_to_f32(result);
+    } else if (source->dtype == llama_safetensors_dtype::F16 && target_type == GGML_TYPE_F32) {
+        result = llama_safetensors_f16_to_f32(result);
     }
     if (result.size() != target_size) {
         throw std::runtime_error("produced " + std::to_string(result.size()) + " bytes, expected " +

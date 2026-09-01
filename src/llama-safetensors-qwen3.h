@@ -32,10 +32,18 @@ class llama_safetensors_qwen3_importer final : public llama_safetensors_importer
   private:
     std::filesystem::path                             model_dir_;
     llama_safetensors_json                            config_;
+    llama_safetensors_json                            text_config_;
     llama_safetensors_json                            generation_;
     llama_safetensors_json                            tokenizer_;
     std::optional<std::string>                        chat_template_;
+    std::optional<std::string>                        padding_token_;
     llama_safetensors_registry                        registry_;
     std::unique_ptr<llama_safetensors_quant_adapters> quant_;
     uint32_t                                          n_layer_ = 0;
+    uint32_t                                          n_head_ = 0;
+    uint32_t                                          n_head_kv_ = 0;
+    uint32_t                                          head_dim_ = 0;
+    std::string                                       source_prefix_ = "model.";
+    std::string                                       architecture_ = "qwen3";
+    bool                                              add_bos_token_ = false;
 };

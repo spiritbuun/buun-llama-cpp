@@ -183,7 +183,7 @@ marlin_fn select_marlin_kernel(int m_blocks, bool m_block_8) {
 bool ggml_cuda_marlin_q4_a32_enabled() {
     static const bool enabled = [] {
         const char * value = std::getenv("GGML_CUDA_MARLIN_Q4_A32");
-        return value != nullptr && std::atoi(value) != 0;
+        return value == nullptr || std::atoi(value) != 0;
     }();
     return enabled;
 }

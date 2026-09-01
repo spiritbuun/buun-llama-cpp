@@ -45,7 +45,7 @@ std::unique_ptr<llama_safetensors_importer> create_qwen3_importer(
 std::unique_ptr<llama_safetensors_importer> select_importer(
         const std::filesystem::path & model_dir,
         llama_safetensors_io_mode io_mode) {
-    const llama_safetensors_json config = llama_safetensors_read_json(model_dir / "config.json");
+    const llama_safetensors_json config = llama_safetensors_read_model_config(model_dir);
     static constexpr std::array<importer_registration, 2> importers = { {
         { "qwen3", llama_safetensors_qwen3_importer::probe, create_qwen3_importer },
         { "qwen3_5", llama_safetensors_qwen35_importer::probe, create_qwen35_importer },
@@ -93,6 +93,46 @@ llama_safetensors_io_mode source_io_mode(llama_load_mode load_mode) {
 }
 
 }  // namespace
+
+llama_safetensors_json llama_safetensors_read_model_config(const std::filesystem::path & model_dir) {
+    llama_safetensors_json config = llama_safetensors_read_json(model_dir / "config.json");
+    const auto inc_quant_path = model_dir / "quantization_config.json";
+    if (!config.contains("quantization_config") && std::filesystem::is_regular_file(inc_quant_path)) {
+        llama_safetensors_json quant = llama_safetensors_read_json(inc_quant_path);
+        if (!quant.is_object() || quant.empty()) {
+            throw std::runtime_error("quantization_config.json must contain a non-empty object");
+        }
+        config["quantization_config"] = std::move(quant);
+    }
+    const auto hf_quant_path = model_dir / "hf_quant_config.json";
+    if (!config.contains("quantization_config") && std::filesystem::is_regular_file(hf_quant_path)) {
+        const llama_safetensors_json hf_quant = llama_safetensors_read_json(hf_quant_path);
+        if (hf_quant.contains("quantization") && hf_quant.at("quantization").is_object()) {
+            llama_safetensors_json quant = hf_quant.at("quantization");
+            quant["quant_method"] = "modelopt";
+            if (hf_quant.contains("producer")) {
+                quant["producer"] = hf_quant.at("producer");
+            }
+            config["quantization_config"] = std::move(quant);
+        }
+    }
+    const auto quanto_map_path = model_dir / "quanto_qmap.json";
+    if (std::filesystem::is_regular_file(quanto_map_path)) {
+        if (config.contains("quantization_config")) {
+            throw std::runtime_error(
+                "native safetensors model contains both quantization_config and quanto_qmap.json");
+        }
+        llama_safetensors_json quanto_map = llama_safetensors_read_json(quanto_map_path);
+        if (!quanto_map.is_object() || quanto_map.empty()) {
+            throw std::runtime_error("quanto_qmap.json must contain a non-empty object");
+        }
+        config["quantization_config"] = {
+            { "quant_method", "quanto" },
+            { "quantization_map", std::move(quanto_map) },
+        };
+    }
+    return config;
+}
 
 llama_model * llama_model_load_from_safetensors_dir(
         const std::filesystem::path & model_dir, llama_model_params params) {

@@ -177,6 +177,17 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
     const int gqa_ratio = Q->ne[2] / K->ne[2];
 
+    // For 6:1 GQA, the generic 8-head tile wastes two columns. On SM80/D256,
+    // three 2-head tiles are faster for full 1K-aligned prefill batches, where
+    // both layouts avoid stream-K fixup. Tail batches keep the original layout.
+    if constexpr (DKQ == 256 && DV == 256) {
+        if (cc == GGML_CUDA_CC_AMPERE && use_gqa_opt && gqa_ratio == 6 &&
+                Q->ne[1] >= 1024 && Q->ne[1] % 1024 == 0) {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2, V_is_K_view>(ctx, dst);
+            return;
+        }
+    }
+
     // On Volta the GQA optimizations aren't as impactful vs. minimizing wasted compute:
     if (cc == GGML_CUDA_CC_VOLTA) {
         if (use_gqa_opt && gqa_ratio % 8 == 0) {

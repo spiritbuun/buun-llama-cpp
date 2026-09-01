@@ -446,7 +446,60 @@ extern "C" {
         GGML_TYPE_F8_E4M3 = 54, // raw signed E4M3FN weights; external per-channel scale is a separate tensor
         GGML_TYPE_Q4_A32 = 55, // asymmetric 4-bit weights, BF16 scale + packed zero point per group-32 (4.625 bpw)
         GGML_TYPE_Q8_0_G128 = 56, // symmetric 8-bit weights, one BF16 scale per group-128 (8.125 bpw)
-        GGML_TYPE_COUNT   = 57,
+        // BitsAndBytes weights keep the checkpoint's packed nibbles. Their
+        // block scales/codebooks are attached as a separate MUL_MAT source.
+        GGML_TYPE_BNB_NF4 = 57,
+        GGML_TYPE_BNB_FP4 = 58,
+        // Native GPTQ act-order weights retain the checkpoint's packed I4
+        // matrix. Per-column group indices/scales/zeros are an attached
+        // MUL_MAT auxiliary rather than being flattened into Q4_1.
+        GGML_TYPE_GPTQ_AO = 59,
+        GGML_TYPE_COUNT   = 60,
+    };
+
+    // Serialized auxiliary for GGML_TYPE_BNB_{NF4,FP4}. Offsets are from the
+    // beginning of this header and keep the checkpoint's optional nested
+    // (double-quantized) absmax representation intact.
+    #define GGML_BNB_SCALE_MAGIC 0x53424e42u // "BNBS"
+    struct ggml_bnb_scale_header {
+        uint32_t magic;
+        uint32_t version;
+        uint32_t n_blocks;
+        uint32_t block_size;
+        uint32_t nested_block_size;
+        float    nested_offset;
+        uint32_t absmax_offset;
+        uint32_t nested_absmax_offset;
+        uint32_t quant_map_offset;
+        uint32_t nested_quant_map_offset;
+        uint32_t total_size;
+    };
+
+    #define GGML_GPTQ_AO_MAGIC 0x4f415147u // "GQAO"
+    struct ggml_gptq_ao_header {
+        uint32_t magic;
+        uint32_t version;
+        uint32_t cols;
+        uint32_t rows;
+        uint32_t groups;
+        uint32_t group_size;
+        uint32_t scale_type; // 0 = F16, 1 = BF16
+        uint32_t zeros_offset;
+        uint32_t scales_offset;
+        uint32_t g_idx_offset;
+        uint32_t total_size;
+    };
+
+    // Serialized per-output-channel BF16 scale for weight-only INT8
+    // checkpoints. The I8 payload remains the canonical weight tensor; this
+    // sidecar distinguishes W8A16 from the dynamic/static W8A8 contracts.
+    #define GGML_W8A16_SCALE_MAGIC 0x36314157u // "WA16"
+    struct ggml_w8a16_scale_header {
+        uint32_t magic;
+        uint32_t version;
+        uint32_t n_channels;
+        uint32_t values_offset;
+        uint32_t total_size;
     };
 
     // precision
