@@ -974,9 +974,76 @@ Current architecture proof (2026-09-01):
   the 300-token image batch in 671 ms and correctly identified the July 21,
   1969 New York Times Apollo 11 front page. A separate text-only invocation
   initialized the unchanged text graph, produced coherent deterministic
-  reasoning, and tore down cleanly. Cache-aware `soft` placement, VBR,
-  long-context, and KLD gates remain required. The tiny fixture remains an
-  architecture/transform proof rather than a quality model.
+  reasoning, and tore down cleanly. The subsequent bullets record the completed
+  cache-aware `soft` placement, VBR, long-context, and KLD gates. The tiny
+  fixture remains an architecture/transform proof rather than a quality model.
+- Fidelity gates now use an opt-in exact-reference form of the existing
+  perplexity/KLD artifact (`LLAMA_KLD_EXACT_BASE=1`). The legacy upstream
+  artifact quantizes every vocabulary log-probability to 16 bits and therefore
+  produces a deterministic self-comparison floor around `1e-5`; that floor is
+  serialization error, not evidence that two forward passes differ. The exact
+  form stores the scored F32 logits, remains backward-compatible with legacy
+  artifacts, and short-circuits byte-identical distributions to bitwise-zero
+  per-position KLD. An independent DeepSeek BF16 anchor passed with all 127 raw
+  values exactly `+0.0f`; the independent Qwen4 BF16 anchor did the same.
+- The bounded Qwen4 `Q8_0_G128` expert-bridge comparison is measured rather
+  than assumed lossless. Against the exact BF16 reference its 127-position
+  slice had median KLD `6.8e-5`, mean `0.004827`, maximum `0.07359`, and
+  98.425% same-top tokens. Mean PPL was effectively unchanged (`1.47886`
+  versus `1.48040`), but the heavy KLD tail means this is not a near-zero
+  bridge result and must remain visible in the release-quality decision.
+- Against that exact BF16 GGUF reference, the official DeepSeek4 source is
+  numerically indistinguishable at the 256-token acceptance depth: 122/127
+  positions were bitwise zero, the remaining five had maximum KLD `1.389e-8`,
+  median `0`, and same-top-token rate `100%`. This closes the bounded native-
+  source reference-fidelity gate for the retained MXFP4 expert and block-FP8
+  projection path.
+- DeepSeek4 also passed a 5,689-token production prompt with explicit host
+  experts, `--moe-cache soft`, and dynamic-VBR syntax. As designed, its coupled
+  cache reported the existing static-`q8_0` fallback. Runtime soft pools landed
+  at 9,872/11,776/11,815/11,075 MiB against grants of
+  9,879/11,785/11,823/11,081 MiB, generated the correct sentence about Du Fu's
+  influence on Japanese literature, and tore down with 75.9--76.9% cache hits,
+  10,498 fills, 18 replacements, and zero fill/dispatch/collection failures.
+  This proves the runtime soft-budget policy under explicit host-expert
+  placement; the unpinned cache-aware placement result follows.
+- The unpinned DeepSeek4 cache-aware soft solve is now complete. It kept one of
+  44 routed-expert layers resident, evicted 137,088 of 140,352 MiB, and projected
+  41,753 MiB of cache capacity. Runtime live-memory grants were
+  1,883/14,287/14,287/14,287 MiB and the corresponding pools landed at
+  1,878/14,280/14,280/14,280 MiB. The runtime total safely exceeded the dry
+  projection because the fit also withholds its normal per-device fit margins;
+  every pool remained below its live grant. Generation returned `Paris`, all
+  fills completed without fill/dispatch/collection failures, and teardown was
+  clean.
+- The production Qwen4 dynamic-VBR gate is complete. A 17,445-token prompt plus
+  512 decode tokens at a deliberately constrained 184-MiB mapped-physical KV
+  budget exercised 41 live tier transitions across all four GPUs: every
+  attention KV layer first moved from f16 to turbo8, followed by selected
+  turbo8-to-turbo4 transitions as the sequence grew. The four device budgets
+  were 47.14/45.62/45.62/45.62 MiB within 124/120/120/120-MiB VMM pools. The
+  run remained coherent, completed at 212.2 prompt tokens/s and 10.0 generation
+  tokens/s, reported no reserve, allocation, or CUDA failure, and tore down
+  cleanly at 17,956 resident tokens.
+- That gate also found and closed a multi-GPU FLA integration defect before the
+  accepted run: the embedded gated-delta-net module/function cache was keyed
+  only by compute capability even though CUDA modules are context-scoped. A
+  module first loaded on CUDA0 was therefore an invalid handle on CUDA1. The
+  cache is now keyed by device and architecture; the exact production-shaped
+  `GATED_DELTA_NET` backend case passes sequentially on CUDA0 through CUDA3 in
+  one process, and the complete four-GPU Qwen4 run above provides the model-level
+  proof.
+- The unpinned Qwen4 cache-aware soft solve is complete. Starting from a fully
+  overcommitted 130,445-MiB projection, the per-device fitter selected a
+  partial-eviction layout with 5/49 routed-expert layers resident, evicted
+  104,812 of 117,000 MiB, retained 12,187 MiB, and projected 64,296 MiB of cache
+  capacity (55.0% coverage). The first real request measured live grants of
+  80/22,152/22,152/22,152 MiB. CUDA0 correctly declined to create an undersized
+  pool, while CUDA1--3 each allocated 22,148 MiB, four MiB below its grant. The
+  66,444-MiB live total safely exceeds the dry projection because the fit also
+  withholds its normal per-device margins. Generation returned `Paris`; all
+  three active pools completed eight fills with zero fill, dispatch, or
+  collection failures, and teardown was clean.
 
 ## 7. Test matrix
 
@@ -1038,7 +1105,7 @@ Questions reviewers must answer:
 
 ## 9. Recommended next order
 
-Current checkpoint (2026-09-01):
+Current checkpoint (2026-09-02):
 
 - the architecture bridge, bounded loader, quant adapters, and simplification
   pass are committed in reviewable units;
@@ -1056,23 +1123,19 @@ Current checkpoint (2026-09-01):
 - the remaining work below is acceptance and integration work, not another
   importer architecture rewrite.
 
-The first gate from the 2026-09-01 sequence is complete. Run the remaining four
-gates in this order:
+The multimodal gate, bounded DeepSeek4 production matrix, exact Qwen4 BF16
+reference artifact, independent zero anchor, bounded Q8 bridge comparison,
+Qwen4 long-context dynamic-VBR gate, and Qwen4 cache-aware soft-fit gate are
+complete. The five-step large-MoE acceptance tranche is closed; proceed to the
+broader release matrix below.
 
-1. establish Qwen4 reference fidelity, including an exact-zero reference anchor
-   and KLD for the `Q8_0_G128` routed-expert bridge whose source block-FP8 weights
-   are requantized for the portable `MUL_MAT_ID`/offload/cache contract;
-2. run Qwen4 VBR and long-context gates, checking fit-time accounting, final
-   residency, dynamic decode behavior, generation, and clean teardown;
-3. prove cache-aware `--moe-cache soft` fit and placement for both Qwen4 and
-   DeepSeek4, including agreement between the fit projection and final buffers;
-4. close the remaining DeepSeek4 production matrix: reference KLD, long-context,
-   teardown, and retained placement/cache policies. Dynamic DeepSeek4 VBR remains
-   a separately identified runtime-cache project until per-child tier ganging is
-   implemented; native safetensors must continue to reach the same explicit
-   static-`q8_0` fallback as GGUF.
+DeepSeek4 reference KLD, long-context generation, teardown, and the explicit
+host-expert soft-cache runtime are already closed. Dynamic DeepSeek4 VBR remains
+a separately identified runtime-cache project until per-child tier ganging is
+implemented; native safetensors reaches the same explicit static-`q8_0` fallback
+as GGUF.
 
-After those five gates:
+Next release work:
 
 1. run the representative Qwen3.8-27B acceptance matrix from Phase 0, including
    exact-zero anchors, reference KLD, coherent generation, resident VRAM, peak
