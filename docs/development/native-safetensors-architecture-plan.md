@@ -1028,32 +1028,54 @@ Questions reviewers must answer:
 
 ## 9. Recommended next order
 
-The architecture bridge, bounded loader, second-model proof, and first format
-adapters have working implementations. Before describing the branch as
-release-ready:
+Current checkpoint (2026-09-01):
 
-1. finish the current simplification/correctness pass, remove abandoned
-   experiments, and split the working tree into reviewable commits;
-2. add source adapters for the existing `LLM_ARCH_QWEN4EXP` and
-   `LLM_ARCH_DEEPSEEK4` model classes, using their converters only as mapping
-   oracles and keeping all graph/runtime policy in the model implementations;
-3. run the representative Qwen3.8-27B acceptance matrix from Phase 0, including
+- the architecture bridge, bounded loader, quant adapters, and simplification
+  pass are committed in reviewable units;
+- native adapters for `LLM_ARCH_QWEN4EXP` and `LLM_ARCH_DEEPSEEK4` load their
+  official sources through the existing model implementations;
+- both large MoEs have passed bounded production loads, coherent generation,
+  layer split, tensor split, and partial CPU/expert placement;
+- adaptive expert caching has passed `auto`, explicit `on`, fixed-budget,
+  replacement, multi-slot, and multi-GPU expert-parallel execution;
+- native MTP has passed production generation for both architectures, including
+  Qwen4 layer/tensor split and DeepSeek hyper-connection projection; and
+- the remaining work below is acceptance and integration work, not another
+  importer architecture rewrite.
+
+Run the next five gates in this order:
+
+1. complete the production Qwen4 multimodal source path: reuse the existing
+   Qwen3-VL vision/mmproj runtime, preserve bounded PLE/vision loading, and prove
+   text-only behavior is unchanged;
+2. establish Qwen4 reference fidelity, including an exact-zero reference anchor
+   and KLD for the `Q8_0_G128` routed-expert bridge whose source block-FP8 weights
+   are requantized for the portable `MUL_MAT_ID`/offload/cache contract;
+3. run Qwen4 VBR and long-context gates, checking fit-time accounting, final
+   residency, dynamic decode behavior, generation, and clean teardown;
+4. prove cache-aware `--moe-cache soft` fit and placement for both Qwen4 and
+   DeepSeek4, including agreement between the fit projection and final buffers;
+5. close the remaining DeepSeek4 production matrix: reference KLD, long-context,
+   teardown, and retained placement/cache policies. Dynamic DeepSeek4 VBR remains
+   a separately identified runtime-cache project until per-child tier ganging is
+   implemented; native safetensors must continue to reach the same explicit
+   static-`q8_0` fallback as GGUF.
+
+After those five gates:
+
+1. run the representative Qwen3.8-27B acceptance matrix from Phase 0, including
    exact-zero anchors, reference KLD, coherent generation, resident VRAM, peak
    host memory, PP, and TG;
-4. run the Qwen4/DeepSeek large-MoE matrix from section 6.2 before calling the
-   architecture boundary complete;
-5. run the real-machine placement matrix for every retained family: single CUDA,
-   layer split, tensor split, partial CPU offload, CPU-only or precise early
+2. finish the retained real-machine/backend matrix: CPU-only or precise early
    rejection, HIP or precise early rejection, cancellation, and teardown;
-6. close the measured compact W4A16 prompt-processing gap with a native MMQ/GEMM
-   path that consumes the canonical allocation without a second resident copy;
-7. freeze reproducible commands and baselines for BF16, NVFP4, FP8, W8A8,
-   BitsAndBytes, and normal/act-order GPTQ, then optimize only the paths with a
-   measured material gap;
-8. verify MTP, VBR, and multimodal integration on representative Qwen3.8 models;
-9. publish a user-facing format/backend/architecture support matrix, invocation
+3. freeze reproducible commands and baselines for BF16, NVFP4, FP8, W8A8,
+   BitsAndBytes, and normal/act-order GPTQ;
+4. close only measured material kernel gaps, including compact W4A16 prompt
+   processing, without introducing a second resident weight copy;
+5. publish a user-facing format/backend/architecture support matrix, invocation
    examples, memory behavior, performance baselines, and precise limitations;
-10. widen the architecture bridge only when a real checkpoint proves the
+   and
+6. widen the architecture bridge only when a real checkpoint proves the
    canonical name/layout mapping.
 
 Post-release, in priority order:
