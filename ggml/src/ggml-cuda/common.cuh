@@ -47,7 +47,6 @@
 
 #if !defined(GGML_USE_HIP)
 bool ggml_cuda_humming_fp8_is_repacked(const ggml_tensor * tensor);
-bool ggml_cuda_humming_nvfp4_is_repacked(const ggml_tensor * tensor);
 #endif
 
 #if defined(GGML_USE_HIP)
