@@ -949,9 +949,20 @@ Current architecture proof (2026-09-01):
   replacements; fill, dispatch, and collection failures remained zero. This
   closes the tensor-split and multi-slot cache execution gate, not a throughput
   comparison against layer split.
+- Embedded MTP now passes the official-source gate after merging the shared-MTP
+  runtime work from master. The direct importer reports 48 trunk layers, 49
+  total layers, and one NextN layer; all 3,101 `mtp.*` source tensors (2.513
+  GiB) are consumed instead of reported unused. MTP increases model residency
+  by about 2.55 GiB (2,437.5 MiB host plus 169.7 MiB on CUDA3), proving that the
+  173-GiB trunk is not duplicated. The target graph has 7,703 nodes and the
+  separately constructed MTP context has 166 nodes. A deterministic quicksort
+  request generated coherent code at 14.02 t/s with 72/72 drafts accepted; a
+  prose request exercised recurrent rollback with 96/189 drafts accepted and
+  remained coherent. A focused registry fixture separately pins the NextN norm,
+  concatenated `eh_proj`, and `mtp.layers.0` mappings.
 - The full production Qwen multimodal path, cache-aware `soft` placement,
-  MTP/VBR, long-context, and KLD gates remain required. The tiny fixture remains
-  an architecture/transform proof rather than a quality model.
+  VBR, long-context, and KLD gates remain required. The tiny fixture remains an
+  architecture/transform proof rather than a quality model.
 
 ## 7. Test matrix
 
