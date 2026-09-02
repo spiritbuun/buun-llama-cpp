@@ -1668,8 +1668,17 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
              KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
     } else {
         constexpr bool oob_check = false;
-        if constexpr (sparse_mask && V_is_K_view && DKQ == 512 && ncols1 == 8 && ncols2 == 8 &&
-                nbatch_fa == 32 && warp_size == 32 && nwarps * warp_size == ncols1 * nbatch_fa) {
+        // The sparse bitmap specialization is a CUDA-only optimization. HIP still parses
+        // discarded template branches aggressively enough to instantiate its CUDA-specific
+        // block-shape assertion for unrelated wave32 kernels (notably gfx1201).
+#if defined(GGML_USE_HIP)
+        constexpr bool use_sparse_bitmap = false;
+#else
+        constexpr bool use_sparse_bitmap = sparse_mask && V_is_K_view && DKQ == 512 &&
+                                           ncols1 == 8 && ncols2 == 8 && nbatch_fa == 32 && warp_size == 32 &&
+                                           nwarps * warp_size == ncols1 * nbatch_fa;
+#endif
+        if constexpr (use_sparse_bitmap) {
             // Scan 32 KV tiles at a time. Each warp covers one query row and each lane
             // covers one KV row, producing a 32-bit occupied-tile bitmap. Keeping that
             // bitmap in registers replaces one block-wide vote per empty tile with two

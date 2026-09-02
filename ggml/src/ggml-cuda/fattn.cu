@@ -1576,6 +1576,17 @@ void ggml_cuda_fattn_scratch_free(ggml_backend_cuda_context & ctx) {
     }
 }
 
+enum best_fattn_kernel {
+    BEST_FATTN_KERNEL_NONE      =   0,
+    BEST_FATTN_KERNEL_VEC       = 100,
+    BEST_FATTN_KERNEL_TILE      = 200,
+    BEST_FATTN_KERNEL_WMMA_F16 = 300,
+    BEST_FATTN_KERNEL_MMA_F16  = 400,
+};
+
+static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(int device, const ggml_tensor * dst);
+
 static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     load_tcq_decode_alpha(ctx.device);
     cudaStream_t stream = ctx.stream();
@@ -1793,8 +1804,25 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
     dst->src[2] = v_fp16 ? &V_f16 : orig_v;
     std::atomic_signal_fence(std::memory_order_seq_cst);
 
-    // Dispatch to MMA kernel (sees rotated Q, fp16 K/V, uses tensor cores)
-    ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+    // Re-select the native attention kernel after materialization. The original Turbo tensors
+    // select this wrapper, but the temporary tensors are ordinary F16 and must follow the same
+    // backend-specific dispatch as a native F16 cache (rocWMMA/tile on AMD, MMA on NVIDIA).
+    switch (ggml_cuda_get_best_fattn_kernel(ctx.device, dst)) {
+        case BEST_FATTN_KERNEL_VEC:
+            ggml_cuda_flash_attn_ext_vec(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_TILE:
+            ggml_cuda_flash_attn_ext_tile(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_WMMA_F16:
+            ggml_cuda_flash_attn_ext_wmma_f16(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_MMA_F16:
+            ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_NONE:
+            GGML_ABORT("fatal error");
+    }
 
     // Restore original tensor pointers
     dst->src[0] = orig_q;
@@ -1934,15 +1962,6 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
 
     GGML_ABORT("fatal error");
 }
-
-// Best FlashAttention kernel for a specific GPU:
-enum best_fattn_kernel {
-    BEST_FATTN_KERNEL_NONE    =   0,
-    BEST_FATTN_KERNEL_TILE    = 200,
-    BEST_FATTN_KERNEL_VEC     = 100,
-    BEST_FATTN_KERNEL_WMMA_F16 = 300,
-    BEST_FATTN_KERNEL_MMA_F16 = 400,
-};
 
 static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
     // TurboQuant KV types (turbo2/3/4/8_0, turbo3/2/1_tcq) are handled by the fork's
