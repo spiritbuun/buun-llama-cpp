@@ -224,8 +224,11 @@ enum llm_kv {
     LLM_KV_MOE_EVERY_N_LAYERS,
     LLM_KV_MOE_LATENT_SIZE,
     LLM_KV_NEXTN_PREDICT_LAYERS,
-    LLM_KV_NEXTN_SHARED_TARGET_TENSORS,
-    LLM_KV_NUM_DEEPSTACK_LAYERS,
+    // Fork extension. Keep it out of the legacy sequential range below:
+    // inserting it there aliases LLM_KV_EMBEDDING_SCALE with the explicitly
+    // numbered LLM_KV_TOKEN_SHIFT_COUNT.
+    LLM_KV_NEXTN_SHARED_TARGET_TENSORS = 247,
+    LLM_KV_NUM_DEEPSTACK_LAYERS = 54,
     LLM_KV_DEEPSTACK_MAPPING,
     LLM_KV_HIDDEN_ACT,
     LLM_KV_POOLING_TYPE,

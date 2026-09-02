@@ -342,13 +342,13 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
     return true;
 }
 
-static bool test_indexed_hybrid_tree_refusal(const llama_model & model) {
+static bool test_indexed_hybrid_tree_collection(const llama_model & model) {
     const llama_memory_i::layer_filter_cb reject_all = [](int32_t) { return false; };
 
     // No Qwen4 fixture is needed to pin the topology decision: empty layer
     // filters construct only the composite type, without allocating model
-    // payload tensors. The derived-type refusal must run before the generic
-    // llama_memory_hybrid branch or the indexer child would be omitted.
+    // payload tensors. The derived-type branch must run before the generic
+    // llama_memory_hybrid branch or the QSA owner would be omitted.
     llama_memory_hybrid_idx indexed(
         model,
         GGML_TYPE_F16, GGML_TYPE_F16, false, 8, 1, 0, LLAMA_SWA_TYPE_NONE,
@@ -356,11 +356,15 @@ static bool test_indexed_hybrid_tree_refusal(const llama_model & model) {
         1, 1, false, false,
         reject_all, reject_all, reject_all);
 
-    std::vector<llama_memory_tree_child> tree = {
-        { 99, nullptr, nullptr, checkpoint_child_dependency_mode::absent },
-    };
-    if (llama_memory_tree_collect(&indexed, tree) || !tree.empty()) {
-        fprintf(stderr, "%s : indexed hybrid topology was accepted or left a partial tree\n", __func__);
+    std::vector<llama_memory_tree_child> tree;
+    if (!llama_memory_tree_collect(&indexed, tree) || tree.size() != 2 ||
+        tree[0].child_id != 0 || tree[0].attention != indexed.get_mem_attn() ||
+        tree[0].recurrent != nullptr || tree[0].qsa_index_owner != &indexed ||
+        tree[0].dependency_mode != checkpoint_child_dependency_mode::live_guarded ||
+        tree[1].child_id != 1 || tree[1].attention != nullptr ||
+        tree[1].recurrent != indexed.get_mem_recr() || tree[1].qsa_index_owner != nullptr ||
+        tree[1].dependency_mode != checkpoint_child_dependency_mode::absent) {
+        fprintf(stderr, "%s : indexed hybrid topology was incomplete or misclassified\n", __func__);
         return false;
     }
     return true;
@@ -409,7 +413,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (!test_indexed_hybrid_tree_refusal(*model)) {
+    if (!test_indexed_hybrid_tree_collection(*model)) {
         return 1;
     }
 

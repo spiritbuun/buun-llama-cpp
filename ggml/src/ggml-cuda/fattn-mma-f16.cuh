@@ -67,7 +67,7 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(192, 128, 32, 128, 2,  32,  96,  64,  64, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(192, 128, 64, 128, 2,  32,  96,  64,  64, 2, true);
 
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256,  8,  64, 4,  64, 128, 128, 128, 2, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256,  8, 128, 2,  64, 128, 128, 128, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 16,  64, 4,  32, 128, 128, 128, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 2,  32, 128, 128, 128, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 128, 2,  32, 128, 128, 128, 2, true);
@@ -2227,11 +2227,9 @@ static __global__ void flash_attn_ext_f16(
 
     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
 
-    constexpr bool is_turbo_kv = (type_K != GGML_TYPE_F16 || type_V != GGML_TYPE_F16);
-
     const int stride_Q1   = nb01 / sizeof(float2);
     const int stride_Q2   = nb02 / sizeof(float2);
-    // Stride unit is PER SIDE, keyed on each side's own type — not the combined is_turbo_kv flag.
+    // Stride unit is PER SIDE, keyed on each side's own type rather than a combined Turbo flag.
     // Turbo loaders cast to char* and want the raw byte stride; the f16 loader indexes a half2*
     // and wants the half2-element stride. In an asymmetric f16<->t8 pair each side takes its own
     // path, so a single is_turbo_kv-based stride mis-indexes the f16 side (VBR entry-band garbage).

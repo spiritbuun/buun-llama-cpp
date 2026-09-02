@@ -1169,6 +1169,7 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
     for (uint32_t il = 0; il < n_recur; ++il) {
         inspect(r_l[il]);
         inspect(s_l[il]);
+        inspect(p_l[il]);
     }
 
     if (compatible && copy_dev && n_tensors > 0) {
@@ -1213,6 +1214,7 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
             for (uint32_t il = 0; il < n_recur; ++il) {
                 add_copy(r_l[il]);
                 add_copy(s_l[il]);
+                add_copy(p_l[il]);
             }
 
             const ggml_status status =
@@ -1271,6 +1273,9 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
         }
         if (s_l[il]) {
             copy_row(s_l[il]);
+        }
+        if (p_l[il]) {
+            copy_row(p_l[il]);
         }
     }
 

@@ -16,7 +16,7 @@ Use `--moe-cache MODE` with programs that use the common argument parser:
 
 | Mode | Cache budget | Weight repacking | Device requirements |
 | --- | --- | --- | --- |
-| `auto` | Free VRAM minus the reserve | Preserved unless cache-aware fit selects canonical CPU experts | At least two eligible selected CUDA devices, compute capability 8.0 or newer |
+| `auto` | Free VRAM minus the reserve | Preserved unless cache-aware fit selects canonical CPU experts | At least one eligible selected CUDA device, compute capability 8.0 or newer |
 | `on` | Free VRAM minus the reserve | Disabled | At least one eligible selected CUDA device, compute capability 7.0 or newer |
 | `N` | At most `N` MiB per device, after the reserve | Disabled | Same as `on` |
 | `off` or `0` | No cache session | Preserved unless changed separately | None |
@@ -37,7 +37,7 @@ With default settings, a node must satisfy all of these conditions:
 - One expert meets the selected devices' effective size floor. The default is 512 KiB when every selected device is compute capability 8.0 or newer and 1 MiB otherwise. An explicit threshold remains authoritative.
 - The graph node contains no more than the configured maximum token batch and no more than 64 routed rows. The default maximum is ten tokens in every active mode.
 - The selected device can hold a pool of at least 64 experts of that shape. Entries are aggregated across same-shape tensors, so an individual tensor may contain fewer than 64 experts.
-- In `auto`, each selected device has at least 1 GiB available for aggregate cache slabs after dispatch scratch. Forced modes retain the 64-slot floor for explicit capacity experiments.
+- In `auto`, at least one selected device has 1 GiB available for aggregate cache slabs after dispatch scratch. Forced modes retain the 64-slot floor for explicit capacity experiments.
 
 Each physical device budget is coordinated across every target, draft, MTP, and server scheduler in the process. It is claimed once, at first eligible use. Shape inventory counts the exact number of experts in every observed tensor; mixed expert counts do not reserve nonexistent slots. Device reservations are tracked per participating session, so releasing a high-reserve target immediately restores the correct capacity for the remaining sessions.
 
@@ -181,6 +181,13 @@ These matched canonical-weight decode checks force routed experts to CPU memory.
 
 The updated hardware-aware threshold made the Qwen3.6 experts eligible on four RTX 3090 devices. Its row uses 512 warmup and 512 measured generation tokens with canonical CPU experts in both arms. A fixed 4096 MiB cache reached 83.89 t/s in the same run. Llama-4 has only 16 experts per tensor, but 48 layers contribute enough entries to its shared-shape pool. Aggregating those entries instead of applying the 64-slot floor to each tensor restored cache eligibility. With 512 warmup and 512 measured generation tokens, five same-binary samples reached `25.966 +/- 0.006` t/s off, `33.541 +/- 0.320` t/s with a fixed 4096 MiB cache, and `46.901 +/- 0.235` t/s with the automatic budget. The literal default `--moe-cache auto` and default repacking reached `46.803 +/- 0.230` t/s over three samples. This exceeds the older branch's 45.03 t/s result without restoring redirect, backfill, or persistent state. This matrix is evidence for the tested hardware, not a guarantee that every eligible GPU and model will improve.
 
+Automatic mode is also supported on one eligible CUDA device. On a single RTX 3090, Qwen3.8
+Flash-Next with literal `--fit on --moe-cache auto -ngl auto` and no expert-placement, reserve, or
+dedicated-DOWN override selected a 16.5 GiB cache, reached 82.7% hits with zero cache failures, and
+averaged 39.500 t/s. The matched automatic-placement cache-off control averaged 28.325 t/s. This
+validates automatic policy selection rather than prescribing a fixed cache size; available memory,
+context size, model quantization, and active devices still determine the selected capacity.
+
 The real OLMoE model also exercised the available quant families from Q2_K through Q8_0. The matched off versus fixed 4096 MiB results were 251.54 versus 263.34 t/s for Q2_K, 215.12 versus 257.65 t/s for Q3_K_M, 200.12 versus 265.97 t/s for Q4_0, 173.49 versus 256.55 t/s for Q5_K_M, 157.75 versus 236.78 t/s for Q6_K, and 130.60 versus 224.03 t/s for Q8_0. F16 remained dormant because that cache matvec type is unsupported and preserved parity at 74.43 versus 74.78 t/s. A fully resident Qwen3.6-35B control preserved repacking and remained dormant at 144.80 t/s off versus 144.68 t/s auto.
 
 The Ampere admission floor is 512 KiB rather than the earlier permissive 64 KiB. This is below the smallest profitable local experts: OLMoE Q2_K uses 672-880 KiB experts and reached `296.37 +/- 0.08` t/s at a 512 KiB floor versus `246.98 +/- 0.87` t/s when a 1 MiB floor made the cache dormant. Qwen3.6 uses 576-704 KiB experts and reached `92.88 +/- 0.76` versus `81.41 +/- 0.10` t/s in the same boundary test. No local measurement supports admitting experts below 512 KiB automatically. `GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB` remains available for explicit experiments.
@@ -203,7 +210,7 @@ CUDA output can differ slightly from CPU output because the hit path uses CUDA a
 
 Public writes to a cached host weight buffer invalidate the affected byte range before the write begins. Invalidation cancels overlapping queued fills, waits for overlapping active reads and transfers, and removes overlapping slots and demand records. The same process runs before a host allocation is released or stops being a weight buffer. Callers must still obey the normal backend synchronization rules when mutating a weight used by concurrent graph execution. Scheduler teardown stops admission, cancels queued work, waits for active graph scopes and nodes, joins fill workers, and then frees device storage.
 
-The normal CUDA allocator may trim an active expert cache as a last attempt to satisfy an allocation. Trimming frees all cache storage on that device and leaves it disabled for the rest of the session. Device scratch growth also retries once after releasing the superseded scratch allocation when replacement overlap causes an out-of-memory result. A session becomes permanently dormant when no nonzero device budget remains, or when `auto` drops below two devices that satisfy its slab floor; any remaining cache devices are then trimmed as well.
+The normal CUDA allocator may trim an active expert cache as a last attempt to satisfy an allocation. Trimming frees all cache storage on that device and leaves it disabled for the rest of the session. Device scratch growth also retries once after releasing the superseded scratch allocation when replacement overlap causes an out-of-memory result. A session becomes permanently dormant when it drops below the configured number of devices with a nonzero budget or, in `auto`, enough capacity to satisfy the automatic slab floor; any remaining cache devices are then trimmed as well.
 
 ## Diagnostics and developer controls
 

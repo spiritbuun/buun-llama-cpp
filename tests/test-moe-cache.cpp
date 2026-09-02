@@ -450,7 +450,8 @@ static bool run_capability_queries(
     configure_cache(nullptr);
     ggml_moe_cache_config config = {};
     bool ok = ggml_moe_cache.query_config(1, 0, &config) == 1;
-    ok &= config.min_devices == 2;
+    ok &= config.automatic == 1;
+    ok &= config.min_devices == 1;
     ok &= config.budget_bytes == 4u * 1024 * 1024;
     ok &= config.reserve_bytes == 0;
     ok &= config.minimum_slab_bytes == 1024u * 1024 * 1024;
@@ -535,7 +536,8 @@ static bool run_capability_queries(
     set_env("GGML_CUDA_MOE_CACHE_MIN_CC", nullptr);
     set_env("GGML_CUDA_MOE_CACHE_OVERLAP_CPU_ROWS", nullptr);
     ok &= ggml_moe_cache.query_config(1, 0, &config) == 1;
-    ok &= config.min_devices == 2;
+    ok &= config.automatic == 1;
+    ok &= config.min_devices == 1;
     ok &= config.minimum_slab_bytes == 1024u * 1024 * 1024;
     ok &= config.min_compute_capability == 800;
     ok &= config.min_expert_bytes == 512u * 1024;
@@ -546,6 +548,7 @@ static bool run_capability_queries(
     ok &= device.min_expert_bytes == 512u * 1024;
 
     ok &= ggml_moe_cache.query_config(0, 0, &config) == 1;
+    ok &= config.automatic == 0;
     ok &= config.min_devices == 1;
     ok &= config.minimum_slab_bytes == 0;
     ok &= config.min_compute_capability == 700;
@@ -2197,6 +2200,15 @@ static bool run_explicit_session_config(
         }
     }
     config.expert_parallel = 0;
+    for (int automatic : { -1, 2 }) {
+        config.automatic = automatic;
+        void * invalid = ggml_moe_cache.session_create(backends, 2, &config);
+        invalid_rejected &= invalid == nullptr;
+        if (invalid) {
+            ggml_moe_cache.session_destroy(invalid);
+        }
+    }
+    config.automatic = 0;
     for (int min_expert_explicit : { -1, 2 }) {
         config.min_expert_explicit = min_expert_explicit;
         void * invalid = ggml_moe_cache.session_create(backends, 2, &config);
@@ -2208,6 +2220,57 @@ static bool run_explicit_session_config(
     configure_cache(nullptr);
     printf("cache-explicit-config: %s\n", ok && invalid_rejected ? "OK" : "FAIL");
     return ok && invalid_rejected;
+}
+
+static bool run_single_device_automatic_session(
+        ggml_backend_t cuda, ggml_backend_t cpu) {
+    configure_cache(nullptr);
+    ggml_moe_cache_config config = {};
+    if (!ggml_moe_cache.query_config ||
+        !ggml_moe_cache.query_config(1, 4, &config)) {
+        fprintf(stderr, "cache-single-auto: failed to query automatic configuration\n");
+        return false;
+    }
+
+    // Keep the production automatic policy bit while shrinking only the test
+    // capacity floors enough for a model-free CI allocation.
+    config.minimum_slab_bytes = 0;
+    config.min_expert_bytes = 1;
+    config.min_expert_explicit = 1;
+    void * backends[] = { cuda, cpu };
+
+    config.min_devices = 2;
+    void * too_many = ggml_moe_cache.session_create(backends, 2, &config);
+    const bool minimum_enforced = too_many == nullptr;
+    if (too_many) {
+        ggml_moe_cache.session_destroy(too_many);
+    }
+
+    config.min_devices = 1;
+    void * session = ggml_moe_cache.session_create(backends, 2, &config);
+    if (!session) {
+        fprintf(stderr, "cache-single-auto: failed to create one-device automatic session\n");
+        configure_cache(nullptr);
+        return false;
+    }
+
+    constexpr int64_t direct_n_in = 1024;
+    constexpr int64_t direct_n_out = 64;
+    constexpr int64_t direct_n_expert = 64;
+    const size_t expert_size =
+        ggml_row_size(GGML_TYPE_Q4_0, direct_n_in) * direct_n_out;
+    std::vector<uint8_t> weights(expert_size * direct_n_expert);
+    ggml_moe_cache.session_enter(session);
+    const bool pool_ready = wait_for_direct_pool(
+            "blk.0.ffn_up_exps.weight", weights.data(), expert_size,
+            direct_n_in, direct_n_out, GGML_TYPE_Q4_0, direct_n_expert);
+    ggml_moe_cache.session_leave(session);
+    ggml_moe_cache.session_destroy(session);
+    configure_cache(nullptr);
+
+    const bool ok = config.automatic == 1 && minimum_enforced && pool_ready;
+    printf("cache-single-auto: %s\n", ok ? "OK" : "FAIL");
+    return ok;
 }
 
 static bool run_expert_profile_roundtrip(
@@ -4105,6 +4168,7 @@ int main(int argc, char ** argv) {
     free_stress_fixture(stress);
     ok &= run_scope_isolation(cuda, cpu, weights);
     ok &= run_explicit_session_config(cuda, cpu);
+    ok &= run_single_device_automatic_session(cuda, cpu);
     ok &= run_expert_profile_roundtrip(cuda, cpu, weights, gate_weights, capture);
     ok &= run_policy_diagnostics(cuda, cpu, weights, capture);
     ok &= run_cpu_overlap_policy(cuda, cpu, weights, capture);

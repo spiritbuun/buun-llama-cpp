@@ -179,11 +179,11 @@ NVLink.
 
 ### Choose the MoE cache mode
 
-Start with `--fit on --moe-cache soft` on both single- and multi-GPU hosts. This is the recommended
-adaptive path for large CPU-expert models. It first tries the normal model placement and uses only
-spare VRAM; if that cannot form useful cache pools, the fit pass evicts the minimum number of expert
-layers needed to make the cache viable. Explicit tensor overrides, GPU layers, tensor splits, CPU
-affinity, and thread counts remain authoritative.
+Start with `--fit on --moe-cache auto` on both single- and multi-GPU hosts. This is the recommended
+adaptive path for large CPU-expert models. It preserves normal placement when the complete model
+fits, and otherwise selects canonical CPU experts when the remaining VRAM can form useful cache
+pools. Explicit tensor overrides, GPU layers, tensor splits, CPU affinity, and thread counts remain
+authoritative.
 
 Leave the other resource knobs unset for the first run. The defaults now:
 
@@ -195,10 +195,10 @@ Leave the other resource knobs unset for the first run. The defaults now:
 - persist a bounded per-model expert heatmap in the normal llama.cpp cache directory for later
   prewarming.
 
-`--moe-cache auto` remains the conservative, repack-preserving default and requires at least two
-eligible devices. `--moe-cache on` forces canonical CPU expert weights immediately. Prefer `soft`
-for a new deployment because it can use one GPU, preserves more of the stock placement when that
-wins, and adapts before resorting to expert eviction.
+`--moe-cache auto` is the conservative, repack-preserving default and can use one or more eligible
+devices. `--moe-cache on` forces canonical CPU expert weights immediately. `soft` remains available
+when partial expert eviction is specifically desired: it first tries spare VRAM with stock placement,
+then evicts the minimum expert footprint needed to form cache pools.
 
 ### Choose the KV/VBR entry tier
 
@@ -214,19 +214,19 @@ speed. Static `-ctk t8 -ctv t8` and `-ctk t4 -ctv t4` remain useful for fixed-ti
 ```sh
 ./build/bin/llama-server \
   -m DeepSeek-V4-Flash-0731-UD-IQ2_M-00001-of-00003.gguf \
-  -ngl 99 -sm layer -fa on -c 8192 -np 1 -ub 4096 \
+  -ngl auto -sm layer -fa on -c 8192 -np 1 -ub 4096 \
   --vbr-entry t8 \
-  -ot 'exps=CPU' --fit on --moe-cache soft \
+  --fit on --moe-cache auto \
   --moe-cache-expert-parallel auto \
   --host 0.0.0.0 --port 8081
 ```
 
-`-ot 'exps=CPU'` leaves the routed experts in system RAM while keeping the remaining offloaded
-weights on GPU. `--moe-cache soft` then fits the least disruptive viable placement, fills available
-VRAM with the hottest expert tensors, and adapts their residency as routing changes. Expert-parallel
-mode divides resident rows within a layer across the selected cache devices while the CPU computes
-misses. `auto` uses both devices on a dual-GPU host and caps larger hosts at three-way dispatch. On
-one GPU, omit `--moe-cache-expert-parallel auto`; the remaining command is unchanged.
+Automatic fit leaves the routed experts in system RAM only when doing so creates a viable cache
+placement, fills available VRAM with the hottest expert tensors, and adapts their residency as
+routing changes. Expert-parallel mode divides resident rows within a layer across the selected cache
+devices while the CPU computes misses. It uses both devices on a dual-GPU host and caps larger hosts
+at three-way dispatch. On one GPU, omit `--moe-cache-expert-parallel auto`; the remaining command is
+unchanged.
 
 ### Qwen3.8 Flash Next + official MTP sidecar
 
@@ -234,9 +234,9 @@ one GPU, omit `--moe-cache-expert-parallel auto`; the remaining command is uncha
 ./build/bin/llama-server \
   -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
   -md MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
-  -ngl 99 -sm layer -fa on -c 8192 -np 1 -ub 512 \
+  -ngl auto -sm layer -fa on -c 8192 -np 1 -ub 512 \
   --vbr-entry t8 \
-  -ot 'exps=CPU' --fit on --moe-cache soft \
+  --fit on --moe-cache auto \
   --spec-type draft-mtp \
   --host 0.0.0.0 --port 8081
 ```
@@ -252,9 +252,9 @@ substantially slower in testing.
 ./build/bin/llama-server \
   -m DeepSeek-V4-Flash-0731-UD-IQ2_M-00001-of-00003.gguf \
   -md dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf \
-  -ngl 99 -sm layer -fa on -c 8192 -np 1 -ub 4096 \
+  -ngl auto -sm layer -fa on -c 8192 -np 1 -ub 4096 \
   --vbr-entry t8 \
-  -ot 'exps=CPU' --fit on --moe-cache soft \
+  --fit on --moe-cache auto \
   --moe-cache-expert-parallel auto \
   --spec-type draft-dspark -ngld 0 -otd 'exps=CPU' \
   --spec-draft-n-max 3 --spec-draft-p-min 0 \
@@ -293,9 +293,9 @@ use `--spec-draft-device none` to keep the entire drafter on CPU.
 ./build/bin/llama-server \
   -m DeepSeek-V4-Flash-0731-UD-IQ2_M-00001-of-00003.gguf \
   -md dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf \
-  -ngl 99 -sm layer -fa on -c 8192 -np 1 -ub 4096 \
+  -ngl auto -sm layer -fa on -c 8192 -np 1 -ub 4096 \
   --vbr-entry t8 \
-  -ot 'exps=CPU' --fit on --moe-cache soft \
+  --fit on --moe-cache auto \
   --spec-type draft-dspark -ngld 0 -otd 'exps=CPU' \
   --spec-draft-n-max 2 --spec-draft-p-min 0 \
   --host 0.0.0.0 --port 8081

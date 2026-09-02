@@ -135,7 +135,7 @@ public:
     // llama_memory_hybrid_idx_context specific API
     //
 
-    // nullptr with no indexer, and for the update context, which builds no sparse graph
+    // nullptr with no indexer
     const llama_kv_cache_context * get_idx() const;
 
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
@@ -164,7 +164,7 @@ private:
     // declared first, so it is initialised while sinfos_idx is still intact
     const std::vector<uint32_t> ns_ubatch;
 
-    // null unless the model has an indexer and this is a batch or full context
+    // null unless the model has an indexer
     const llama_memory_context_ptr ctx_idx;
 
     // mirrors the base class's ubatch cursor, which is private there

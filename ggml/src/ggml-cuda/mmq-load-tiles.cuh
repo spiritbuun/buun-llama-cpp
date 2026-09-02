@@ -240,20 +240,32 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             const int byte = (qs0 >> (j * 8)) & 0xFF;
+#if defined(GGML_USE_HIP)
+            const uint32_t indices = (byte & 0x03) | ((byte & 0x0C) << 6) |
+                                     ((byte & 0x30) << 12) | ((byte & 0xC0) << 18);
+            unpacked_bytes[j] = __builtin_amdgcn_perm(0x020100FF, 0x020100FF, indices);
+#else
             const int s0 = ((byte >> 0) & 3) - 1;
             const int s1 = ((byte >> 2) & 3) - 1;
             const int s2 = ((byte >> 4) & 3) - 1;
             const int s3 = ((byte >> 6) & 3) - 1;
             unpacked_bytes[j] = (s0 & 0xFF) | ((s1 & 0xFF) << 8) | ((s2 & 0xFF) << 16) | ((s3 & 0xFF) << 24);
+#endif // defined(GGML_USE_HIP)
         }
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             const int byte = (qs1 >> (j * 8)) & 0xFF;
+#if defined(GGML_USE_HIP)
+            const uint32_t indices = (byte & 0x03) | ((byte & 0x0C) << 6) |
+                                     ((byte & 0x30) << 12) | ((byte & 0xC0) << 18);
+            unpacked_bytes[4 + j] = __builtin_amdgcn_perm(0x020100FF, 0x020100FF, indices);
+#else
             const int s0 = ((byte >> 0) & 3) - 1;
             const int s1 = ((byte >> 2) & 3) - 1;
             const int s2 = ((byte >> 4) & 3) - 1;
             const int s3 = ((byte >> 6) & 3) - 1;
             unpacked_bytes[4 + j] = (s0 & 0xFF) | ((s1 & 0xFF) << 8) | ((s2 & 0xFF) << 16) | ((s3 & 0xFF) << 24);
+#endif // defined(GGML_USE_HIP)
         }
 
         const int dst_offset = kbx*(scale_entries_per_block*QI8_0) + kqsx*QI8_0;

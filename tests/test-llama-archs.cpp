@@ -158,7 +158,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v/--verbose] [-h/--help]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -351,6 +351,30 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK, uint32_t(8));
         // without this the QSA layers fall back to dense and go uncovered
         ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>(n_layer, 4));
+
+        // has_cell_ext() needs ple_n_heads here: the indexer cache serializes no ext without it
+        const uint32_t ple_ngram_size      = 3;
+        const uint32_t ple_heads_per_ngram = 2;
+        const uint32_t ple_n_heads         = (ple_ngram_size - 1)*ple_heads_per_ngram;
+        GGML_ASSERT(n_embd % ple_n_heads == 0);
+        const uint32_t ple_head_dim = n_embd/ple_n_heads;
+
+        std::vector<uint64_t> ple_head_offsets(ple_n_heads);
+        std::vector<uint64_t> ple_head_vocab_sizes(ple_n_heads, n_vocab);
+        for (uint32_t h = 0; h < ple_n_heads; h++) {
+            ple_head_offsets[h] = uint64_t(h)*n_vocab;
+        }
+
+        // the PLE history lives in the recurrent cache, so it must sit on a linear attention layer
+        ms.add_kv(LLM_KV_PLE_LAYERS,                  std::vector<uint32_t>({ 0 }));
+        ms.add_kv(LLM_KV_PLE_NGRAM_SIZE,              ple_ngram_size);
+        ms.add_kv(LLM_KV_PLE_HEADS_PER_NGRAM,         ple_heads_per_ngram);
+        ms.add_kv(LLM_KV_PLE_CONV_KERNEL,             uint32_t(4));
+        ms.add_kv(LLM_KV_PLE_EOS_TOKEN_ID,            uint32_t(0));
+        ms.add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER,  ple_head_dim);
+        ms.add_kv(LLM_KV_PLE_LAYER_MULTIPLIERS,       std::vector<uint64_t>({ 1, 3, 5 }));
+        ms.add_kv(LLM_KV_PLE_HEAD_OFFSETS,            ple_head_offsets);
+        ms.add_kv(LLM_KV_PLE_HEAD_VOCAB_SIZES,        ple_head_vocab_sizes);
     }
 
     // minimax-m3 keeps one indexer head per GQA head; the rest use a fixed 64 to match the fused
@@ -2425,7 +2449,9 @@ static void test_qwen4_vbr_cuda(const size_t seed) {
     assert_qsa_image(qsa_layout);
 
     decode_range(ctx.get(), 321, 1);
-    GGML_ASSERT(nmse(qsa_continuation_reference, last_logits(ctx.get())) <= 1e-12);
+    const double qsa_restore_nmse = nmse(qsa_continuation_reference, last_logits(ctx.get()));
+    std::printf("Qwen4 occupied QSA rollback continuation NMSE %.17g\n", qsa_restore_nmse);
+    GGML_ASSERT(qsa_restore_nmse <= 1e-12);
 
     // Qwen4 recurrent sequence images interleave the PLE convolution-history
     // row immediately after each R row.  Prove the atomic recurrent companion
@@ -2885,6 +2911,9 @@ static gguf_context_ptr get_qwen4_mtp_gguf_ctx(uint32_t n_nextn = 1) {
 
     // The ordinary fixture has two trunk blocks. Reinterpret the second as the
     // single dense MTP block and pin its lack of QSA compression in metadata.
+    // This fixture exercises MTP rather than PLE, so remove the inherited PLE
+    // layer before making the sole target block full attention.
+    GGML_ASSERT(gguf_remove_key(gguf_ctx.get(), "qwen4exp.ple.layers") >= 0);
     metadata.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, n_nextn);
     metadata.add_kv(LLM_KV_FULL_ATTENTION_INTERVAL, uint32_t(1));
     metadata.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>({ 4, 0 }));
@@ -3528,22 +3557,27 @@ static bool arch_tensor_split_supported(const llm_arch arch) {
     return true;
 }
 
-static int save_models(const llm_arch target_arch, const size_t seed, const ggml_log_level log_level, const std::string & dir) {
+static int save_models(const llm_arch target_arch, const size_t seed, const int verbosity, const std::string & dir) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
             void * user_data;
-        } original_logger;
-        ggml_log_level min_level; // prints below this log level go to debug log
+        } log_old;
+
+        int verbosity;
+
+        user_data_t(int verbosity) : verbosity(verbosity) {
+            llama_log_get(&log_old.callback, &log_old.user_data);
+        }
     };
-    user_data_t ud;
-    llama_log_get(&ud.original_logger.callback, &ud.original_logger.user_data);
-    ud.min_level = log_level;
+    user_data_t ud(verbosity);
 
     llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
         const user_data_t * ud = (const user_data_t *) user_data;
-        const ggml_log_level level_eff = level >= ud->min_level ? level : GGML_LOG_LEVEL_DEBUG;
-        ud->original_logger.callback(level_eff, text, ud->original_logger.user_data);
+        int verbosity = common_log_get_verbosity(level);
+        if (verbosity <= ud->verbosity) {
+            ud->log_old.callback(level, text, ud->log_old.user_data);
+        }
     }, &ud);
 
     for (const llm_arch & arch : llm_arch_all()) {
@@ -3577,26 +3611,31 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
             llama_model_save_to_file(model_and_ctx.first.get(), path.c_str());
         }
     }
-    llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+    llama_log_set(ud.log_old.callback, ud.log_old.user_data);
     return 0;
 }
 
-static int test_backends(const llm_arch target_arch, const size_t seed, const ggml_log_level log_level) {
+static int test_backends(const llm_arch target_arch, const size_t seed, const int verbosity) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
             void * user_data;
-        } original_logger;
-        ggml_log_level min_level; // prints below this log level go to debug log
+        } log_old;
+
+        int verbosity;
+
+        user_data_t(int verbosity) : verbosity(verbosity) {
+            llama_log_get(&log_old.callback, &log_old.user_data);
+        }
     };
-    user_data_t ud;
-    llama_log_get(&ud.original_logger.callback, &ud.original_logger.user_data);
-    ud.min_level = log_level;
+    user_data_t ud(verbosity);
 
     llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
         const user_data_t * ud = (const user_data_t *) user_data;
-        const ggml_log_level level_eff = level >= ud->min_level ? level : GGML_LOG_LEVEL_DEBUG;
-        ud->original_logger.callback(level_eff, text, ud->original_logger.user_data);
+        int verbosity = common_log_get_verbosity(level);
+        if (verbosity <= ud->verbosity) {
+            ud->log_old.callback(level, text, ud->log_old.user_data);
+        }
     }, &ud);
 
     const std::vector<llama_token> tokens = get_tokens(128, 128, seed);
@@ -3743,19 +3782,22 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
             }
         }
     }
-    llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+    llama_log_set(ud.log_old.callback, ud.log_old.user_data);
     return all_ok ? 0 : 1;
 }
 
 int main(int argc, char ** argv) {
-    // FIXME these tests are disabled in the CI for macOS-latest-cmake-arm64 because they are segfaulting
+    // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
+    common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
     common_init();
+
     std::random_device rd;
 
     llm_arch arch = LLM_ARCH_UNKNOWN;
     size_t seed = rd();
-    ggml_log_level log_level = GGML_LOG_LEVEL_ERROR;
     std::string out;
+
+    int verbosity = LOG_LEVEL_ERROR;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -3783,9 +3825,13 @@ int main(int argc, char ** argv) {
                 return 1;
             }
         }
-        if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
-            log_level = GGML_LOG_LEVEL_INFO;
-            continue;
+        if (strcmp(argv[i], "-v") == 0) {
+            if (i + 1 < argc) {
+                verbosity = std::stoull(argv[++i]);
+            } else {
+                usage(argv);
+                return 1;
+            }
         }
         if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--out") == 0) {
             if (i + 1 < argc) {
@@ -3802,7 +3848,7 @@ int main(int argc, char ** argv) {
         test_dflash_selector_family_contract();
         test_dflash_loader_exact_identity();
         if (!out.empty()) {
-            return save_models(arch, seed, log_level, out);
+            return save_models(arch, seed, verbosity, out);
         }
         if (arch == LLM_ARCH_UNKNOWN || arch == LLM_ARCH_QWEN35) {
             test_qwen35_mtp_d2t_contract(seed);
@@ -3813,7 +3859,7 @@ int main(int argc, char ** argv) {
             test_qwen4_vbr_cuda(seed);
             test_qwen4_mtp_sidecar_contract(seed);
         }
-        return test_backends(arch, seed, log_level);
+        return test_backends(arch, seed, verbosity);
     } catch (const std::exception & err) {
         fprintf(stderr, "encountered runtime error: %s\n", err.what());
         return -1;

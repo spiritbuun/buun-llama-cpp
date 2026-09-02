@@ -163,6 +163,7 @@ struct moe_cache_demand {
 struct moe_cache_config {
     bool enabled = true;
     bool automatic = true;
+    int min_devices = 1;
     size_t budget_mb = 0;
     size_t reserve_mb = 3072;
     bool reserve_explicit = false;
@@ -1356,7 +1357,8 @@ static int moe_cache_query_config(
     result->min_expert_explicit = config.min_expert_explicit;
     result->max_batch = config.max_batch;
     result->min_compute_capability = config.min_compute_capability;
-    result->min_devices = config.automatic ? 2 : 1;
+    result->automatic = config.automatic;
+    result->min_devices = config.min_devices;
     result->overlap_cpu_rows = config.overlap_cpu_rows;
     result->expert_parallel = config.expert_parallel;
     result->profile_path = nullptr;
@@ -1968,6 +1970,8 @@ static void * moe_cache_session_create(
                 supplied_config->reserve_explicit > 1 ||
                 supplied_config->max_batch < 1 ||
                 supplied_config->max_batch > moe_cache_batch_max ||
+                supplied_config->automatic < 0 ||
+                supplied_config->automatic > 1 ||
                 supplied_config->min_devices < 1 ||
                 supplied_config->min_compute_capability < 0 ||
                 supplied_config->min_compute_capability > 999 ||
@@ -1978,7 +1982,8 @@ static void * moe_cache_session_create(
                 return nullptr;
             }
             config.enabled = true;
-            config.automatic = supplied_config->min_devices > 1;
+            config.automatic = supplied_config->automatic != 0;
+            config.min_devices = supplied_config->min_devices;
             config.budget_mb = supplied_config->budget_bytes / MiB;
             config.reserve_mb = supplied_config->reserve_bytes / MiB;
             config.reserve_explicit = supplied_config->reserve_explicit;
@@ -2041,8 +2046,7 @@ static void * moe_cache_session_create(
                 moe_cache_recommended_reserve_bytes(info.devices[logical].total_vram);
         }
 
-        if (session->devices.empty() ||
-            (session->config.automatic && session->devices.size() < 2)) {
+        if ((int) session->devices.size() < session->config.min_devices) {
             return nullptr;
         }
         if (!session->config.reserve_explicit) {
@@ -2393,12 +2397,14 @@ static void * moe_cache_begin(
                 eligible_devices++;
             }
         }
-        if (budget_devices == 0 ||
+        if (budget_devices < session->config.min_devices ||
             (session->config.automatic &&
-             (budget_devices < 2 || slab_devices < 2))) {
-            if (session->config.automatic && slab_devices < 2) {
-                MOE_CACHE_LOG("[moe-cache] session dormant: only %d devices satisfy the %zu MiB automatic slab floor\n",
-                        slab_devices, session->config.minimum_slab_bytes >> 20);
+             slab_devices < session->config.min_devices)) {
+            if (session->config.automatic &&
+                slab_devices < session->config.min_devices) {
+                MOE_CACHE_LOG("[moe-cache] session dormant: only %d/%d devices satisfy the %zu MiB automatic slab floor\n",
+                        slab_devices, session->config.min_devices,
+                        session->config.minimum_slab_bytes >> 20);
             }
             session->dormant.store(true);
             lock.unlock();
@@ -2407,7 +2413,8 @@ static void * moe_cache_begin(
             }
             return nullptr;
         }
-        if (session->config.automatic && eligible_devices < 2) {
+        if (session->config.automatic &&
+            eligible_devices < session->config.min_devices) {
             return nullptr;
         }
 

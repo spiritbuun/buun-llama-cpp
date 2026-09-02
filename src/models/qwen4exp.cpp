@@ -13,6 +13,7 @@ static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, 
     }
 }
 
+// get_arr() copies a short array as-is, leaving a zero tail the n-gram hash silently drops
 static void qwen4exp_require_arr_len(llama_model_loader & ml, llm_kv kid, uint32_t n_min) {
     uint32_t n_arr = 0;
     ml.get_arr_n(kid, n_arr, true);
@@ -43,6 +44,8 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     // HC; low_rank is qwen4exp-specific, DeepSeek-V4 leaves it absent (full rank)
     ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT,    hparams.dsv4_hc_mult);
     ml.get_key(LLM_KV_HYPER_CONNECTION_LOW_RANK, hparams.hc_low_rank);
+    // a count of 1 has nothing to mix: transformers configuration_qwen4_exp.py:196, vLLM
+    // config.py:49 and SGLang configs/qwen4_exp.py:38 all raise on hc_count <= 1
     if (hparams.dsv4_hc_mult <= 1) {
         throw std::runtime_error(format("%s must be greater than one, got %u",
                                         ml.llm_kv(LLM_KV_HYPER_CONNECTION_COUNT).c_str(), hparams.dsv4_hc_mult));
@@ -74,6 +77,7 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
         std::vector<uint32_t> ple_layers;
         ml.get_arr(LLM_KV_PLE_LAYERS, ple_layers);
         if (n_ple != 1) {
+            // hparams holds one set of hash constants, so several PLE modules cannot be represented
             throw std::runtime_error(format("%s lists %u layers, but only one PLE layer is supported",
                                             ml.llm_kv(LLM_KV_PLE_LAYERS).c_str(), n_ple));
         }
@@ -144,6 +148,13 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
         }
     }
 
+    // the PLE conv history is a row of the recurrent cache, which linear layers alone have
+    for (uint32_t i = 0; i < hparams.n_layer_all; ++i) {
+        if (hparams.is_ple(i) && !hparams.is_recr(i)) {
+            throw std::runtime_error(format("PLE layer %u is not a linear attention layer", i));
+        }
+    }
+
     switch (hparams.n_layer()) {
         case 48: type = LLM_TYPE_A3B; break;
         default: type = LLM_TYPE_UNKNOWN;
@@ -175,18 +186,24 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
 
-    // flat [ple_head_dim, n_rows] gather target; n_rows is padded, so read it back
+    // flat [ple_head_dim, n_rows] gather target
     if (hparams.ple_n_heads > 0) {
-        const std::string ple_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
-        const auto & ple_w = ml.require_weight(ple_name.c_str());
-        const int64_t ple_rows = ple_w.tensor->ne[1];
-
-        // sanity check
+        // the head ranges are what the gather indexes, so they set the minimum row count
+        int64_t ple_rows = 0;
         for (uint32_t h = 0; h < hparams.ple_n_heads; ++h) {
-            if ((int64_t) hparams.ple_head_offsets[h] + hparams.ple_head_vocab_sizes[h] > ple_rows) {
-                throw std::runtime_error(format("PLE head %u range exceeds the %" PRId64 " table rows", h, ple_rows));
-            }
+            ple_rows = std::max(ple_rows, (int64_t) hparams.ple_head_offsets[h] + hparams.ple_head_vocab_sizes[h]);
         }
+
+        // the converter pads the table; a model synthesised from metadata has no tensor to ask
+        const std::string ple_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
+        if (const auto * ple_w = ml.get_weight(ple_name.c_str())) {
+            if (ple_w->tensor->ne[1] < ple_rows) {
+                throw std::runtime_error(format("%s has %" PRId64 " rows, too few for the PLE head ranges (%" PRId64 ")",
+                                                ple_name.c_str(), ple_w->tensor->ne[1], ple_rows));
+            }
+            ple_rows = ple_w->tensor->ne[1];
+        }
+
         per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
                                            { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
     }
@@ -1439,12 +1456,10 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
 
     GGML_ASSERT(mctx != nullptr);
 
-    for (int64_t i = 0; i < n_tokens; ++i) {
-        // the preceding tokens would be ambiguous, see get_prev_tokens()
-        GGML_ASSERT(ubatch->n_seq_id[i] == 1 && "PLE n-gram embeddings do not support tokens shared by multiple sequences");
-    }
-
     // predecessors come from the KV cells (ext.tok); apply_ubatch() already stored this ubatch, so its own tokens count too
+    // Shared text tokens are valid when every owning sequence has the same
+    // predecessor window. get_prev_tokens() verifies that invariant and uses
+    // the common window; genuinely divergent histories remain ambiguous.
     mctx->get_prev_tokens(*ubatch, n_prev, prev);
 
     for (int64_t i = 0; i < n_tokens; ++i) {

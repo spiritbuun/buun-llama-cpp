@@ -1023,18 +1023,6 @@ static void common_params_fit_impl(
         }
     }
 
-    auto sum_context_bytes = [&](const dmds_t & dmds) {
-        int64_t result = 0;
-        if (nd == 0) {
-            result += dmds.back().mb.context;
-        } else {
-            for (size_t id = 0; id < nd; id++) {
-                result += dmds[id].mb.context;
-            }
-        }
-        return result;
-    };
-
     // Context bytes whose representation is selected by Turbo/VBR. This is intentionally not
     // `context - context_fixed`: an auxiliary index cache can scale with n_ctx while remaining
     // fixed-layout and outside the controller budget.

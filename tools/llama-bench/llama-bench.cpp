@@ -283,7 +283,7 @@ static const char * lazy_mode_str(llama_lazy_mode mode) {
         case LLAMA_LAZY_MODE_ON:
             return "on";
         default:
-            GGML_ABORT("invalid tensor read lazy mode");
+            GGML_ABORT("invalid lazy mode");
     }
 }
 
@@ -615,7 +615,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -fa, --flash-attn <on|off|auto>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.flash_attn, llama_flash_attn_type_name), ",").c_str());
     printf("  -dev, --device <dev0/dev1/...>                    (default: auto)\n");
     printf("  -lm, --load-mode <auto|none|mmap|mlock|mmap+mlock|dio> (default: %s)\n", join(transform_to_str(cmd_params_defaults.load_mode, llama_load_mode_name), ",").c_str());
-    printf("  --tensor-read-lazy <on|auto|off>                  (default: %s)\n", join(transform_to_str(cmd_params_defaults.lazy_mode, lazy_mode_str), ",").c_str());
+    printf("  -lzm, --lazy-mode <on|auto|off>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.lazy_mode, lazy_mode_str), ",").c_str());
     printf("  --mmap-prefetch <on|auto|off>                     (default: %s)\n", join(transform_to_str(cmd_params_defaults.mmap_prefetch, mmap_prefetch_mode_str), ",").c_str());
     printf("  -mmp, --mmap <0|1>                                (DEPRECATED IN FAVOUR OF --load-mode)\n");
     printf("  -dio, --direct-io <0|1>                           (DEPRECATED IN FAVOUR OF --load-mode)\n");
@@ -1049,7 +1049,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 params.load_mode.insert(params.load_mode.end(), modes.begin(), modes.end());
-            } else if (arg == "--tensor-read-lazy") {
+            } else if (arg == "-lzm" || arg == "--lazy-mode") {
                 if (++i >= argc) {
                     invalid_param = true;
                     break;
