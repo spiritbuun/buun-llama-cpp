@@ -47,13 +47,14 @@ struct fla_modules {
     std::array<CUfunction, K_COUNT> funcs{};
 };
 
-static fla_modules & get_modules(int cc) {
+static fla_modules & get_modules(int device, int cc) {
+    GGML_ASSERT(device >= 0 && device < GGML_CUDA_MAX_DEVICES);
     GGML_ASSERT(cc == 800 || cc == 860);
     const int arch = cc == 800 ? 0 : 1;
-    static std::array<fla_modules, 2> results;
-    static std::array<std::once_flag, 2> once;
-    std::call_once(once[arch], [&, arch] {
-        fla_modules & result = results[arch];
+    static std::array<std::array<fla_modules, 2>, GGML_CUDA_MAX_DEVICES> results;
+    static std::array<std::array<std::once_flag, 2>, GGML_CUDA_MAX_DEVICES> once;
+    std::call_once(once[device][arch], [&, device, arch] {
+        fla_modules & result = results[device][arch];
         const char * base = std::getenv("GGML_CUDA_GDN_FLA_PTX_DIR");
         const char * files[K_COUNT] = {
             "H3W6T2GDMYXPGO54W5AODQVEFALZB3UDMPQRWCWEU2FJYSZ5GQ4A/chunk_local_cumsum_scalar_kernel.cubin",
@@ -108,7 +109,7 @@ static fla_modules & get_modules(int cc) {
             CU_CHECK(cuFuncSetAttribute(result.funcs[i], CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, shared[i]));
         }
     });
-    return results[arch];
+    return results[device][arch];
 }
 
 __global__ void pack_gdn_inputs_bf16(
@@ -519,7 +520,7 @@ void ggml_cuda_gdn_fla_ptx(
         float * rms_output, bool rms_output_bf16,
         bool rms_output_int8, float * rms_output_scale, float rms_eps) {
     cudaStream_t stream = ctx.stream();
-    fla_modules & m = get_modules(cc);
+    fla_modules & m = get_modules(ctx.device, cc);
 
     GGML_ASSERT(n_tokens > 0 && n_tokens % GDN_BT == 0 && n_tokens <= INT_MAX);
     const int n_chunks         = int(n_tokens / GDN_BT);
