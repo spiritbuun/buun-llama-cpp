@@ -1050,22 +1050,23 @@ Current checkpoint (2026-09-01):
   replacement, multi-slot, and multi-GPU expert-parallel execution;
 - native MTP has passed production generation for both architectures, including
   Qwen4 layer/tensor split and DeepSeek hyper-connection projection; and
+- Qwen4 multimodal loading now consumes the official embedded vision tower
+  directly from safetensors and has passed real-image generation plus the
+  independent text-only regression; and
 - the remaining work below is acceptance and integration work, not another
   importer architecture rewrite.
 
-Run the next five gates in this order:
+The first gate from the 2026-09-01 sequence is complete. Run the remaining four
+gates in this order:
 
-1. complete the production Qwen4 multimodal source path: reuse the existing
-   Qwen3-VL vision/mmproj runtime, preserve bounded PLE/vision loading, and prove
-   text-only behavior is unchanged;
-2. establish Qwen4 reference fidelity, including an exact-zero reference anchor
+1. establish Qwen4 reference fidelity, including an exact-zero reference anchor
    and KLD for the `Q8_0_G128` routed-expert bridge whose source block-FP8 weights
    are requantized for the portable `MUL_MAT_ID`/offload/cache contract;
-3. run Qwen4 VBR and long-context gates, checking fit-time accounting, final
+2. run Qwen4 VBR and long-context gates, checking fit-time accounting, final
    residency, dynamic decode behavior, generation, and clean teardown;
-4. prove cache-aware `--moe-cache soft` fit and placement for both Qwen4 and
+3. prove cache-aware `--moe-cache soft` fit and placement for both Qwen4 and
    DeepSeek4, including agreement between the fit projection and final buffers;
-5. close the remaining DeepSeek4 production matrix: reference KLD, long-context,
+4. close the remaining DeepSeek4 production matrix: reference KLD, long-context,
    teardown, and retained placement/cache policies. Dynamic DeepSeek4 VBR remains
    a separately identified runtime-cache project until per-child tier ganging is
    implemented; native safetensors must continue to reach the same explicit
