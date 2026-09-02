@@ -959,7 +959,11 @@ Current architecture proof (2026-09-01):
   request generated coherent code at 14.02 t/s with 72/72 drafts accepted; a
   prose request exercised recurrent rollback with 96/189 drafts accepted and
   remained coherent. A focused registry fixture separately pins the NextN norm,
-  concatenated `eh_proj`, and `mtp.layers.0` mappings.
+  concatenated `eh_proj`, and `mtp.layers.0` mappings. Four-GPU tensor split
+  also constructs the 166-node MTP graph through Meta and produces byte-identical
+  quicksort output with the same 72/72 acceptance. It decodes at 10.04 t/s and
+  falls back to the CPU sampler, so this is a placement/correctness proof rather
+  than a tensor-split performance result.
 - The full production Qwen multimodal path, cache-aware `soft` placement,
   VBR, long-context, and KLD gates remain required. The tiny fixture remains an
   architecture/transform proof rather than a quality model.
