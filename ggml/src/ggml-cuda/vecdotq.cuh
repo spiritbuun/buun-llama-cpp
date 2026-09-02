@@ -944,7 +944,7 @@ static __device__ __forceinline__ float vec_dot_q8_0_g128_q8_1(
     int sumi = 0;
 #pragma unroll
     for (int i = 0; i < QK8_1/4; ++i) {
-        sumi = ggml_cuda_dp4a(get_int_b1(qs, i), get_int_b4(bq8->qs, i), sumi);
+        sumi = ggml_cuda_dp4a(get_int_b2(qs, i), get_int_b4(bq8->qs, i), sumi);
     }
 
     const float d = __uint_as_float(uint32_t(bq8_0->d) << 16);

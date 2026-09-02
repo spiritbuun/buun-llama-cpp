@@ -252,11 +252,11 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             const block_q8_0_g128 * bxi = (const block_q8_0_g128 *) x + kbx0 + i*stride + kbx;
             const int dst_offset = kbx*(chunks_per_block*QI8_0) + chunk*QI8_0 + 2*lane;
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-            x_qs[i*sram_stride + dst_offset + 0] = get_int_b1(bxi->qs + chunk*QK8_1, 2*lane + 0);
-            x_qs[i*sram_stride + dst_offset + 1] = get_int_b1(bxi->qs + chunk*QK8_1, 2*lane + 1);
+            x_qs[i*sram_stride + dst_offset + 0] = get_int_b2(bxi->qs + chunk*QK8_1, 2*lane + 0);
+            x_qs[i*sram_stride + dst_offset + 1] = get_int_b2(bxi->qs + chunk*QK8_1, 2*lane + 1);
 #else
-            x_qs[i*(2*MMQ_TILE_NE_K + 1) + dst_offset + 0] = get_int_b1(bxi->qs + chunk*QK8_1, 2*lane + 0);
-            x_qs[i*(2*MMQ_TILE_NE_K + 1) + dst_offset + 1] = get_int_b1(bxi->qs + chunk*QK8_1, 2*lane + 1);
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + dst_offset + 0] = get_int_b2(bxi->qs + chunk*QK8_1, 2*lane + 0);
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + dst_offset + 1] = get_int_b2(bxi->qs + chunk*QK8_1, 2*lane + 1);
 #endif
         }
     }
