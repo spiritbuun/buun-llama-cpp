@@ -964,8 +964,18 @@ Current architecture proof (2026-09-01):
   quicksort output with the same 72/72 acceptance. It decodes at 10.04 t/s and
   falls back to the CPU sampler, so this is a placement/correctness proof rather
   than a tensor-split performance result.
-- The full production Qwen multimodal path, cache-aware `soft` placement,
-  VBR, long-context, and KLD gates remain required. The tiny fixture remains an
+- The production Qwen4 multimodal source path now reuses the existing Qwen3-VL
+  vision runtime directly from the same safetensors directory passed to `-m`
+  and `--mmproj`; it does not create a temporary GGUF. The adapter consumed all
+  333 official vision sources into 334 canonical tensors (the temporal patch
+  kernel becomes two existing Conv2D weights), kept ordinary vision tensors in
+  BF16, and converted only the position table to F32 for the existing dynamic
+  interpolation contract. On the official source, a real-image gate encoded
+  the 300-token image batch in 671 ms and correctly identified the July 21,
+  1969 New York Times Apollo 11 front page. A separate text-only invocation
+  initialized the unchanged text graph, produced coherent deterministic
+  reasoning, and tore down cleanly. Cache-aware `soft` placement, VBR,
+  long-context, and KLD gates remain required. The tiny fixture remains an
   architecture/transform proof rather than a quality model.
 
 ## 7. Test matrix
