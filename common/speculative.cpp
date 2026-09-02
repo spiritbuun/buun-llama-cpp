@@ -98,6 +98,73 @@ void common_speculative_mtp_carry_lifecycle::sequence_transition(
     }
 }
 
+bool common_speculative_mtp_carry_state_save(
+        const common_speculative_mtp_carry_lifecycle & lifecycle,
+        const std::vector<float> & pending_h,
+        std::vector<uint8_t> & data) {
+    constexpr uint32_t magic       = 0x4d545043; // MTPC
+    constexpr uint32_t version     = 1;
+    constexpr size_t   header_size = 3*sizeof(uint32_t);
+
+    if (!lifecycle.draft_ready() || pending_h.empty() ||
+            pending_h.size() > UINT32_MAX) {
+        data.clear();
+        return false;
+    }
+
+    const uint32_t width = (uint32_t) pending_h.size();
+    data.resize(header_size + (size_t) width*sizeof(float));
+    std::memcpy(data.data() + 0*sizeof(uint32_t), &magic,   sizeof(uint32_t));
+    std::memcpy(data.data() + 1*sizeof(uint32_t), &version, sizeof(uint32_t));
+    std::memcpy(data.data() + 2*sizeof(uint32_t), &width,   sizeof(uint32_t));
+    std::memcpy(data.data() + header_size, pending_h.data(),
+                (size_t) width*sizeof(float));
+    return true;
+}
+
+bool common_speculative_mtp_carry_state_load(
+        common_speculative_mtp_carry_lifecycle & lifecycle,
+        std::vector<float> & pending_h,
+        const std::vector<uint8_t> & data) {
+    constexpr uint32_t magic       = 0x4d545043; // MTPC
+    constexpr uint32_t version     = 1;
+    constexpr size_t   header_size = 3*sizeof(uint32_t);
+
+    lifecycle.target_process_skipped();
+
+    uint32_t stored_magic = 0;
+    uint32_t stored_version = 0;
+    uint32_t width = 0;
+    if (data.size() < header_size) {
+        return false;
+    }
+    std::memcpy(&stored_magic,   data.data() + 0*sizeof(uint32_t), sizeof(uint32_t));
+    std::memcpy(&stored_version, data.data() + 1*sizeof(uint32_t), sizeof(uint32_t));
+    std::memcpy(&width,          data.data() + 2*sizeof(uint32_t), sizeof(uint32_t));
+    if (stored_magic != magic || stored_version != version ||
+            width != pending_h.size() ||
+            data.size() != header_size + (size_t) width*sizeof(float)) {
+        return false;
+    }
+
+    std::memcpy(pending_h.data(), data.data() + header_size,
+                (size_t) width*sizeof(float));
+    lifecycle.target_process_refreshed();
+    return true;
+}
+
+common_speculative_checkpoint_policy common_speculative_checkpoint_policy_resolve(
+        bool has_draft_context,
+        bool vbr_prompt_cache,
+        bool can_speculate,
+        bool mtp_primary) noexcept {
+    const bool require_mtp = has_draft_context && can_speculate && mtp_primary;
+    return {
+        has_draft_context && (vbr_prompt_cache || require_mtp),
+        require_mtp,
+    };
+}
+
 common_speculative_mtp_process_preflight
 common_speculative_mtp_process_preflight_resolve(
         const std::vector<common_speculative_mtp_carry_lifecycle> & lifecycles,
@@ -252,7 +319,7 @@ struct common_speculative_impl {
 
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
-    virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
+    virtual bool set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) { return false; }
     // Called after an external sequence lifecycle mutation. Most implementations
     // have no branch-local state beyond their serialized state and need no action.
     virtual void sequence_transition(
@@ -1004,15 +1071,15 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         return true;
     }
 
-    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+    bool set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
         if (!need_boundary_stash()) {
-            return;
+            return false;
         }
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
-            return;
+            return false;
         }
         if (data.size() != sizeof(llama_pos) + (size_t) n_embd_dec * sizeof(float)) {
-            return;
+            return false;
         }
 
         llama_pos pos = -1;
@@ -1021,6 +1088,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         pending_pos_last[seq_id] = pos;
         pending_g_last[seq_id].resize(n_embd_dec);
         std::memcpy(pending_g_last[seq_id].data(), data.data() + sizeof(llama_pos), (size_t) n_embd_dec * sizeof(float));
+        return true;
     }
 };
 
@@ -3057,6 +3125,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+    }
+
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return false;
+        }
+        return common_speculative_mtp_carry_state_save(
+            pending_h_lifecycle[seq_id], pending_h[seq_id], data);
+    }
+
+    bool set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return false;
+        }
+        return common_speculative_mtp_carry_state_load(
+            pending_h_lifecycle[seq_id], pending_h[seq_id], data);
     }
 
     void sequence_transition(
@@ -6026,14 +6110,16 @@ bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id
     return false;
 }
 
-void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data) {
+bool common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data) {
     if (spec == nullptr) {
-        return;
+        return false;
     }
 
+    bool restored = false;
     for (auto & impl : spec->impls) {
-        impl->set_state(seq_id, data);
+        restored = impl->set_state(seq_id, data) || restored;
     }
+    return restored;
 }
 
 void common_speculative_sequence_transition(

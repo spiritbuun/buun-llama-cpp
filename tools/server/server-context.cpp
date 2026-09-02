@@ -11804,10 +11804,11 @@ private:
     // capture path below (it alone populated data_dft/spec state via update_dft/common_speculative_get_state,
     // which the live path never fills). The single capture path is the inline one in
     // update_slots. Draft/speculative checkpoint aux state now lives in the typed
-    // common_prompt_checkpoint::accel record: the ring is
-    // mandatory-on-presence (fail-closed at the restore site), spec is optional.
-    // The live capture path fills accel.ring only; accel.spec remains a stash slot
-    // for spec impls that need it (e.g. eagle3), applied on restore when present.
+    // common_prompt_checkpoint::accel record. The ring is mandatory-on-presence
+    // (fail-closed at the restore site). For MTP, accel.spec stores the deferred
+    // hidden row and is required together with a complete draft sequence image;
+    // other speculative implementations may continue to use it as an optional
+    // stash applied on restore when present.
 
     void assert_scheduler_thread(
             std::thread::id & pinned,
@@ -17560,11 +17561,6 @@ private:
                                                 slot.cache_plan->restore_attempt_failed = true;
                                             }
                                         } else if (!do_reset) {
-                                            // restore the drafter's speculative state (per-slot spec or shared)
-                                            common_speculative_set_state(
-                                                slot.get_spec(), slot.id,
-                                                it->accel.spec.view());
-
                                             pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                             n_past = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
                                             if (slot.retention_reuse_pending &&
@@ -17600,14 +17596,34 @@ private:
                                             // optional accelerator image. This ordering lets legacy
                                             // DFlash clear an old ring while preserving the newly
                                             // authenticated checkpoint ring installed below.
+                                            const bool draft_image_restored =
+                                                !it->data_dft.empty() &&
+                                                it->data_dft_full_sequence;
                                             common_speculative_sequence_transition(
                                                 slot.get_spec(), slot.id,
-                                                !it->data_dft.empty() &&
-                                                        it->data_dft_full_sequence
-                                                    ? common_speculative_sequence_event::draft_image_restored
+                                                draft_image_restored
+                                                    ? (!it->accel.spec.empty()
+                                                        ? common_speculative_sequence_event::composite_image_restored
+                                                        : common_speculative_sequence_event::draft_image_restored)
                                                     : common_speculative_sequence_event::target_restored_without_draft);
 
-                                            bool checkpoint_aux_ok = true;
+                                            // A sequence transition invalidates deferred branch
+                                            // state. Apply the matching checkpoint state only after
+                                            // that invalidation; doing this in the opposite order
+                                            // immediately discards a restored MTP carry.
+                                            const bool spec_state_ok =
+                                                it->accel.spec.empty() ||
+                                                common_speculative_set_state(
+                                                    slot.get_spec(), slot.id,
+                                                    it->accel.spec.view());
+
+                                            bool checkpoint_aux_ok = spec_state_ok;
+                                            if (!spec_state_ok) {
+                                                SLT_ERR(slot,
+                                                    "failed to restore checkpoint speculative state "
+                                                    "(n_tokens = %" PRId64 ", state size = %zu) -- failing closed\n",
+                                                    it->n_tokens, it->accel.spec.size());
+                                            }
                                             if (slot.can_speculate() && !it->accel.ring.empty() &&
                                                 (!common_speculative_ring_state_matches_frontier(
                                                      slot.get_spec(),
@@ -18411,8 +18427,21 @@ private:
                                 (qsa_provider.size && qsa_provider.size(
                                     qsa_provider.context, slot.id, qsa_size) &&
                                  qsa_size != 0 && qsa_size <= SIZE_MAX));
-                            const size_t draft_size = ctx_dft &&
-                                    params_base.vbr_prompt_cache
+                            const auto checkpoint_policy =
+                                common_speculative_checkpoint_policy_resolve(
+                                    ctx_dft != nullptr,
+                                    params_base.vbr_prompt_cache,
+                                    slot.can_speculate(),
+                                    params_base.speculative.uses_mtp_as_primary_drafter());
+                            const bool mtp_checkpoint_required =
+                                checkpoint_policy.require_complete_draft_and_state;
+                            const bool capture_draft = checkpoint_policy.capture_draft;
+                            std::vector<uint8_t> spec_state;
+                            const bool mtp_state_ready = !mtp_checkpoint_required ||
+                                (common_speculative_get_state(
+                                    slot.get_spec(), slot.id, spec_state) &&
+                                 !spec_state.empty());
+                            const size_t draft_size = capture_draft
                                 ? llama_state_seq_get_size_ext(
                                     ctx_dft.get(), slot.id,
                                     LLAMA_STATE_SEQ_FLAGS_NONE)
@@ -18430,14 +18459,20 @@ private:
                                     uint64_t(checkpoint_size);
                             const bool draft_vbr_fits =
                                 draft_size != 0 && qsa_vbr_fits &&
+                                mtp_state_ready &&
                                 uint64_t(ring_size) <=
                                     exact_capture_limit-
                                         uint64_t(checkpoint_size)-qsa_size &&
+                                uint64_t(spec_state.size()) <=
+                                    exact_capture_limit-
+                                        uint64_t(checkpoint_size)-qsa_size-
+                                        uint64_t(ring_size) &&
                                 uint64_t(draft_size) <=
                                     exact_capture_limit-
                                         uint64_t(checkpoint_size)-
                                         qsa_size-
-                                        uint64_t(ring_size);
+                                        uint64_t(ring_size)-
+                                        uint64_t(spec_state.size());
                             if (!qsa_topology_ready) {
                                 SLT_ERR(slot, "%s",
                                     "skipping context checkpoint: QSA topology is unavailable\n");
@@ -18497,8 +18532,7 @@ private:
                             // empty; retain the full draft sequence here so a
                             // checkpoint-backed MTP/DFlash prefix can be
                             // published as one atomic companion set.
-                            if (!staged.empty() && ctx_dft &&
-                                params_base.vbr_prompt_cache) {
+                            if (!staged.empty() && capture_draft) {
                                 if (draft_vbr_fits) {
                                     size_t draft_written = 0;
                                     next.data_dft.overwrite(
@@ -18516,16 +18550,41 @@ private:
                                             "skipping context checkpoint: draft state short write (expected %zu, got %zu)\n",
                                             draft_size, draft_written);
                                         staged.clear();
+                                    } else if (mtp_checkpoint_required) {
+                                        next.accel.spec.overwrite(
+                                            spec_state.size(),
+                                            [&](uint8_t * data, size_t size) {
+                                                std::memcpy(data, spec_state.data(), size);
+                                            });
                                     }
                                 } else {
-                                    SLT_DBG(slot,
-                                        "VBR checkpoint companion skipped: "
-                                        "target=%zu draft=%zu ring=%zu exceeds "
-                                        "automatic capture runway=%" PRIu64
-                                        "\n",
-                                        checkpoint_size, draft_size,
-                                        ring_size,
-                                        exact_capture_limit);
+                                    if (mtp_checkpoint_required) {
+                                        SLT_ERR(slot,
+                                            "MTP checkpoint companion skipped: "
+                                            "target=%zu draft=%zu spec=%zu ring=%zu "
+                                            "runway=%" PRIu64 " state-ready=%d\n",
+                                            checkpoint_size, draft_size,
+                                            spec_state.size(), ring_size,
+                                            exact_capture_limit,
+                                            (int) mtp_state_ready);
+                                    } else {
+                                        SLT_DBG(slot,
+                                            "VBR checkpoint companion skipped: "
+                                            "target=%zu draft=%zu spec=%zu ring=%zu "
+                                            "runway=%" PRIu64 " state-ready=%d\n",
+                                            checkpoint_size, draft_size,
+                                            spec_state.size(), ring_size,
+                                            exact_capture_limit,
+                                            (int) mtp_state_ready);
+                                    }
+                                    // An MTP restore without both its complete
+                                    // draft sequence and pending hidden carry
+                                    // permanently disables drafting. Prefer no
+                                    // checkpoint over publishing that partial
+                                    // accelerator image.
+                                    if (mtp_checkpoint_required) {
+                                        staged.clear();
+                                    }
                                 }
                             }
 
