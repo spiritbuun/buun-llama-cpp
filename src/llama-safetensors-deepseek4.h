@@ -37,7 +37,7 @@ class llama_safetensors_deepseek4_importer final : public llama_safetensors_impo
     std::filesystem::path model_dir_;
     llama_safetensors_json config_;
     llama_safetensors_json generation_;
-    llama_safetensors_json tokenizer_;
+    llama_safetensors_tokenizer_json tokenizer_;
     std::optional<std::string> chat_template_;
     llama_safetensors_registry registry_;
     std::unique_ptr<llama_safetensors_quant_adapters> quant_;

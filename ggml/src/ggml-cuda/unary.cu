@@ -82,8 +82,47 @@ static __global__ void int8_dynamic_fake_quant_kernel(
     }
 }
 
+static __device__ __forceinline__ uint32_t bnb_source_scale_block(
+        const ggml_bnb_scale_header * header, uint32_t block) {
+    if (header->layout == GGML_BNB_SCALE_LAYOUT_NONE) {
+        return block;
+    }
+
+    assert((header->layout == GGML_BNB_SCALE_LAYOUT_ROWS ||
+            header->layout == GGML_BNB_SCALE_LAYOUT_COLUMNS) &&
+           header->layout_rows > 0 && header->layout_cols > 0 &&
+           header->layout_cols % header->block_size == 0 &&
+           header->layout_n_key_heads > 0 && header->layout_values_per_key > 0 &&
+           header->layout_head_span > 0);
+    const uint32_t row_blocks = header->layout_cols / header->block_size;
+    const uint32_t row = block / row_blocks;
+    const uint32_t col_block = block % row_blocks;
+    if (header->layout == GGML_BNB_SCALE_LAYOUT_ROWS) {
+        if (row < header->layout_prefix) {
+            return block;
+        }
+        const uint32_t relative = row - header->layout_prefix;
+        const uint32_t dst_head = relative / header->layout_head_span;
+        const uint32_t lane = relative % header->layout_head_span;
+        const uint32_t v = dst_head / header->layout_n_key_heads;
+        const uint32_t k = dst_head % header->layout_n_key_heads;
+        const uint32_t src_head = k * header->layout_values_per_key + v;
+        return (header->layout_prefix + src_head * header->layout_head_span + lane) * row_blocks + col_block;
+    }
+
+    assert(header->layout == GGML_BNB_SCALE_LAYOUT_COLUMNS);
+    const uint32_t dst_head = col_block / header->layout_head_span;
+    const uint32_t lane = col_block % header->layout_head_span;
+    const uint32_t v = dst_head / header->layout_n_key_heads;
+    const uint32_t k = dst_head % header->layout_n_key_heads;
+    const uint32_t src_head = k * header->layout_values_per_key + v;
+    return row * row_blocks + src_head * header->layout_head_span + lane;
+}
+
 static __device__ __forceinline__ float bnb_block_scale(
         const ggml_bnb_scale_header * header, uint32_t block) {
+    block = bnb_source_scale_block(header, block);
+    assert(block < header->n_blocks);
     const uint8_t * bundle = reinterpret_cast<const uint8_t *>(header);
     if (header->nested_block_size == 0) {
         return reinterpret_cast<const float *>(bundle + header->absmax_offset)[block];

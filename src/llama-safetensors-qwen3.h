@@ -34,7 +34,7 @@ class llama_safetensors_qwen3_importer final : public llama_safetensors_importer
     llama_safetensors_json                            config_;
     llama_safetensors_json                            text_config_;
     llama_safetensors_json                            generation_;
-    llama_safetensors_json                            tokenizer_;
+    llama_safetensors_tokenizer_json                  tokenizer_;
     std::optional<std::string>                        chat_template_;
     std::optional<std::string>                        padding_token_;
     llama_safetensors_registry                        registry_;

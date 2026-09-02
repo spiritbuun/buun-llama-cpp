@@ -1040,11 +1040,11 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         return value != nullptr && std::atoi(value) != 0;
     }();
     if (ggml_cuda_humming_fp8_enabled() && full_tensor && tensor->type == GGML_TYPE_F8_E4M3 &&
+        (tensor->flags & GGML_TENSOR_FLAG_BLOCK_FP8) != 0 &&
         tensor->view_src == nullptr && ggml_is_contiguous(tensor) &&
         ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
         tensor->ne[2] == 1 && tensor->ne[3] == 1 &&
-        (ggml_cuda_humming_fp8_supports_shape(tensor->ne[1], tensor->ne[0], 1, cc) ||
-         ggml_cuda_humming_fp8_block_supports_shape(tensor->ne[1], tensor->ne[0], 1, cc))) {
+        ggml_cuda_humming_fp8_block_supports_shape(tensor->ne[1], tensor->ne[0], 1, cc)) {
         std::vector<uint8_t> repacked(size);
         ggml_cuda_humming_fp8_repack_host(data, repacked.data(), tensor->ne[1], tensor->ne[0]);
         CUDA_CHECK(cudaMemcpyAsync(tensor->data, repacked.data(), size, cudaMemcpyHostToDevice, cudaStreamPerThread));
@@ -2594,6 +2594,31 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             return;
         }
         const ggml_tensor * scale = dst->src[2];
+        const bool generic_fp8_channel = src0->type == GGML_TYPE_F8_E4M3 &&
+            !ggml_cuda_humming_fp8_is_repacked(src0) && src1->type == GGML_TYPE_F32 &&
+            dst->type == GGML_TYPE_F32 && scale->type == GGML_TYPE_BF16 &&
+            scale->ne[0] == src0->ne[1] && scale->ne[1] == 1 &&
+            scale->ne[2] == 1 && scale->ne[3] == 1 &&
+            src1->ne[0] == src0->ne[0] && dst->ne[0] == src0->ne[1] &&
+            ggml_is_contiguous(src0) && ggml_is_contiguous(scale) && ggml_is_contiguous(dst);
+        if (generic_fp8_channel) {
+            ggml_cuda_pool_alloc<float> unscaled(ctx.pool(), ggml_nelements(dst));
+            ggml_tensor ordinary = *dst;
+            ordinary.data = unscaled.get();
+            ordinary.src[2] = nullptr;
+            ggml_cuda_mul_mat(ctx, src0, src1, &ordinary);
+
+            ggml_tensor unscaled_tensor = *dst;
+            unscaled_tensor.data = unscaled.get();
+            unscaled_tensor.src[2] = nullptr;
+            ggml_tensor scaled = *dst;
+            scaled.src[0] = &unscaled_tensor;
+            scaled.src[1] = dst->src[2];
+            scaled.src[2] = nullptr;
+            scaled.src[3] = nullptr;
+            ggml_cuda_op_mul(ctx, &scaled);
+            return;
+        }
         const bool generic_fp8_block = src0->type == GGML_TYPE_F8_E4M3 &&
             !ggml_cuda_humming_fp8_is_repacked(src0) && src1->type == GGML_TYPE_F32 &&
             dst->type == GGML_TYPE_F32 && scale->type == GGML_TYPE_F32 &&
@@ -5122,6 +5147,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 0;
     }
 
+    // Q4_A32's standalone Marlin/MMQ/MMVQ executors preserve the asymmetric
+    // group-32 contract. The shared BF16-retaining fusion epilogues do not yet
+    // reproduce that path closely enough for autoregressive decode, so keep
+    // these projections on their ordinary graph until each fusion has an
+    // end-to-end fidelity proof.
+    if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) &&
+            node->src[0] != nullptr && node->src[0]->type == GGML_TYPE_Q4_A32) {
+        return 0;
+    }
+
 #if !defined(GGML_USE_HIP)
     if (node->op == GGML_OP_MUL_MAT && node->src[1] != nullptr &&
             node->src[1]->ne[1] > MMVQ_MAX_BATCH_SIZE) {
@@ -6123,8 +6158,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                                            add_node->src[1] == reshaped ? add_node->src[0] : nullptr;
             const ggml_tensor * norm_weight = norm_node->src[0] == rms_node ? norm_node->src[1] :
                                               norm_node->src[1] == rms_node ? norm_node->src[0] : nullptr;
-            if ((mm_node->src[2] != nullptr || mm_node->src[0]->type == GGML_TYPE_Q4_A32 ||
-                    mm_node->src[0]->type == GGML_TYPE_BF16) &&
+            const bool block_fp8 = mm_node->src[0]->type == GGML_TYPE_F8_E4M3 &&
+                mm_node->src[2] != nullptr;
+            if (block_fp8 &&
                     reshaped->src[0] == mm_node && residual != nullptr &&
                     norm_weight != nullptr && rms_node->src[0] == add_node &&
                     residual->type == GGML_TYPE_F32 && norm_weight->type == GGML_TYPE_F32 &&
@@ -6180,8 +6216,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                                            add_node->src[1] == mm_node ? add_node->src[0] : nullptr;
             const ggml_tensor * norm_weight = norm_node->src[0] == rms_node ? norm_node->src[1] :
                                               norm_node->src[1] == rms_node ? norm_node->src[0] : nullptr;
-            if ((mm_node->src[2] != nullptr || mm_node->src[0]->type == GGML_TYPE_Q4_A32 ||
-                    mm_node->src[0]->type == GGML_TYPE_BF16) &&
+            const bool block_fp8 = mm_node->src[0]->type == GGML_TYPE_F8_E4M3 &&
+                mm_node->src[2] != nullptr;
+            if (block_fp8 &&
                     residual != nullptr && norm_weight != nullptr &&
                     rms_node->src[0] == add_node && residual->type == GGML_TYPE_F32 &&
                     norm_weight->type == GGML_TYPE_F32 && ggml_is_contiguous(residual) &&
@@ -7670,6 +7707,18 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                          scale->type == GGML_TYPE_F16 || scale->type == GGML_TYPE_BF16) &&
                         b->ne[0] == a->ne[0] && op->ne[0] == a->ne[1] && op->ne[1] == b->ne[1];
                     if (i8_channel) {
+                        return true;
+                    }
+                    const bool f8_channel = a->type == GGML_TYPE_F8_E4M3 &&
+                        b->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                        cc >= GGML_CUDA_CC_AMPERE && ggml_is_contiguous(a) &&
+                        ggml_is_contiguous(b) && ggml_is_contiguous(scale) &&
+                        ggml_is_contiguous(op) && scale->type == GGML_TYPE_BF16 &&
+                        scale->ne[0] == a->ne[1] && scale->ne[1] == 1 &&
+                        scale->ne[2] == 1 && scale->ne[3] == 1 &&
+                        b->ne[0] == a->ne[0] && op->ne[0] == a->ne[1] &&
+                        op->ne[1] == b->ne[1];
+                    if (f8_channel) {
                         return true;
                     }
                     return a->type == GGML_TYPE_F8_E4M3 && b->type == GGML_TYPE_F32 &&

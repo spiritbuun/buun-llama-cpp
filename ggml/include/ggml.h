@@ -461,6 +461,9 @@ extern "C" {
     // beginning of this header and keep the checkpoint's optional nested
     // (double-quantized) absmax representation intact.
     #define GGML_BNB_SCALE_MAGIC 0x53424e42u // "BNBS"
+    #define GGML_BNB_SCALE_LAYOUT_NONE 0u
+    #define GGML_BNB_SCALE_LAYOUT_ROWS 1u
+    #define GGML_BNB_SCALE_LAYOUT_COLUMNS 2u
     struct ggml_bnb_scale_header {
         uint32_t magic;
         uint32_t version;
@@ -473,6 +476,15 @@ extern "C" {
         uint32_t quant_map_offset;
         uint32_t nested_quant_map_offset;
         uint32_t total_size;
+        // Optional logical-layout mapping for architecture adapters that
+        // permute packed weights without rewriting nested scale groups.
+        uint32_t layout;
+        uint32_t layout_rows;
+        uint32_t layout_cols;
+        uint32_t layout_prefix;
+        uint32_t layout_n_key_heads;
+        uint32_t layout_values_per_key;
+        uint32_t layout_head_span;
     };
 
     #define GGML_GPTQ_AO_MAGIC 0x4f415147u // "GQAO"
@@ -730,6 +742,9 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
+        // ...uses an E4M3 weight with a 128x128 block-scale tensor. Backends
+        // may use this to select a block-FP8-specific storage layout.
+        GGML_TENSOR_FLAG_BLOCK_FP8 = 32,
     };
 
     enum ggml_tri_type {

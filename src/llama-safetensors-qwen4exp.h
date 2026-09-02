@@ -39,7 +39,7 @@ class llama_safetensors_qwen4exp_importer final : public llama_safetensors_impor
     std::filesystem::path model_dir_;
     llama_safetensors_json config_;
     llama_safetensors_json generation_;
-    llama_safetensors_json tokenizer_;
+    llama_safetensors_tokenizer_json tokenizer_;
     std::optional<std::string> chat_template_;
     std::string model_prefix_;
     llama_safetensors_registry registry_;

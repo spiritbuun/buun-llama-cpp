@@ -334,6 +334,62 @@ std::unique_ptr<llama_safetensors_importer> make_importer(const std::filesystem:
 }  // namespace
 
 int main(int argc, char ** argv) {
+    if (argc == 4 && std::string(argv[1]) == "load-only") {
+        const bool native = std::string(argv[3]) == "native";
+        require(native || std::string(argv[3]) == "gguf", "load-only source must be native or gguf");
+        ggml_backend_load_all();
+        llama_model_params model_params = llama_model_default_params();
+        model_params.n_gpu_layers       = 99;
+        llama_model * model             = native ? llama_model_load_from_safetensors_dir(argv[2], model_params) :
+                                                   llama_model_load_from_file(argv[2], model_params);
+        require(model != nullptr, "model-only load failed");
+        llama_model_free(model);
+        std::cout << "load_source=" << (native ? "native" : "gguf") << " result=ok\n";
+        return 0;
+    }
+    if (argc == 4 && std::string(argv[1]) == "probe") {
+        const bool native = std::string(argv[3]) == "native";
+        require(native || std::string(argv[3]) == "gguf", "probe source must be native or gguf");
+        ggml_backend_load_all();
+        llama_model_params model_params = llama_model_default_params();
+        model_params.n_gpu_layers       = 99;
+        model_params.load_mode          = LLAMA_LOAD_MODE_NONE;
+        model_params.no_alloc           = true;
+        llama_model * model             = native ? llama_model_load_from_safetensors_dir(argv[2], model_params) :
+                                                   llama_model_load_from_file(argv[2], model_params);
+        require(model != nullptr, "no-allocation model probe failed");
+        llama_model_free(model);
+        std::cout << "probe_source=" << (native ? "native" : "gguf") << " result=ok\n";
+        return 0;
+    }
+    if (argc == 3 && std::string(argv[1]) == "cancel") {
+        struct callback_state {
+            size_t calls = 0;
+            float  last_progress = 0.0f;
+        };
+
+        ggml_backend_load_all();
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            callback_state    state;
+            llama_model_params model_params        = llama_model_default_params();
+            model_params.n_gpu_layers              = 99;
+            model_params.progress_callback         = [](float progress, void * user_data) {
+                auto * state = static_cast<callback_state *>(user_data);
+                ++state->calls;
+                state->last_progress = progress;
+                return state->calls < 8;
+            };
+            model_params.progress_callback_user_data = &state;
+
+            llama_model * model = llama_model_load_from_safetensors_dir(argv[2], model_params);
+            require(model == nullptr, "cancelled direct safetensors load unexpectedly succeeded");
+            require(state.calls == 8, "direct safetensors load did not propagate progress cancellation");
+            std::cout << "cancelled_attempt=" << attempt + 1
+                      << " callbacks=" << state.calls
+                      << " last_progress=" << state.last_progress << '\n';
+        }
+        return 0;
+    }
     if (argc == 5 && std::string(argv[1]) == "compare") {
         ggml_backend_load_all();
         llama_model_params model_params = llama_model_default_params();
@@ -1195,6 +1251,69 @@ int main(int argc, char ** argv) {
                     std::vector<uint8_t>({ 1, 2, 3, 4 }),
                 "Qwen output channel scale incorrectly followed the weight's column permutation");
 
+        const std::filesystem::path plain_layout_dir = dir.path / "plain-layout-direct-upload";
+        const std::string plain_layout_module = "model.language_model.layers.0.linear_attn.in_proj_z.weight";
+        std::vector<uint8_t> plain_layout_source;
+        for (uint16_t row = 0; row < 4; ++row) {
+            for (uint16_t col = 0; col < 2; ++col) {
+                const uint16_t value = static_cast<uint16_t>(10 * row + col);
+                plain_layout_source.push_back(static_cast<uint8_t>(value));
+                plain_layout_source.push_back(static_cast<uint8_t>(value >> 8));
+            }
+        }
+        write_single_shard_model(plain_layout_dir, {
+            { plain_layout_module, "BF16", { 4, 2 }, plain_layout_source },
+        });
+        write_text(plain_layout_dir / "generation_config.json", "{}");
+        write_text(plain_layout_dir / "tokenizer.json", "{}");
+        llama_safetensors_json plain_layout_config = config;
+        plain_layout_config.erase("quantization_config");
+        plain_layout_config["text_config"]["linear_num_key_heads"]   = 2;
+        plain_layout_config["text_config"]["linear_num_value_heads"] = 4;
+        plain_layout_config["text_config"]["linear_key_head_dim"]    = 1;
+        plain_layout_config["text_config"]["linear_value_head_dim"]  = 1;
+        llama_safetensors_qwen35_importer plain_layout_importer(plain_layout_dir, plain_layout_config);
+        ggml_type plain_layout_type;
+        std::array<int64_t, GGML_MAX_DIMS> plain_layout_ne;
+        require(plain_layout_importer.describe("blk.0.attn_gate.weight", plain_layout_type, plain_layout_ne) &&
+                    plain_layout_type == GGML_TYPE_BF16 && plain_layout_ne[0] == 2 && plain_layout_ne[1] == 4,
+                "plain Qwen recurrent projection has the wrong target contract");
+        ggml_init_params plain_layout_params {
+            /*.mem_size   =*/ 2 * ggml_tensor_overhead() + 1024,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context * plain_layout_ctx = ggml_init(plain_layout_params);
+        require(plain_layout_ctx != nullptr, "failed to create plain-layout upload context");
+        ggml_tensor * plain_layout_dst = ggml_new_tensor_2d(
+            plain_layout_ctx, plain_layout_type, plain_layout_ne[0], plain_layout_ne[1]);
+        ggml_backend_buffer_t plain_layout_buffer =
+            ggml_backend_alloc_ctx_tensors_from_buft(plain_layout_ctx, ggml_backend_cpu_buffer_type());
+        require(plain_layout_buffer != nullptr, "failed to allocate plain-layout upload buffer");
+        require(plain_layout_importer.load("blk.0.attn_gate.weight", plain_layout_dst, true),
+                "mapped Qwen recurrent projection did not take the direct transform/upload path");
+        std::vector<uint8_t> plain_layout_uploaded(plain_layout_source.size());
+        ggml_backend_tensor_get(
+            plain_layout_dst, plain_layout_uploaded.data(), 0, plain_layout_uploaded.size());
+        const std::array<size_t, 4> plain_layout_rows = { 0, 2, 1, 3 };
+        for (size_t row = 0; row < plain_layout_rows.size(); ++row) {
+            const size_t source_row = plain_layout_rows[row];
+            require(std::equal(
+                        plain_layout_uploaded.begin() + row * 4,
+                        plain_layout_uploaded.begin() + (row + 1) * 4,
+                        plain_layout_source.begin() + source_row * 4),
+                    "direct Qwen recurrent upload permuted the wrong row");
+        }
+        llama_safetensors_qwen35_importer buffered_layout_importer(
+            plain_layout_dir, plain_layout_config, llama_safetensors_io_mode::BUFFERED);
+        require(!buffered_layout_importer.load("blk.0.attn_gate.weight", plain_layout_dst, true),
+                "buffered Qwen recurrent projection incorrectly used the mapped transform path");
+        require(buffered_layout_importer.materialize(
+                    "blk.0.attn_gate.weight", plain_layout_type, plain_layout_source.size()) == plain_layout_uploaded,
+                "buffered Qwen recurrent fallback differs from mapped direct transformation");
+        ggml_backend_buffer_free(plain_layout_buffer);
+        ggml_free(plain_layout_ctx);
+
         const std::filesystem::path w8_dir = dir.path / "w8-column-transform";
         std::vector<uint8_t> w8_codes(2 * 128);
         for (size_t row = 0; row < 2; ++row) {
@@ -1234,24 +1353,150 @@ int main(int argc, char ** argv) {
             }
         }
 
-        const std::filesystem::path awq_dir = dir.path / "awq-row-transform";
-        const std::string awq_module = "model.language_model.layers.0.linear_attn.in_proj_z";
-        write_single_shard_model(awq_dir, {
-            { awq_module + ".qweight", "I32", { 128, 1 }, std::vector<uint8_t>(128 * sizeof(uint32_t)) },
-            { awq_module + ".qzeros",  "I32", { 1, 1 },   i32_bytes({ 1 })                              },
-            { awq_module + ".scales",  "F16", { 1, 8 },   std::vector<uint8_t>(8 * sizeof(uint16_t), 1) },
+        // BitsAndBytes keeps its second-level scale groups in source order.
+        // Recurrent head permutation therefore moves packed codes while the
+        // scale bundle records the inverse logical-block mapping.
+        const std::filesystem::path bnb_rows_dir = dir.path / "bnb-nf4-row-transform";
+        const std::string bnb_module = "model.language_model.layers.0.linear_attn.in_proj_z";
+        constexpr size_t bnb_rows = 512;
+        constexpr size_t bnb_cols = 128;
+        constexpr size_t bnb_blocks = bnb_rows * bnb_cols / 64;
+        std::vector<uint8_t> bnb_weight(bnb_rows * bnb_cols / 2);
+        std::vector<uint8_t> bnb_absmax(bnb_blocks);
+        for (size_t row = 0; row < bnb_rows; ++row) {
+            const uint8_t head = static_cast<uint8_t>(row / 128);
+            std::fill_n(bnb_weight.begin() + row * bnb_cols / 2, bnb_cols / 2,
+                        static_cast<uint8_t>((head << 4) | head));
+            std::fill_n(bnb_absmax.begin() + row * 2, 2, static_cast<uint8_t>(16 + head));
+        }
+        std::vector<uint8_t> bnb_quant_map(16 * sizeof(float));
+        std::vector<uint8_t> bnb_nested_map(256 * sizeof(float));
+        std::vector<uint8_t> bnb_nested_absmax(4 * sizeof(float));
+        for (size_t i = 0; i < 16; ++i) {
+            const float value = float(i);
+            std::memcpy(bnb_quant_map.data() + i * sizeof(float), &value, sizeof(value));
+        }
+        for (size_t i = 0; i < 256; ++i) {
+            const float value = float(i) / 16.0f;
+            std::memcpy(bnb_nested_map.data() + i * sizeof(float), &value, sizeof(value));
+        }
+        for (size_t i = 0; i < 4; ++i) {
+            const float value = float(i + 1);
+            std::memcpy(bnb_nested_absmax.data() + i * sizeof(float), &value, sizeof(value));
+        }
+        const std::string bnb_state =
+            R"({"quant_type":"nf4","blocksize":64,"dtype":"bfloat16","shape":[512,128],"nested_blocksize":256,"nested_dtype":"float32","nested_offset":0.25})";
+        write_single_shard_model(bnb_rows_dir, {
+            { bnb_module + ".weight", "U8", { bnb_rows * bnb_cols / 2, 1 }, bnb_weight },
+            { bnb_module + ".weight.absmax", "U8", { bnb_blocks }, bnb_absmax },
+            { bnb_module + ".weight.quant_map", "F32", { 16 }, bnb_quant_map },
+            { bnb_module + ".weight.quant_state.bitsandbytes__nf4", "U8", { bnb_state.size() },
+              std::vector<uint8_t>(bnb_state.begin(), bnb_state.end()) },
+            { bnb_module + ".weight.nested_absmax", "F32", { 4 }, bnb_nested_absmax },
+            { bnb_module + ".weight.nested_quant_map", "F32", { 256 }, bnb_nested_map },
         });
-        write_text(awq_dir / "generation_config.json", "{}");
-        write_text(awq_dir / "tokenizer.json", "{}");
-        config["quantization_config"] = llama_safetensors_json::parse(awq_config).at("quantization_config");
-        llama_safetensors_qwen35_importer awq_importer(awq_dir, config);
-        require_rejected(
-            [&] {
-                ggml_type type;
-                std::array<int64_t, GGML_MAX_DIMS> ne;
-                (void) awq_importer.describe("blk.0.attn_gate.weight", type, ne);
-            },
-            "Qwen3.5 accepted an AWQ row transform after repacking");
+        write_text(bnb_rows_dir / "generation_config.json", "{}");
+        write_text(bnb_rows_dir / "tokenizer.json", "{}");
+        llama_safetensors_json bnb_qwen_config = config;
+        bnb_qwen_config["quantization_config"] =
+            llama_safetensors_json::parse(bnb_nf4_config).at("quantization_config");
+        bnb_qwen_config["text_config"]["linear_num_key_heads"]   = 2;
+        bnb_qwen_config["text_config"]["linear_num_value_heads"] = 4;
+        bnb_qwen_config["text_config"]["linear_key_head_dim"]    = 128;
+        bnb_qwen_config["text_config"]["linear_value_head_dim"]  = 128;
+        llama_safetensors_qwen35_importer bnb_importer(bnb_rows_dir, bnb_qwen_config);
+        ggml_type bnb_type;
+        std::array<int64_t, GGML_MAX_DIMS> bnb_ne;
+        require(bnb_importer.describe("blk.0.attn_gate.weight", bnb_type, bnb_ne) &&
+                    bnb_type == GGML_TYPE_BNB_NF4 && bnb_ne[0] == bnb_cols && bnb_ne[1] == bnb_rows,
+                "Qwen3.5 BitsAndBytes row transform has the wrong weight contract");
+        const std::vector<uint8_t> bnb_weight_transformed = bnb_importer.materialize(
+            "blk.0.attn_gate.weight", bnb_type, bnb_weight.size());
+        constexpr std::array<size_t, 4> bnb_head_order = { 0, 2, 1, 3 };
+        for (size_t dst_head = 0; dst_head < bnb_head_order.size(); ++dst_head) {
+            const uint8_t expected = static_cast<uint8_t>(
+                (bnb_head_order[dst_head] << 4) | bnb_head_order[dst_head]);
+            const uint8_t * begin = bnb_weight_transformed.data() + dst_head * 128 * bnb_cols / 2;
+            require(std::all_of(begin, begin + 128 * bnb_cols / 2,
+                                [&](uint8_t value) { return value == expected; }),
+                    "Qwen3.5 BitsAndBytes row transform moved the wrong packed head");
+        }
+        ggml_type bnb_scale_type;
+        std::array<int64_t, GGML_MAX_DIMS> bnb_scale_ne;
+        require(bnb_importer.describe("blk.0.attn_gate.scale", bnb_scale_type, bnb_scale_ne) &&
+                    bnb_scale_type == GGML_TYPE_I8,
+                "Qwen3.5 BitsAndBytes row transform has the wrong scale contract");
+        const std::vector<uint8_t> bnb_bundle = bnb_importer.materialize(
+            "blk.0.attn_gate.scale", bnb_scale_type, static_cast<size_t>(bnb_scale_ne[0]));
+        ggml_bnb_scale_header bnb_header;
+        std::memcpy(&bnb_header, bnb_bundle.data(), sizeof(bnb_header));
+        require(bnb_header.magic == GGML_BNB_SCALE_MAGIC &&
+                    bnb_header.layout == GGML_BNB_SCALE_LAYOUT_ROWS &&
+                    bnb_header.layout_rows == bnb_rows && bnb_header.layout_cols == bnb_cols &&
+                    bnb_header.layout_prefix == 0 && bnb_header.layout_n_key_heads == 2 &&
+                    bnb_header.layout_values_per_key == 2 && bnb_header.layout_head_span == 128,
+                "Qwen3.5 BitsAndBytes row transform lost its nested-scale mapping");
+
+        const std::filesystem::path gptq_dir = dir.path / "gptq-row-transform";
+        const std::string gptq_module = "model.language_model.layers.0.linear_attn.in_proj_z";
+        constexpr size_t gptq_cols = 128;
+        constexpr size_t gptq_rows = 128;
+        constexpr size_t gptq_groups = gptq_cols / 32;
+        std::vector<uint32_t> gptq_weights((gptq_cols / 8) * gptq_rows);
+        std::vector<uint32_t> gptq_zeros(gptq_groups * (gptq_rows / 8));
+        std::vector<uint8_t> gptq_scales(gptq_groups * gptq_rows * sizeof(uint16_t));
+        for (size_t row = 0; row < gptq_rows; ++row) {
+            const size_t head = row / 32;
+            for (size_t group = 0; group < gptq_groups; ++group) {
+                const uint8_t code = static_cast<uint8_t>(3 * head + group);
+                for (size_t lane = 0; lane < 32; ++lane) {
+                    const size_t col = group * 32 + lane;
+                    gptq_weights[(col / 8) * gptq_rows + row] |=
+                        uint32_t(code) << (4 * (col % 8));
+                }
+                gptq_zeros[group * (gptq_rows / 8) + row / 8] |=
+                    uint32_t(7) << (4 * (row % 8));
+                store_f16(gptq_scales, group * gptq_rows + row, float(head + 1));
+            }
+        }
+        write_single_shard_model(gptq_dir, {
+            { gptq_module + ".qweight", "I32", { gptq_cols / 8, gptq_rows }, i32_bytes(gptq_weights) },
+            { gptq_module + ".qzeros",  "I32", { gptq_groups, gptq_rows / 8 }, i32_bytes(gptq_zeros) },
+            { gptq_module + ".scales",  "F16", { gptq_groups, gptq_rows }, gptq_scales },
+        });
+        write_text(gptq_dir / "generation_config.json", "{}");
+        write_text(gptq_dir / "tokenizer.json", "{}");
+        config["quantization_config"] = llama_safetensors_json::parse(gptq_g32_config).at("quantization_config");
+        config["text_config"]["linear_num_key_heads"]   = 2;
+        config["text_config"]["linear_num_value_heads"] = 4;
+        config["text_config"]["linear_key_head_dim"]    = 32;
+        config["text_config"]["linear_value_head_dim"]  = 32;
+        llama_safetensors_qwen35_importer gptq_importer(gptq_dir, config);
+        ggml_type gptq_type;
+        std::array<int64_t, GGML_MAX_DIMS> gptq_ne;
+        require(gptq_importer.describe("blk.0.attn_gate.weight", gptq_type, gptq_ne) &&
+                    gptq_type == GGML_TYPE_Q4_1 && gptq_ne[0] == gptq_cols && gptq_ne[1] == gptq_rows,
+                "Qwen3.5 GPTQ row transform has the wrong target contract");
+        constexpr size_t gptq_block_size = 2 * sizeof(ggml_fp16_t) + 16;
+        const std::vector<uint8_t> gptq_transformed = gptq_importer.materialize(
+            "blk.0.attn_gate.weight", gptq_type, gptq_rows * gptq_groups * gptq_block_size);
+        constexpr std::array<size_t, 4> gptq_head_order = { 0, 2, 1, 3 };
+        for (size_t dst_head = 0; dst_head < gptq_head_order.size(); ++dst_head) {
+            const size_t src_head = gptq_head_order[dst_head];
+            for (size_t row = 0; row < 32; ++row) {
+                for (size_t group = 0; group < gptq_groups; ++group) {
+                    std::array<uint8_t, 32> codes;
+                    codes.fill(static_cast<uint8_t>(3 * src_head + group));
+                    require_q4_1_block(
+                        gptq_transformed.data() +
+                            ((dst_head * 32 + row) * gptq_groups + group) * gptq_block_size,
+                        float(src_head + 1), 8, codes,
+                        "Qwen3.5 GPTQ row transform changed a code, scale, zero, or head order");
+                }
+            }
+        }
+
+        const std::string awq_module = "model.language_model.layers.0.linear_attn.in_proj_z";
 
         const auto packed_config_json = llama_safetensors_json::parse(packed_int_config);
         const auto make_packed_qwen_config = [&](const std::string & module) {
@@ -1355,11 +1600,11 @@ int main(int argc, char ** argv) {
             { "top_p",       0.75f },
             { "temperature", 0.5f  },
         };
-        const llama_safetensors_json tokenizer = {
+        const llama_safetensors_tokenizer_json tokenizer = {
             { "model",
              {
                   { "vocab", { { "a", 0 }, { "b", 1 } } },
-                  { "merges", { llama_safetensors_json::array({ "a", "b" }), "a b" } },
+                  { "merges", { llama_safetensors_tokenizer_json::array({ "a", "b" }), "a b" } },
               } },
             { "added_tokens",
              {
@@ -2153,11 +2398,11 @@ int main(int argc, char ** argv) {
                 packed_weight[row * (cols / 8) + col / 8] |=
                     uint32_t((5 * row + 3 * col) % 16) << (4 * (col % 8));
             }
-            store_bf16(scales, row, 0.5f + 0.75f * row);
+            store_f16(scales, row, row == 0 ? -0.5f : 1.25f);
         }
         write_single_shard_model(path, {
             { "int4.weight_packed", "I32",  { rows, cols / 8 }, i32_bytes(packed_weight) },
-            { "int4.weight_scale",  "BF16", { rows, 1 },        scales                   },
+            { "int4.weight_scale",  "F16",  { rows, 1 },        scales                   },
             { "int4.weight_shape",  "I64",  { 2 },              i64_bytes({ int64_t(rows), int64_t(cols) }) },
         });
         write_text(path / "config.json", packed_int4_symmetric_config);
@@ -2177,7 +2422,7 @@ int main(int argc, char ** argv) {
             for (size_t col = 0; col < cols; ++col) {
                 codes[col] = (5 * row + 3 * col) % 16;
             }
-            const float scale = 0.5f + 0.75f * row;
+            const float scale = row == 0 ? -0.5f : 1.25f;
             require_q4_a32_block(repacked.data() + row * block_size,
                 { scale, scale, scale, scale }, { 8, 8, 8, 8 }, codes,
                 "symmetric compressed-tensors W4A16 repack changed a row/lane value");
@@ -3795,10 +4040,10 @@ int main(int argc, char ** argv) {
         require(weight.has_value() && weight->target_type == GGML_TYPE_NVFP4 &&
                     weight->target_shape == std::vector<int64_t>({ 64, 2 }) && adapters.read(*weight).size() == 72,
                 "NVFP4 packed-weight binding or repack is wrong");
-        require(scale.has_value() && input.has_value(), "NVFP4 global scale binding is incomplete");
+        require(scale.has_value() && !input.has_value(),
+                "dynamic NVFP4 incorrectly materialized a static activation scale");
         adapters.consume(*weight);
         adapters.consume(*scale);
-        adapters.consume(*input);
         adapters.validate_complete();
     }
     {
@@ -3900,14 +4145,12 @@ int main(int argc, char ** argv) {
         require(weight.has_value() && weight->primary == "module.weight" &&
                     weight->target_type == GGML_TYPE_NVFP4 && adapters.read(*weight).size() == 72 &&
                     scale.has_value() && scale->primary == "module.weight_scale_2" &&
-                    input.has_value() && input->primary == "module.input_scale" &&
+                    !input.has_value() &&
                     scale->materialization == llama_safetensors_quant_materialization::POSITIVE_F32 &&
-                    input->materialization == llama_safetensors_quant_materialization::POSITIVE_F32 &&
                     !adapters.applies("ignored"),
                 "Quark NVFP4 binding is wrong");
         adapters.consume(*weight);
         adapters.consume(*scale);
-        adapters.consume(*input);
         adapters.validate_complete();
     }
     {

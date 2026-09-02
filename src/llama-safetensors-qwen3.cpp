@@ -163,7 +163,7 @@ llama_safetensors_qwen3_importer::llama_safetensors_qwen3_importer(const std::fi
     head_dim_                                     = text_config_.value(
         "head_dim", text_config_.at("hidden_size").get<uint32_t>() / n_head_);
     generation_                                   = llama_safetensors_read_json(model_dir_ / "generation_config.json");
-    tokenizer_                                    = llama_safetensors_read_json(model_dir_ / "tokenizer.json");
+    tokenizer_                                    = llama_safetensors_read_tokenizer_json(model_dir_ / "tokenizer.json");
     const llama_safetensors_json tokenizer_config = llama_safetensors_read_json(model_dir_ / "tokenizer_config.json");
     add_bos_token_ = tokenizer_config.value("add_bos_token", is_llama);
     if (tokenizer_config.contains("pad_token") && tokenizer_config.at("pad_token").is_string()) {

@@ -1373,6 +1373,8 @@ llama_safetensors_quant_config llama_safetensors_quant_config::from_json(const l
                 !require_json_value(input, "actorder", "input activations for group '" + name + "'").is_null()) {
                 throw std::runtime_error("unsupported NVFP4 input activation contract in group '" + name + "'");
             }
+            group.input_quantized = true;
+            group.input_dynamic   = true;
         } else if (format == "float-quantized") {
             const uint32_t num_bits =
                 require_json_value(weights, "num_bits", "quantization group '" + name + "'").get<uint32_t>();

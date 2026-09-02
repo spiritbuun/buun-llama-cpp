@@ -561,7 +561,12 @@ std::optional<llama_safetensors_quant_binding> llama_safetensors_quant_adapters:
                 llama_safetensors_quant_materialization::POSITIVE_F32 :
                 llama_safetensors_quant_materialization::RECIPROCAL_F32;
         } else {
-            if (group->modelopt && !group->input_quantized) {
+            // Dynamic NVFP4 execution derives a local activation scale from
+            // each runtime input. The serialized global scale remains a
+            // required, validated source auxiliary, but is not a static graph
+            // operand. Only a future static-input contract should materialize
+            // an activation scale here.
+            if (!group->input_quantized || group->input_dynamic) {
                 return std::nullopt;
             }
             result.primary         = module + (group->modelopt ? ".input_scale" : ".input_global_scale");
@@ -1402,7 +1407,8 @@ void llama_safetensors_quant_adapters::validate() {
             const bool common_valid = tensor.dtype == llama_safetensors_dtype::I32 && tensor.shape.size() == 2 &&
                 cols % group.group_size == 0 && cols % 128 == 0 && rows > 0 &&
                 tensor.shape == std::vector<uint64_t>({ rows, cols / pack_factor }) &&
-                scale.dtype == llama_safetensors_dtype::BF16 &&
+                (scale.dtype == llama_safetensors_dtype::F16 ||
+                 scale.dtype == llama_safetensors_dtype::BF16) &&
                 scale.shape == std::vector<uint64_t>({ rows, groups });
             if (!common_valid) {
                 throw std::runtime_error("invalid packed integer WNA16 contract for source tensor '" + tensor.name + "'");
@@ -1667,7 +1673,7 @@ void llama_safetensors_quant_adapters::validate() {
             dependencies_[tensor.name] = { scale_name };
             const std::string weight_global = module + (group->modelopt ? ".weight_scale_2" : ".weight_global_scale");
             dependencies_[tensor.name].push_back(weight_global);
-            if (!group->modelopt || group->input_quantized) {
+            if ((!group->modelopt || group->input_quantized) && !group->input_dynamic) {
                 dependencies_[tensor.name].push_back(
                     module + (group->modelopt ? ".input_scale" : ".input_global_scale"));
             }
@@ -2165,7 +2171,8 @@ std::vector<uint8_t> llama_safetensors_quant_adapters::repack_packed_int4(
     const size_t packed_rows = (rows + pack_factor - 1) / pack_factor;
     if (weight_desc.dtype != llama_safetensors_dtype::I32 ||
         weight_desc.shape != std::vector<uint64_t>({ rows, packed_cols }) ||
-        scale_desc.dtype != llama_safetensors_dtype::BF16 ||
+        (scale_desc.dtype != llama_safetensors_dtype::F16 &&
+         scale_desc.dtype != llama_safetensors_dtype::BF16) ||
         scale_desc.shape != std::vector<uint64_t>({ rows, groups }) ||
         (symmetric ? zero_desc != nullptr || zero != nullptr :
             zero_desc == nullptr || zero == nullptr || zero_desc->dtype != llama_safetensors_dtype::I32 ||
@@ -2188,13 +2195,20 @@ std::vector<uint8_t> llama_safetensors_quant_adapters::repack_packed_int4(
             for (size_t local_group = 0; local_group < block_values / 32; ++local_group) {
                 const size_t col = ib * block_values + local_group * 32;
                 const size_t group = col / group_size;
-                uint16_t scale_bits;
-                std::memcpy(&scale_bits, scale + (row * groups + group) * sizeof(scale_bits), sizeof(scale_bits));
-                const float scale_f32 = load_bf16(reinterpret_cast<const uint8_t *>(&scale_bits));
-                if (!(scale_f32 > 0.0f) || !std::isfinite(scale_f32)) {
-                    throw std::runtime_error("packed INT4 scale must be finite and positive");
+                uint16_t source_bits;
+                std::memcpy(
+                    &source_bits, scale + (row * groups + group) * sizeof(source_bits), sizeof(source_bits));
+                const float scale_f32 = scale_desc.dtype == llama_safetensors_dtype::BF16 ?
+                    load_bf16(reinterpret_cast<const uint8_t *>(&source_bits)) : ggml_fp16_to_fp32(source_bits);
+                const ggml_bf16_t scale_bits = ggml_fp32_to_bf16(scale_f32);
+                const float restored_scale = ggml_bf16_to_fp32(scale_bits);
+                if (scale_f32 == 0.0f || !std::isfinite(scale_f32) ||
+                    restored_scale == 0.0f || !std::isfinite(restored_scale)) {
+                    throw std::runtime_error(
+                        "packed INT4 scale must be finite, non-zero, and representable in BF16");
                 }
-                std::memcpy(out + local_group * sizeof(scale_bits), &scale_bits, sizeof(scale_bits));
+                std::memcpy(
+                    out + local_group * sizeof(scale_bits.bits), &scale_bits.bits, sizeof(scale_bits.bits));
 
                 uint8_t zero_code = 8;
                 if (!symmetric) {

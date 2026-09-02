@@ -654,7 +654,7 @@ llama_safetensors_qwen4exp_importer::llama_safetensors_qwen4exp_importer(
     }
     generation_ = std::filesystem::is_regular_file(model_dir_ / "generation_config.json") ?
         llama_safetensors_read_json(model_dir_ / "generation_config.json") : llama_safetensors_json::object();
-    tokenizer_ = llama_safetensors_read_json(model_dir_ / "tokenizer.json");
+    tokenizer_ = llama_safetensors_read_tokenizer_json(model_dir_ / "tokenizer.json");
     chat_template_ = llama_safetensors_read_optional_text(model_dir_ / "chat_template.jinja");
     registry_ = llama_safetensors_registry::load(model_dir_, io_mode);
     quant_ = std::make_unique<llama_safetensors_quant_adapters>(config_, registry_);

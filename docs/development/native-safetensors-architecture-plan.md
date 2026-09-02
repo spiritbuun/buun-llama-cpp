@@ -238,28 +238,184 @@ Qwen3.8-Flash-Next (`qwen4exp`) and DeepSeek-V4-Flash architectures.
 
 ### Phase 0 — Freeze trustworthy baselines
 
-- [ ] Record exact revisions for the representative Qwen3.8-27B release set:
+- [x] Record exact revisions for the representative Qwen3.8-27B release set:
   official block-FP8, Unsloth NVFP4, AWQ INT4, GPTQ INT4, AutoRound W4A16,
   W8A16 INT8, SmoothQuant W8A8, and BitsAndBytes NF4.
 - [x] Pin the official Qwen3.8-Flash-Next and DeepSeek-V4-Flash safetensors
   revisions. Inventory their complete tensor contracts, including Qwen PLE
   shards and DeepSeek's mixed FP4/FP8 expert representation, before describing
   either source format as supported.
-- [ ] Record PP, TG, peak VRAM, peak host memory, load time, and first-token
+- [x] Record PP, TG, peak VRAM, peak host memory, load time, and first-token
   correctness on the reference hardware used for each external-engine comparison.
-- [ ] Preserve direct projection correctness tests for every supported shape.
-- [ ] Preserve same-process reference-vs-reference anchor tests; the anchor must be exactly zero.
+- [x] Profile and reduce native-directory load latency. Record cold- and warm-cache
+  load times against the equivalent GGUF and vLLM source, separating manifest/
+  metadata work, source reads, validation/repack, host-to-device upload, and first
+  graph construction. On the 2026-09-02 A100 gate, model-only warm loads of the
+  same BF16 tensors took 30.9--31.2 seconds from the native directory versus
+  12.4--13.0 seconds from an equivalent BF16 GGUF. No-allocation construction
+  accounts for only about 0.4 seconds of that gap. Enabling the GGUF mmap
+  prefetch policy for every safetensors shard did not help (33.9--34.5 seconds)
+  and was removed. Instrumentation then attributed 17.13 seconds to CPU
+  materialization of 10.37 GiB of Qwen recurrent-layout tensors, versus 4.65
+  seconds for direct upload of the other 39.74 GiB. The mapped layout fast path
+  now permutes directly into one bounded uninitialized staging allocation and
+  uploads that result, eliminating the redundant source-sized vector. Warm
+  model-only load fell to 16.4 seconds, closing roughly 80% of the original
+  native/GGUF gap without a whole-model duplicate. The final uncontended ordered
+  loads were 18.05, 16.58, and 16.76 seconds (16.67-second warm median), with
+  52.64--52.66 GiB peak RSS. Both the mapped fast path and buffered `--no-mmap`
+  path matched the independent BF16 anchor at exactly zero KLD and 100% same-top.
+- [x] Preserve direct projection correctness tests for every supported shape.
+- [x] Preserve same-process reference-vs-reference anchor tests; the anchor must be exactly zero.
 - [ ] Disable or reject experimental backend paths that are known to produce incorrect output.
-- [ ] Save vLLM commands, versions, and corresponding baselines.
+- [x] Save vLLM commands, versions, and corresponding baselines.
 
 Gate: every representative Phase-0 source loads and produces coherent greedy
 output, and the recorded performance is reproducible within the chosen
 thermal/clock tolerance.
 
+Pinned Qwen3.8-27B release matrix (2026-09-02):
+
+- BF16 reference: `Qwen/Qwen3.8-27B@1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`;
+- block FP8: `Qwen/Qwen3.8-27B-FP8@017b9c7af6b5689d5dd426a76e0bc077eb5ca20a`;
+- NVFP4: `unsloth/Qwen3.8-27B-NVFP4@57926baca9a82b4d6906b43f2750d55315f5b10f`;
+- AWQ INT4: `cyankiwi/Qwen3.8-27B-AWQ-INT4@63768c10df38c0395e12ef49edac1bd539eaeeea`;
+- GPTQ INT4: `btbtyler09/Qwen3.8-27B-GPTQ-4bit@b64f44dfedb71b73287219e0ec348b0a20c447e2`;
+- AutoRound W4A16: `dbirks/Qwen3.8-27B-W4A16-AutoRound@1f05c441c4e64ae0549de44fa9ea5a6d43610314`;
+- W8A16 INT8: `lued/Qwen3.8-27B-INT8-W8A16-MTP@7c12373712d1363e2b76655cb3332c9c124627d7`;
+- SmoothQuant W8A8: `Freaksterz/Qwen3.8-27B-SmoothQuant-W8A8-INT8@68746dd1df1b7290aa6c1cb789773a7829fb86fc`;
+  and
+- BitsAndBytes NF4: `unsloth/Qwen3.8-27B-unsloth-bnb-4bit@8aa5f05d26b7205477066e1449e0af13f762a299`.
+
+The matrix uses the same A100-SXM4-80GB host, F16 KV, batch/ubatch 2048,
+single sequence, and exact BF16 reference artifact for every native-engine
+comparison. External-engine rows must record their engine revision and cannot
+be mixed into the native timing table unless those execution conditions match.
+
 Current known exception: explicitly enabling the experimental Humming NVFP4
 path produced incoherent greedy output on the A6000 while the ordinary NVFP4
 path remained coherent. The experimental path stays opt-in and must not be
 treated as a correctness baseline until separately repaired and revalidated.
+
+Matrix receipts recorded on the A100-SXM4-80GB on 2026-09-02:
+
+- Native BF16 passed the 16K exact self-anchor with zero KLD at every reported
+  statistic and 100% same-top. Its five-run averages were 3582.46 PP512,
+  4075.66 PP2048, and 29.15 TG128; the first PP512 sample was a cold outlier
+  (3014.44 versus 3715--3733 thereafter). Peak model-process RSS was 52.83 GiB
+  and peak GPU residency was 50.71 GiB.
+- SmoothQuant W8A8 passed coherent greedy generation and the full 16K panel:
+  median KLD 0.004269, mean KLD 0.010246, p99 0.104072, and 95.545% same-top.
+  Its five-run averages were 5305.95 PP512, 6205.32 PP2048, and 46.86 TG128;
+  the first PP512 sample was again cold (3840.53 versus 5658--5683). Peak
+  model-process RSS was 29.96 GiB and peak GPU residency was 28.07 GiB. The
+  retained vLLM 0.28.0 comparison reached about 7795.86 PP2048 and 44.23 TG128
+  on the same checkpoint and GPU, leaving a material prompt-processing gap but
+  no decode deficit.
+- Official block FP8 passed the full 16K panel with median KLD 0.001218, mean
+  KLD 0.003070, p99 0.031344, and 97.604% same-top. Its five-run averages were
+  3140.15 PP512, 3418.38 PP2048, and 42.52 TG128; peak model-process RSS was
+  29.42 GiB and peak GPU use was 30.67 GiB. The intended block-scaled residual/
+  RMS path remained enabled. Prompt processing trails both native BF16 and
+  SmoothQuant W8A8 and is therefore a measured post-matrix optimization target.
+  On the exact checkpoint, vLLM 0.28.0 reached median 3298.01 PP2048 and 49.23
+  TG128: native execution is 3.65% faster for PP2048 but 13.64% slower for
+  TG128. vLLM reported 5.56 seconds for shard loading and about 15 seconds from
+  process start through engine initialization, versus roughly 152 seconds to
+  native evaluation after a warm load.
+- Unsloth NVFP4 passed the full 16K panel after separating topology-safe block-
+  FP8 storage repacking from canonical channel-FP8 fallback execution: median
+  KLD 0.008546, mean KLD 0.017724, p99 0.153687, p99.9 0.510997, and 94.001%
+  same-top. On Ampere, where NVFP4 executes through software/Q8_1 rather than
+  native FP4 tensor cores, its five-run averages were 1094.10 PP512, 1256.67
+  PP2048, and 28.47 TG128. Peak model-process RSS was 22.44 GiB and peak GPU
+  use was 20.94 GiB. These are support baselines, not a claim that Ampere is
+  the preferred NVFP4 deployment target.
+- Compressed-tensors AWQ INT4 passed coherent greedy generation and the full
+  16K panel after Q4_A32 was excluded from shared BF16-retaining graph fusions
+  whose epilogues had not proved asymmetric group-32 decoding end to end.
+  Before that exclusion, the same imported weights were clean on CPU and with
+  CUDA fusion disabled but produced median KLD 0.138924 and incoherent decode
+  on the normal CUDA path. The repaired path reached median KLD 0.009504,
+  mean KLD 0.022924, p99 0.242685, p99.9 0.745260, and 93.670% same-top. Its
+  isolated native measurements were 2897.69 PP512, 3024.52 PP2048, and 57.19
+  TG128; peak model-process RSS was 20.62 GiB and peak GPU use was 18.62 GiB.
+  On the same checkpoint and A100, vLLM 0.28.0 selected its compressed-tensors
+  Marlin kernel and reached median 3406.62 PP512, 3472.22 PP2048, and 70.96
+  TG128 while reporting 18.37 GiB for model loading. Native is therefore about
+  16.6% behind at PP2048 and 19.4% behind at TG128, with comparable resident
+  weight memory. Exact residual-chain and GLU-chain CUDA regression tests now
+  pin the repaired Q4_A32 graph boundary.
+- Non-act-order GPTQ INT4 group-32 initially rejected the real Qwen3.8
+  checkpoint because its recurrent projections require Qwen value-head row and
+  column permutations. The importer now repacks to canonical Q4_1 first, then
+  moves complete rows or block-aligned 32-value blocks together with their
+  scale/minimum; a focused group-32 fixture pins codes, affine parameters, and
+  head order. The repaired model generated coherently and passed the full 16K
+  panel with median KLD 0.011511, mean KLD 0.028099, p99 0.285001, p99.9
+  1.041912, and 92.898% same-top. Native measurements were 1494.17 PP512,
+  1578.12 PP2048, and 65.49 TG128; peak model-process RSS was 20.72 GiB and
+  peak GPU use was 19.57 GiB. vLLM 0.28.0 selected AutoGPTQ Marlin, reported
+  17.88 GiB for model loading, and reached median 3538.55 PP512, 3637.57
+  PP2048, and 72.41 TG128. The large prompt-processing gap and roughly 1.7 GiB
+  resident-memory gap are the measured cost of the correctness-first 5-bpw
+  Q4_1 representation and remain the principal compact-W4A16 optimization
+  target after the format/architecture matrix is complete.
+- Compressed-tensors AutoRound W4A16 group-128 initially rejected its signed
+  FP16 group scales because the adapter had only admitted positive BF16 scales.
+  The packed INT4 materializer now accepts F16/BF16, preserves finite non-zero
+  sign, and converts the value to Q4_A32's BF16 scale field; a focused signed-
+  scale fixture pins the contract. The real checkpoint generated coherently and
+  passed the full 16K panel with median KLD 0.012353, mean KLD 0.028677, p99
+  0.271468, p99.9 0.895385, and 92.868% same-top. Native measurements were
+  2905.13 PP512, 3026.36 PP2048, and 58.32 TG128; peak process RSS was 19.25
+  GiB and peak GPU use was 18.60 GiB. vLLM 0.28.0 selected compressed-tensors
+  Marlin, reported 16.84 GiB model load memory, and reached median 3700.55
+  PP512, 3628.31 PP2048, and 75.09 TG128. Native is about 16.6% behind at
+  PP2048 and 22.3% behind at TG128; the compact-runtime and resident-memory
+  gaps remain post-matrix optimization work.
+- Compressed-tensors W8A16 group-128 with BF16 scales loaded without a format
+  repair, generated coherently, and passed the full 16K panel with median KLD
+  0.000315, mean KLD 0.000948, p99 0.008468, p99.9 0.042950, and 98.695%
+  same-top. Native measurements were 1356.81 PP512, 1460.07 PP2048, and 26.67
+  TG128; peak process RSS was 30.50 GiB and peak GPU use was 28.43 GiB. vLLM
+  0.28.0 selected compressed-tensors Marlin, reported 28.03 GiB model load
+  memory, and reached median 3281.26 PP512, 3131.73 PP2048, and 48.77 TG128.
+  Resident weight memory is already close, but native is about 53.4% behind at
+  PP2048 and 45.3% behind at TG128; optimized packed-INT8 execution is therefore
+  a measured post-matrix kernel priority.
+- BitsAndBytes NF4 now loads the real Unsloth checkpoint and generates coherent
+  greedy output. Qwen recurrent packed weights are permuted into canonical head
+  order while a 28-byte scale-layout descriptor maps each destination block back
+  to its original nested-scale block; this preserves exact nested quantization
+  without expanding the model's scale arrays. A fixture whose head permutation
+  crosses second-level 256-block groups and a CUDA mapped-scale operation test
+  pin that contract. The full 16K panel reached median KLD 0.014419, mean KLD
+  0.030736, p99 0.289774, p99.9 0.928127, and 92.433% same-top. The correctness-
+  first scalar executor reached 6.25 PP512, 6.26 PP2048, and 4.54 TG128, with
+  23.05 GiB peak process RSS. These numbers identify the executor itself as a
+  post-matrix optimization project, not a production-speed baseline. vLLM
+  0.28.0 cannot provide a comparison row because it rejects this checkpoint's
+  `bitsandbytes` quantization method before allocation.
+- Warm startup was initially dominated by parsing `tokenizer.json` through
+  `nlohmann::ordered_json`. Its vector-backed object preserved order needed by
+  quantization rule declarations but made Qwen's 248K-entry vocabulary
+effectively quadratic. Tokenizer objects now use ordinary map-backed JSON;
+token IDs remain authoritative and merge-array order remains intact. On the
+warm A100 BF16 gate, tokenizer parsing fell from 47.68 to 0.28 seconds,
+auto-fit fell from 53.14 to 1.10 seconds, and fit-enabled process startup fell
+from 136.34 to 33.14 seconds. The remaining model-stage gap was subsequently
+attributed to recurrent-layout materialization and reduced by the bounded
+mapped-layout fast path described in the Phase-0 load-latency gate above.
+
+An equivalent 866-tensor BF16 GGUF control now isolates metadata/model
+construction from allocation and upload.  Three warm A100 `no_alloc` probes
+averaged 1.61 seconds and 462 MiB peak RSS for the native directory versus
+1.20 seconds and 403 MiB for GGUF.  Native source construction therefore costs
+about 0.4 seconds, not the remaining 26.5 seconds.  The next load experiment is
+the final uncontended mapped-versus-buffered exact-logit gate and an ordered
+warm timing pair. Cold-cache figures remain storage-specific and must be
+reported separately rather than mixed into the warm model-stage comparison.
 
 ### Phase 1 — Introduce `llama_tensor_source` without changing behavior
 
@@ -267,7 +423,17 @@ treated as a correctness baseline until separately repaired and revalidated.
 - [x] Adapt the direct safetensors loader to implement it while preserving the public callback API.
 - [x] Route `describe`, `get_tensor_info`, loading, progress accounting, and errors through one interface.
 - [x] Keep synthetic tensor metadata temporarily as the source of descriptions.
-- [ ] Add tests for callback failure propagation, cancellation, optional tensors, and source lifetime.
+- [x] Add tests for callback failure propagation, cancellation, optional tensors, and source lifetime.
+
+The live source test now cancels two native-directory loads in one process
+after eight progress callbacks each and requires a null model result both
+times.  A separate successful CPU-only load then proves the same build remains
+usable.  The Qwen3 W4A16 fixture cancelled at progress 0.556168 with 704 MiB
+peak RSS; the follow-up load and generation completed with 1.17 GiB peak RSS.
+The focused registry suite retains the required/optional binding and completion
+checks.  Together these pin synchronous source lifetime and cleanup after a
+partially populated model allocation rather than testing cancellation only
+before source reads.
 
 Gate: no tensor bytes, graph nodes, logits, PP, or TG change from the Phase-0 safetensors baseline; GGUF tests remain unchanged.
 
@@ -447,13 +613,13 @@ of France is` matched GPTQModel's argmax and all top-10 tokens with last-logit
 KLD 0.000679. The scrambled group map is therefore exercised end to end rather
 than inferred from a synthetic identity fixture.
 
-Qwen3.5 recurrent projections add row/column layout transforms. The reference
-AWQ/GPTQ repacks cannot apply those transforms after unpacking without also
-moving their group parameters, and W8A8/NVFP4 column transforms need a
-block-aware permutation. Those combinations are rejected during tensor
-description rather than misusing the packed source shape. Production native
-executors must make the coupled transform order explicit before lifting this
-restriction.
+Qwen3.5 recurrent projections add row/column layout transforms. Non-act-order
+AWQ/GPTQ is first repacked into canonical Q4_1 blocks; row transforms then move
+complete rows, while column transforms move only block-aligned 32-value blocks
+with their scale and minimum. W8A8/NVFP4 likewise use block-aware column
+permutations. GPTQ act-order remains rejected for these recurrent projections:
+its separate `g_idx`, scale, and zero bundle requires a coupled transform that
+has not yet been designed and proved.
 
 One 512-token WikiText control per format measured the representation cost
 against weights dequantized directly from the same source tensors:
@@ -486,6 +652,20 @@ that disabling mmap takes the bounded-read/materialization path rather than the
 direct mapped upload. HIP and multi-device split inherit established
 Q8_0/Q4_1 kernels and placement semantics, but still need real-machine
 regression runs before release.
+
+The release-matrix CPU gate now also covers the representations that no longer
+repack into those established types.  A native Qwen3-4B dynamic channel-INT8
+checkpoint loaded entirely on CPU and generated `Paris. The capital of Germany
+is Berlin` (9.81 GiB peak RSS).  A native Qwen3-1.7B BitsAndBytes-NF4
+checkpoint completed the same CPU-only load/decode path in 59.9 seconds with
+2.67 GiB peak RSS and a coherent Paris continuation.  These are portability
+proofs for the reference executors, not performance claims.
+
+A real Qwen3-1.7B MXFP8 checkpoint also completed CPU-only loading and generated
+`Paris. The capital of Italy is Rome` with 5.13 GiB peak RSS. Load took 90.8
+seconds and prompt/decode each ran at about 0.02 tokens/second, so this closes
+the CPU correctness/placement proof only; the scalar CPU executor is not a
+production performance path.
 
 ### Rejected experiment — packed sibling projections
 
@@ -650,7 +830,7 @@ The implementation order is deliberately shared-contract-first:
 | W4A8 INT8 | group-128 I4 weights and dynamic/static INT8 activations | exact Q4-A32 repack plus scaled CUDA executor | full-model KLD/perf and unsupported-backend gates |
 | W4A8 FP8 | group-128 I4 weights and dynamic FP8 activations | exact repack plus CUDA executor | Hopper/Blackwell real-model KLD/perf |
 | MXFP4/MXFP8 | microscaled weights/activations and E8M0 sidecars | native compressed-tensors importer and CUDA execution; Quark MXFP4 schema and real checkpoint proven | real-model KLD/perf on each supported architecture |
-| AutoRound/INC MXFP4/MXFP8 | the same group-32 MX values and E8M0 scales, declared by the compact AutoRound schema | maps onto the existing MXFP contracts, including exact per-module FP16 exceptions and the optional `quantization_config.json` sidecar | real small-model full-load proof; current public LLM checkpoints are very large MoEs |
+| AutoRound/INC MXFP4/MXFP8 | the same group-32 MX values and E8M0 scales, declared by the compact AutoRound schema | maps onto the existing MXFP contracts, including exact per-module FP16 exceptions and the optional `quantization_config.json` sidecar; a real Qwen3-1.7B MXFP8 checkpoint completed CPU-only load and coherent generation | optimized CPU execution is out of scope; retain CUDA fidelity/performance and unsupported-backend gates |
 | TorchAO tiled INT4 / unpacked INT8 | `Int4TilePackedTo4dTensor` and `IntxUnpackedToInt8Tensor` safetensors subclasses | exact load-time repack into Q4_1/Q8_0; all tiled lanes and INT8 rows covered | native execution formats if load time or repack precision becomes material |
 | Transformers HQQ INT4 | flattened axis-1 `4bit_u8` codes with learned F16 scale/zero per group | exact code-preserving Q4_1 repack for unquantized metadata at group sizes divisible by 32; public Llama-3.2-1B checkpoint loads and generates coherently | external-reference KLD and a native metadata-preserving executor |
 | ExecuTorch HQQ experts | packed signed INT4 expert rows plus one BF16 scale per 128 values | exact nibble-preserving Q4_0 repack for the public Qwen3.5-MoE export; every expert/row/lane covered | external-reference KLD and a native scale-preserving executor |
@@ -1140,16 +1320,19 @@ Next release work:
 1. run the representative Qwen3.8-27B acceptance matrix from Phase 0, including
    exact-zero anchors, reference KLD, coherent generation, resident VRAM, peak
    host memory, PP, and TG;
-2. finish the retained real-machine/backend matrix: CPU-only or precise early
+2. profile native-directory loading on cold and warm page caches, explain the
+   BF16 A100 load-time gap against equivalent GGUF and vLLM loads, and remove
+   material duplicate scans, conversions, or uploads before release;
+3. finish the retained real-machine/backend matrix: CPU-only or precise early
    rejection, HIP or precise early rejection, cancellation, and teardown;
-3. freeze reproducible commands and baselines for BF16, NVFP4, FP8, W8A8,
+4. freeze reproducible commands and baselines for BF16, NVFP4, FP8, W8A8,
    BitsAndBytes, and normal/act-order GPTQ;
-4. close only measured material kernel gaps, including compact W4A16 prompt
+5. close only measured material kernel gaps, including compact W4A16 prompt
    processing, without introducing a second resident weight copy;
-5. publish a user-facing format/backend/architecture support matrix, invocation
+6. publish a user-facing format/backend/architecture support matrix, invocation
    examples, memory behavior, performance baselines, and precise limitations;
    and
-6. widen the architecture bridge only when a real checkpoint proves the
+7. widen the architecture bridge only when a real checkpoint proves the
    canonical name/layout mapping.
 
 Post-release, in priority order:

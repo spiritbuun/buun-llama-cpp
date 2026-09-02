@@ -222,7 +222,7 @@ llama_safetensors_deepseek4_importer::llama_safetensors_deepseek4_importer(
         throw std::runtime_error("native DeepSeek-V4 importer does not support this tensor geometry");
     }
     generation_ = llama_safetensors_read_json(model_dir_ / "generation_config.json");
-    tokenizer_ = llama_safetensors_read_json(model_dir_ / "tokenizer.json");
+    tokenizer_ = llama_safetensors_read_tokenizer_json(model_dir_ / "tokenizer.json");
     const auto tokenizer_config_path = model_dir_ / "tokenizer_config.json";
     if (std::filesystem::is_regular_file(tokenizer_config_path)) {
         const auto tokenizer_config = llama_safetensors_read_json(tokenizer_config_path);

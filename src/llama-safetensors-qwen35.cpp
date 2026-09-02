@@ -8,9 +8,11 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <regex>
 #include <stdexcept>
 #include <string_view>
+#include <thread>
 
 namespace {
 
@@ -26,6 +28,12 @@ enum class transform_kind {
     CONV_ROWS,
     V_COLUMNS,
 };
+
+bool is_plain_layout_transform(transform_kind transform) {
+    return transform == transform_kind::QKV_ROWS || transform == transform_kind::V_ROWS ||
+           transform == transform_kind::HEAD_ROWS || transform == transform_kind::CONV_ROWS ||
+           transform == transform_kind::V_COLUMNS;
+}
 
 struct source_spec {
     std::string name;
@@ -352,7 +360,8 @@ source_spec map_target_unchecked(
             }
             source_spec result = bind_source_name(quant, std::move(source), std::move(transforms));
             if (suffix == "ssm_out.scale" && result.quant &&
-                result.quant->materialization == llama_safetensors_quant_materialization::FP8_BLOCK_SCALE) {
+                (result.quant->materialization == llama_safetensors_quant_materialization::FP8_BLOCK_SCALE ||
+                 result.quant->materialization == llama_safetensors_quant_materialization::BNB_SCALE_BUNDLE)) {
                 result.transforms.push_back(transform_kind::V_COLUMNS);
             }
             return result;
@@ -383,24 +392,12 @@ source_spec map_target_unchecked(
     throw unsupported_target(target_name);
 }
 
-bool is_row_transform(transform_kind transform) {
-    return transform == transform_kind::QKV_ROWS || transform == transform_kind::V_ROWS ||
-           transform == transform_kind::HEAD_ROWS || transform == transform_kind::CONV_ROWS;
-}
-
 void validate_transform_plan(const source_spec & spec, const std::string & target_name) {
     if (!spec.quant) {
         return;
     }
 
     const auto materialization = spec.quant->materialization;
-    const bool packed_affine_rows =
-        materialization == llama_safetensors_quant_materialization::AWQ_REPACK ||
-        materialization == llama_safetensors_quant_materialization::GPTQ_REPACK;
-    // NVFP4 is repacked before layout transforms. Its 64-value storage blocks
-    // can therefore be permuted directly when the Qwen value-head mapping is
-    // block aligned (validated by apply_quantized_layout_transform()).
-    const bool packed_columns = packed_affine_rows;
     const bool gptq_act_order = spec.quant->target_type == GGML_TYPE_GPTQ_AO ||
         materialization == llama_safetensors_quant_materialization::GPTQ_SCALE_BUNDLE;
     for (transform_kind transform : spec.transforms) {
@@ -408,12 +405,6 @@ void validate_transform_plan(const source_spec & spec, const std::string & targe
             throw std::runtime_error(
                 "native safetensors cannot apply a Qwen3.5 recurrent layout transform to GPTQ act-order tensor '" +
                 spec.name + "' for '" + target_name + "'");
-        }
-        if ((is_row_transform(transform) && packed_affine_rows) ||
-            (transform == transform_kind::V_COLUMNS && packed_columns)) {
-            throw std::runtime_error(
-                "native safetensors cannot apply the Qwen3.5 recurrent layout transform after repacking '" +
-                target_name + "'");
         }
     }
 }
@@ -603,18 +594,112 @@ std::vector<size_t> v_head_row_permutation(const qwen_geometry & geometry, size_
     return result;
 }
 
+template <typename Fn>
+void parallel_transform_ranges(size_t count, size_t bytes, const Fn & fn) {
+    constexpr size_t min_parallel_bytes = 8 * 1024 * 1024;
+    constexpr size_t max_threads        = 8;
+    const size_t available = std::max<size_t>(1, std::thread::hardware_concurrency());
+    const size_t n_threads = bytes >= min_parallel_bytes ? std::min({ max_threads, available, count }) : 1;
+    if (n_threads <= 1) {
+        fn(0, count);
+        return;
+    }
+
+    std::vector<std::thread> workers;
+    workers.reserve(n_threads - 1);
+    try {
+        for (size_t thread = 1; thread < n_threads; ++thread) {
+            const size_t begin = count * thread / n_threads;
+            const size_t end   = count * (thread + 1) / n_threads;
+            workers.emplace_back(fn, begin, end);
+        }
+    } catch (...) {
+        for (std::thread & worker : workers) {
+            worker.join();
+        }
+        throw;
+    }
+    fn(0, count / n_threads);
+    for (std::thread & worker : workers) {
+        worker.join();
+    }
+}
+
+void permute_rows_into(uint8_t * result,
+                       const uint8_t * source,
+                       size_t          source_size,
+                       size_t          row_size,
+                       size_t          prefix_rows,
+                       const std::vector<size_t> & permutation) {
+    const size_t permuted_end = (prefix_rows + permutation.size()) * row_size;
+    if (source_size < permuted_end) {
+        throw std::runtime_error("row permutation exceeds source tensor");
+    }
+    const size_t rows = source_size / row_size;
+    if (rows * row_size != source_size) {
+        throw std::runtime_error("row permutation has a partial source row");
+    }
+    parallel_transform_ranges(rows, source_size, [&](size_t begin, size_t end) {
+        for (size_t dst = begin; dst < end; ++dst) {
+            const size_t src = dst >= prefix_rows && dst < prefix_rows + permutation.size() ?
+                prefix_rows + permutation[dst - prefix_rows] : dst;
+            std::memcpy(result + dst * row_size, source + src * row_size, row_size);
+        }
+    });
+}
+
+std::vector<uint8_t> permute_rows(const uint8_t * source,
+                                  size_t          source_size,
+                                  size_t          row_size,
+                                  size_t          prefix_rows,
+                                  const std::vector<size_t> & permutation) {
+    std::vector<uint8_t> result(source, source + source_size);
+    permute_rows_into(result.data(), source, source_size, row_size, prefix_rows, permutation);
+    return result;
+}
+
 std::vector<uint8_t> permute_rows(const std::vector<uint8_t> & source,
                                   size_t                       row_size,
                                   size_t                       prefix_rows,
                                   const std::vector<size_t> &  permutation) {
-    if (source.size() < (prefix_rows + permutation.size()) * row_size) {
-        throw std::runtime_error("row permutation exceeds source tensor");
+    return permute_rows(source.data(), source.size(), row_size, prefix_rows, permutation);
+}
+
+void permute_columns_into(uint8_t * result,
+                          const uint8_t * source,
+                          size_t          source_size,
+                          size_t          rows,
+                          size_t          cols,
+                          size_t          element_size,
+                          const std::vector<size_t> & permutation) {
+    if (permutation.size() != cols || source_size != rows * cols * element_size) {
+        throw std::runtime_error("column permutation shape mismatch");
     }
-    std::vector<uint8_t> result(source);
-    for (size_t dst = 0; dst < permutation.size(); ++dst) {
-        std::memcpy(result.data() + (prefix_rows + dst) * row_size,
-                    source.data() + (prefix_rows + permutation[dst]) * row_size, row_size);
-    }
+    parallel_transform_ranges(rows, source_size, [&](size_t begin, size_t end) {
+        for (size_t row = begin; row < end; ++row) {
+            size_t dst = 0;
+            while (dst < cols) {
+                const size_t src = permutation[dst];
+                size_t run = 1;
+                while (dst + run < cols && permutation[dst + run] == src + run) {
+                    ++run;
+                }
+                std::memcpy(result + (row * cols + dst) * element_size,
+                            source + (row * cols + src) * element_size, run * element_size);
+                dst += run;
+            }
+        }
+    });
+}
+
+std::vector<uint8_t> permute_columns(const uint8_t * source,
+                                     size_t          source_size,
+                                     size_t          rows,
+                                     size_t          cols,
+                                     size_t          element_size,
+                                     const std::vector<size_t> & permutation) {
+    std::vector<uint8_t> result(source, source + source_size);
+    permute_columns_into(result.data(), source, source_size, rows, cols, element_size, permutation);
     return result;
 }
 
@@ -623,17 +708,7 @@ std::vector<uint8_t> permute_columns(const std::vector<uint8_t> & source,
                                      size_t                       cols,
                                      size_t                       element_size,
                                      const std::vector<size_t> &  permutation) {
-    if (permutation.size() != cols || source.size() != rows * cols * element_size) {
-        throw std::runtime_error("column permutation shape mismatch");
-    }
-    std::vector<uint8_t> result(source.size());
-    for (size_t row = 0; row < rows; ++row) {
-        for (size_t dst = 0; dst < cols; ++dst) {
-            std::memcpy(result.data() + (row * cols + dst) * element_size,
-                        source.data() + (row * cols + permutation[dst]) * element_size, element_size);
-        }
-    }
-    return result;
+    return permute_columns(source.data(), source.size(), rows, cols, element_size, permutation);
 }
 
 std::vector<uint8_t> apply_quantized_layout_transform(
@@ -703,6 +778,75 @@ std::vector<uint8_t> apply_quantized_layout_transform(
             throw std::runtime_error("unsupported transform for a packed quantized Qwen projection");
     }
     throw std::runtime_error("unknown quantized Qwen layout transform");
+}
+
+std::vector<uint8_t> configure_bnb_scale_layout(
+        transform_kind transform,
+        const qwen_geometry & geometry,
+        const std::vector<int64_t> & weight_shape,
+        std::vector<uint8_t> bundle) {
+    if (bundle.size() < sizeof(ggml_bnb_scale_header) || weight_shape.size() != 2 ||
+            weight_shape[0] <= 0 || weight_shape[1] <= 0) {
+        throw std::runtime_error("invalid BitsAndBytes scale layout transform");
+    }
+    ggml_bnb_scale_header header;
+    std::memcpy(&header, bundle.data(), sizeof(header));
+    if (header.magic != GGML_BNB_SCALE_MAGIC || header.version != 1 ||
+            header.block_size == 0 || weight_shape[0] % header.block_size != 0 ||
+            uint64_t(weight_shape[0]) * uint64_t(weight_shape[1]) / header.block_size != header.n_blocks) {
+        throw std::runtime_error("invalid BitsAndBytes scale bundle for Qwen layout transform");
+    }
+
+    header.layout = GGML_BNB_SCALE_LAYOUT_NONE;
+    header.layout_rows = static_cast<uint32_t>(weight_shape[1]);
+    header.layout_cols = static_cast<uint32_t>(weight_shape[0]);
+    header.layout_prefix = 0;
+    header.layout_n_key_heads = geometry.n_key_heads;
+    header.layout_values_per_key = geometry.values_per_key();
+    header.layout_head_span = 0;
+
+    const uint64_t n_value_heads = uint64_t(header.layout_n_key_heads) * header.layout_values_per_key;
+    switch (transform) {
+        case transform_kind::QKV_ROWS:
+            header.layout_prefix = 2 * geometry.n_key_heads * geometry.key_head_dim;
+            header.layout_head_span = geometry.value_head_dim;
+            header.layout = GGML_BNB_SCALE_LAYOUT_ROWS;
+            break;
+        case transform_kind::V_ROWS:
+            header.layout_head_span = geometry.value_head_dim;
+            header.layout = GGML_BNB_SCALE_LAYOUT_ROWS;
+            break;
+        case transform_kind::HEAD_ROWS:
+            header.layout_head_span = 1;
+            header.layout = GGML_BNB_SCALE_LAYOUT_ROWS;
+            break;
+        case transform_kind::CONV_ROWS:
+            header.layout_prefix = 2 * geometry.n_key_heads * geometry.key_head_dim;
+            header.layout_head_span = geometry.value_head_dim;
+            header.layout = GGML_BNB_SCALE_LAYOUT_ROWS;
+            break;
+        case transform_kind::V_COLUMNS:
+            if (geometry.value_head_dim % header.block_size != 0) {
+                throw std::runtime_error("BitsAndBytes value head is not scale-block aligned");
+            }
+            header.layout_head_span = geometry.value_head_dim / header.block_size;
+            header.layout = GGML_BNB_SCALE_LAYOUT_COLUMNS;
+            break;
+        case transform_kind::NONE:
+            break;
+        case transform_kind::OFFSET_NORM:
+        case transform_kind::A_LOG:
+            throw std::runtime_error("unsupported BitsAndBytes scale layout transform");
+    }
+
+    if ((header.layout == GGML_BNB_SCALE_LAYOUT_ROWS &&
+         uint64_t(header.layout_prefix) + n_value_heads * header.layout_head_span != header.layout_rows) ||
+        (header.layout == GGML_BNB_SCALE_LAYOUT_COLUMNS &&
+         n_value_heads * header.layout_head_span != header.layout_cols / header.block_size)) {
+        throw std::runtime_error("BitsAndBytes scale layout does not match Qwen head geometry");
+    }
+    std::memcpy(bundle.data(), &header, sizeof(header));
+    return bundle;
 }
 
 // The GGUF converter casts BF16 A_log to F32 before torch.exp(). The
@@ -824,14 +968,17 @@ std::vector<uint8_t> negate_exp_f16_to_f32(const std::vector<uint8_t> & source) 
     return result;
 }
 
-std::vector<uint8_t> apply_layout_transform(
+void apply_layout_transform_into(
+        uint8_t * result,
         transform_kind transform,
         const qwen_geometry & geometry,
         const llama_safetensors_tensor & tensor,
         bool block_scale,
-        std::vector<uint8_t> source) {
+        const uint8_t * source,
+        size_t source_size) {
     if (tensor.shape.empty()) {
-        return source;
+        std::memcpy(result, source, source_size);
+        return;
     }
 
     size_t key_head_dim   = geometry.key_head_dim;
@@ -850,19 +997,22 @@ std::vector<uint8_t> apply_layout_transform(
         const size_t qk_rows = 2 * geometry.n_key_heads * key_head_dim;
         const auto permutation = v_head_row_permutation(geometry, value_head_dim);
         const size_t     rows        = tensor.shape[0];
-        const size_t     row_size    = source.size() / rows;
-        return permute_rows(source, row_size, qk_rows, permutation);
+        const size_t     row_size    = source_size / rows;
+        permute_rows_into(result, source, source_size, row_size, qk_rows, permutation);
+        return;
         }
         case transform_kind::V_ROWS: {
         const auto permutation = v_head_row_permutation(geometry, value_head_dim);
-        return permute_rows(source, source.size() / tensor.shape[0], 0, permutation);
+        permute_rows_into(result, source, source_size, source_size / tensor.shape[0], 0, permutation);
+        return;
         }
         case transform_kind::HEAD_ROWS: {
         if (block_scale) {
             throw std::runtime_error("Qwen per-head vector cannot use a block-FP8 scale transform");
         }
         const auto permutation = v_head_row_permutation(geometry, 1);
-        return permute_rows(source, source.size() / tensor.shape[0], 0, permutation);
+        permute_rows_into(result, source, source_size, source_size / tensor.shape[0], 0, permutation);
+        return;
         }
         case transform_kind::CONV_ROWS: {
         if (block_scale) {
@@ -870,22 +1020,45 @@ std::vector<uint8_t> apply_layout_transform(
         }
         const size_t qk_rows = 2 * geometry.n_key_heads * geometry.key_head_dim;
         const auto permutation = v_head_row_permutation(geometry, geometry.value_head_dim);
-        return permute_rows(source, source.size() / tensor.shape[0], qk_rows, permutation);
+        permute_rows_into(result, source, source_size, source_size / tensor.shape[0], qk_rows, permutation);
+        return;
         }
         case transform_kind::V_COLUMNS: {
         if (tensor.shape.size() != 2) {
             throw std::runtime_error("unexpected linear-attention output projection rank");
         }
-        return permute_columns(
-            source, tensor.shape[0], tensor.shape[1], llama_safetensors_dtype_size(tensor.dtype),
+        permute_columns_into(
+            result, source, source_size, tensor.shape[0], tensor.shape[1], llama_safetensors_dtype_size(tensor.dtype),
             v_head_row_permutation(geometry, value_head_dim));
+        return;
         }
         case transform_kind::NONE:
         case transform_kind::OFFSET_NORM:
         case transform_kind::A_LOG:
-            break;
+            std::memcpy(result, source, source_size);
+            return;
     }
-    return source;
+}
+
+std::vector<uint8_t> apply_layout_transform(
+        transform_kind transform,
+        const qwen_geometry & geometry,
+        const llama_safetensors_tensor & tensor,
+        bool block_scale,
+        const uint8_t * source,
+        size_t source_size) {
+    std::vector<uint8_t> result(source, source + source_size);
+    apply_layout_transform_into(result.data(), transform, geometry, tensor, block_scale, source, source_size);
+    return result;
+}
+
+std::vector<uint8_t> apply_layout_transform(
+        transform_kind transform,
+        const qwen_geometry & geometry,
+        const llama_safetensors_tensor & tensor,
+        bool block_scale,
+        std::vector<uint8_t> source) {
+    return apply_layout_transform(transform, geometry, tensor, block_scale, source.data(), source.size());
 }
 
 std::vector<uint8_t> bf16_add_one_to_f32(const std::vector<uint8_t> & source) {
@@ -982,7 +1155,7 @@ llama_safetensors_qwen35_importer::llama_safetensors_qwen35_importer(
     const auto generation_path = model_dir_ / "generation_config.json";
     generation_    = std::filesystem::is_regular_file(generation_path) ?
         llama_safetensors_read_json(generation_path) : llama_safetensors_json::object();
-    tokenizer_     = llama_safetensors_read_json(model_dir_ / "tokenizer.json");
+    tokenizer_     = llama_safetensors_read_tokenizer_json(model_dir_ / "tokenizer.json");
     chat_template_ = llama_safetensors_read_optional_text(model_dir_ / "chat_template.jinja");
     registry_      = llama_safetensors_registry::load(model_dir_, io_mode);
     if (n_mtp_ != 0) {
@@ -1156,11 +1329,30 @@ bool llama_safetensors_qwen35_importer::load(
         full_attention_interval_, text_only_, moe_, executorch_flat_,
     };
     const source_spec spec = map_target(*quant_, geometry, target_name);
-    if (!spec.transforms.empty() || spec.row_count != 0 || !spec.hqq_scale.empty()) {
+    if (spec.transforms.empty() && spec.row_count == 0 && spec.hqq_scale.empty()) {
+        return llama_safetensors_load_tensor_direct(
+            registry_, { spec.name, spec.quant }, destination, check_tensor);
+    }
+    if (spec.quant || !spec.hqq_scale.empty() || spec.row_count != 0 ||
+        spec.transforms.size() != 1 || !is_plain_layout_transform(spec.transforms[0])) {
         return false;
     }
-    return llama_safetensors_load_tensor_direct(
-        registry_, { spec.name, spec.quant }, destination, check_tensor);
+    const llama_safetensors_tensor & source = require_tensor(registry_, spec.name);
+    const uint8_t * mapped = registry_.data(source);
+    const size_t destination_size = ggml_nbytes(destination);
+    if (mapped == nullptr || source.size != destination_size ||
+        target_type_for(registry_, spec, target_name) != destination->type) {
+        return false;
+    }
+
+    std::unique_ptr<uint8_t[]> transformed(new uint8_t[destination_size]);
+    apply_layout_transform_into(
+        transformed.get(), spec.transforms[0], geometry, source, false, mapped, destination_size);
+    if (check_tensor && !ggml_validate_row_data(destination->type, transformed.get(), destination_size)) {
+        throw std::runtime_error("tensor '" + target_name + "' has invalid data");
+    }
+    ggml_backend_tensor_set(destination, transformed.get(), 0, destination_size);
+    return true;
 }
 
 void llama_safetensors_qwen35_importer::validate_complete() const {
@@ -1195,12 +1387,18 @@ std::vector<uint8_t> llama_safetensors_qwen35_importer::materialize(const std::s
             spec.quant->materialization == llama_safetensors_quant_materialization::FP8_BLOCK_SCALE;
         const bool nvfp4_quant_blocks = spec.quant &&
             spec.quant->materialization == llama_safetensors_quant_materialization::NVFP4_REPACK;
+        const bool bnb_quant_blocks = spec.quant &&
+            (spec.quant->target_type == GGML_TYPE_BNB_NF4 || spec.quant->target_type == GGML_TYPE_BNB_FP4);
+        const bool bnb_scale_bundle = spec.quant &&
+            spec.quant->materialization == llama_safetensors_quant_materialization::BNB_SCALE_BUNDLE;
         const bool canonical_quant_blocks = spec.quant &&
-            (spec.quant->materialization == llama_safetensors_quant_materialization::PACKED_INT4_REPACK ||
+            (spec.quant->materialization == llama_safetensors_quant_materialization::AWQ_REPACK ||
+             spec.quant->materialization == llama_safetensors_quant_materialization::GPTQ_REPACK ||
+             spec.quant->materialization == llama_safetensors_quant_materialization::PACKED_INT4_REPACK ||
              spec.quant->materialization == llama_safetensors_quant_materialization::PACKED_INT8_REPACK ||
              spec.quant->materialization == llama_safetensors_quant_materialization::QUARK_W4A16_REPACK ||
              spec.quant->materialization == llama_safetensors_quant_materialization::TORCHAO_INT4_REPACK ||
-             nvfp4_quant_blocks);
+             nvfp4_quant_blocks || bnb_quant_blocks);
         std::vector<int64_t> quant_shape;
         if (spec.quant) {
             quant_shape = spec.quant->target_shape;
@@ -1235,11 +1433,26 @@ std::vector<uint8_t> llama_safetensors_qwen35_importer::materialize(const std::s
                 }
                 value_converted = true;
             } else {
-                result = canonical_quant_blocks ?
+                if (bnb_scale_bundle) {
+                    const std::string suffix = ".weight.absmax";
+                    if (!ends_with(spec.quant->primary, suffix)) {
+                        throw std::runtime_error("invalid BitsAndBytes scale source name");
+                    }
+                    const std::string module = spec.quant->primary.substr(
+                        0, spec.quant->primary.size() - suffix.size());
+                    const auto weight_binding = quant_->bind(module, llama_safetensors_quant_role::WEIGHT);
+                    if (!weight_binding) {
+                        throw std::runtime_error("missing BitsAndBytes weight binding for scale transform");
+                    }
+                    result = configure_bnb_scale_layout(
+                        transform, geometry, weight_binding->target_shape, std::move(result));
+                } else {
+                    result = canonical_quant_blocks ?
                     apply_quantized_layout_transform(
                         transform, geometry, target_type, quant_shape, std::move(result)) :
                     apply_layout_transform(
                         transform, geometry, source_desc, block_scale, std::move(result));
+                }
             }
         }
         if (spec.quant) {

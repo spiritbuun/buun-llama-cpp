@@ -15,8 +15,10 @@
 // Preserve declaration order for producer configuration such as
 // compressed-tensors target groups.
 using llama_safetensors_json = nlohmann::ordered_json;
+using llama_safetensors_tokenizer_json = nlohmann::json;
 
 llama_safetensors_json     llama_safetensors_read_json(const std::filesystem::path & path);
+llama_safetensors_tokenizer_json llama_safetensors_read_tokenizer_json(const std::filesystem::path & path);
 std::string                llama_safetensors_read_text(const std::filesystem::path & path);
 std::optional<std::string> llama_safetensors_read_optional_text(const std::filesystem::path & path);
 
@@ -77,7 +79,7 @@ struct llama_safetensors_bpe_policy {
 };
 
 void llama_safetensors_emit_bpe_tokenizer(llama_safetensors_metadata_sink &    sink,
-                                          const llama_safetensors_json &       tokenizer,
+                                          const llama_safetensors_tokenizer_json & tokenizer,
                                           const llama_safetensors_bpe_policy & policy,
                                           const std::optional<std::string> &   chat_template);
 

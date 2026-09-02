@@ -1760,6 +1760,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                                weight->ne[0] % 32 == 0 &&
                                scale->ne[0] == weight->ne[0] / 32 && scale->ne[1] == weight->ne[1] &&
                                scale->ne[2] == 1 && scale->ne[3] == 1;
+            if (block) {
+                weight->flags |= GGML_TENSOR_FLAG_BLOCK_FP8;
+            }
             if (!tensor && !channel && !block && !mxfp8 && !group && !w8a16) {
                 throw std::runtime_error(format(
                     "channel-scaled weight '%s' requires a compatible scale with %" PRId64 " values",

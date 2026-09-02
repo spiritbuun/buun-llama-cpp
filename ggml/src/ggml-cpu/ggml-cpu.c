@@ -1518,6 +1518,45 @@ static void ggml_compute_forward_mul_mat_f8_quantized_input(
     }
 }
 
+static void ggml_compute_forward_mul_mat_f8_channel(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    const struct ggml_tensor * weight = dst->src[0];
+    const struct ggml_tensor * input  = dst->src[1];
+    const struct ggml_tensor * scale  = dst->src[2];
+    GGML_ASSERT(weight->type == GGML_TYPE_F8_E4M3 && input->type == GGML_TYPE_F32 &&
+        scale != NULL && scale->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_F32 &&
+        scale->ne[0] == weight->ne[1] && scale->ne[1] == 1 &&
+        scale->ne[2] == 1 && scale->ne[3] == 1);
+
+    const int64_t k = weight->ne[0];
+    const int64_t n = weight->ne[1];
+    const int64_t m = input->ne[1];
+    const int64_t r2 = input->ne[2] / weight->ne[2];
+    const int64_t r3 = input->ne[3] / weight->ne[3];
+    const int64_t total = n * m * input->ne[2] * input->ne[3];
+    for (int64_t index = params->ith; index < total; index += params->nth) {
+        int64_t rem = index;
+        const int64_t row = rem % n; rem /= n;
+        const int64_t token = rem % m; rem /= m;
+        const int64_t i2 = rem % input->ne[2];
+        const int64_t i3 = rem / input->ne[2];
+        const int64_t w2 = i2 / r2;
+        const int64_t w3 = i3 / r3;
+        const uint8_t * w = (const uint8_t *) weight->data +
+            row * weight->nb[1] + w2 * weight->nb[2] + w3 * weight->nb[3];
+        const float * x = (const float *) ((const char *) input->data +
+            token * input->nb[1] + i2 * input->nb[2] + i3 * input->nb[3]);
+        float sum = 0.0f;
+        for (int64_t col = 0; col < k; ++col) {
+            sum += ggml_e4m3_to_fp32(w[col]) * x[col];
+        }
+        float * out = (float *) ((char *) dst->data +
+            row * dst->nb[0] + token * dst->nb[1] + i2 * dst->nb[2] + i3 * dst->nb[3]);
+        *out = sum * ggml_cpu_quant_scale_value(scale, row);
+    }
+}
+
 static void ggml_compute_forward_mul_mat_f8_block_scale(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1649,7 +1688,46 @@ static void ggml_compute_forward_mul_mat_grouped_fp8_quantized_input(
     }
 }
 
+static uint32_t ggml_bnb_source_scale_block(
+        const struct ggml_bnb_scale_header * header, uint32_t block) {
+    if (header->layout == GGML_BNB_SCALE_LAYOUT_NONE) {
+        return block;
+    }
+
+    GGML_ASSERT((header->layout == GGML_BNB_SCALE_LAYOUT_ROWS ||
+                 header->layout == GGML_BNB_SCALE_LAYOUT_COLUMNS) &&
+                header->layout_rows > 0 && header->layout_cols > 0 &&
+                header->layout_cols % header->block_size == 0 &&
+                header->layout_n_key_heads > 0 && header->layout_values_per_key > 0 &&
+                header->layout_head_span > 0);
+    const uint32_t row_blocks = header->layout_cols / header->block_size;
+    const uint32_t row = block / row_blocks;
+    const uint32_t col_block = block % row_blocks;
+    if (header->layout == GGML_BNB_SCALE_LAYOUT_ROWS) {
+        if (row < header->layout_prefix) {
+            return block;
+        }
+        const uint32_t relative = row - header->layout_prefix;
+        const uint32_t dst_head = relative / header->layout_head_span;
+        const uint32_t lane = relative % header->layout_head_span;
+        const uint32_t v = dst_head / header->layout_n_key_heads;
+        const uint32_t k = dst_head % header->layout_n_key_heads;
+        const uint32_t src_head = k * header->layout_values_per_key + v;
+        return (header->layout_prefix + src_head * header->layout_head_span + lane) * row_blocks + col_block;
+    }
+
+    GGML_ASSERT(header->layout == GGML_BNB_SCALE_LAYOUT_COLUMNS);
+    const uint32_t dst_head = col_block / header->layout_head_span;
+    const uint32_t lane = col_block % header->layout_head_span;
+    const uint32_t v = dst_head / header->layout_n_key_heads;
+    const uint32_t k = dst_head % header->layout_n_key_heads;
+    const uint32_t src_head = k * header->layout_values_per_key + v;
+    return row * row_blocks + src_head * header->layout_head_span + lane;
+}
+
 static float ggml_bnb_block_scale(const struct ggml_bnb_scale_header * header, uint32_t block) {
+    block = ggml_bnb_source_scale_block(header, block);
+    GGML_ASSERT(block < header->n_blocks);
     const uint8_t * bundle = (const uint8_t *) header;
     if (header->nested_block_size == 0) {
         float value;
@@ -1938,6 +2016,11 @@ void ggml_compute_forward_mul_mat(
     }
     if (src0->type == GGML_TYPE_F8_E4M3 && dst->src[3] != NULL) {
         ggml_compute_forward_mul_mat_f8_quantized_input(params, dst);
+        return;
+    }
+    if (src0->type == GGML_TYPE_F8_E4M3 && dst->src[2] != NULL &&
+            dst->src[2]->type == GGML_TYPE_BF16) {
+        ggml_compute_forward_mul_mat_f8_channel(params, dst);
         return;
     }
     if (src0->type == GGML_TYPE_Q4_A32 && dst->src[3] != NULL) {

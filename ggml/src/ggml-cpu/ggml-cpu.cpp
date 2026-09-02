@@ -540,7 +540,9 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             if (op->src[2] != nullptr) {
                 const ggml_tensor * scale = op->src[2];
                 const ggml_tensor * input_scale = op->src[3];
-                return src0->type == GGML_TYPE_I8 && src1->type == GGML_TYPE_F32 &&
+                const bool channel_weight = src0->type == GGML_TYPE_I8 ||
+                    (src0->type == GGML_TYPE_F8_E4M3 && scale->type == GGML_TYPE_BF16);
+                return channel_weight && src1->type == GGML_TYPE_F32 &&
                     op->type == GGML_TYPE_F32 && ggml_is_contiguous(src0) &&
                     ggml_is_contiguous(src1) && ggml_is_contiguous(scale) &&
                     (scale->type == GGML_TYPE_F32 || scale->type == GGML_TYPE_F16 ||

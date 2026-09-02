@@ -105,6 +105,19 @@ llama_safetensors_json llama_safetensors_read_json(const std::filesystem::path &
     }
 }
 
+llama_safetensors_tokenizer_json llama_safetensors_read_tokenizer_json(
+        const std::filesystem::path & path) {
+    std::ifstream input(path);
+    if (!input) {
+        throw std::runtime_error("failed to open tokenizer JSON file '" + path.string() + "'");
+    }
+    try {
+        return llama_safetensors_tokenizer_json::parse(input);
+    } catch (const llama_safetensors_tokenizer_json::exception & error) {
+        throw std::runtime_error("invalid tokenizer JSON in '" + path.string() + "': " + error.what());
+    }
+}
+
 std::string llama_safetensors_read_text(const std::filesystem::path & path) {
     std::ifstream input(path, std::ios::binary);
     if (!input) {
@@ -234,7 +247,7 @@ uint32_t llama_safetensors_first_token_id(const llama_safetensors_json & value, 
 }
 
 void llama_safetensors_emit_bpe_tokenizer(llama_safetensors_metadata_sink &    sink,
-                                          const llama_safetensors_json &       tokenizer,
+                                          const llama_safetensors_tokenizer_json & tokenizer,
                                           const llama_safetensors_bpe_policy & policy,
                                           const std::optional<std::string> &   chat_template) {
     if (!tokenizer.is_object() || !tokenizer.contains("model") || !tokenizer.at("model").is_object()) {
@@ -262,7 +275,7 @@ void llama_safetensors_emit_bpe_tokenizer(llama_safetensors_metadata_sink &    s
         token_types[id] = 1;  // GGML normal token
     }
 
-    const llama_safetensors_json empty_added = llama_safetensors_json::array();
+    const llama_safetensors_tokenizer_json empty_added = llama_safetensors_tokenizer_json::array();
     const auto & added_tokens = tokenizer.contains("added_tokens") ? tokenizer.at("added_tokens") : empty_added;
     if (!added_tokens.is_array()) {
         throw std::runtime_error("tokenizer added_tokens must be an array");
