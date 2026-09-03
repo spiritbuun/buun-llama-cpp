@@ -3618,6 +3618,7 @@ struct test_hc_combine_fusion : public test_case {
         extra_consumer,
         inplace_add,
         aliased_block_inject,
+        produced_inputs,
     };
 
     int64_t n_embd;
@@ -3636,15 +3637,21 @@ struct test_hc_combine_fusion : public test_case {
     bool run_whole_graph() override { return true; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, nt);
+        ggml_tensor * residual_src = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, nt);
         ggml_tensor * shared = v == variant::aliased_block_inject
             ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd*nt) : nullptr;
-        ggml_tensor * block = v == variant::aliased_block_inject
+        ggml_tensor * block_src = v == variant::aliased_block_inject
             ? ggml_view_2d(ctx, shared, n_embd, nt, n_embd*sizeof(float), 0)
             : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, nt);
-        ggml_tensor * inject = v == variant::aliased_block_inject
+        ggml_tensor * inject_src = v == variant::aliased_block_inject
             ? ggml_view_2d(ctx, shared, hc, nt, hc*sizeof(float), 0)
             : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, nt);
+        ggml_tensor * residual = v == variant::produced_inputs
+            ? ggml_scale(ctx, residual_src, 1.0f) : residual_src;
+        ggml_tensor * block = v == variant::produced_inputs
+            ? ggml_scale(ctx, block_src, 1.0f) : block_src;
+        ggml_tensor * inject = v == variant::produced_inputs
+            ? ggml_scale(ctx, inject_src, 1.0f) : inject_src;
         ggml_tensor * scale_in = ggml_scale(ctx, inject,
             v == variant::wrong_input_scale ? 0.5f : 1.0f/(float) hc);
         ggml_tensor * sigmoid = v == variant::wrong_unary
@@ -9699,6 +9706,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_mmvq_post_silu_fusion::variant::small_k));
     test_cases.emplace_back(new test_hc_combine_fusion(31, 1, 1));
     test_cases.emplace_back(new test_hc_combine_fusion(257, 4, 17));
+    test_cases.emplace_back(new test_hc_combine_fusion(
+        2560, 4, 2, test_hc_combine_fusion::variant::produced_inputs));
     test_cases.emplace_back(new test_hc_combine_fusion(256, 8, 3));
     test_cases.emplace_back(new test_hc_combine_fusion(127, 4, 5, test_hc_combine_fusion::variant::swapped_add));
     test_cases.emplace_back(new test_hc_combine_fusion(127, 4, 5, test_hc_combine_fusion::variant::wrong_input_scale));
