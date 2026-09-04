@@ -1456,3 +1456,8 @@ This architecture project is complete when:
   gates without changing their canonical expert ownership;
 - correctness, KLD, placement, load-memory, PP, and TG gates pass; and
 - adding a third already-supported architecture demonstrably requires only metadata/name/layout policy unless it introduces a genuinely new operation or quantization format.
+
+Status 2026-09-04: the importer now serves a fused Q|K|V projection for attention layers
+(`LLAMA_SAFETENSORS_FUSE_QKV=0` disables): AWQ 60→62 t/s, W8A16 44.6→46.2 t/s, fidelity unchanged.
+A recurrent qkv|z fusion gave no gain and was dropped. Remaining decode gap to vLLM is the
+per-layer launch count in the recurrent block and the output head.
