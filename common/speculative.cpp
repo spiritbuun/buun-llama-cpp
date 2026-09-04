@@ -2802,19 +2802,35 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
 
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+
         // pending_h is an activation, not part of either serialized sequence
-        // image. A restored/rewound nonzero frontier therefore cannot safely
-        // catch the draft model up: the predecessor target-hidden row is
-        // unavailable. Stay target-only without touching the restored draft
-        // sequence. A true cold frontier has a defined zero predecessor and can
-        // start/re-arm normal MTP processing.
+        // image. A restored/rewound nonzero frontier therefore cannot replay
+        // this target batch into the draft model: the predecessor target-hidden
+        // row is unavailable. Use this verified target batch as a recovery
+        // boundary instead. Drop the stale draft sequence, retain the newest
+        // target-hidden row, and re-arm MTP for the next process/draft cycle.
+        // The draft context then refills incrementally while every proposal
+        // remains target-verified.
         if (!is_mem_shared) {
             const auto preflight = common_speculative_mtp_process_preflight_resolve(
                 pending_h_lifecycle, i_batch_beg, batch_in.pos);
             if (preflight == common_speculative_mtp_process_preflight::target_only) {
+                auto * mem_dft = llama_get_memory(ctx_dft);
                 for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                     if (i_batch_beg[seq_id] >= 0) {
-                        pending_h_lifecycle[seq_id].target_process_skipped();
+                        if (!mem_dft || !llama_memory_seq_rm(
+                                mem_dft, seq_id, -1, -1)) {
+                            return false;
+                        }
+                        const float * h_tgt = llama_get_embeddings_nextn_ith(
+                            ctx_tgt, i_batch_end[seq_id]);
+                        if (!h_tgt) {
+                            return false;
+                        }
+                        std::memcpy(
+                            pending_h[seq_id].data(), h_tgt, row_bytes);
+                        pending_h_lifecycle[seq_id].target_process_refreshed();
                         verify_h_rows[seq_id] = 0;
                     }
                 }
@@ -2831,8 +2847,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     batch_in.pos[i_batch_beg[seq_id]], -1);
             }
         }
-
-        const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {

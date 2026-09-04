@@ -1,5 +1,6 @@
 #include "common.h"
 #include "log.h"
+#include "speculative.h"
 #include "ggml-backend.h"
 #include "ggml-vbr.h"
 #include "ggml.h"
@@ -3296,6 +3297,81 @@ static void test_qwen4_mtp_sidecar_contract(const size_t seed) {
     GGML_ASSERT(shared_gf != nullptr);
     GGML_ASSERT(ggml_graph_get_tensor(shared_gf, "mtp_h_input") != nullptr);
     GGML_ASSERT(ggml_graph_get_tensor(shared_gf, "result_output") != nullptr);
+
+    // A target-only VBR restore cannot recover the predecessor hidden row for
+    // its first suffix batch. That batch must become a bounded recovery
+    // boundary: discard stale draft KV, seed the next carry from the verified
+    // target output, then resume filling the draft cache on the following
+    // batch instead of remaining target-only forever.
+    {
+        llama_context_params recovery_target_params = target_ctx_params;
+        recovery_target_params.n_ctx = 8;
+        recovery_target_params.n_batch = 8;
+        recovery_target_params.n_ubatch = 8;
+        recovery_target_params.n_seq_max = 1;
+        recovery_target_params.n_outputs_max = 8;
+        llama_context_ptr recovery_target(llama_init_from_model(
+                target_model.get(), recovery_target_params));
+        GGML_ASSERT(recovery_target != nullptr);
+
+        llama_context_params recovery_draft_params = ctx_params;
+        recovery_draft_params.n_seq_max = 1;
+        recovery_draft_params.n_outputs_max = 1;
+        recovery_draft_params.ctx_other = recovery_target.get();
+        llama_context_ptr recovery_draft(llama_init_from_model(
+                shared_model.get(), recovery_draft_params));
+        GGML_ASSERT(recovery_draft != nullptr);
+
+        common_params_speculative recovery_params;
+        recovery_params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+        recovery_params.draft.ctx_tgt = recovery_target.get();
+        recovery_params.draft.ctx_dft = recovery_draft.get();
+        recovery_params.draft.backend_sampling = false;
+        common_speculative_ptr recovery_spec(
+            common_speculative_init(recovery_params, 1));
+        GGML_ASSERT(recovery_spec != nullptr);
+
+        auto decode_target = [&](llama_token token, llama_pos pos) {
+            llama_batch target_batch = llama_batch_init(1, 0, 1);
+            common_batch_add(target_batch, token, pos, { 0 }, true);
+            GGML_ASSERT(llama_decode(recovery_target.get(), target_batch) == 0);
+            llama_synchronize(recovery_target.get());
+            GGML_ASSERT(common_speculative_process(
+                recovery_spec.get(), target_batch));
+            llama_batch_free(target_batch);
+        };
+
+        decode_target(5, 0);
+        decode_target(6, 1);
+        GGML_ASSERT(llama_memory_seq_pos_max(
+            llama_get_memory(recovery_draft.get()), 0) == 1);
+
+        common_speculative_sequence_transition(
+            recovery_spec.get(), 0,
+            common_speculative_sequence_event::target_restored_without_draft);
+        std::vector<uint8_t> recovered_carry;
+        GGML_ASSERT(!common_speculative_get_state(
+            recovery_spec.get(), 0, recovered_carry));
+
+        decode_target(7, 2);
+        GGML_ASSERT(llama_memory_seq_pos_max(
+            llama_get_memory(recovery_draft.get()), 0) < 0);
+        GGML_ASSERT(common_speculative_get_state(
+            recovery_spec.get(), 0, recovered_carry));
+        const float * verified_h = llama_get_embeddings_nextn_ith(
+            recovery_target.get(), 0);
+        constexpr size_t carry_header_size = 3*sizeof(uint32_t);
+        GGML_ASSERT(verified_h != nullptr);
+        GGML_ASSERT(recovered_carry.size() == carry_header_size +
+            target_h.size()*sizeof(float));
+        GGML_ASSERT(std::memcmp(
+            recovered_carry.data() + carry_header_size, verified_h,
+            target_h.size()*sizeof(float)) == 0);
+
+        decode_target(8, 3);
+        GGML_ASSERT(llama_memory_seq_pos_max(
+            llama_get_memory(recovery_draft.get()), 0) == 3);
+    }
 
     llama_context_ptr ctx(llama_init_from_model(model.get(), ctx_params));
     if (!ctx) {
