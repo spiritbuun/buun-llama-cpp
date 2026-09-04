@@ -218,13 +218,18 @@ bool ggml_cuda_mul_mat_marlin_q4_a32(
             return true;
         }
     } else {
+        // An unfused projection writes F32 straight into the graph tensor.
         ggml_cuda_marlin_q4_a32_launch(
-            input, entry.weight, entry.scale, entry.zero, output, lock_storage.ptr,
+            input, entry.weight, entry.scale, entry.zero,
+            direct_f32 ? dst->data : static_cast<void *>(output), direct_f32, lock_storage.ptr,
             n, k, m, max_shared, sms, stream);
         if (gate != nullptr) {
             ggml_cuda_marlin_q4_a32_launch(
                 input, gate_entry.weight, gate_entry.scale, gate_entry.zero,
-                gate_output.get(), lock_storage.ptr, n, k, m, max_shared, sms, stream);
+                gate_output.get(), false, lock_storage.ptr, n, k, m, max_shared, sms, stream);
+        }
+        if (direct_f32) {
+            return true;
         }
     }
 
@@ -320,7 +325,7 @@ bool ggml_cuda_mul_mat_marlin_q8_g128(
     }
     if (pair_launch) {
         ggml_cuda_marlin_q8_g128_launch(
-            input, src0->data, scales_of(src0), gate->data, scales_of(gate), output, lock_storage.ptr,
+            input, src0->data, scales_of(src0), gate->data, scales_of(gate), output, false, lock_storage.ptr,
             n, k, m, max_shared, sms, stream);
         ggml_cuda_humming_fp8_swiglu_paired(output, dst->data, m, n, retain_bf16, stream);
         return true;
@@ -337,14 +342,17 @@ bool ggml_cuda_mul_mat_marlin_q8_g128(
         ggml_cuda_marlin_gemm_bf16(ctx, ggml_cuda_marlin_q8_g128_dequant_bf16, gate->data, input,
             gate_output, CUDA_R_16BF, n, k, m, stream);
     } else {
+        // An unfused projection writes F32 straight into the graph tensor.
         ggml_cuda_marlin_q8_g128_launch(
-            input, src0->data, scales_of(src0), nullptr, nullptr, output, lock_storage.ptr,
+            input, src0->data, scales_of(src0), nullptr, nullptr,
+            gate == nullptr ? dst->data : static_cast<void *>(output), gate == nullptr, lock_storage.ptr,
             n, k, m, max_shared, sms, stream);
-        if (gate != nullptr) {
-            ggml_cuda_marlin_q8_g128_launch(
-                input, gate->data, scales_of(gate), nullptr, nullptr, gate_output, lock_storage.ptr,
-                n, k, m, max_shared, sms, stream);
+        if (gate == nullptr) {
+            return true;
         }
+        ggml_cuda_marlin_q8_g128_launch(
+            input, gate->data, scales_of(gate), nullptr, nullptr, gate_output, false, lock_storage.ptr,
+            n, k, m, max_shared, sms, stream);
     }
     if (retain_bf16) {
         ggml_cuda_humming_fp8_swiglu_bf16(

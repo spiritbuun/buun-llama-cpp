@@ -157,20 +157,21 @@ __global__ void assemble_q4_a32_canonical(
 
 using marlin_fn = void (*)(MARLIN_KERNEL_PARAMS);
 
-template<int M_BLOCKS, bool M_BLOCK_8, int N_BLOCKS, int K_BLOCKS, int THREADS>
+template<int M_BLOCKS, bool M_BLOCK_8, int N_BLOCKS, int K_BLOCKS, int THREADS, bool C_F32>
 constexpr marlin_fn marlin_kernel() {
     return marlin::Marlin<
         vllm::kBFloat16.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(),
-        THREADS, M_BLOCKS, N_BLOCKS, K_BLOCKS, M_BLOCK_8, 4, 2, false>;
+        THREADS, M_BLOCKS, N_BLOCKS, K_BLOCKS, M_BLOCK_8, 4, 2, false, C_F32>;
 }
 
+template<bool C_F32>
 marlin_fn select_marlin_kernel(int m_blocks, bool m_block_8) {
     if (m_blocks == 1) {
-        return m_block_8 ? marlin_kernel<1, true, 8, 8, 256>() : marlin_kernel<1, false, 8, 8, 256>();
+        return m_block_8 ? marlin_kernel<1, true, 8, 8, 256, C_F32>() : marlin_kernel<1, false, 8, 8, 256, C_F32>();
     }
-    if (m_blocks == 2) return marlin_kernel<2, false, 16, 4, 256>();
-    if (m_blocks == 3) return marlin_kernel<3, false, 16, 4, 256>();
-    if (m_blocks == 4) return marlin_kernel<4, false, 16, 4, 256>();
+    if (m_blocks == 2) return marlin_kernel<2, false, 16, 4, 256, C_F32>();
+    if (m_blocks == 3) return marlin_kernel<3, false, 16, 4, 256, C_F32>();
+    if (m_blocks == 4) return marlin_kernel<4, false, 16, 4, 256, C_F32>();
     GGML_ABORT("invalid Marlin M block count");
 }
 
@@ -286,7 +287,8 @@ void ggml_cuda_marlin_q4_a32_launch(
         const void * weight,
         const void * scale,
         const void * zero,
-        nv_bfloat16 * output,
+        void * output,
+        bool out_f32,
         int32_t * locks,
         int64_t n,
         int64_t k,
@@ -294,18 +296,20 @@ void ggml_cuda_marlin_q4_a32_launch(
         int max_shared,
         int sms,
         cudaStream_t stream) {
+    const size_t out_elem = out_f32 ? sizeof(float) : sizeof(nv_bfloat16);
     int64_t remaining = m;
     int64_t offset = 0;
     while (remaining > 0) {
         const int64_t split = ggml_cuda_marlin::next_m_split(remaining);
         const int m_blocks = ggml_cuda_marlin::m_blocks_for(split);
         const bool m_block_8 = split <= 8;
-        marlin_fn kernel = select_marlin_kernel(m_blocks, m_block_8);
+        marlin_fn kernel = out_f32 ? select_marlin_kernel<true>(m_blocks, m_block_8) :
+                                     select_marlin_kernel<false>(m_blocks, m_block_8);
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared));
         kernel<<<sms, 256, max_shared, stream>>>(
             reinterpret_cast<const int4 *>(input + offset * k),
             static_cast<const int4 *>(weight),
-            reinterpret_cast<int4 *>(output + offset * n),
+            reinterpret_cast<int4 *>(static_cast<char *>(output) + offset * n * out_elem),
             nullptr, nullptr, nullptr,
             static_cast<const int4 *>(scale), nullptr,
             static_cast<const int4 *>(zero), nullptr,

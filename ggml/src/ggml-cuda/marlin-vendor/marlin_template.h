@@ -238,7 +238,8 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
                              // fetch pipeline
           const int group_blocks,  // number of consecutive 16x16 blocks
                                    // with a separate quantization scale
-          const bool is_zp_float   // is zero point of float16 type?
+          const bool is_zp_float,  // is zero point of float16 type?
+          const bool c_f32         // buun: C holds F32 (BF16-rounded) instead of scalar_t
           >
 __global__ void Marlin(
     const int4* __restrict__ A0,  // fp16 input matrix of shape mxk
@@ -485,7 +486,7 @@ __global__ void Marlin(
 
     if (slice_col == n_tiles) {
       A += 16 * thread_m_blocks * lda / (is_a_8bit ? 16 : 8);
-      C += 16 * thread_m_blocks * prob_n / 8;
+      C += 16 * thread_m_blocks * prob_n / 8 * (c_f32 ? 2 : 1);  // buun: F32 rows are twice as wide
       slice_col = 0;
       par_id++;
     }
@@ -504,7 +505,7 @@ __global__ void Marlin(
       slice_col = slice_col_par % n_tiles;
       slice_iters = k_tiles;
       A = A0 + 16 * thread_m_blocks / (is_a_8bit ? 16 : 8) * par_id * lda;
-      C = C0 + 16 * thread_m_blocks / 8 * par_id * prob_n;
+      C = C0 + 16 * thread_m_blocks / 8 * par_id * prob_n * (c_f32 ? 2 : 1);
       if (is_a_8bit) {
         __syncthreads();
         int a_s_gl_rd = par_id * 16 * thread_m_blocks + threadIdx.x;
@@ -522,7 +523,7 @@ __global__ void Marlin(
       slice_col = (slice_col_par + global_mn_tiles - part2_mn_tiles) % n_tiles;
       par_id = (slice_col_par + global_mn_tiles - part2_mn_tiles) / n_tiles;
       A = A0 + 16 * thread_m_blocks / (is_a_8bit ? 16 : 8) * par_id * lda;
-      C = C0 + 16 * thread_m_blocks / 8 * par_id * prob_n;
+      C = C0 + 16 * thread_m_blocks / 8 * par_id * prob_n * (c_f32 ? 2 : 1);
     }
     if (!in_part2) {
       init_part1_slice();
@@ -1549,9 +1550,16 @@ __global__ void Marlin(
                                           8 * (i / 2) + row < prob_m) ||
                     (m_block_size_8) && ((threadIdx.x % 4) * 2 + i < prob_m);
         if (mask) {
+          // buun: with c_f32 the partial sums live in C as 8 floats per int4 slot
+          const int c_idx = m_block_size_8 ?
+              c_gl_wr + i * c_gl_stride + (threadIdx.x % 8) / 4 * c_gl_wr_delta_i :
+              c_gl_wr + c_gl_wr_delta_o * (i / 2) + c_gl_wr_delta_i * (i % 2);
           if (!first) {
             c_scalar_t* c_red_f16;
-            if constexpr (is_a_8bit) {
+            float* c_red_f32 = nullptr;
+            if constexpr (c_f32) {
+              c_red_f32 = reinterpret_cast<float*>(C) + 8 * c_idx;
+            } else if constexpr (is_a_8bit) {
               int2 tmp =
                   reinterpret_cast<int2*>(sh_red)[c_sh_wr + i * c_sh_wr_delta];
               c_red_f16 = reinterpret_cast<c_scalar_t*>(&tmp);
@@ -1567,33 +1575,37 @@ __global__ void Marlin(
               }
               reinterpret_cast<float*>(
                   &frag_c)[(is_a_8bit ? 2 : 4) * 2 * 4 * (i / 4) + 4 * j +
-                           (i % 4) + delta] += Cdtype::num2float(c_red_f16[j]);
+                           (i % 4) + delta] +=
+                  c_f32 ? c_red_f32[j] : Cdtype::num2float(c_red_f16[j]);
             }
           }
           if (!last) {
             c_scalar_t c_f16[is_a_8bit ? 4 : 8];
+            float* c_out_f32 = c_f32 ? reinterpret_cast<float*>(C) + 8 * c_idx : nullptr;
   #pragma unroll
             for (int j = 0; j < 2 * (is_a_8bit ? 2 : 4); j++) {
               int delta = 0;
               if constexpr (m_block_size_8) {
                 delta = j % 2 == 1 ? -2 : 0;
               }
-              c_f16[j] = Cdtype::float2num(reinterpret_cast<float*>(
+              const float v = reinterpret_cast<float*>(
                   &frag_c)[(is_a_8bit ? 2 : 4) * 2 * 4 * (i / 4) + 4 * j +
-                           (i % 4) + delta]);
+                           (i % 4) + delta];
+              if constexpr (c_f32) {
+                c_out_f32[j] = v;
+              } else {
+                c_f16[j] = Cdtype::float2num(v);
+              }
             }
-            if constexpr (m_block_size_8) {
-              C[c_gl_wr + i * c_gl_stride +
-                (threadIdx.x % 8) / 4 * c_gl_wr_delta_i] =
-                  *reinterpret_cast<int4*>(c_f16);
+            if constexpr (c_f32) {
+              // written above
+            } else if constexpr (m_block_size_8) {
+              C[c_idx] = *reinterpret_cast<int4*>(c_f16);
             } else if constexpr (is_a_8bit) {
               int2* c_int2 = reinterpret_cast<int2*>(C);
-              c_int2[c_gl_wr + c_gl_wr_delta_o * (i / 2) +
-                     c_gl_wr_delta_i * (i % 2)] =
-                  *reinterpret_cast<int2*>(c_f16);
+              c_int2[c_idx] = *reinterpret_cast<int2*>(c_f16);
             } else {
-              C[c_gl_wr + c_gl_wr_delta_o * (i / 2) +
-                c_gl_wr_delta_i * (i % 2)] = *reinterpret_cast<int4*>(c_f16);
+              C[c_idx] = *reinterpret_cast<int4*>(c_f16);
             }
           }
         }
@@ -1759,6 +1771,15 @@ __global__ void Marlin(
           for (int a = 0; a < 4; a++) {
             atomicAdd(&C_half2[a], sh_red_half2[a]);
           }
+        } else if constexpr (c_f32) {
+          // buun: expand the staged BF16 row segment to 8 floats
+          const int4 v = sh_red[c_sh_rd];
+          const c_scalar_t* h = reinterpret_cast<const c_scalar_t*>(&v);
+          float4* cp = reinterpret_cast<float4*>(reinterpret_cast<float*>(C) + 8 * c_gl_wr);
+          cp[0] = make_float4(Cdtype::num2float(h[0]), Cdtype::num2float(h[1]),
+                              Cdtype::num2float(h[2]), Cdtype::num2float(h[3]));
+          cp[1] = make_float4(Cdtype::num2float(h[4]), Cdtype::num2float(h[5]),
+                              Cdtype::num2float(h[6]), Cdtype::num2float(h[7]));
         } else {
           C[c_gl_wr] = sh_red[c_sh_rd];
         }

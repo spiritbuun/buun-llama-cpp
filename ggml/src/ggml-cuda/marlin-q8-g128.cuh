@@ -40,7 +40,8 @@ void ggml_cuda_marlin_q8_g128_launch(
     const void * scale,
     const void * weight_alt,
     const void * scale_alt,
-    nv_bfloat16 * output,
+    void * output,          // BF16, or F32 (BF16-rounded values) when out_f32
+    bool out_f32,
     int32_t * locks,
     int64_t n,
     int64_t k,

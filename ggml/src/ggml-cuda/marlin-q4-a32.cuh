@@ -49,7 +49,8 @@ void ggml_cuda_marlin_q4_a32_launch(
     const void * weight,
     const void * scale,
     const void * zero,
-    nv_bfloat16 * output,
+    void * output,          // BF16, or F32 (BF16-rounded values) when out_f32
+    bool out_f32,
     int32_t * locks,
     int64_t n,
     int64_t k,
