@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -42,6 +43,9 @@ struct source_spec {
     size_t row_offset = 0;
     size_t row_count  = 0;
     std::string hqq_scale;
+    // Canonical targets whose rows are concatenated when the primary source
+    // is absent (a fused Q|K|V projection assembled from separate ones).
+    std::vector<std::string> part_targets;
 
     source_spec() = default;
     source_spec(
@@ -124,6 +128,14 @@ source_spec quantized_or_plain(
         return { {}, std::move(transforms), std::nullopt };
     }
     return { plain_name, std::move(transforms), std::nullopt };
+}
+
+bool fuse_qkv_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("LLAMA_SAFETENSORS_FUSE_QKV");
+        return value == nullptr || std::atoi(value) != 0;
+    }();
+    return enabled;
 }
 
 source_spec sliced_quantized(
@@ -303,6 +315,21 @@ source_spec map_target_unchecked(
             transforms.push_back(transform_kind::OFFSET_NORM);
         }
         return bind_source_name(quant, std::move(*ordinary), std::move(transforms));
+    }
+
+    if (!is_recurrent_layer(layer, geometry) && suffix == "attn_qkv.weight") {
+        // Attention layers: a checkpoint with separate q/k/v projections still
+        // serves the fused tensor the graph prefers (one launch instead of three
+        // at decode) by row-concatenating the three canonical projections.
+        const std::string module = prefix + "self_attn.qkv_proj";
+        source_spec fused = quantized_or_plain(
+            quant, module, llama_safetensors_quant_role::WEIGHT, {}, module + ".weight");
+        if (fuse_qkv_enabled()) {
+            for (const char * part : { "attn_q.weight", "attn_k.weight", "attn_v.weight" }) {
+                fused.part_targets.push_back("blk." + std::to_string(layer) + "." + part);
+            }
+        }
+        return fused;
     }
 
     struct recurrent_name {
@@ -1288,7 +1315,28 @@ bool llama_safetensors_qwen35_importer::describe(
         return false;
     }
     if (registry_.find(spec.name) == nullptr) {
-        return false;
+        if (spec.part_targets.empty()) {
+            return false;
+        }
+        // Row-concatenate the parts: same type, same width, summed rows.
+        ne.fill(1);
+        type = GGML_TYPE_COUNT;
+        for (const std::string & part : spec.part_targets) {
+            ggml_type part_type;
+            std::array<int64_t, GGML_MAX_DIMS> part_ne;
+            if (!describe(part, part_type, part_ne) || part_ne[2] != 1 || part_ne[3] != 1) {
+                return false;
+            }
+            if (type == GGML_TYPE_COUNT) {
+                type  = part_type;
+                ne[0] = part_ne[0];
+                ne[1] = 0;
+            } else if (part_type != type || part_ne[0] != ne[0]) {
+                return false;
+            }
+            ne[1] += part_ne[1];
+        }
+        return true;
     }
     if (!spec.hqq_scale.empty() && registry_.find(spec.hqq_scale) == nullptr) {
         throw std::runtime_error("missing HQQ expert scale tensor '" + spec.hqq_scale + "'");
@@ -1317,6 +1365,12 @@ void llama_safetensors_qwen35_importer::bind(const std::string & target_name) co
         full_attention_interval_, text_only_, moe_, executorch_flat_,
     };
     const source_spec spec = map_target(*quant_, geometry, target_name);
+    if (registry_.find(spec.name) == nullptr && !spec.part_targets.empty()) {
+        for (const std::string & part : spec.part_targets) {
+            bind(part);
+        }
+        return;
+    }
     if (spec.quant) {
         quant_->consume(*spec.quant);
     }
@@ -1329,6 +1383,9 @@ bool llama_safetensors_qwen35_importer::load(
         full_attention_interval_, text_only_, moe_, executorch_flat_,
     };
     const source_spec spec = map_target(*quant_, geometry, target_name);
+    if (registry_.find(spec.name) == nullptr && !spec.part_targets.empty()) {
+        return false;
+    }
     if (spec.transforms.empty() && spec.row_count == 0 && spec.hqq_scale.empty()) {
         return llama_safetensors_load_tensor_direct(
             registry_, { spec.name, spec.quant }, destination, check_tensor);
@@ -1368,6 +1425,25 @@ std::vector<uint8_t> llama_safetensors_qwen35_importer::materialize(const std::s
             full_attention_interval_, text_only_, moe_, executorch_flat_,
         };
         const source_spec spec = map_target(*quant_, geometry, target_name);
+        if (registry_.find(spec.name) == nullptr && !spec.part_targets.empty()) {
+            std::vector<uint8_t> fused;
+            fused.reserve(target_size);
+            for (const std::string & part : spec.part_targets) {
+                ggml_type part_type;
+                std::array<int64_t, GGML_MAX_DIMS> part_ne;
+                if (!describe(part, part_type, part_ne) || part_type != target_type) {
+                    throw std::runtime_error("fused part '" + part + "' is not available");
+                }
+                const size_t part_size = ggml_row_size(part_type, part_ne[0]) * size_t(part_ne[1]);
+                const std::vector<uint8_t> bytes = materialize(part, part_type, part_size);
+                fused.insert(fused.end(), bytes.begin(), bytes.end());
+            }
+            if (fused.size() != target_size) {
+                throw std::runtime_error("fused tensor produced " + std::to_string(fused.size()) +
+                                         " bytes, expected " + std::to_string(target_size));
+            }
+            return fused;
+        }
         const llama_safetensors_tensor & source_desc = require_tensor(registry_, spec.name);
         std::vector<uint8_t> result = !spec.hqq_scale.empty() ?
             repack_hqq_experts_q4_0(registry_, spec) :
