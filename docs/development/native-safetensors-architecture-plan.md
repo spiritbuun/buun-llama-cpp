@@ -426,6 +426,21 @@ Matrix receipts recorded on the A100-SXM4-80GB on 2026-09-02:
   (the post-SiLU MMVQ fusion read the private layout at `m = 1` and produced
   NaN logits); `ggml_cuda_try_fuse` now admits a repacked Q8 weight only to
   that one matcher, and the MMVQ fusion predicate declines repacked weights.
+  Profiling the W4A16 prefill then showed that the Marlin kernel is 88% of a
+  prompt pass and runs at about half the tensor-core rate of the dense BF16
+  GEMM on the same model (BF16 prefills at 3377 / 3999 PP512 / PP2048 versus
+  2742 / 2951 for AWQ). Both Marlin executors therefore gained a large-batch
+  route: above `GGML_CUDA_MARLIN_GEMM_MIN_M` (default 1024) the weight is
+  dequantized straight from its private layout into a BF16 copy, one matrix at
+  a time, and multiplied with cuBLAS; unfused projections take the F32 result
+  directly, fused ones reuse the BF16 epilogues. With the route forced on the
+  A100 the AWQ checkpoint reaches 2475 / 3012 / 3526 at micro-batch 512 / 1024
+  / 2048 (Marlin: 2779 / 2901 / 2939; vLLM 3472 at 2048) and W8A16 reaches
+  2416 / 2986 / 3569 (Marlin: 2730 / 2790 / 2833; vLLM 3132), so the crossover
+  sits near 1024 rows. KLD is unchanged on the route (AWQ 0.009541 versus
+  0.009504, W8A16 0.000159 versus 0.000171). The dequant (about 860 GB/s) and
+  the activation conversions around each projection are the remaining prefill
+  overhead.
 - BitsAndBytes NF4 now loads the real Unsloth checkpoint and generates coherent
   greedy output. Qwen recurrent packed weights are permuted into canonical head
   order while a 28-byte scale-layout descriptor maps each destination block back

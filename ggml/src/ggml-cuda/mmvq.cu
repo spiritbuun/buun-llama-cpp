@@ -9,6 +9,7 @@
 #include "humming-fp8-block.cuh"
 #include "marlin-q4-a32.cuh"
 #include "marlin-q8-g128.cuh"
+#include "marlin-common.cuh"
 #endif
 
 #include <atomic>
@@ -100,6 +101,42 @@ bool ggml_cuda_marlin_q8_g128_accepts_mul_mat(
         ggml_cuda_marlin_q8_g128_supports_shape(src0->ne[1], src0->ne[0], src1->ne[1], cc);
 }
 
+using marlin_dequant_fn = void (*)(const void *, nv_bfloat16 *, int64_t, int64_t, int64_t, int64_t, cudaStream_t);
+
+// Large-batch route for a Marlin-repacked weight: dequantize row chunks of the
+// private layout to BF16 and multiply with cuBLAS. output is [m][n], BF16 for
+// a fused epilogue or F32 written straight into the graph tensor.
+static void ggml_cuda_marlin_gemm_bf16(
+        ggml_backend_cuda_context & ctx,
+        marlin_dequant_fn dequant,
+        const void * storage,
+        const nv_bfloat16 * input,
+        void * output,
+        cudaDataType_t output_type,
+        int64_t n,
+        int64_t k,
+        int64_t m,
+        cudaStream_t stream) {
+    // One chunk per matrix unless the BF16 copy would be very large: small
+    // chunks cost more in cuBLAS host overhead and split-K inefficiency than
+    // they save in cache residency (A100: 3116 chunks/pass added ~200 ms).
+    constexpr size_t chunk_bytes = size_t(256) << 20;
+    const int64_t rows_per_chunk = std::max<int64_t>(64,
+        std::min<int64_t>(n, int64_t(chunk_bytes / (size_t(k) * sizeof(nv_bfloat16))) / 64 * 64));
+    ggml_cuda_pool_alloc<nv_bfloat16> weight(ctx.pool(), size_t(rows_per_chunk) * k);
+    const float alpha = 1.0f;
+    const float beta  = 0.0f;
+    CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), stream));
+    for (int64_t row0 = 0; row0 < n; row0 += rows_per_chunk) {
+        const int64_t rows = std::min(rows_per_chunk, n - row0);
+        dequant(storage, weight.get(), n, k, row0, rows, stream);
+        void * out = static_cast<char *>(output) + row0 * (output_type == CUDA_R_32F ? sizeof(float) : sizeof(nv_bfloat16));
+        CUBLAS_CHECK(cublasGemmEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N, rows, m, k,
+            &alpha, weight.get(), CUDA_R_16BF, k, input, CUDA_R_16BF, k,
+            &beta, out, output_type, n, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    }
+}
+
 bool ggml_cuda_mul_mat_marlin_q4_a32(
         ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0,
@@ -167,13 +204,28 @@ bool ggml_cuda_mul_mat_marlin_q4_a32(
     if (gate != nullptr) {
         gate_output.alloc(size_t(m) * n);
     }
-    ggml_cuda_marlin_q4_a32_launch(
-        input, entry.weight, entry.scale, entry.zero, output, lock_storage.ptr,
-        n, k, m, max_shared, sms, stream);
-    if (gate != nullptr) {
+    // Unfused projections take the GEMM result as F32 directly; fused epilogues
+    // consume the BF16 scratch exactly as they do after a Marlin launch.
+    const bool direct_f32 = gate == nullptr && (fusion == nullptr || fusion->residual == nullptr);
+    if (m >= ggml_cuda_marlin::gemm_min_m()) {
+        ggml_cuda_marlin_gemm_bf16(ctx, ggml_cuda_marlin_q4_a32_dequant_bf16, src0->data, input,
+            direct_f32 ? dst->data : static_cast<void *>(output), direct_f32 ? CUDA_R_32F : CUDA_R_16BF, n, k, m, stream);
+        if (gate != nullptr) {
+            ggml_cuda_marlin_gemm_bf16(ctx, ggml_cuda_marlin_q4_a32_dequant_bf16, gate->data, input,
+                gate_output.get(), CUDA_R_16BF, n, k, m, stream);
+        }
+        if (direct_f32) {
+            return true;
+        }
+    } else {
         ggml_cuda_marlin_q4_a32_launch(
-            input, gate_entry.weight, gate_entry.scale, gate_entry.zero,
-            gate_output.get(), lock_storage.ptr, n, k, m, max_shared, sms, stream);
+            input, entry.weight, entry.scale, entry.zero, output, lock_storage.ptr,
+            n, k, m, max_shared, sms, stream);
+        if (gate != nullptr) {
+            ggml_cuda_marlin_q4_a32_launch(
+                input, gate_entry.weight, gate_entry.scale, gate_entry.zero,
+                gate_output.get(), lock_storage.ptr, n, k, m, max_shared, sms, stream);
+        }
     }
 
     if (fusion != nullptr && fusion->residual != nullptr &&
@@ -274,13 +326,25 @@ bool ggml_cuda_mul_mat_marlin_q8_g128(
         return true;
     }
     nv_bfloat16 * gate_output = gate != nullptr ? output + output_count : nullptr;
-    ggml_cuda_marlin_q8_g128_launch(
-        input, src0->data, scales_of(src0), nullptr, nullptr, output, lock_storage.ptr,
-        n, k, m, max_shared, sms, stream);
-    if (gate != nullptr) {
+    if (m >= ggml_cuda_marlin::gemm_min_m()) {
+        // An unfused projection takes the GEMM result as F32 directly.
+        ggml_cuda_marlin_gemm_bf16(ctx, ggml_cuda_marlin_q8_g128_dequant_bf16, src0->data, input,
+            gate == nullptr ? dst->data : static_cast<void *>(output), gate == nullptr ? CUDA_R_32F : CUDA_R_16BF,
+            n, k, m, stream);
+        if (gate == nullptr) {
+            return true;
+        }
+        ggml_cuda_marlin_gemm_bf16(ctx, ggml_cuda_marlin_q8_g128_dequant_bf16, gate->data, input,
+            gate_output, CUDA_R_16BF, n, k, m, stream);
+    } else {
         ggml_cuda_marlin_q8_g128_launch(
-            input, gate->data, scales_of(gate), nullptr, nullptr, gate_output, lock_storage.ptr,
+            input, src0->data, scales_of(src0), nullptr, nullptr, output, lock_storage.ptr,
             n, k, m, max_shared, sms, stream);
+        if (gate != nullptr) {
+            ggml_cuda_marlin_q8_g128_launch(
+                input, gate->data, scales_of(gate), nullptr, nullptr, gate_output, lock_storage.ptr,
+                n, k, m, max_shared, sms, stream);
+        }
     }
     if (retain_bf16) {
         ggml_cuda_humming_fp8_swiglu_bf16(

@@ -9,15 +9,10 @@
 
 namespace {
 
+using ggml_cuda_marlin::scale_source_row;
+
 __device__ __forceinline__ uint8_t q4_a32_value(const block_q4_a32 & block, uint32_t index) {
     return (block.qs[index / 2] >> (4 * (index % 2))) & 0x0f;
-}
-
-// Marlin consumes scales in the same 64-row lane order as its output tiles.
-__device__ __forceinline__ uint32_t scale_source_row(uint32_t dst_row) {
-    const uint32_t chunk = dst_row & ~63u;
-    const uint32_t lane = dst_row & 63u;
-    return chunk + (lane >> 3) + 8u * (lane & 7u);
 }
 
 __global__ void extract_q4_a32_marlin_inputs(
@@ -271,6 +266,19 @@ void ggml_cuda_marlin_q4_a32_prepare(
     repack<<<sms, marlin::repack_threads, max_shared, stream>>>(
         static_cast<const uint32_t *>(raw_weight), nullptr,
         static_cast<uint32_t *>(marlin_weight), k, n);
+}
+
+void ggml_cuda_marlin_q4_a32_dequant_bf16(
+        const void * storage,
+        nv_bfloat16 * dst,
+        int64_t n,
+        int64_t k,
+        int64_t row0,
+        int64_t rows,
+        cudaStream_t stream) {
+    const char * scale = static_cast<const char *>(storage) + size_t(n) * k / 2;
+    const char * zero  = scale + size_t(n) * k / QG4_A32 * sizeof(nv_bfloat16);
+    ggml_cuda_marlin::dequant_bf16<true>(storage, scale, zero, dst, n, k, row0, rows, stream);
 }
 
 void ggml_cuda_marlin_q4_a32_launch(

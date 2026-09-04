@@ -22,6 +22,16 @@ void ggml_cuda_marlin_q8_g128_unrepack(
     int64_t k,
     cudaStream_t stream);
 
+// BF16 rows [row0, row0 + rows) of the weight, read from the Marlin layout.
+void ggml_cuda_marlin_q8_g128_dequant_bf16(
+    const void * storage,
+    nv_bfloat16 * dst,
+    int64_t n,
+    int64_t k,
+    int64_t row0,
+    int64_t rows,
+    cudaStream_t stream);
+
 // weight_alt/scale_alt (optional) append a second projection so the launch
 // computes [weight | weight_alt] as one 2n-wide GEMM into output rows of 2n.
 void ggml_cuda_marlin_q8_g128_launch(

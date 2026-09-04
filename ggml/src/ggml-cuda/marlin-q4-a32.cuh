@@ -34,6 +34,16 @@ void ggml_cuda_marlin_q4_a32_prepare(
     int sms,
     cudaStream_t stream);
 
+// BF16 rows [row0, row0 + rows) of the weight, read from the Marlin layout.
+void ggml_cuda_marlin_q4_a32_dequant_bf16(
+    const void * storage,
+    nv_bfloat16 * dst,
+    int64_t n,
+    int64_t k,
+    int64_t row0,
+    int64_t rows,
+    cudaStream_t stream);
+
 void ggml_cuda_marlin_q4_a32_launch(
     const nv_bfloat16 * input,
     const void * weight,

@@ -9,11 +9,7 @@
 
 namespace {
 
-__device__ __forceinline__ uint32_t scale_source_row(uint32_t dst_row) {
-    const uint32_t chunk = dst_row & ~63u;
-    const uint32_t lane = dst_row & 63u;
-    return chunk + (lane >> 3) + 8u * (lane & 7u);
-}
+using ggml_cuda_marlin::scale_source_row;
 
 __global__ void extract_q8_g128_marlin_inputs(
         const block_q8_0_g128 * canonical,
@@ -206,6 +202,18 @@ void ggml_cuda_marlin_q8_g128_unrepack(
         static_cast<block_q8_0_g128 *>(canonical), n, k);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaFree(raw_weight));
+}
+
+void ggml_cuda_marlin_q8_g128_dequant_bf16(
+        const void * storage,
+        nv_bfloat16 * dst,
+        int64_t n,
+        int64_t k,
+        int64_t row0,
+        int64_t rows,
+        cudaStream_t stream) {
+    const char * scale = static_cast<const char *>(storage) + size_t(n) * k;
+    ggml_cuda_marlin::dequant_bf16<false>(storage, scale, nullptr, dst, n, k, row0, rows, stream);
 }
 
 void ggml_cuda_marlin_q8_g128_launch(
