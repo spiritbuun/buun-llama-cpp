@@ -2746,7 +2746,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
     }
-    if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
+    // Experiment: GGML_CUDA_MMQ_MAX_BATCH caps the batch size served by MMQ;
+    // larger batches dequantize and run cuBLAS instead. Unset = MMQ as usual.
+    static const int64_t mmq_max_batch = [] {
+        const char * env = std::getenv("GGML_CUDA_MMQ_MAX_BATCH");
+        return env != nullptr ? std::atoll(env) : int64_t(-1);
+    }();
+    if ((mmq_max_batch < 0 || ne11 <= mmq_max_batch) &&
+            ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
     }
