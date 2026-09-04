@@ -52,12 +52,14 @@ void ggml_cuda_humming_fp8_swiglu_bf16(
         int64_t n,
         cudaStream_t stream);
 
-// SwiGLU over one [rows][2n] buffer holding up | gate per row (paired Marlin launch).
-void ggml_cuda_humming_fp8_swiglu_f32_paired(
+// SwiGLU over one [rows][2n] buffer holding up | gate per row (paired Marlin
+// launch); writes F32, or BF16 when the result is retained for a BF16 consumer.
+void ggml_cuda_humming_fp8_swiglu_paired(
         const nv_bfloat16 * src,
-        float * dst,
+        void * dst,
         int64_t rows,
         int64_t n,
+        bool bf16_out,
         cudaStream_t stream);
 
 void ggml_cuda_humming_fp8_residual_add(

@@ -26,6 +26,7 @@
 
 #include <atomic>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -251,9 +252,10 @@ __global__ void output_bf16_swiglu_bf16(
 }
 
 // SwiGLU over one [rows][2n] buffer holding up | gate per row.
+template<typename dst_t>
 __global__ void output_bf16_swiglu_paired(
         const nv_bfloat16 * src,
-        float * dst,
+        dst_t * dst,
         uint32_t rows,
         uint32_t n) {
     const uint64_t index = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -261,7 +263,12 @@ __global__ void output_bf16_swiglu_paired(
         return;
     }
     const uint64_t base = uint64_t(index / n) * 2 * n + index % n;
-    dst[index] = __bfloat162float(src[base]) * ggml_cuda_op_silu_single(__bfloat162float(src[base + n]));
+    const float value = __bfloat162float(src[base]) * ggml_cuda_op_silu_single(__bfloat162float(src[base + n]));
+    if constexpr (std::is_same<dst_t, nv_bfloat16>::value) {
+        dst[index] = __float2bfloat16(value);
+    } else {
+        dst[index] = value;
+    }
 }
 
 __global__ void output_bf16_residual_add(
@@ -576,14 +583,20 @@ void ggml_cuda_humming_fp8_swiglu_bf16(
     output_bf16_swiglu_bf16<<<((n + 1) / 2 + 255) / 256, 256, 0, stream>>>(src, gate, dst, n);
 }
 
-void ggml_cuda_humming_fp8_swiglu_f32_paired(
+void ggml_cuda_humming_fp8_swiglu_paired(
         const nv_bfloat16 * src,
-        float * dst,
+        void * dst,
         int64_t rows,
         int64_t n,
+        bool bf16_out,
         cudaStream_t stream) {
     const uint64_t count = uint64_t(rows) * n;
-    output_bf16_swiglu_paired<<<(count + 255) / 256, 256, 0, stream>>>(src, dst, rows, n);
+    const dim3 grid((count + 255) / 256);
+    if (bf16_out) {
+        output_bf16_swiglu_paired<<<grid, 256, 0, stream>>>(src, static_cast<nv_bfloat16 *>(dst), rows, n);
+    } else {
+        output_bf16_swiglu_paired<<<grid, 256, 0, stream>>>(src, static_cast<float *>(dst), rows, n);
+    }
 }
 
 void ggml_cuda_humming_fp8_residual_add(

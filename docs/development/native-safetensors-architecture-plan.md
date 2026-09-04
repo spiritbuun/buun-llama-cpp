@@ -416,7 +416,16 @@ Matrix receipts recorded on the A100-SXM4-80GB on 2026-09-02:
   BF16-activation Marlin path is also the more faithful one. Final-binary
   throughput on that box was 2706 / 2819 / 43.53 (PP512 / PP2048 / TG128) with
   the fusion, 2629 / 2737 / 42.25 without it, and 1456 / 1564 / 39.47 with
-  Marlin disabled.
+  Marlin disabled. A follow-up let the Q8 gate/up fusion retain its SwiGLU
+  result as BF16 for the Q8 down projection (the retention predicate now admits
+  any Marlin consumer at any served width, not only the 17,408-wide FFN), which
+  removes one activation conversion per layer: 2756 / 2873 / 43.75 versus
+  2675 / 2814 / 43.45 with retention disabled, KLD unchanged at 0.000171.
+  Routing the Q8 fusion through the shared gate/up/GLU matcher also exposed
+  that a repacked weight must stay out of every other small-batch matcher
+  (the post-SiLU MMVQ fusion read the private layout at `m = 1` and produced
+  NaN logits); `ggml_cuda_try_fuse` now admits a repacked Q8 weight only to
+  that one matcher, and the MMVQ fusion predicate declines repacked weights.
 - BitsAndBytes NF4 now loads the real Unsloth checkpoint and generates coherent
   greedy output. Qwen recurrent packed weights are permuted into canonical head
   order while a 28-byte scale-layout descriptor maps each destination block back

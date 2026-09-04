@@ -2402,6 +2402,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     bool use_mul_mat_vec_q = (ggml_is_quantized(src0->type) || src0->type == GGML_TYPE_F8_E4M3) &&
                              ggml_cuda_f8_mmvq_layout_supported(src0) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
+                             !ggml_cuda_marlin_owner_is_repacked(src0) &&
                              dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE &&
                              ggml_cuda_should_use_mmvq(src0->type, cc, src1->ne[1]);
 
@@ -4979,7 +4980,7 @@ static bool ggml_cuda_all_consumers_use_cached_bf16(
 static bool ggml_cuda_can_retain_glu_bf16(
         const ggml_cgraph * cgraph, const ggml_tensor * activation, int cc) {
     if ((activation->flags & GGML_TENSOR_FLAG_OUTPUT) || activation->type != GGML_TYPE_F32 ||
-            !ggml_is_contiguous(activation) || activation->ne[0] != 17408) {
+            !ggml_is_contiguous(activation)) {
         return false;
     }
 
@@ -5005,21 +5006,28 @@ static bool ggml_cuda_can_retain_glu_bf16(
             consumer->src[0]->ne[0] != activation->ne[0]) {
         return false;
     }
-    if (consumer->src[0]->type == GGML_TYPE_BF16) {
-        return consumer->src[2] == nullptr;
+    const ggml_tensor * weight = consumer->src[0];
+    // The BF16 GEMM and INT8 consumers are proven only at the Qwen3.8 FFN width.
+    if (weight->type == GGML_TYPE_BF16) {
+        return activation->ne[0] == 17408 && consumer->src[2] == nullptr;
     }
-    if (consumer->src[0]->type == GGML_TYPE_I8) {
-        return cc >= GGML_CUDA_CC_AMPERE && consumer->src[0]->ne[0] % 8 == 0 &&
-            ggml_cuda_int8_channel_supports(
-            consumer->src[0], activation, consumer->src[2], consumer, cc);
+    if (weight->type == GGML_TYPE_I8) {
+        return activation->ne[0] == 17408 && cc >= GGML_CUDA_CC_AMPERE && weight->ne[0] % 8 == 0 &&
+            ggml_cuda_int8_channel_supports(weight, activation, consumer->src[2], consumer, cc);
     }
-    if (consumer->src[2] != nullptr || consumer->src[0]->type != GGML_TYPE_Q4_A32 ||
-            !ggml_cuda_marlin_q4_a32_enabled() ||
-            !ggml_cuda_marlin_q4_a32_is_repacked(consumer->src[0])) {
-        return false;
+    // A Marlin consumer reads BF16 input for every contract it serves; the
+    // same predicate gates its dispatch, so the retained activation cannot
+    // reach a canonical executor.
+    if (weight->type == GGML_TYPE_Q4_A32) {
+        return ggml_cuda_marlin_q4_a32_is_repacked(weight) &&
+            ggml_cuda_marlin_q4_a32_accepts_mul_mat(weight, activation, consumer->src[2], consumer, cc);
     }
-    return ggml_cuda_marlin_q4_a32_supports_shape(
-            consumer->src[0]->ne[1], consumer->src[0]->ne[0], activation->ne[1], cc);
+    if (weight->type == GGML_TYPE_Q8_0_G128) {
+        static const bool disable = std::getenv("GGML_CUDA_DISABLE_MARLIN_Q8_RETAIN") != nullptr;
+        return !disable && ggml_cuda_marlin_q8_g128_is_repacked(weight) &&
+            ggml_cuda_marlin_q8_g128_accepts_mul_mat(weight, activation, consumer->src[2], consumer, cc);
+    }
+    return false;
 }
 
 static const ggml_tensor * ggml_cuda_find_bf16_projection_input(
@@ -5163,6 +5171,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+    // A Marlin-repacked Q8-G128 weight is served only by its executor: unfused
+    // through ggml_cuda_mul_mat, or fused by the gate/up/GLU matcher further
+    // down. No other matcher here may read the private layout as Q8.
+    if (node->op == GGML_OP_MUL_MAT && node->src[0] != nullptr &&
+            ggml_cuda_marlin_q8_g128_is_repacked(node->src[0]) &&
+            !(i + 2 < cgraph->n_nodes &&
+              ggml_cuda_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU }, {}))) {
+        return 0;
+    }
 
     // Input-quantized projections carry their activation contract in src[3].
     // The ordinary MUL_MAT executor implements it; legacy graph fusions do
@@ -5183,37 +5200,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
 #if !defined(GGML_USE_HIP)
-    // A repacked Q8-G128 tensor is a backend-private Marlin representation.
-    // Only fusions that explicitly consume that representation may see it;
-    // every canonical Q8 matcher must decline.
-    if (node->op == GGML_OP_MUL_MAT && node->src[0] != nullptr &&
-            ggml_cuda_marlin_q8_g128_is_repacked(node->src[0])) {
-        static const bool disable_q8_marlin_glu =
-            std::getenv("GGML_CUDA_DISABLE_MARLIN_Q8_GLU") != nullptr;
-        if (!disable_q8_marlin_glu && i + 2 < cgraph->n_nodes &&
-                ggml_cuda_can_fuse(cgraph, i,
-                    { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU }, {})) {
-            ggml_tensor * glu  = cgraph->nodes[i + 2];
-            ggml_tensor * lhs  = cgraph->nodes[i];
-            ggml_tensor * rhs  = cgraph->nodes[i + 1];
-            ggml_tensor * gate = glu->src[0];
-            ggml_tensor * up   = glu->src[1];
-            const bool ordered = (gate == lhs && up == rhs) || (gate == rhs && up == lhs);
-            if (ordered && up->src[1] == gate->src[1] &&
-                    ggml_cuda_marlin_q8_g128_is_repacked(up->src[0]) &&
-                    ggml_cuda_marlin_q8_g128_is_repacked(gate->src[0])) {
-                ggml_cuda_mm_fusion_args_host fusion{};
-                fusion.gate   = gate->src[0];
-                fusion.glu_op = ggml_get_glu_op(glu);
-                if (ggml_cuda_mul_mat_marlin_q8_g128(
-                        *cuda_ctx, up->src[0], up->src[1], up->src[2], glu, &fusion)) {
-                    return 2;
-                }
-            }
-        }
-        return 0;
-    }
-
     if (node->op == GGML_OP_MUL_MAT && node->src[1] != nullptr &&
             node->src[1]->ne[1] > MMVQ_MAX_BATCH_SIZE) {
         ggml_cuda_prepare_q8_activation_reuse(cuda_ctx, cgraph, i);
@@ -6140,8 +6126,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             marlin_fusion.gate   = gate->src[0];
             marlin_fusion.glu_op = ggml_get_glu_op(glu);
             marlin_fusion.retain_bf16_output = retain_bf16_output;
-            if (ggml_cuda_mul_mat_marlin_q4_a32(
-                    *cuda_ctx, src0, src1, ids, glu, &marlin_fusion)) {
+            if (ggml_cuda_mul_mat_marlin_q4_a32(*cuda_ctx, src0, src1, ids, glu, &marlin_fusion) ||
+                    ggml_cuda_mul_mat_marlin_q8_g128(*cuda_ctx, src0, src1, ids, glu, &marlin_fusion)) {
                 fused_mul_mat_vec = true;
                 fused_node_count  = 3;
                 break;

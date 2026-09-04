@@ -180,7 +180,7 @@ bool ggml_cuda_mul_mat_marlin_q4_a32(
             ggml_cuda_humming_finish_residual_rms(ctx, fusion, output, dst, n, m, stream)) {
         // The fused epilogue materializes the required F32 graph outputs and
         // preserves a BF16 normalized activation for following projections.
-    } else if (gate != nullptr && fusion != nullptr && fusion->retain_bf16_output && n == 17408) {
+    } else if (gate != nullptr && fusion != nullptr && fusion->retain_bf16_output) {
         ggml_cuda_humming_fp8_swiglu_bf16(
             output, gate_output.get(), static_cast<nv_bfloat16 *>(dst->data), size_t(m) * n, stream);
         ctx.humming_bf16_activations.insert(dst);
@@ -204,9 +204,16 @@ bool ggml_cuda_mul_mat_marlin_q8_g128(
         return false;
     }
 
-    // The only fusion the private-layout matcher requests is gate/up + SwiGLU.
+    // The fusions requested for this executor are gate/up + SwiGLU, optionally
+    // retaining the BF16 result for a Marlin consumer.
+    static const bool disable_glu = std::getenv("GGML_CUDA_DISABLE_MARLIN_Q8_GLU") != nullptr;
     const ggml_tensor * gate = fusion != nullptr ? fusion->gate : nullptr;
-    if (gate != nullptr && (fusion->glu_op != GGML_GLU_OP_SWIGLU ||
+    if (fusion != nullptr && (gate == nullptr || fusion->residual != nullptr ||
+            fusion->x_scale != nullptr || fusion->gate_scale != nullptr ||
+            fusion->x_bias != nullptr || fusion->gate_bias != nullptr)) {
+        return false;
+    }
+    if (gate != nullptr && (disable_glu || fusion->glu_op != GGML_GLU_OP_SWIGLU ||
             gate->type != GGML_TYPE_Q8_0_G128 || !ggml_are_same_shape(gate, src0) ||
             !ggml_are_same_stride(gate, src0) || !ggml_is_contiguous(gate))) {
         return false;
@@ -245,12 +252,25 @@ bool ggml_cuda_mul_mat_marlin_q8_g128(
     const size_t output_count = size_t(m) * n;
     ggml_cuda_pool_alloc<nv_bfloat16> output_scratch(ctx.pool(), output_count * (gate != nullptr ? 2 : 1));
     nv_bfloat16 * output = output_scratch.get();
-    float * dst_f32 = static_cast<float *>(dst->data);
+    // A retained result is written as BF16 into the F32-sized destination and
+    // handed straight to the consuming Marlin projection.
+    const bool retain_bf16 = gate != nullptr && fusion->retain_bf16_output;
+    if (retain_bf16) {
+        ctx.humming_bf16_activations.insert(dst);
+    }
+    static const bool debug = std::getenv("GGML_CUDA_MARLIN_DEBUG") != nullptr;
+    if (debug) {
+        static int budget = 64;
+        if (budget-- > 0) {
+            GGML_LOG_INFO("marlin-q8: %s n=%lld k=%lld m=%lld gate=%d pair=%d retain=%d\n", src0->name,
+                (long long) n, (long long) k, (long long) m, gate != nullptr, pair_launch, retain_bf16);
+        }
+    }
     if (pair_launch) {
         ggml_cuda_marlin_q8_g128_launch(
             input, src0->data, scales_of(src0), gate->data, scales_of(gate), output, lock_storage.ptr,
             n, k, m, max_shared, sms, stream);
-        ggml_cuda_humming_fp8_swiglu_f32_paired(output, dst_f32, m, n, stream);
+        ggml_cuda_humming_fp8_swiglu_paired(output, dst->data, m, n, retain_bf16, stream);
         return true;
     }
     nv_bfloat16 * gate_output = gate != nullptr ? output + output_count : nullptr;
@@ -262,7 +282,13 @@ bool ggml_cuda_mul_mat_marlin_q8_g128(
             input, gate->data, scales_of(gate), nullptr, nullptr, gate_output, lock_storage.ptr,
             n, k, m, max_shared, sms, stream);
     }
-    ggml_cuda_humming_fp8_output_bf16_to_f32(output, gate_output, dst_f32, output_count, stream);
+    if (retain_bf16) {
+        ggml_cuda_humming_fp8_swiglu_bf16(
+            output, gate_output, static_cast<nv_bfloat16 *>(dst->data), output_count, stream);
+    } else {
+        ggml_cuda_humming_fp8_output_bf16_to_f32(
+            output, gate_output, static_cast<float *>(dst->data), output_count, stream);
+    }
     return true;
 }
 
