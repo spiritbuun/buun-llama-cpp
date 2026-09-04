@@ -3223,6 +3223,18 @@ static void test_qwen4_mtp_sidecar_contract(const size_t seed) {
     llama_model_ptr target_model(llama_model_load_from_file_ptr(
             target_file.get(), target_model_params));
     GGML_ASSERT(target_model != nullptr);
+
+    // A self-contained MTP drafter owns its embedding and output head. Sharing
+    // setup must not replace them with the target's tensors merely because the
+    // drafter was supplied through -md --spec-type draft-mtp.
+    ggml_tensor * self_embd = model->tok_embd;
+    ggml_tensor * self_out  = model->output;
+    GGML_ASSERT(self_embd != nullptr && self_out != nullptr);
+    GGML_ASSERT(self_embd != target_model->tok_embd);
+    llama_model_share_tensors(model.get(), target_model.get());
+    GGML_ASSERT(model->tok_embd == self_embd);
+    GGML_ASSERT(model->output   == self_out);
+
     uint8_t semantic_digest[32] = {};
     // This synthetic fixture intentionally has no production vocabulary, so
     // semantic identity is unavailable. It must nevertheless traverse the

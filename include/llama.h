@@ -1479,8 +1479,8 @@ extern "C" {
     // DDTree: rollback SSM state to committed token using stored intermediates
     LLAMA_API void llama_tree_rollback(struct llama_context * ctx, int commit_n, const int32_t * parents, int n_seq0);
 
-    // DFlash: share tok_embd and output tensors from src model to dst model
-    // Used to avoid duplicating embedding/lm_head weights between target and drafter
+    // Drafter: populate missing or already-borrowed tok_embd/output tensors from src.
+    // Distinct tensors owned by a self-contained drafter are left unchanged.
     LLAMA_API void llama_model_share_tensors(struct llama_model * dst, const struct llama_model * src);
 
     //

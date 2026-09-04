@@ -5609,10 +5609,10 @@ common_speculative_init_result::common_speculative_init_result(
         }
 
         if (external_mtp_sidecar) {
-            // The loader borrows exact pointers so the compact file can be
-            // constructed. Normalize them for the drafter scheduler now:
-            // same-device tensors stay shared; foreign/meta tensors become
-            // draft-owned gathered copies.
+            // Normalize tensors omitted or borrowed by compact sidecars for the
+            // drafter scheduler. Self-contained MTP models retain their own
+            // embedding/head. Same-device target tensors stay shared;
+            // foreign/meta tensors become draft-owned gathered copies.
             llama_model_share_tensors(model_dft, model_tgt);
         }
 

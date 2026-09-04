@@ -3160,6 +3160,21 @@ bool llama_model_shared_output_needs_separate_copy(
 }
 
 void llama_model_share_tensors(llama_model * dst, const llama_model * src) {
+    // Only normalize tensors that this drafter actually shares with the target:
+    // omitted tensors have not been attached yet, while borrowed tensors already
+    // alias the target. A self-contained drafter can have a different embedding
+    // width and must retain its own tensors.
+    const bool share_embd = src->tok_embd != nullptr &&
+        (dst->tok_embd == nullptr || dst->tok_embd == src->tok_embd);
+    const bool share_out = src->output != nullptr &&
+        (dst->output == nullptr || dst->output == src->output);
+    if (!share_embd && !share_out) {
+        return;
+    }
+
+    const ggml_tensor * src_embd = share_embd ? src->tok_embd : nullptr;
+    const ggml_tensor * src_out  = share_out  ? src->output   : nullptr;
+
     // a target tensor can be shared by pointer only if the drafter can schedule it: host
     // buffers and buffers on one of the drafter's own devices. Meta (tensor-sharded)
     // buffers and foreign devices (e.g. -sm layer target whose output.weight sits on the
@@ -3186,11 +3201,15 @@ void llama_model_share_tensors(llama_model * dst, const llama_model * src) {
         }
         return true;
     };
-    const bool copy_embd = needs_copy(src->tok_embd);
-    const bool copy_out  = needs_copy(src->output);
+    const bool copy_embd = needs_copy(src_embd);
+    const bool copy_out  = needs_copy(src_out);
     if (!copy_embd && !copy_out) {
-        dst->tok_embd = src->tok_embd;
-        dst->output   = src->output;
+        if (share_embd) {
+            dst->tok_embd = src->tok_embd;
+        }
+        if (share_out) {
+            dst->output = src->output;
+        }
         return;
     }
 
@@ -3210,12 +3229,12 @@ void llama_model_share_tensors(llama_model * dst, const llama_model * src) {
         ggml_set_name(out, t->name);
         return out;
     };
-    ggml_tensor * embd_cp = copy_embd ? declare_copy(src->tok_embd) : nullptr;
-    const bool tied_output = src->output == src->tok_embd;
+    ggml_tensor * embd_cp = copy_embd ? declare_copy(src_embd) : nullptr;
+    const bool tied_output = src_out != nullptr && src_out == src_embd;
     const bool copy_out_separately = llama_model_shared_output_needs_separate_copy(
             copy_embd, copy_out, tied_output);
     ggml_tensor * out_cp = copy_out_separately
-        ? declare_copy(src->output)
+        ? declare_copy(src_out)
         : (copy_out ? embd_cp : nullptr);
     const size_t copy_bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx, buft);
 
@@ -3246,15 +3265,19 @@ void llama_model_share_tensors(llama_model * dst, const llama_model * src) {
     };
     if (!dst->hparams.no_alloc) {
         if (embd_cp != nullptr) {
-            gather(src->tok_embd, embd_cp);
+            gather(src_embd, embd_cp);
         }
         if (out_cp != nullptr && out_cp != embd_cp) {
-            gather(src->output, out_cp);
+            gather(src_out, out_cp);
         }
     }
 
-    dst->tok_embd = embd_cp != nullptr ? embd_cp : src->tok_embd;
-    dst->output   = out_cp  != nullptr ? out_cp  : src->output;
+    if (share_embd) {
+        dst->tok_embd = embd_cp != nullptr ? embd_cp : src->tok_embd;
+    }
+    if (share_out) {
+        dst->output = out_cp != nullptr ? out_cp : src->output;
+    }
 
     dst->adopt_buffer(std::move(ctx_ptr), ggml_backend_buffer_ptr(buf));
 
