@@ -154,6 +154,11 @@ bool ggml_cuda_mul_mat_marlin_q4_a32(
             fusion->x_bias != nullptr || fusion->gate_bias != nullptr)) {
         return false;
     }
+    static const bool disable_glu = std::getenv("GGML_CUDA_DISABLE_MARLIN_Q4_GLU") != nullptr;
+    static const bool disable_residual = std::getenv("GGML_CUDA_DISABLE_MARLIN_RESIDUAL") != nullptr;
+    if ((disable_glu && gate != nullptr) || (disable_residual && fusion != nullptr && fusion->residual != nullptr)) {
+        return false;
+    }
     if (gate != nullptr && (fusion->glu_op != GGML_GLU_OP_SWIGLU ||
             gate->type != GGML_TYPE_Q4_A32 || !ggml_are_same_shape(gate, src0) ||
             !ggml_are_same_stride(gate, src0) || !ggml_is_contiguous(gate))) {
@@ -207,6 +212,15 @@ bool ggml_cuda_mul_mat_marlin_q4_a32(
     // Unfused projections take the GEMM result as F32 directly; fused epilogues
     // consume the BF16 scratch exactly as they do after a Marlin launch.
     const bool direct_f32 = gate == nullptr && (fusion == nullptr || fusion->residual == nullptr);
+    static const bool debug = std::getenv("GGML_CUDA_MARLIN_DEBUG") != nullptr;
+    if (debug) {
+        static int budget = 64;
+        if (budget-- > 0) {
+            GGML_LOG_INFO("marlin-q4: %s n=%lld k=%lld m=%lld gate=%d residual=%d retain=%d\n", src0->name,
+                (long long) n, (long long) k, (long long) m, gate != nullptr,
+                fusion != nullptr && fusion->residual != nullptr, fusion != nullptr && fusion->retain_bf16_output);
+        }
+    }
     if (m >= ggml_cuda_marlin::gemm_min_m()) {
         ggml_cuda_marlin_gemm_bf16(ctx, ggml_cuda_marlin_q4_a32_dequant_bf16, src0->data, input,
             direct_f32 ? dst->data : static_cast<void *>(output), direct_f32 ? CUDA_R_32F : CUDA_R_16BF, n, k, m, stream);
@@ -261,11 +275,16 @@ bool ggml_cuda_mul_mat_marlin_q8_g128(
         return false;
     }
 
-    // The fusions requested for this executor are gate/up + SwiGLU, optionally
-    // retaining the BF16 result for a Marlin consumer.
+    // The fusions requested for this executor are gate/up + SwiGLU (optionally
+    // retaining the BF16 result for a Marlin consumer) and the residual + RMS
+    // norm epilogue of an unfused projection.
     static const bool disable_glu = std::getenv("GGML_CUDA_DISABLE_MARLIN_Q8_GLU") != nullptr;
+    static const bool disable_residual = std::getenv("GGML_CUDA_DISABLE_MARLIN_RESIDUAL") != nullptr;
     const ggml_tensor * gate = fusion != nullptr ? fusion->gate : nullptr;
-    if (fusion != nullptr && (gate == nullptr || fusion->residual != nullptr ||
+    if (disable_residual && fusion != nullptr && fusion->residual != nullptr) {
+        return false;
+    }
+    if (fusion != nullptr && ((gate == nullptr) == (fusion->residual == nullptr) ||
             fusion->x_scale != nullptr || fusion->gate_scale != nullptr ||
             fusion->x_bias != nullptr || fusion->gate_bias != nullptr)) {
         return false;
@@ -332,23 +351,33 @@ bool ggml_cuda_mul_mat_marlin_q8_g128(
     }
     nv_bfloat16 * gate_output = gate != nullptr ? output + output_count : nullptr;
     if (m >= ggml_cuda_marlin::gemm_min_m()) {
-        // An unfused projection takes the GEMM result as F32 directly.
+        // An unfused projection takes the GEMM result as F32 directly unless
+        // a residual + RMS epilogue consumes the BF16 result.
+        const bool direct_f32 = gate == nullptr && fusion == nullptr;
         ggml_cuda_marlin_gemm_bf16(ctx, ggml_cuda_marlin_q8_g128_dequant_bf16, src0->data, input,
-            gate == nullptr ? dst->data : static_cast<void *>(output), gate == nullptr ? CUDA_R_32F : CUDA_R_16BF,
+            direct_f32 ? dst->data : static_cast<void *>(output), direct_f32 ? CUDA_R_32F : CUDA_R_16BF,
             n, k, m, stream);
-        if (gate == nullptr) {
+        if (direct_f32) {
             return true;
+        }
+        if (gate == nullptr) {
+            return ggml_cuda_humming_finish_residual_rms(ctx, fusion, output, dst, n, m, stream);
         }
         ggml_cuda_marlin_gemm_bf16(ctx, ggml_cuda_marlin_q8_g128_dequant_bf16, gate->data, input,
             gate_output, CUDA_R_16BF, n, k, m, stream);
     } else {
-        // An unfused projection writes F32 straight into the graph tensor.
+        // An unfused projection writes F32 straight into the graph tensor
+        // unless a residual + RMS epilogue consumes the BF16 result.
+        const bool direct_f32 = gate == nullptr && fusion == nullptr;
         ggml_cuda_marlin_q8_g128_launch(
             input, src0->data, scales_of(src0), nullptr, nullptr,
-            gate == nullptr ? dst->data : static_cast<void *>(output), gate == nullptr, lock_storage.ptr,
+            direct_f32 ? dst->data : static_cast<void *>(output), direct_f32, lock_storage.ptr,
             n, k, m, max_shared, sms, stream);
-        if (gate == nullptr) {
+        if (direct_f32) {
             return true;
+        }
+        if (gate == nullptr) {
+            return ggml_cuda_humming_finish_residual_rms(ctx, fusion, output, dst, n, m, stream);
         }
         ggml_cuda_marlin_q8_g128_launch(
             input, gate->data, scales_of(gate), nullptr, nullptr, gate_output, false, lock_storage.ptr,
@@ -392,7 +421,15 @@ static nv_bfloat16 * ggml_cuda_humming_get_input(
         const ggml_tensor * src,
         size_t count,
         cudaStream_t stream) {
-    if (const nv_bfloat16 * cached = ggml_cuda_get_cached_bf16_input(ctx, src, count)) {
+    static const bool debug = std::getenv("GGML_CUDA_MARLIN_DEBUG") != nullptr;
+    const nv_bfloat16 * cached = ggml_cuda_get_cached_bf16_input(ctx, src, count);
+    if (debug) {
+        static int budget = 96;
+        if (budget-- > 0) {
+            GGML_LOG_INFO("marlin-input: %s (%s) %s\n", src->name, ggml_op_name(src->op), cached ? "cached" : "CONVERTED");
+        }
+    }
+    if (cached != nullptr) {
         return const_cast<nv_bfloat16 *>(cached);
     }
     return ggml_cuda_prepare_bf16_input(ctx, src, count, stream);

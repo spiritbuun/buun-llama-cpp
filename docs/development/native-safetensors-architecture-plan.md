@@ -450,6 +450,16 @@ Matrix receipts recorded on the A100-SXM4-80GB on 2026-09-02:
   0.010214, because the activations stay in BF16 rather than Q8_1. This
   applies to every GGUF quantization on tensor-core hardware and is covered
   by the release regression pass rather than by this project's gates.
+  A decode profile (CUDA graph nodes traced) then split the AWQ token time of
+  17.2 ms into the Marlin kernel (11.9 ms, about 73% of memory bandwidth),
+  the BF16 output head (1.7 ms), and roughly 1,400 small launches (3.6 ms):
+  400 BF16-to-F32 output conversions, norms, residual adds, and the recurrent
+  chain. The vendored Marlin kernel therefore gained an F32 output variant
+  used by every unfused projection, which removed the 400 conversions per
+  token: AWQ 59.5 TG128 (from 58.1), W8A16 44.3 (from 43.9). The remaining
+  decode gap to vLLM (71.0 and 48.8) is split between the Marlin kernel's
+  bandwidth efficiency at one row and the launch count of the per-layer
+  chain, which is architecture-specific fusion work.
 - BitsAndBytes NF4 now loads the real Unsloth checkpoint and generates coherent
   greedy output. Qwen recurrent packed weights are permuted into canonical head
   order while a 28-byte scale-layout descriptor maps each destination block back

@@ -5186,14 +5186,34 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
-    // A Marlin-repacked Q8-G128 weight is served only by its executor: unfused
-    // through ggml_cuda_mul_mat, or fused by the gate/up/GLU matcher further
-    // down. No other matcher here may read the private layout as Q8.
+    // No matcher below may read a private Marlin layout as canonical blocks;
+    // only the gate/up/GLU and residual + RMS-norm matchers, which dispatch
+    // to the Marlin executors, may see a repacked weight.
     if (node->op == GGML_OP_MUL_MAT && node->src[0] != nullptr &&
-            ggml_cuda_marlin_q8_g128_is_repacked(node->src[0]) &&
-            !(i + 2 < cgraph->n_nodes &&
-              ggml_cuda_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU }, {}))) {
-        return 0;
+            ggml_cuda_marlin_owner_is_repacked(node->src[0])) {
+        static const ggml_op residual_ops[4] = { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL };
+        static const ggml_op reshaped_ops[5] = { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL };
+        const int residual_out[] = { i + 1, i + 3 };
+        const int reshaped_out[] = { i + 2, i + 4 };
+        const bool marlin_fusion =
+            (i + 2 < cgraph->n_nodes &&
+             ggml_cuda_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU }, {})) ||
+            ggml_can_fuse_subgraph(cgraph, i, 4, residual_ops, residual_out, 2) ||
+            ggml_can_fuse_subgraph(cgraph, i, 5, reshaped_ops, reshaped_out, 2);
+        static const bool debug = std::getenv("GGML_CUDA_MARLIN_DEBUG") != nullptr;
+        if (debug) {
+            static int budget = 24;
+            if (budget-- > 0) {
+                std::string chain;
+                for (int j = i; j < std::min(i + 6, cgraph->n_nodes); ++j) {
+                    chain += std::string(ggml_op_name(cgraph->nodes[j]->op)) + "(" + cgraph->nodes[j]->name + ") ";
+                }
+                GGML_LOG_INFO("marlin chain at %s: fusion=%d :: %s\n", node->src[0]->name, marlin_fusion, chain.c_str());
+            }
+        }
+        if (!marlin_fusion) {
+            return 0;
+        }
     }
 
     // Input-quantized projections carry their activation contract in src[3].
@@ -5204,13 +5224,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 0;
     }
 
-    // Q4_A32's standalone Marlin/MMQ/MMVQ executors preserve the asymmetric
-    // group-32 contract. The shared BF16-retaining fusion epilogues do not yet
-    // reproduce that path closely enough for autoregressive decode, so keep
-    // these projections on their ordinary graph until each fusion has an
-    // end-to-end fidelity proof.
+    // A Marlin-repacked weight (Q4-A32 or Q8-G128) is served only by its
+    // executor: unfused through ggml_cuda_mul_mat, or by the gate/up/GLU and
+    // residual + RMS-norm matchers below. Q4-A32 weights that are not repacked
+    // (unsupported shapes, other devices) also stay on their ordinary graph so
+    // the group-32 asymmetric contract is never reinterpreted by a fusion.
     if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) &&
-            node->src[0] != nullptr && node->src[0]->type == GGML_TYPE_Q4_A32) {
+            node->src[0] != nullptr && node->src[0]->type == GGML_TYPE_Q4_A32 &&
+            !ggml_cuda_marlin_owner_is_repacked(node->src[0])) {
         return 0;
     }
 
@@ -6217,7 +6238,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                                               norm_node->src[1] == rms_node ? norm_node->src[0] : nullptr;
             const bool block_fp8 = mm_node->src[0]->type == GGML_TYPE_F8_E4M3 &&
                 mm_node->src[2] != nullptr;
-            if (block_fp8 &&
+            // Marlin-repacked weights take the same residual + RMS epilogue.
+            const bool marlin = mm_node->src[2] == nullptr &&
+                ggml_cuda_marlin_owner_is_repacked(mm_node->src[0]);
+            if ((block_fp8 || marlin) &&
                     reshaped->src[0] == mm_node && residual != nullptr &&
                     norm_weight != nullptr && rms_node->src[0] == add_node &&
                     residual->type == GGML_TYPE_F32 && norm_weight->type == GGML_TYPE_F32 &&
@@ -6235,7 +6259,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
                 const bool all_consumers_cached = ggml_cuda_all_consumers_use_cached_bf16(
                     cgraph, i + n_ops, norm_node, cc);
-                fusion_data.materialize_rms_output = !all_consumers_cached;
+                // Marlin chains always write the F32 norm output: a consumer
+                // outside the cached-BF16 predicate reads it (AWQ KLD 0.27
+                // versus 0.009 without it), and at decode the write is tiny.
+                fusion_data.materialize_rms_output = !all_consumers_cached || marlin;
                 memcpy(&fusion_data.rms_eps, rms_node->op_params, sizeof(float));
                 if (ggml_cuda_mul_mat_bf16_residual_rms(
                         *cuda_ctx, mm_node, residual, add_node, norm_weight,
@@ -6244,6 +6271,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                         *cuda_ctx, mm_node->src[0], mm_node->src[1], mm_node->src[2],
                         norm_node, &fusion_data) ||
                     ggml_cuda_mul_mat_marlin_q4_a32(
+                        *cuda_ctx, mm_node->src[0], mm_node->src[1], nullptr,
+                        norm_node, &fusion_data) ||
+                    ggml_cuda_mul_mat_marlin_q8_g128(
                         *cuda_ctx, mm_node->src[0], mm_node->src[1], nullptr,
                         norm_node, &fusion_data) ||
                     ggml_cuda_mul_mat_humming_fp8_block_fused(
@@ -6275,7 +6305,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                                               norm_node->src[1] == rms_node ? norm_node->src[0] : nullptr;
             const bool block_fp8 = mm_node->src[0]->type == GGML_TYPE_F8_E4M3 &&
                 mm_node->src[2] != nullptr;
-            if (block_fp8 &&
+            // Marlin-repacked weights take the same residual + RMS epilogue.
+            const bool marlin = mm_node->src[2] == nullptr &&
+                ggml_cuda_marlin_owner_is_repacked(mm_node->src[0]);
+            if ((block_fp8 || marlin) &&
                     residual != nullptr && norm_weight != nullptr &&
                     rms_node->src[0] == add_node && residual->type == GGML_TYPE_F32 &&
                     norm_weight->type == GGML_TYPE_F32 && ggml_is_contiguous(residual) &&
@@ -6292,7 +6325,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
                 const bool all_consumers_cached = ggml_cuda_all_consumers_use_cached_bf16(
                     cgraph, i + n_ops, norm_node, cc);
-                fusion_data.materialize_rms_output = !all_consumers_cached;
+                // Marlin chains always write the F32 norm output: a consumer
+                // outside the cached-BF16 predicate reads it (AWQ KLD 0.27
+                // versus 0.009 without it), and at decode the write is tiny.
+                fusion_data.materialize_rms_output = !all_consumers_cached || marlin;
                 memcpy(&fusion_data.rms_eps, rms_node->op_params, sizeof(float));
                 if (ggml_cuda_mul_mat_bf16_residual_rms(
                         *cuda_ctx, mm_node, residual, add_node, norm_weight,
@@ -6301,6 +6337,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                         *cuda_ctx, mm_node->src[0], mm_node->src[1], mm_node->src[2],
                         norm_node, &fusion_data) ||
                     ggml_cuda_mul_mat_marlin_q4_a32(
+                        *cuda_ctx, mm_node->src[0], mm_node->src[1], nullptr,
+                        norm_node, &fusion_data) ||
+                    ggml_cuda_mul_mat_marlin_q8_g128(
                         *cuda_ctx, mm_node->src[0], mm_node->src[1], nullptr,
                         norm_node, &fusion_data) ||
                     ggml_cuda_mul_mat_humming_fp8_block_fused(
