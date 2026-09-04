@@ -440,7 +440,16 @@ Matrix receipts recorded on the A100-SXM4-80GB on 2026-09-02:
   sits near 1024 rows. KLD is unchanged on the route (AWQ 0.009541 versus
   0.009504, W8A16 0.000159 versus 0.000171). The dequant (about 860 GB/s) and
   the activation conversions around each projection are the remaining prefill
-  overhead.
+  overhead. The same measurement generalized to the canonical quant types: on
+  the A100 the MMQ kernels reach 74--79 TFLOPS at 4096 x 512 x 14336 against
+  187 for a dense BF16 GEMM, so `ggml_cuda_mul_mat` now sends batches above
+  `GGML_CUDA_MMQ_MAX_BATCH` rows (default 128; crossover measured near 192)
+  through dequantize-plus-cuBLAS with BF16 inputs and F32 accumulation. The
+  GPTQ checkpoint, which executes as Q4_1, moved from 1483 / 1564 to 2239 /
+  3340 at micro-batch 512 / 2048 with KLD improving from 0.011511 to
+  0.010214, because the activations stay in BF16 rather than Q8_1. This
+  applies to every GGUF quantization on tensor-core hardware and is covered
+  by the release regression pass rather than by this project's gates.
 - BitsAndBytes NF4 now loads the real Unsloth checkpoint and generates coherent
   greedy output. Qwen recurrent packed weights are permuted into canonical head
   order while a 28-byte scale-layout descriptor maps each destination block back

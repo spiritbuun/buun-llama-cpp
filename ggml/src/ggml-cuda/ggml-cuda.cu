@@ -2186,7 +2186,12 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
             ? GGML_TYPE_BF16
             : GGML_TYPE_F32;
     } else if (ggml_is_quantized(compute_type)) {
-        compute_type = fast_fp16_hardware_available(ggml_cuda_info().devices[ctx.device].cc) ? GGML_TYPE_F16 : GGML_TYPE_F32;
+        // BF16 inputs with F32 accumulation beat the F16 path on both speed
+        // and fidelity where BF16 MMA exists (GPTQ Q4_1: 3340 vs 3134 PP2048,
+        // KLD 0.0102 vs 0.0103).
+        const int cc = ggml_cuda_info().devices[ctx.device].cc;
+        compute_type = bf16_mma_hardware_available(cc) ? GGML_TYPE_BF16 :
+                       fast_fp16_hardware_available(cc) ? GGML_TYPE_F16 : GGML_TYPE_F32;
     } else if (compute_type == GGML_TYPE_F16 && !fast_fp16_hardware_available(ggml_cuda_info().devices[ctx.device].cc)) {
         compute_type = GGML_TYPE_F32;
     }
@@ -2746,11 +2751,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
     }
-    // Experiment: GGML_CUDA_MMQ_MAX_BATCH caps the batch size served by MMQ;
-    // larger batches dequantize and run cuBLAS instead. Unset = MMQ as usual.
+    // MMQ serves batches up to GGML_CUDA_MMQ_MAX_BATCH rows (default 128, -1 =
+    // always); larger batches dequantize and run cuBLAS. On tensor-core
+    // hardware the MMQ kernels reach well under half the dense GEMM rate, so
+    // the dequant pass pays for itself once the batch is large enough (A100,
+    // 27B: crossover near 192 rows, 1.5-2x faster at 512-2048).
     static const int64_t mmq_max_batch = [] {
         const char * env = std::getenv("GGML_CUDA_MMQ_MAX_BATCH");
-        return env != nullptr ? std::atoll(env) : int64_t(-1);
+        return env != nullptr ? std::atoll(env) : int64_t(128);
     }();
     if ((mmq_max_batch < 0 || ne11 <= mmq_max_batch) &&
             ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
