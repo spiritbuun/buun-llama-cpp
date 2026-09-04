@@ -456,10 +456,24 @@ Matrix receipts recorded on the A100-SXM4-80GB on 2026-09-02:
   400 BF16-to-F32 output conversions, norms, residual adds, and the recurrent
   chain. The vendored Marlin kernel therefore gained an F32 output variant
   used by every unfused projection, which removed the 400 conversions per
-  token: AWQ 59.5 TG128 (from 58.1), W8A16 44.3 (from 43.9). The remaining
-  decode gap to vLLM (71.0 and 48.8) is split between the Marlin kernel's
-  bandwidth efficiency at one row and the launch count of the per-layer
-  chain, which is architecture-specific fusion work.
+  token: AWQ 59.5 TG128 (from 58.1), W8A16 44.3 (from 43.9). Two dormant
+  fusions were then switched on: the projection + residual + RMS-norm chain
+  matchers had been gated on block-FP8 weights, so their Marlin call never
+  ran, and a blanket try_fuse early return had kept every Q4-A32 projection
+  out of every fusion. With both active (and the chain always materializing
+  its F32 norm output, which the cached-BF16 predicate had wrongly skipped for
+  Q4 consumers), the A100 measures AWQ 2983 / 3694 / 60.7 and W8A16 2706 /
+  3618 / 44.8 (PP512 / PP2048 / TG128) at unchanged KLD. A vLLM decode
+  profile on the same GPU then attributed the remaining gap (71.0 and 48.8):
+  the same Marlin kernel moving the same bytes takes 10.2 ms there in 255
+  launches versus 11.9 ms here in 400, because vLLM packs Q/K/V and the
+  recurrent qkv/gate projections into single launches. Per-launch timings
+  show every launch of 20--40 us reaching only about 1.3 TB/s of the 2.0 TB/s
+  peak, whatever its shape; a memory-streaming dp4a kernel over the Marlin
+  layout (built, verified, then removed) reached exactly the same rate while
+  costing W8A16 fidelity through Q8_1 activations. Launch width, not kernel
+  quality, is what remains: a segmented launch for sibling projections that
+  share an input is the next decode step.
 - BitsAndBytes NF4 now loads the real Unsloth checkpoint and generates coherent
   greedy output. Qwen recurrent packed weights are permuted into canonical head
   order while a 28-byte scale-layout descriptor maps each destination block back
