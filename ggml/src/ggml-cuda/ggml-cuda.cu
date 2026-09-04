@@ -83,6 +83,7 @@
 #include "ggml-cuda/humming-fp8-block.cuh"
 #include "ggml-cuda/int8-channel.cuh"
 #include "ggml-cuda/marlin-q4-a32.cuh"
+#include "ggml-cuda/marlin-q8-g128.cuh"
 #include "ggml.h"
 
 
@@ -860,8 +861,20 @@ struct ggml_backend_cuda_buffer_context {
     bool owned = true; // false for buffers wrapping externally-managed memory (VBR VMM pool)
     std::string name;
 #if !defined(GGML_USE_HIP)
+    // Immutable weights stored in a backend-private layout, keyed by data pointer.
     std::unordered_set<const void *> humming_fp8_repacked;
     std::unordered_set<const void *> marlin_q4_a32_repacked;
+    std::unordered_set<const void *> marlin_q8_g128_repacked;
+
+    bool repacked(const void * data) const {
+        return humming_fp8_repacked.count(data) != 0 || marlin_q4_a32_repacked.count(data) != 0 ||
+            marlin_q8_g128_repacked.count(data) != 0;
+    }
+    void forget_repacked(const void * data) {
+        humming_fp8_repacked.erase(data);
+        marlin_q4_a32_repacked.erase(data);
+        marlin_q8_g128_repacked.erase(data);
+    }
 #endif
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr, bool owned = true) :
@@ -900,6 +913,14 @@ bool ggml_cuda_marlin_q4_a32_is_repacked(const ggml_tensor * tensor) {
     }
     const auto * ctx = static_cast<const ggml_backend_cuda_buffer_context *>(tensor->buffer->context);
     return ctx->marlin_q4_a32_repacked.count(tensor->data) != 0;
+}
+
+bool ggml_cuda_marlin_q8_g128_is_repacked(const ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->buffer == nullptr || !ggml_backend_buffer_is_cuda(tensor->buffer)) {
+        return false;
+    }
+    const auto * ctx = static_cast<const ggml_backend_cuda_buffer_context *>(tensor->buffer->context);
+    return ctx->marlin_q8_g128_repacked.count(tensor->data) != 0;
 }
 
 static ggml_tensor * ggml_cuda_tensor_owner(ggml_tensor * tensor) {
@@ -947,6 +968,78 @@ static void ggml_cuda_canonicalize_repacked(
         CUDA_CHECK(cudaFree(canonical));
     }
 
+    if (ctx->marlin_q8_g128_repacked.erase(owner->data) != 0) {
+        void * canonical = nullptr;
+        CUDA_CHECK(cudaMalloc(&canonical, size));
+        ggml_cuda_marlin_q8_g128_unrepack(
+            owner->data, canonical, owner->ne[1], owner->ne[0], cudaStreamPerThread);
+        CUDA_CHECK(cudaMemcpyAsync(
+            owner->data, canonical, size, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        CUDA_CHECK(cudaFree(canonical));
+    }
+
+}
+
+// Whether the storage behind a tensor (or the tensor it views) holds a private
+// Marlin layout; returns the matching canonical type or GGML_TYPE_COUNT.
+static ggml_type ggml_cuda_marlin_repacked_type(const ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->buffer == nullptr || !ggml_backend_buffer_is_cuda(tensor->buffer)) {
+        return GGML_TYPE_COUNT;
+    }
+    const auto * ctx = static_cast<const ggml_backend_cuda_buffer_context *>(tensor->buffer->context);
+    const ggml_tensor * owner = ggml_cuda_tensor_owner(tensor);
+    if (ctx->marlin_q4_a32_repacked.count(owner->data) != 0) {
+        return GGML_TYPE_Q4_A32;
+    }
+    if (ctx->marlin_q8_g128_repacked.count(owner->data) != 0) {
+        return GGML_TYPE_Q8_0_G128;
+    }
+    return GGML_TYPE_COUNT;
+}
+
+static bool ggml_cuda_marlin_owner_is_repacked(const ggml_tensor * tensor) {
+    return ggml_cuda_marlin_repacked_type(tensor) != GGML_TYPE_COUNT;
+}
+
+// A Marlin-repacked weight is only readable by the Marlin executors. Any other
+// consumer in this graph (a MUL_MAT contract they decline, a view, a copy, ...)
+// would interpret the private bytes as canonical blocks, so restore the
+// canonical layout once, before graph capture, and say so.
+static void ggml_cuda_canonicalize_unserved_marlin_weights(
+        ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph) {
+    const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+    bool restored = false;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            ggml_tensor * src = node->src[s];
+            if (src == nullptr || (src->type != GGML_TYPE_Q4_A32 && src->type != GGML_TYPE_Q8_0_G128)) {
+                continue;
+            }
+            const ggml_type repacked = ggml_cuda_marlin_repacked_type(src);
+            if (repacked == GGML_TYPE_COUNT) {
+                continue;
+            }
+            ggml_tensor * owner = ggml_cuda_tensor_owner(src);
+            const bool served = node->op == GGML_OP_MUL_MAT && s == 0 && src == owner && (
+                repacked == GGML_TYPE_Q4_A32 ?
+                    ggml_cuda_marlin_q4_a32_accepts_mul_mat(src, node->src[1], node->src[2], node, cc) :
+                    ggml_cuda_marlin_q8_g128_accepts_mul_mat(src, node->src[1], node->src[2], node, cc));
+            if (served) {
+                continue;
+            }
+            GGML_LOG_WARN("%s: restoring canonical %s layout of '%s' for %s '%s' (src%d)\n",
+                __func__, ggml_type_name(repacked), owner->name, ggml_op_name(node->op), node->name, s);
+            auto * buf_ctx = static_cast<ggml_backend_cuda_buffer_context *>(src->buffer->context);
+            ggml_cuda_set_device(buf_ctx->device);
+            ggml_cuda_canonicalize_repacked(buf_ctx, owner);
+            restored = true;
+        }
+    }
+    if (restored) {
+        ggml_cuda_set_device(cuda_ctx->device);
+    }
 }
 #endif
 
@@ -987,8 +1080,7 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
 #if !defined(GGML_USE_HIP)
     ggml_tensor * owner = ggml_cuda_tensor_owner(tensor);
     if (tensor == owner && offset == 0 && size == ggml_nbytes(owner)) {
-        ctx->humming_fp8_repacked.erase(owner->data);
-        ctx->marlin_q4_a32_repacked.erase(owner->data);
+        ctx->forget_repacked(owner->data);
     } else {
         ggml_cuda_canonicalize_repacked(ctx, tensor);
     }
@@ -1005,8 +1097,7 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     ggml_tensor * owner = ggml_cuda_tensor_owner(tensor);
     const bool full_owner = tensor == owner && offset == 0 && size == ggml_nbytes(owner);
     if (full_owner) {
-        ctx->humming_fp8_repacked.erase(owner->data);
-        ctx->marlin_q4_a32_repacked.erase(owner->data);
+        ctx->forget_repacked(owner->data);
     } else {
         ggml_cuda_canonicalize_repacked(ctx, tensor);
     }
@@ -1031,9 +1122,22 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         tensor->ne[2] == 1 && tensor->ne[3] == 1 &&
         ggml_cuda_marlin_q4_a32_supports_shape(tensor->ne[1], tensor->ne[0], 1, cc)) {
         ggml_cuda_marlin_q4_a32_repack_upload(
-            data, tensor->data, tensor->ne[1], tensor->ne[0], ctx->device,
+            data, tensor->data, tensor->ne[1], tensor->ne[0],
+            int(ggml_cuda_info().devices[ctx->device].smpbo),
             ggml_cuda_info().devices[ctx->device].nsm, cudaStreamPerThread);
         ctx->marlin_q4_a32_repacked.insert(tensor->data);
+        return;
+    }
+    if (ggml_cuda_marlin_q8_g128_enabled() && full_tensor && tensor->type == GGML_TYPE_Q8_0_G128 &&
+        tensor->view_src == nullptr && ggml_is_contiguous(tensor) &&
+        ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+        tensor->ne[2] == 1 && tensor->ne[3] == 1 &&
+        ggml_cuda_marlin_q8_g128_supports_shape(tensor->ne[1], tensor->ne[0], 1, cc)) {
+        ggml_cuda_marlin_q8_g128_repack_upload(
+            data, tensor->data, tensor->ne[1], tensor->ne[0],
+            int(ggml_cuda_info().devices[ctx->device].smpbo),
+            ggml_cuda_info().devices[ctx->device].nsm, cudaStreamPerThread);
+        ctx->marlin_q8_g128_repacked.insert(tensor->data);
         return;
     }
 #endif
@@ -1048,8 +1152,7 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
 #if !defined(GGML_USE_HIP)
     const ggml_tensor * owner = ggml_cuda_tensor_owner(tensor);
     if (owner != tensor &&
-        (ctx->humming_fp8_repacked.count(owner->data) != 0 ||
-         ctx->marlin_q4_a32_repacked.count(owner->data) != 0)) {
+        ctx->repacked(owner->data)) {
         ggml_cuda_canonicalize_repacked(ctx, const_cast<ggml_tensor *>(tensor));
     }
     if (ctx->humming_fp8_repacked.find(tensor->data) != ctx->humming_fp8_repacked.end()) {
@@ -1062,11 +1165,12 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
         memcpy(data, canonical.data() + offset, size);
         return;
     }
-    if (ctx->marlin_q4_a32_repacked.count(tensor->data) != 0) {
+    if (ctx->repacked(tensor->data)) {
         const size_t tensor_size = ggml_nbytes(tensor);
         void * canonical_device = nullptr;
         CUDA_CHECK(cudaMalloc(&canonical_device, tensor_size));
-        ggml_cuda_marlin_q4_a32_unrepack(
+        (ctx->marlin_q4_a32_repacked.count(tensor->data) != 0 ?
+            ggml_cuda_marlin_q4_a32_unrepack : ggml_cuda_marlin_q8_g128_unrepack)(
             tensor->data, canonical_device, tensor->ne[1], tensor->ne[0], cudaStreamPerThread);
         CUDA_CHECK(cudaMemcpyAsync(
             data, static_cast<const char *>(canonical_device) + offset, size,
@@ -1101,24 +1205,10 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
 #if !defined(GGML_USE_HIP)
     const ggml_tensor * owner = ggml_cuda_tensor_owner(tensor);
     if (owner != tensor &&
-        (ctx->humming_fp8_repacked.count(owner->data) != 0 ||
-         ctx->marlin_q4_a32_repacked.count(owner->data) != 0)) {
+        ctx->repacked(owner->data)) {
         ggml_cuda_canonicalize_repacked(ctx, const_cast<ggml_tensor *>(tensor));
     }
-    if (ctx->humming_fp8_repacked.find(tensor->data) != ctx->humming_fp8_repacked.end()) {
-        const size_t tensor_size = ggml_nbytes(tensor);
-        std::vector<uint8_t> repacked(tensor_size);
-        std::vector<uint8_t> canonical(tensor_size);
-        CUDA_CHECK(cudaMemcpyAsync(repacked.data(), tensor->data, tensor_size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
-        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
-        ggml_cuda_humming_fp8_unrepack_host(repacked.data(), canonical.data(), tensor->ne[1], tensor->ne[0]);
-        for (size_t i = 0; i < n_copies; ++i) {
-            memcpy(static_cast<char *>(data) + i * stride_data,
-                   canonical.data() + offset + i * stride_tensor, size);
-        }
-        return;
-    }
-    if (ctx->marlin_q4_a32_repacked.count(tensor->data) != 0) {
+    if (ctx->repacked(tensor->data)) {
         const size_t tensor_size = ggml_nbytes(tensor);
         std::vector<uint8_t> canonical(tensor_size);
         ggml_backend_cuda_buffer_get_tensor(buffer, tensor, canonical.data(), 0, tensor_size);
@@ -1142,8 +1232,7 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
         const ggml_tensor * src_owner = ggml_cuda_tensor_owner(src);
         ggml_tensor * dst_owner = ggml_cuda_tensor_owner(dst);
         if (src_owner != src &&
-            (src_ctx->humming_fp8_repacked.count(src_owner->data) != 0 ||
-             src_ctx->marlin_q4_a32_repacked.count(src_owner->data) != 0)) {
+            src_ctx->repacked(src_owner->data)) {
             ggml_cuda_set_device(src_ctx->device);
             ggml_cuda_canonicalize_repacked(src_ctx, const_cast<ggml_tensor *>(src));
         }
@@ -1153,17 +1242,21 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
         }
         const bool src_repacked = src_ctx->humming_fp8_repacked.find(src->data) != src_ctx->humming_fp8_repacked.end();
         const bool src_marlin_q4_repacked = src_ctx->marlin_q4_a32_repacked.count(src->data) != 0;
+        const bool src_marlin_q8_repacked = src_ctx->marlin_q8_g128_repacked.count(src->data) != 0;
         const int dst_cc = ggml_cuda_info().devices[dst_ctx->device].cc;
         if (src_marlin_q4_repacked &&
             !ggml_cuda_marlin_q4_a32_supports_shape(dst->ne[1], dst->ne[0], 1, dst_cc)) {
             return false;
         }
-        if ((src_repacked || src_marlin_q4_repacked) &&
+        if (src_marlin_q8_repacked &&
+            !ggml_cuda_marlin_q8_g128_supports_shape(dst->ne[1], dst->ne[0], 1, dst_cc)) {
+            return false;
+        }
+        if ((src_repacked || src_marlin_q4_repacked || src_marlin_q8_repacked) &&
             (dst_owner != dst || src->type != dst->type || !ggml_are_same_shape(src, dst))) {
             return false;
         }
-        dst_ctx->humming_fp8_repacked.erase(dst->data);
-        dst_ctx->marlin_q4_a32_repacked.erase(dst->data);
+        dst_ctx->forget_repacked(dst->data);
 #endif
         // compare the backing physical devices: distinct virtual devices may share one physical GPU,
         // in which case a same-device copy (not a peer copy) is required
@@ -1186,6 +1279,9 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
         if (src_marlin_q4_repacked) {
             dst_ctx->marlin_q4_a32_repacked.insert(dst->data);
         }
+        if (src_marlin_q8_repacked) {
+            dst_ctx->marlin_q8_g128_repacked.insert(dst->data);
+        }
 #endif
         return true;
     }
@@ -1200,6 +1296,7 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
 #if !defined(GGML_USE_HIP)
     ctx->humming_fp8_repacked.clear();
     ctx->marlin_q4_a32_repacked.clear();
+    ctx->marlin_q8_g128_repacked.clear();
 #endif
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
@@ -2606,8 +2703,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
 #if !defined(GGML_USE_HIP)
-    if (ggml_cuda_mul_mat_marlin_q4_a32(ctx, src0, src1, nullptr, dst)) {
+    if (ggml_cuda_mul_mat_marlin_q8_g128(ctx, src0, src1, nullptr, dst) ||
+        ggml_cuda_mul_mat_marlin_q4_a32(ctx, src0, src1, nullptr, dst)) {
         return;
+    }
+    // ggml_cuda_canonicalize_unserved_marlin_weights restores the canonical layout
+    // before capture for every consumer the Marlin executors decline.
+    if (ggml_cuda_marlin_owner_is_repacked(src0)) {
+        GGML_ABORT("repacked Marlin tensor '%s' reached a canonical MUL_MAT executor", src0->name);
     }
 #endif
 
@@ -3241,8 +3344,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     auto * buf_ctx = static_cast<ggml_backend_cuda_buffer_context *>(buf->context);
     ggml_tensor * owner = ggml_cuda_tensor_owner(tensor);
     if (tensor == owner && offset == 0 && size == ggml_nbytes(owner)) {
-        buf_ctx->humming_fp8_repacked.erase(owner->data);
-        buf_ctx->marlin_q4_a32_repacked.erase(owner->data);
+        buf_ctx->forget_repacked(owner->data);
     } else {
         ggml_cuda_set_device(buf_ctx->device);
         ggml_cuda_canonicalize_repacked(buf_ctx, tensor);
@@ -3262,13 +3364,11 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
     auto * buf_ctx = static_cast<ggml_backend_cuda_buffer_context *>(buf->context);
     const ggml_tensor * owner = ggml_cuda_tensor_owner(tensor);
     if (owner != tensor &&
-        (buf_ctx->humming_fp8_repacked.count(owner->data) != 0 ||
-         buf_ctx->marlin_q4_a32_repacked.count(owner->data) != 0)) {
+        buf_ctx->repacked(owner->data)) {
         ggml_cuda_set_device(buf_ctx->device);
         ggml_cuda_canonicalize_repacked(buf_ctx, const_cast<ggml_tensor *>(tensor));
     }
-    if (buf_ctx->humming_fp8_repacked.find(tensor->data) != buf_ctx->humming_fp8_repacked.end() ||
-        buf_ctx->marlin_q4_a32_repacked.count(tensor->data) != 0) {
+    if (buf_ctx->repacked(tensor->data)) {
         ggml_backend_cuda_buffer_get_tensor(buf, tensor, data, offset, size);
         return;
     }
@@ -3305,13 +3405,11 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
     auto * buf_ctx = static_cast<ggml_backend_cuda_buffer_context *>(buf->context);
     const ggml_tensor * owner = ggml_cuda_tensor_owner(tensor);
     if (owner != tensor &&
-        (buf_ctx->humming_fp8_repacked.count(owner->data) != 0 ||
-         buf_ctx->marlin_q4_a32_repacked.count(owner->data) != 0)) {
+        buf_ctx->repacked(owner->data)) {
         ggml_cuda_set_device(buf_ctx->device);
         ggml_cuda_canonicalize_repacked(buf_ctx, const_cast<ggml_tensor *>(tensor));
     }
-    if (buf_ctx->humming_fp8_repacked.find(tensor->data) != buf_ctx->humming_fp8_repacked.end() ||
-        buf_ctx->marlin_q4_a32_repacked.count(tensor->data) != 0) {
+    if (buf_ctx->repacked(tensor->data)) {
         ggml_backend_cuda_buffer_get_tensor_2d(buf, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
         return;
     }
@@ -3350,8 +3448,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     const ggml_tensor * src_owner = ggml_cuda_tensor_owner(src);
     ggml_tensor * dst_owner = ggml_cuda_tensor_owner(dst);
     if (src_owner != src &&
-        (buf_ctx_src->humming_fp8_repacked.count(src_owner->data) != 0 ||
-         buf_ctx_src->marlin_q4_a32_repacked.count(src_owner->data) != 0)) {
+        buf_ctx_src->repacked(src_owner->data)) {
         ggml_cuda_set_device(buf_ctx_src->device);
         ggml_cuda_canonicalize_repacked(buf_ctx_src, const_cast<ggml_tensor *>(src));
     }
@@ -3361,17 +3458,21 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     }
     const bool src_fp8_repacked = buf_ctx_src->humming_fp8_repacked.count(src->data) != 0;
     const bool src_marlin_q4_repacked = buf_ctx_src->marlin_q4_a32_repacked.count(src->data) != 0;
+    const bool src_marlin_q8_repacked = buf_ctx_src->marlin_q8_g128_repacked.count(src->data) != 0;
     const int dst_cc = ggml_cuda_info().devices[buf_ctx_dst->device].cc;
     if (src_marlin_q4_repacked &&
         !ggml_cuda_marlin_q4_a32_supports_shape(dst->ne[1], dst->ne[0], 1, dst_cc)) {
         return false;
     }
-    if ((src_fp8_repacked || src_marlin_q4_repacked) &&
+    if (src_marlin_q8_repacked &&
+        !ggml_cuda_marlin_q8_g128_supports_shape(dst->ne[1], dst->ne[0], 1, dst_cc)) {
+        return false;
+    }
+    if ((src_fp8_repacked || src_marlin_q4_repacked || src_marlin_q8_repacked) &&
         (dst_owner != dst || src->type != dst->type || !ggml_are_same_shape(src, dst))) {
         return false;
     }
-    buf_ctx_dst->humming_fp8_repacked.erase(dst->data);
-    buf_ctx_dst->marlin_q4_a32_repacked.erase(dst->data);
+    buf_ctx_dst->forget_repacked(dst->data);
 #endif
 
     if (backend_src != backend_dst) {
@@ -3410,6 +3511,9 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     }
     if (src_marlin_q4_repacked) {
         buf_ctx_dst->marlin_q4_a32_repacked.insert(dst->data);
+    }
+    if (src_marlin_q8_repacked) {
+        buf_ctx_dst->marlin_q8_g128_repacked.insert(dst->data);
     }
 #endif
     return true;
@@ -4915,7 +5019,7 @@ static bool ggml_cuda_can_retain_glu_bf16(
         return false;
     }
     return ggml_cuda_marlin_q4_a32_supports_shape(
-        consumer->src[0]->ne[1], consumer->src[0]->ne[0], activation->ne[1], cc);
+            consumer->src[0]->ne[1], consumer->src[0]->ne[0], activation->ne[1], cc);
 }
 
 static const ggml_tensor * ggml_cuda_find_bf16_projection_input(
@@ -5008,6 +5112,12 @@ static void ggml_cuda_prepare_q8_activation_reuse(
         return;
     }
     const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+    if (ggml_cuda_marlin_q8_g128_enabled() &&
+            ggml_cuda_marlin_q8_g128_is_repacked(node->src[0]) &&
+            ggml_cuda_marlin_q8_g128_supports_shape(
+                node->src[0]->ne[1], node->src[0]->ne[0], activation->ne[1], cc)) {
+        return;
+    }
     if (!ggml_cuda_should_use_mmq(node->src[0]->type, cc, activation->ne[1], /*n_experts=*/0)) {
         return;
     }
@@ -5073,6 +5183,37 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
 #if !defined(GGML_USE_HIP)
+    // A repacked Q8-G128 tensor is a backend-private Marlin representation.
+    // Only fusions that explicitly consume that representation may see it;
+    // every canonical Q8 matcher must decline.
+    if (node->op == GGML_OP_MUL_MAT && node->src[0] != nullptr &&
+            ggml_cuda_marlin_q8_g128_is_repacked(node->src[0])) {
+        static const bool disable_q8_marlin_glu =
+            std::getenv("GGML_CUDA_DISABLE_MARLIN_Q8_GLU") != nullptr;
+        if (!disable_q8_marlin_glu && i + 2 < cgraph->n_nodes &&
+                ggml_cuda_can_fuse(cgraph, i,
+                    { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU }, {})) {
+            ggml_tensor * glu  = cgraph->nodes[i + 2];
+            ggml_tensor * lhs  = cgraph->nodes[i];
+            ggml_tensor * rhs  = cgraph->nodes[i + 1];
+            ggml_tensor * gate = glu->src[0];
+            ggml_tensor * up   = glu->src[1];
+            const bool ordered = (gate == lhs && up == rhs) || (gate == rhs && up == lhs);
+            if (ordered && up->src[1] == gate->src[1] &&
+                    ggml_cuda_marlin_q8_g128_is_repacked(up->src[0]) &&
+                    ggml_cuda_marlin_q8_g128_is_repacked(gate->src[0])) {
+                ggml_cuda_mm_fusion_args_host fusion{};
+                fusion.gate   = gate->src[0];
+                fusion.glu_op = ggml_get_glu_op(glu);
+                if (ggml_cuda_mul_mat_marlin_q8_g128(
+                        *cuda_ctx, up->src[0], up->src[1], up->src[2], glu, &fusion)) {
+                    return 2;
+                }
+            }
+        }
+        return 0;
+    }
+
     if (node->op == GGML_OP_MUL_MAT && node->src[1] != nullptr &&
             node->src[1]->ne[1] > MMVQ_MAX_BATCH_SIZE) {
         ggml_cuda_prepare_q8_activation_reuse(cuda_ctx, cgraph, i);
@@ -5088,6 +5229,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 node->src[2] == nullptr && pair->src[2] == nullptr &&
                 node->src[0]->type == GGML_TYPE_Q8_0_G128 &&
                 pair->src[0]->type == node->src[0]->type &&
+                !ggml_cuda_marlin_q8_g128_is_repacked(node->src[0]) &&
+                !ggml_cuda_marlin_q8_g128_is_repacked(pair->src[0]) &&
                 pair->src[1] == node->src[1] &&
                 ggml_are_same_shape(pair->src[0], node->src[0]) &&
                 ggml_are_same_stride(pair->src[0], node->src[0]) &&
@@ -6808,6 +6951,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     cuda_ctx->bf16_glu_outputs.clear();
     cuda_ctx->humming_prepared_active.clear();
     cuda_ctx->precomputed_ssm_convs.clear();
+
+    ggml_cuda_canonicalize_unserved_marlin_weights(cuda_ctx, cgraph);
 #endif
 
     // VBR S5: if a KV degrade wave is in flight on the side stream, GPU-wait on it here (before

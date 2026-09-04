@@ -11,7 +11,7 @@ void ggml_cuda_marlin_q4_a32_repack_upload(
     void * storage,
     int64_t n,
     int64_t k,
-    int device,
+    int max_shared,
     int sms,
     cudaStream_t stream);
 
@@ -30,7 +30,7 @@ void ggml_cuda_marlin_q4_a32_prepare(
     void * marlin_zero,
     int64_t n,
     int64_t k,
-    int device,
+    int max_shared,
     int sms,
     cudaStream_t stream);
 
@@ -44,6 +44,6 @@ void ggml_cuda_marlin_q4_a32_launch(
     int64_t n,
     int64_t k,
     int64_t m,
-    int device,
+    int max_shared,
     int sms,
     cudaStream_t stream);

@@ -5353,37 +5353,53 @@ struct test_mul_mat_q4_a32_residual_chain : public test_case {
     double max_nmse_err() override { return 2e-4; }
 };
 
-struct test_mul_mat_q4_a32_glu_chain : public test_case {
+struct test_mul_mat_quant_glu_chain : public test_case {
     static constexpr int64_t k      = 256;
     static constexpr int64_t n_ff   = 17408;
     static constexpr int64_t n_out  = 256;
-    static constexpr int64_t m      = 1;
 
-    std::string vars() override { return "k=256,n_ff=17408,n_out=256,m=1"; }
-    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_Q4_A32_GLU_CHAIN"; }
+    // strided_input feeds the projections a non-contiguous activation view, a
+    // contract the Marlin executors decline: the repacked weights must then be
+    // restored to their canonical layout before the generic executors run.
+    test_mul_mat_quant_glu_chain(ggml_type weight_type, int64_t m, bool include_down = true,
+            bool strided_input = false) :
+        weight_type(weight_type), m(m), include_down(include_down), strided_input(strided_input) {}
+
+    std::string vars() override {
+        return std::string("type=") + ggml_type_name(weight_type) + ",k=256,n_ff=17408,n_out=256,m=" +
+            std::to_string(m) + ",down=" + std::to_string(include_down) +
+            ",strided=" + std::to_string(strided_input);
+    }
+    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_QUANT_GLU_CHAIN"; }
     bool run_whole_graph() override { return true; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * gate_weight = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_A32, k, n_ff);
-        ggml_tensor * up_weight   = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_A32, k, n_ff);
-        ggml_tensor * down_weight = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_A32, n_ff, n_out);
-        ggml_tensor * input       = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
+        ggml_tensor * gate_weight = ggml_new_tensor_2d(ctx, weight_type, k, n_ff);
+        ggml_tensor * up_weight   = ggml_new_tensor_2d(ctx, weight_type, k, n_ff);
+        ggml_tensor * down_weight = include_down ?
+            ggml_new_tensor_2d(ctx, weight_type, n_ff, n_out) : nullptr;
+        ggml_tensor * input       = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, strided_input ? 2 * k : k, m);
+        ggml_set_name(input,       "q4_a32_glu_input");
+        if (strided_input) {
+            input = ggml_view_2d(ctx, input, k, m, input->nb[1], 0);
+        }
         ggml_set_name(gate_weight, "q4_a32_glu_gate");
         ggml_set_name(up_weight,   "q4_a32_glu_up");
-        ggml_set_name(down_weight, "q4_a32_glu_down");
-        ggml_set_name(input,       "q4_a32_glu_input");
+        if (down_weight != nullptr) {
+            ggml_set_name(down_weight, "q4_a32_glu_down");
+        }
 
         ggml_tensor * gate = ggml_mul_mat(ctx, gate_weight, input);
         ggml_tensor * up   = ggml_mul_mat(ctx, up_weight, input);
         ggml_tensor * glu  = ggml_swiglu_split(ctx, gate, up);
-        return ggml_mul_mat(ctx, down_weight, glu);
+        return down_weight != nullptr ? ggml_mul_mat(ctx, down_weight, glu) : glu;
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        const ggml_type_traits * q4 = ggml_get_type_traits(GGML_TYPE_Q4_A32);
+        const ggml_type_traits * traits = ggml_get_type_traits(weight_type);
         for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor != nullptr;
              tensor = ggml_get_next_tensor(ctx, tensor)) {
-            if (tensor->type == GGML_TYPE_Q4_A32) {
+            if (tensor->type == weight_type) {
                 std::vector<float> values(ggml_nelements(tensor));
                 const int phase = strcmp(tensor->name, "q4_a32_glu_gate") == 0 ? 3 :
                                   strcmp(tensor->name, "q4_a32_glu_up") == 0 ? 7 : 11;
@@ -5395,7 +5411,7 @@ struct test_mul_mat_q4_a32_glu_chain : public test_case {
                     }
                 }
                 std::vector<uint8_t> packed(ggml_nbytes(tensor));
-                q4->from_float_ref(values.data(), packed.data(), values.size());
+                traits->from_float_ref(values.data(), packed.data(), values.size());
                 ggml_backend_tensor_set(tensor, packed.data(), 0, packed.size());
             } else if (strcmp(tensor->name, "q4_a32_glu_input") == 0) {
                 std::vector<float> values(ggml_nelements(tensor));
@@ -5410,6 +5426,12 @@ struct test_mul_mat_q4_a32_glu_chain : public test_case {
     // The standalone Marlin path accumulates in BF16. The end-to-end model
     // coherency gate remains the stronger oracle for autoregressive decode.
     double max_nmse_err() override { return 1e-3; }
+
+  private:
+    ggml_type weight_type;
+    int64_t m;
+    bool include_down;
+    bool strided_input;
 };
 
 struct test_mul_mat_dynamic_fp8 : public test_case {
@@ -10562,7 +10584,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_dynamic_i4());
     test_cases.emplace_back(new test_mul_mat_dynamic_i4(true));
     test_cases.emplace_back(new test_mul_mat_q4_a32_residual_chain());
-    test_cases.emplace_back(new test_mul_mat_q4_a32_glu_chain());
+    test_cases.emplace_back(new test_mul_mat_quant_glu_chain(GGML_TYPE_Q4_A32, 1));
+    test_cases.emplace_back(new test_mul_mat_quant_glu_chain(GGML_TYPE_Q8_0_G128, 1));
+    test_cases.emplace_back(new test_mul_mat_quant_glu_chain(GGML_TYPE_Q8_0_G128, 17));
+    test_cases.emplace_back(new test_mul_mat_quant_glu_chain(GGML_TYPE_Q8_0_G128, 512));
+    test_cases.emplace_back(new test_mul_mat_quant_glu_chain(GGML_TYPE_Q8_0_G128, 17, false));
+    test_cases.emplace_back(new test_mul_mat_quant_glu_chain(GGML_TYPE_Q8_0_G128, 512, false));
+    test_cases.emplace_back(new test_mul_mat_quant_glu_chain(GGML_TYPE_Q4_A32, 17, false, true));
+    test_cases.emplace_back(new test_mul_mat_quant_glu_chain(GGML_TYPE_Q8_0_G128, 17, false, true));
     test_cases.emplace_back(new test_mul_mat_dynamic_fp8());
     test_cases.emplace_back(new test_mul_mat_dynamic_fp8(true, 2.0f));
     test_cases.emplace_back(new test_mul_mat_dynamic_fp8(true, 0.0f, false));
@@ -10587,6 +10616,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Native Marlin Q4-A32 path (output rows and reduction width satisfy its
     // 256/128 alignment contract; batch 17 avoids MMVQ).
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_A32, GGML_TYPE_F32, 256, 17, 256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0_G128, GGML_TYPE_F32, 256, 17, 256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0_G128, GGML_TYPE_F32, 256, 65, 256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0_G128, GGML_TYPE_F32, 256, 100, 256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0_G128, GGML_TYPE_F32, 256, 1025, 256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0_G128, GGML_TYPE_F32, 17408, 17, 256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0_G128, GGML_TYPE_F32, 17408, 512, 256, {1, 1}, {1, 1}));
+    // Q4-A32 shares the Marlin batch-split policy; 65 and 100 rows exercise the <= 64-row tail.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_A32, GGML_TYPE_F32, 256, 65, 256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_A32, GGML_TYPE_F32, 256, 100, 256, {1, 1}, {1, 1}));
+    // Representation boundary: Marlin-eligible weights reached through a contract the
+    // Marlin executors decline (broadcast batch here, strided activation in the GLU
+    // chain) must be restored to their canonical layout before a canonical executor
+    // reads them.
+    for (ggml_type type_a : { GGML_TYPE_Q4_A32, GGML_TYPE_Q8_0_G128 }) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 256, 17, 256, {1, 1}, {2, 1}));
+    }
 
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {

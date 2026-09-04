@@ -8,6 +8,7 @@
 #include "humming-fp8.cuh"
 #include "humming-fp8-block.cuh"
 #include "marlin-q4-a32.cuh"
+#include "marlin-q8-g128.cuh"
 #endif
 
 #include <atomic>
@@ -66,6 +67,39 @@ void ggml_cuda_dequantize_fp8_block_bf16(
         dst, weight->ne[0], weight->ne[1], weight->ne[2]);
 }
 
+// The MUL_MAT contract a Marlin executor serves, independent of whether the
+// weight is currently repacked. The pre-capture canonicalization pass uses the
+// same predicate, so a repacked weight can never reach a canonical executor.
+static bool ggml_cuda_marlin_accepts_mul_mat(
+        ggml_type weight_type,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * ids,
+        const ggml_tensor * dst) {
+    return src0->type == weight_type && ids == nullptr &&
+        src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+        src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+        dst->ne[2] == 1 && dst->ne[3] == 1 &&
+        ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
+        src1->ne[0] == src0->ne[0] && dst->ne[0] == src0->ne[1] && dst->ne[1] == src1->ne[1];
+}
+
+bool ggml_cuda_marlin_q4_a32_accepts_mul_mat(
+        const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+        const ggml_tensor * dst, int cc) {
+    return ggml_cuda_marlin_q4_a32_enabled() &&
+        ggml_cuda_marlin_accepts_mul_mat(GGML_TYPE_Q4_A32, src0, src1, ids, dst) &&
+        ggml_cuda_marlin_q4_a32_supports_shape(src0->ne[1], src0->ne[0], src1->ne[1], cc);
+}
+
+bool ggml_cuda_marlin_q8_g128_accepts_mul_mat(
+        const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+        const ggml_tensor * dst, int cc) {
+    return ggml_cuda_marlin_q8_g128_enabled() &&
+        ggml_cuda_marlin_accepts_mul_mat(GGML_TYPE_Q8_0_G128, src0, src1, ids, dst) &&
+        ggml_cuda_marlin_q8_g128_supports_shape(src0->ne[1], src0->ne[0], src1->ne[1], cc);
+}
+
 bool ggml_cuda_mul_mat_marlin_q4_a32(
         ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0,
@@ -73,12 +107,8 @@ bool ggml_cuda_mul_mat_marlin_q4_a32(
         const ggml_tensor * ids,
         ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
-    if (!ggml_cuda_marlin_q4_a32_enabled() || src0->type != GGML_TYPE_Q4_A32 ||
-        ids != nullptr ||
-        src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
-        src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
-        dst->ne[2] != 1 || dst->ne[3] != 1 ||
-        !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!ggml_cuda_marlin_q4_a32_accepts_mul_mat(src0, src1, ids, dst, cc)) {
         return false;
     }
 
@@ -96,11 +126,8 @@ bool ggml_cuda_mul_mat_marlin_q4_a32(
     const int64_t k = src0->ne[0];
     const int64_t n = src0->ne[1];
     const int64_t m = src1->ne[1];
-    const int cc = ggml_cuda_info().devices[ctx.device].cc;
-    if (src1->ne[0] != k || dst->ne[0] != n || dst->ne[1] != m ||
-        !ggml_cuda_marlin_q4_a32_supports_shape(n, k, m, cc)) {
-        return false;
-    }
+    const int max_shared = int(ggml_cuda_info().devices[ctx.device].smpbo);
+    const int sms = ggml_cuda_info().devices[ctx.device].nsm;
 
     cudaStream_t stream = ctx.stream();
     if (!ggml_cuda_marlin_q4_a32_is_repacked(src0) ||
@@ -123,7 +150,7 @@ bool ggml_cuda_mul_mat_marlin_q4_a32(
         ggml_cuda_marlin_q4_a32_layout{};
 
     auto & lock_storage = ctx.humming_fp8_locks[ctx.curr_stream_no];
-    const size_t required_locks = ((m + 15) / 16) * ((n + 63) / 64);
+    const size_t required_locks = ((m + 15) / 16) * (((gate != nullptr ? 2 : 1) * n + 63) / 64);
     if (lock_storage.count < required_locks) {
         if (lock_storage.ptr != nullptr) {
             lock_storage.retired.push_back(lock_storage.ptr);
@@ -142,12 +169,11 @@ bool ggml_cuda_mul_mat_marlin_q4_a32(
     }
     ggml_cuda_marlin_q4_a32_launch(
         input, entry.weight, entry.scale, entry.zero, output, lock_storage.ptr,
-        n, k, m, ctx.device, ggml_cuda_info().devices[ctx.device].nsm, stream);
+        n, k, m, max_shared, sms, stream);
     if (gate != nullptr) {
         ggml_cuda_marlin_q4_a32_launch(
             input, gate_entry.weight, gate_entry.scale, gate_entry.zero,
-            gate_output.get(), lock_storage.ptr, n, k, m, ctx.device,
-            ggml_cuda_info().devices[ctx.device].nsm, stream);
+            gate_output.get(), lock_storage.ptr, n, k, m, max_shared, sms, stream);
     }
 
     if (fusion != nullptr && fusion->residual != nullptr &&
@@ -163,6 +189,80 @@ bool ggml_cuda_mul_mat_marlin_q4_a32(
             output, gate != nullptr ? gate_output.get() : nullptr,
             static_cast<float *>(dst->data), size_t(m) * n, stream);
     }
+    return true;
+}
+
+bool ggml_cuda_mul_mat_marlin_q8_g128(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * ids,
+        ggml_tensor * dst,
+        const ggml_cuda_mm_fusion_args_host * fusion) {
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!ggml_cuda_marlin_q8_g128_accepts_mul_mat(src0, src1, ids, dst, cc)) {
+        return false;
+    }
+
+    // The only fusion the private-layout matcher requests is gate/up + SwiGLU.
+    const ggml_tensor * gate = fusion != nullptr ? fusion->gate : nullptr;
+    if (gate != nullptr && (fusion->glu_op != GGML_GLU_OP_SWIGLU ||
+            gate->type != GGML_TYPE_Q8_0_G128 || !ggml_are_same_shape(gate, src0) ||
+            !ggml_are_same_stride(gate, src0) || !ggml_is_contiguous(gate))) {
+        return false;
+    }
+    if (!ggml_cuda_marlin_q8_g128_is_repacked(src0) ||
+            (gate != nullptr && !ggml_cuda_marlin_q8_g128_is_repacked(gate))) {
+        return false;
+    }
+
+    const int64_t k = src0->ne[0];
+    const int64_t n = src0->ne[1];
+    const int64_t m = src1->ne[1];
+    const int max_shared = int(ggml_cuda_info().devices[ctx.device].smpbo);
+    const int sms = ggml_cuda_info().devices[ctx.device].nsm;
+    // Marlin storage holds the packed weights followed by the BF16 group scales.
+    auto scales_of = [&](const ggml_tensor * weight) {
+        return static_cast<const char *>(weight->data) + size_t(n) * k;
+    };
+
+    cudaStream_t stream = ctx.stream();
+    // One 2n-wide gate|up launch only wins at decode-sized batches; prefill keeps
+    // two narrow launches (measured on the A100, see the architecture plan).
+    const bool pair_launch = gate != nullptr && m <= 8;
+    auto & lock_storage = ctx.humming_fp8_locks[ctx.curr_stream_no];
+    const size_t required_locks = ((m + 15) / 16) * (((pair_launch ? 2 : 1) * n + 63) / 64);
+    if (lock_storage.count < required_locks) {
+        if (lock_storage.ptr != nullptr) {
+            lock_storage.retired.push_back(lock_storage.ptr);
+        }
+        CUDA_CHECK(cudaMalloc(&lock_storage.ptr, required_locks * sizeof(int32_t)));
+        CUDA_CHECK(cudaMemsetAsync(lock_storage.ptr, 0, required_locks * sizeof(int32_t), stream));
+        lock_storage.count = required_locks;
+    }
+
+    nv_bfloat16 * input = ggml_cuda_humming_get_input(ctx, src1, size_t(m) * k, stream);
+    const size_t output_count = size_t(m) * n;
+    ggml_cuda_pool_alloc<nv_bfloat16> output_scratch(ctx.pool(), output_count * (gate != nullptr ? 2 : 1));
+    nv_bfloat16 * output = output_scratch.get();
+    float * dst_f32 = static_cast<float *>(dst->data);
+    if (pair_launch) {
+        ggml_cuda_marlin_q8_g128_launch(
+            input, src0->data, scales_of(src0), gate->data, scales_of(gate), output, lock_storage.ptr,
+            n, k, m, max_shared, sms, stream);
+        ggml_cuda_humming_fp8_swiglu_f32_paired(output, dst_f32, m, n, stream);
+        return true;
+    }
+    nv_bfloat16 * gate_output = gate != nullptr ? output + output_count : nullptr;
+    ggml_cuda_marlin_q8_g128_launch(
+        input, src0->data, scales_of(src0), nullptr, nullptr, output, lock_storage.ptr,
+        n, k, m, max_shared, sms, stream);
+    if (gate != nullptr) {
+        ggml_cuda_marlin_q8_g128_launch(
+            input, gate->data, scales_of(gate), nullptr, nullptr, gate_output, lock_storage.ptr,
+            n, k, m, max_shared, sms, stream);
+    }
+    ggml_cuda_humming_fp8_output_bf16_to_f32(output, gate_output, dst_f32, output_count, stream);
     return true;
 }
 

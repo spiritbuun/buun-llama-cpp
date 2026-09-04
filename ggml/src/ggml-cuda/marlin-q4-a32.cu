@@ -2,6 +2,7 @@
 
 #if !defined(GGML_USE_HIP)
 
+#include "marlin-common.cuh"
 #include "marlin-repack.cuh"
 #include "marlin-vendor/kernel.h"
 #include "marlin-vendor/marlin_template.h"
@@ -198,7 +199,7 @@ void ggml_cuda_marlin_q4_a32_repack_upload(
         void * storage,
         int64_t n,
         int64_t k,
-        int device,
+        int max_shared,
         int sms,
         cudaStream_t stream) {
     const size_t canonical_size = size_t(n) * k / QK4_A32 * sizeof(block_q4_a32);
@@ -216,7 +217,7 @@ void ggml_cuda_marlin_q4_a32_repack_upload(
         storage,
         static_cast<char *>(storage) + weight_size,
         static_cast<char *>(storage) + weight_size + scale_size,
-        n, k, device, sms, stream);
+        n, k, max_shared, sms, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaFree(raw_weight));
     CUDA_CHECK(cudaFree(canonical_device));
@@ -254,7 +255,7 @@ void ggml_cuda_marlin_q4_a32_prepare(
         void * marlin_zero,
         int64_t n,
         int64_t k,
-        int device,
+        int max_shared,
         int sms,
         cudaStream_t stream) {
     GGML_ASSERT(n % 256 == 0 && k % 128 == 0);
@@ -265,8 +266,6 @@ void ggml_cuda_marlin_q4_a32_prepare(
         static_cast<nv_bfloat16 *>(marlin_scale),
         static_cast<uint32_t *>(marlin_zero), n, k);
 
-    int max_shared = 0;
-    CUDA_CHECK(cudaDeviceGetAttribute(&max_shared, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
     constexpr auto repack = marlin::gptq_marlin_repack_kernel<marlin::repack_threads, 4, false, false>;
     CUDA_CHECK(cudaFuncSetAttribute(repack, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared));
     repack<<<sms, marlin::repack_threads, max_shared, stream>>>(
@@ -284,18 +283,14 @@ void ggml_cuda_marlin_q4_a32_launch(
         int64_t n,
         int64_t k,
         int64_t m,
-        int device,
+        int max_shared,
         int sms,
         cudaStream_t stream) {
-    int max_shared = 0;
-    CUDA_CHECK(cudaDeviceGetAttribute(&max_shared, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
-
     int64_t remaining = m;
     int64_t offset = 0;
     while (remaining > 0) {
-        constexpr int max_m = 4 * 16 * 16;
-        const int64_t split = std::min<int64_t>(remaining, max_m);
-        const int m_blocks = std::min<int>(4, (split + 15) / 16);
+        const int64_t split = ggml_cuda_marlin::next_m_split(remaining);
+        const int m_blocks = ggml_cuda_marlin::m_blocks_for(split);
         const bool m_block_8 = split <= 8;
         marlin_fn kernel = select_marlin_kernel(m_blocks, m_block_8);
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared));
@@ -307,7 +302,7 @@ void ggml_cuda_marlin_q4_a32_launch(
             static_cast<const int4 *>(scale), nullptr,
             static_cast<const int4 *>(zero), nullptr,
             k / QG4_A32, split, n, k, k, locks,
-            false, false, false, max_shared);
+            false, false, false, max_shared, nullptr, nullptr);
         offset += split;
         remaining -= split;
     }

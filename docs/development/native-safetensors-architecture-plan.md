@@ -381,9 +381,42 @@ Matrix receipts recorded on the A100-SXM4-80GB on 2026-09-02:
   TG128; peak process RSS was 30.50 GiB and peak GPU use was 28.43 GiB. vLLM
   0.28.0 selected compressed-tensors Marlin, reported 28.03 GiB model load
   memory, and reached median 3281.26 PP512, 3131.73 PP2048, and 48.77 TG128.
-  Resident weight memory is already close, but native is about 53.4% behind at
-  PP2048 and 45.3% behind at TG128; optimized packed-INT8 execution is therefore
-  a measured post-matrix kernel priority.
+  Resident weight memory was already close. The first packed-INT8 pass then
+  added an in-place Q8-G128 Marlin layout (no second resident weight copy),
+  aligned generic Q8-G128 loads, and an exact gate/up/SwiGLU fusion. The initial
+  fusion was incoherent because the generic canonical-Q8 matcher interpreted
+  the backend-private Marlin layout as ordinary Q8; a dedicated private-layout
+  matcher now admits only the closed two-matmul/SwiGLU graph. Profiling also
+  showed that one logical 34,816-row Marlin launch is faster only for decode-
+  sized batches, while two 17,408-row launches are faster for prefill. The
+  retained policy therefore uses the wide launch at `m <= 8` and the original
+  two-launch fused epilogue above that. On the A100 this moved the checkpoint
+  from 1356.81 PP512 / 1460.07 PP2048 / 26.67 TG128 to approximately 2684 /
+  2749 / 43.68 in the final hybrid arm. The remaining gap to vLLM is about 12%
+  at PP2048 and 10% at TG128; full Q/K/V and recurrent QKV/Z projection packing
+  account for the remaining launch-count difference but require unequal-output
+  segmented kernels rather than a blind extension of the equal-width pair.
+  The pre-commit review then closed three defects shared by both Marlin
+  executors: the launchers split batches with one policy (`marlin-common.cuh`)
+  that only ever presents whole 64-row multiples or a final `<= 64`-row tail,
+  because the vendor kernel silently drops any other remainder; launchers take
+  the opt-in shared-memory limit from the backend's per-device table instead of
+  querying the fork's logical device index, which is invalid under virtual
+  devices; and the private Marlin layout is confined to the executors by a
+  pre-capture pass (`ggml_cuda_canonicalize_unserved_marlin_weights`) that
+  restores the canonical layout of any repacked weight reached through a
+  contract the executors decline (a view, a broadcast batch, a non-contiguous
+  activation, a copy), with an abort tripwire behind it. The paired launch
+  passes its second weight/scale pair through explicit kernel parameters rather
+  than reusing unrelated vendor arguments.
+  The fidelity gate was rerun on a fresh A100 against a regenerated exact
+  BF16 anchor (self-KLD exactly zero): the Marlin executor measures median KLD
+  0.000171 with the fusion on or off and at `-ub 8` (the paired decode-width
+  launch) or `-ub 512`, versus 0.000315 for the canonical MMQ path, so the
+  BF16-activation Marlin path is also the more faithful one. Final-binary
+  throughput on that box was 2706 / 2819 / 43.53 (PP512 / PP2048 / TG128) with
+  the fusion, 2629 / 2737 / 42.25 without it, and 1456 / 1564 / 39.47 with
+  Marlin disabled.
 - BitsAndBytes NF4 now loads the real Unsloth checkpoint and generates coherent
   greedy output. Qwen recurrent packed weights are permuted into canonical head
   order while a 28-byte scale-layout descriptor maps each destination block back
@@ -687,9 +720,12 @@ launches on Ampere:
 | packed gate/up + fused split-SwiGLU | 1613.3–1626.8 | 32.25–32.77 |
 
 Packing therefore lost about 4.7% prefill with no decode benefit. The code was
-removed. Do not generalize vLLM's packed-module topology onto the current
-Ampere Marlin executor; reconsider it only alongside a kernel whose tiling was
-designed and benchmarked for the wider projections.
+removed. This Q4 result does not contradict the later Q8-G128 fusion: the Q8
+implementation keeps the established narrow launches for prefill and uses a
+purpose-built paired projection only for `m <= 8`, where it measured about 3%
+faster decode. Do not generalize vLLM's packed-module topology onto every
+quantized executor; each wider projection needs its own batch-size crossover
+and kernel proof.
 
 ### Retained Ampere recurrent-path fusions
 

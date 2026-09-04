@@ -70,6 +70,23 @@ bool ggml_cuda_mul_mat_marlin_q4_a32(
     ggml_tensor * dst,
     const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
 
+// Contract checks shared by the executors and the pre-capture canonicalization
+// pass (ggml-cuda.cu); they do not consult the repacked state.
+bool ggml_cuda_marlin_q4_a32_accepts_mul_mat(
+    const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+    const ggml_tensor * dst, int cc);
+bool ggml_cuda_marlin_q8_g128_accepts_mul_mat(
+    const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+    const ggml_tensor * dst, int cc);
+
+bool ggml_cuda_mul_mat_marlin_q8_g128(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * src0,
+    const ggml_tensor * src1,
+    const ggml_tensor * ids,
+    ggml_tensor * dst,
+    const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
+
 #endif
 
 // Returns the maximum batch size for which MMVQ should be used for MUL_MAT_ID,

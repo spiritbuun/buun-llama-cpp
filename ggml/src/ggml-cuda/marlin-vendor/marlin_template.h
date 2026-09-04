@@ -242,7 +242,7 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
           >
 __global__ void Marlin(
     const int4* __restrict__ A0,  // fp16 input matrix of shape mxk
-    const int4* __restrict__ B,   // 4bit quantized weight matrix of shape kxn
+    const int4* __restrict__ B0,  // quantized weight matrix of shape kxn
     int4* __restrict__ C0,        // fp16 output buffer of shape mxn
     int4* __restrict__ C_tmp,     // fp32 tmp output buffer (for reduce)
     const int4* __restrict__ b_bias_ptr,
@@ -267,7 +267,12 @@ __global__ void Marlin(
     bool has_bias,
     bool use_atomic_add,   // whether to use atomic add to reduce
     bool use_fp32_reduce,  // whether to use fp32 global reduce
-    int max_shared_mem) {
+    int max_shared_mem,
+    // buun: optional second weight/scale pair (Q8-G128 gate/up). When set, the
+    // upper half of prob_n reads B_alt/scales_alt so two independently
+    // allocated projections run as one wide GEMM.
+    const int4* __restrict__ B_alt,
+    const int4* __restrict__ scales_alt) {
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
   // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM
@@ -375,8 +380,11 @@ __global__ void Marlin(
     prob_m = m_block_size;
   }
 
+  const bool paired = B_alt != nullptr;
+  const int weight_n = paired ? prob_n / 2 : prob_n;
   int k_tiles = prob_k / 16 / thread_k_blocks;
   int n_tiles = prob_n / 16 / thread_n_blocks;
+  const int weight_n_tiles = weight_n / 16 / thread_n_blocks;
 
   int global_mn_tiles = parallel * n_tiles;
   int part2_mn_tiles = global_mn_tiles;
@@ -526,6 +534,22 @@ __global__ void Marlin(
 
   init_slice();
 
+  const int4* B = B0;
+  const int4* active_scales_ptr = scales_ptr;
+  auto update_pair_segment = [&]() {
+    if (paired && slice_col >= weight_n_tiles) {
+      B = B_alt;
+      active_scales_ptr = scales_alt;
+    } else {
+      B = B0;
+      active_scales_ptr = scales_ptr;
+    }
+  };
+  auto weight_slice_col = [&]() {
+    return paired ? slice_col % weight_n_tiles : slice_col;
+  };
+  update_pair_segment();
+
   // A sizes/strides
 
   // stride of the A matrix in global memory
@@ -546,7 +570,7 @@ __global__ void Marlin(
   constexpr int a_sh_wr_iters = div_ceil(a_sh_stage, a_sh_wr_delta);
 
   // B sizes/strides
-  int b_gl_stride = 16 * prob_n / (pack_factor * (is_a_8bit ? 2 : 4));
+  int b_gl_stride = 16 * weight_n / (pack_factor * (is_a_8bit ? 2 : 4));
   constexpr int b_sh_stride =
       ((thread_n_blocks * 16) * 16 / pack_factor) / (is_a_8bit ? 2 : 4);
   constexpr int b_thread_vecs = b_type.size_bits() == 4 ? 1 : 2;
@@ -559,7 +583,7 @@ __global__ void Marlin(
   constexpr int b_sh_wr_iters = b_sh_stage / b_sh_wr_delta;
 
   // Scale sizes/strides without act_order
-  int s_gl_stride = prob_n / (is_8bit_scale ? 16 : 8);
+  int s_gl_stride = weight_n / (is_8bit_scale ? 16 : 8);
   constexpr int s_sh_stride = 16 * thread_n_blocks / (is_8bit_scale ? 16 : 8);
   constexpr int s_tb_groups =
       !has_act_order && group_blocks != -1 && group_blocks < thread_k_blocks
@@ -610,7 +634,7 @@ __global__ void Marlin(
         b_gl_stride * (threadIdx.x / b_sh_stride) + (threadIdx.x % b_sh_stride);
   }
 
-  b_gl_rd += b_sh_stride * slice_col;
+  b_gl_rd += b_sh_stride * weight_slice_col();
   b_gl_rd += b_gl_rd_delta_o * slice_row;
   auto b_sh_rd = threadIdx.x * b_thread_vecs;
   b_sh_rd += b_sh_rd / b_sh_stride * (b_sh_stride * (b_sh_wr_iters - 1));
@@ -619,20 +643,20 @@ __global__ void Marlin(
   int slice_k_start = tb_k * slice_row;
   int slice_k_finish = slice_k_start + tb_k * slice_iters;
   int slice_k_start_shared_fetch = slice_k_start;
-  int slice_n_offset = act_s_col_tb_stride * slice_col;
+  int slice_n_offset = act_s_col_tb_stride * weight_slice_col();
 
   // No act_order
   int s_gl_rd;
   if constexpr (!has_act_order) {
     if constexpr (group_blocks == -1) {
-      s_gl_rd = s_sh_stride * slice_col + threadIdx.x;
+      s_gl_rd = s_sh_stride * weight_slice_col() + threadIdx.x;
     } else if constexpr (group_blocks >= thread_k_blocks) {
       s_gl_rd = s_gl_stride * ((thread_k_blocks * slice_row) / group_blocks) +
-                s_sh_stride * slice_col + threadIdx.x;
+                s_sh_stride * weight_slice_col() + threadIdx.x;
     } else {
       s_gl_rd = s_gl_stride * ((thread_k_blocks * slice_row) / group_blocks +
                                threadIdx.x / s_sh_stride) +
-                s_sh_stride * slice_col + threadIdx.x % s_sh_stride;
+                s_sh_stride * weight_slice_col() + threadIdx.x % s_sh_stride;
     }
   }
   auto s_sh_wr = threadIdx.x;
@@ -823,7 +847,7 @@ __global__ void Marlin(
       for (int i = 0; i < sh_num_groups; i++) {
         if (threadIdx.x < s_sh_stride) {
           cp_async4_pred(&sh_s[(i * s_sh_stride) + threadIdx.x],
-                         &scales_ptr[row_offset + (i * s_gl_stride) +
+                         &active_scales_ptr[row_offset + (i * s_gl_stride) +
                                      slice_n_offset + threadIdx.x]);
         }
       }
@@ -831,7 +855,7 @@ __global__ void Marlin(
       for (int i = 0; i < sh_num_groups; i++) {
         if (threadIdx.x < s_sh_stride) {
           sh_s[(i * s_sh_stride) + threadIdx.x] =
-              scales_ptr[row_offset + (i * s_gl_stride) + slice_n_offset +
+              active_scales_ptr[row_offset + (i * s_gl_stride) + slice_n_offset +
                          threadIdx.x];
         }
       }
@@ -884,7 +908,7 @@ __global__ void Marlin(
           // Only fetch scales if this tile starts a new group
           if (pipe % div_ceil(group_blocks, thread_k_blocks) == 0) {
             if (s_sh_wr_pred) {
-              cp_async4(&sh_s_stage[s_sh_wr], &scales_ptr[s_gl_rd]);
+              cp_async4(&sh_s_stage[s_sh_wr], &active_scales_ptr[s_gl_rd]);
             }
             s_gl_rd += s_gl_rd_delta * s_tb_groups;
           }
@@ -916,7 +940,7 @@ __global__ void Marlin(
 
   auto fetch_col_scale_to_shared = [&]() {
     if (s_sh_wr_pred) {
-      cp_async4(&sh_s[s_sh_wr], &scales_ptr[s_gl_rd]);
+      cp_async4(&sh_s[s_sh_wr], &active_scales_ptr[s_gl_rd]);
     }
   };
 
@@ -1902,7 +1926,7 @@ __global__ void Marlin(
                     (has_zp && dequant_skip_flop || !has_zp)) {
         if (b_type.size_bits() == 8 || (last || use_atomic_add) || is_a_8bit) {
           if (s_sh_wr_pred) {
-            cp_async4(&sh_s[s_sh_wr], &scales_ptr[s_gl_rd]);
+            cp_async4(&sh_s[s_sh_wr], &active_scales_ptr[s_gl_rd]);
           }
           cp_async_fence();
         }
@@ -2034,12 +2058,13 @@ __global__ void Marlin(
       init_slice();
 
       if (slice_iters) {
+        update_pair_segment();
         a_gl_rd = a_gl_stride * (threadIdx.x / a_gl_rd_delta_o) +
                   (threadIdx.x % a_gl_rd_delta_o);
         a_gl_rd += a_gl_rd_delta_o * slice_row;
         b_gl_rd = b_gl_stride * (threadIdx.x / b_sh_stride) +
                   (threadIdx.x % b_sh_stride);
-        b_gl_rd += b_sh_stride * slice_col + b_gl_rd_delta_o * slice_row;
+        b_gl_rd += b_sh_stride * weight_slice_col() + b_gl_rd_delta_o * slice_row;
 
         bias_gl_rd = (thread_n_blocks * 16 / 8) * slice_col + threadIdx.x;
         // Update slice k/n for scales loading
@@ -2047,15 +2072,15 @@ __global__ void Marlin(
           slice_k_start = tb_k * slice_row;
           slice_k_finish = slice_k_start + tb_k * slice_iters;
           slice_k_start_shared_fetch = slice_k_start;
-          slice_n_offset = act_s_col_tb_stride * slice_col;
+          slice_n_offset = act_s_col_tb_stride * weight_slice_col();
         } else {
           if constexpr (group_blocks == -1) {
-            s_gl_rd = s_sh_stride * slice_col + threadIdx.x;
+            s_gl_rd = s_sh_stride * weight_slice_col() + threadIdx.x;
             zp_gl_rd = zp_sh_stride * slice_col + threadIdx.x;
           } else if constexpr (group_blocks >= thread_k_blocks) {
             s_gl_rd =
                 s_gl_stride * ((thread_k_blocks * slice_row) / group_blocks) +
-                s_sh_stride * slice_col + threadIdx.x;
+                s_sh_stride * weight_slice_col() + threadIdx.x;
             zp_gl_rd =
                 zp_gl_stride * ((thread_k_blocks * slice_row) / group_blocks) +
                 zp_sh_stride * slice_col + threadIdx.x;
@@ -2063,7 +2088,7 @@ __global__ void Marlin(
             s_gl_rd =
                 s_gl_stride * ((thread_k_blocks * slice_row) / group_blocks +
                                threadIdx.x / s_sh_stride) +
-                s_sh_stride * slice_col + threadIdx.x % s_sh_stride;
+                s_sh_stride * weight_slice_col() + threadIdx.x % s_sh_stride;
             zp_gl_rd =
                 zp_gl_stride * ((thread_k_blocks * slice_row) / group_blocks +
                                 threadIdx.x / zp_sh_stride) +

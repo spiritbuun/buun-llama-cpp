@@ -117,7 +117,7 @@ if (CUDAToolkit_FOUND)
 
     file(GLOB   GGML_SOURCES_CUDA "*.cu")
     list(FILTER GGML_SOURCES_CUDA EXCLUDE REGEX "bsa_.*\\.cu$")
-    set_source_files_properties(marlin-q4-a32.cu PROPERTIES
+    set_source_files_properties(marlin-q4-a32.cu marlin-q8-g128.cu PROPERTIES
         COMPILE_OPTIONS "--expt-relaxed-constexpr")
     set_source_files_properties(int8-channel.cu PROPERTIES
         COMPILE_OPTIONS "--expt-relaxed-constexpr")
