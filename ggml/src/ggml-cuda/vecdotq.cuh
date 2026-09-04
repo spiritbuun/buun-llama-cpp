@@ -853,12 +853,13 @@ static __device__ __forceinline__ float vec_dot_q4_a32_q8_1(
         const int & iqs) {
     const block_q4_a32 * bq4 = (const block_q4_a32 *) vbq + kbx;
     const block_q8_1 * bq8 = bq8_1 + iqs;
+    // qs sits at byte 10 of a 74-byte block: 2-byte aligned, so 16-bit loads.
     const uint8_t * qs = bq4->qs + iqs*(QG4_A32/2);
 
     int sumi = 0;
 #pragma unroll
     for (int i = 0; i < QG4_A32/8; ++i) {
-        const int q = get_int_b1(qs, i);
+        const int q = get_int_b2(qs, i);
         const int u0 = get_int_b4(bq8->qs, 2*i + 0);
         const int u1 = get_int_b4(bq8->qs, 2*i + 1);
         const int u_even = __byte_perm(u0, u1, 0x6420);

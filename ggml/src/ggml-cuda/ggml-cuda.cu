@@ -6609,11 +6609,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_tensor * mul = cgraph->nodes[i + 1];
         bool retain_bf16 = false;
 #if !defined(GGML_USE_HIP)
+        // The normalized activation is kept as BF16 when every consumer takes
+        // BF16 input directly: a BF16 GEMM (prefill widths only) or a Marlin
+        // executor for a contract it serves (any width, so decode skips one
+        // conversion launch per projection).
         const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
         int bf16_consumers = 0;
         bool all_consumers_bf16_mm = !(mul->flags & GGML_TENSOR_FLAG_OUTPUT) &&
             mul->type == GGML_TYPE_F32 && ggml_is_contiguous(mul) &&
-            mul->ne[1] > 16 &&
             bf16_mma_hardware_available(cc);
         for (int j = i + 2; all_consumers_bf16_mm && j < cgraph->n_nodes; ++j) {
             ggml_tensor * consumer = cgraph->nodes[j];
@@ -6622,8 +6625,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     continue;
                 }
                 ++bf16_consumers;
-                if (consumer->op != GGML_OP_MUL_MAT || s != 1 || consumer->src[0] == nullptr ||
-                        consumer->src[0]->type != GGML_TYPE_BF16 || !ggml_is_contiguous(consumer->src[0])) {
+                const ggml_tensor * weight = consumer->src[0];
+                if (consumer->op != GGML_OP_MUL_MAT || s != 1 || weight == nullptr) {
+                    all_consumers_bf16_mm = false;
+                    break;
+                }
+                const bool bf16_gemm = weight->type == GGML_TYPE_BF16 && ggml_is_contiguous(weight) && mul->ne[1] > 16;
+                const bool marlin =
+                    (weight->type == GGML_TYPE_Q4_A32 && ggml_cuda_marlin_q4_a32_is_repacked(weight) &&
+                     ggml_cuda_marlin_q4_a32_accepts_mul_mat(weight, mul, consumer->src[2], consumer, cc)) ||
+                    (weight->type == GGML_TYPE_Q8_0_G128 && ggml_cuda_marlin_q8_g128_is_repacked(weight) &&
+                     ggml_cuda_marlin_q8_g128_accepts_mul_mat(weight, mul, consumer->src[2], consumer, cc));
+                if (!bf16_gemm && !marlin) {
                     all_consumers_bf16_mm = false;
                     break;
                 }
