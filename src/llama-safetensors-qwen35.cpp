@@ -1328,6 +1328,12 @@ bool llama_safetensors_qwen35_importer::describe(
                 return false;
             }
             if (type == GGML_TYPE_COUNT) {
+                // Only self-contained row blocks concatenate; channel-scaled
+                // formats carry sidecar scale tensors and stay separate.
+                if (part_type == GGML_TYPE_F8_E4M3 || part_type == GGML_TYPE_I8 ||
+                        part_type == GGML_TYPE_GPTQ_AO) {
+                    return false;
+                }
                 type  = part_type;
                 ne[0] = part_ne[0];
                 ne[1] = 0;

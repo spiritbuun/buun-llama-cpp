@@ -10630,6 +10630,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1024, 1, 5120, {1, 1}, {1, 1}));
     }
+    // Fused qkv|z width of Qwen3.8-27B (16384 x 5120) at decode and small-batch widths.
+    for (ggml_type type_a : { GGML_TYPE_Q4_A32, GGML_TYPE_Q8_0_G128 }) {
+        for (int64_t n : { 1, 2, 8, 32 }) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 16384, n, 5120, {1, 1}, {1, 1}));
+        }
+    }
     // Q4-A32 shares the Marlin batch-split policy; 65 and 100 rows exercise the <= 64-row tail.
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_A32, GGML_TYPE_F32, 256, 65, 256, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_A32, GGML_TYPE_F32, 256, 100, 256, {1, 1}, {1, 1}));
