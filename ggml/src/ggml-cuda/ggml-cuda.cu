@@ -2720,6 +2720,15 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
 #endif
 
+    // A wide BF16 projection (an output head) at decode width streams faster
+    // through the cuBLAS GEMM than through the vector kernels: A100 Qwen3.8-27B
+    // head 1.40 ms vs 1.66 ms (mmvf) and 1.45 ms (mmf) per token.
+    static const bool head_mmvf = std::getenv("GGML_CUDA_HEAD_MMVF") != nullptr;
+    if (!head_mmvf && src0->type == GGML_TYPE_BF16 && ne01 >= 32768 && ne11 <= 4 &&
+            GGML_CUDA_CC_IS_NVIDIA(cc) && ampere_mma_available(cc)) {
+        ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+        return;
+    }
     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
