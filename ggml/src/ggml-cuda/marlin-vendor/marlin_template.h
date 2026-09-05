@@ -273,7 +273,8 @@ __global__ void Marlin(
     // upper half of prob_n reads B_alt/scales_alt so two independently
     // allocated projections run as one wide GEMM.
     const int4* __restrict__ B_alt,
-    const int4* __restrict__ scales_alt) {
+    const int4* __restrict__ scales_alt,
+    const int4* __restrict__ zp_alt) {
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
   // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM
@@ -537,13 +538,16 @@ __global__ void Marlin(
 
   const int4* B = B0;
   const int4* active_scales_ptr = scales_ptr;
+  const int4* active_zp_ptr = zp_ptr;
   auto update_pair_segment = [&]() {
     if (paired && slice_col >= weight_n_tiles) {
       B = B_alt;
       active_scales_ptr = scales_alt;
+      active_zp_ptr = zp_alt;
     } else {
       B = B0;
       active_scales_ptr = scales_ptr;
+      active_zp_ptr = zp_ptr;
     }
   };
   auto weight_slice_col = [&]() {
@@ -606,7 +610,7 @@ __global__ void Marlin(
   int act_s_col_tb_stride = act_s_col_warp_stride * tb_n_warps;
 
   // Zero-points sizes/strides
-  int zp_gl_stride = is_zp_float ? prob_n / 8 : (prob_n / pack_factor) / 4;
+  int zp_gl_stride = is_zp_float ? weight_n / 8 : (weight_n / pack_factor) / 4;
   constexpr int zp_sh_stride = is_zp_float
                                    ? 16 * thread_n_blocks / 8
                                    : ((16 * thread_n_blocks) / pack_factor) / 4;
@@ -667,14 +671,14 @@ __global__ void Marlin(
   int zp_gl_rd;
   if constexpr (has_zp) {
     if constexpr (group_blocks == -1) {
-      zp_gl_rd = zp_sh_stride * slice_col + threadIdx.x;
+      zp_gl_rd = zp_sh_stride * weight_slice_col() + threadIdx.x;
     } else if constexpr (group_blocks >= thread_k_blocks) {
       zp_gl_rd = zp_gl_stride * ((thread_k_blocks * slice_row) / group_blocks) +
-                 zp_sh_stride * slice_col + threadIdx.x;
+                 zp_sh_stride * weight_slice_col() + threadIdx.x;
     } else {
       zp_gl_rd = zp_gl_stride * ((thread_k_blocks * slice_row) / group_blocks +
                                  threadIdx.x / zp_sh_stride) +
-                 zp_sh_stride * slice_col + threadIdx.x % zp_sh_stride;
+                 zp_sh_stride * weight_slice_col() + threadIdx.x % zp_sh_stride;
     }
   }
   auto zp_sh_wr = threadIdx.x;
@@ -921,7 +925,7 @@ __global__ void Marlin(
           // Only fetch zero points if this tile starts a new group
           if (pipe % div_ceil(group_blocks, thread_k_blocks) == 0) {
             if (zp_sh_wr_pred) {
-              cp_async4(&sh_zp_stage[zp_sh_wr], &zp_ptr[zp_gl_rd]);
+              cp_async4(&sh_zp_stage[zp_sh_wr], &active_zp_ptr[zp_gl_rd]);
             }
             zp_gl_rd += zp_gl_rd_delta * zp_tb_groups;
           }
@@ -935,7 +939,7 @@ __global__ void Marlin(
 
   auto fetch_col_zp_to_shared = [&]() {
     if (zp_sh_wr_pred) {
-      cp_async4(&sh_zp[zp_sh_wr], &zp_ptr[zp_gl_rd]);
+      cp_async4(&sh_zp[zp_sh_wr], &active_zp_ptr[zp_gl_rd]);
     }
   };
 
@@ -2097,14 +2101,14 @@ __global__ void Marlin(
         } else {
           if constexpr (group_blocks == -1) {
             s_gl_rd = s_sh_stride * weight_slice_col() + threadIdx.x;
-            zp_gl_rd = zp_sh_stride * slice_col + threadIdx.x;
+            zp_gl_rd = zp_sh_stride * weight_slice_col() + threadIdx.x;
           } else if constexpr (group_blocks >= thread_k_blocks) {
             s_gl_rd =
                 s_gl_stride * ((thread_k_blocks * slice_row) / group_blocks) +
                 s_sh_stride * weight_slice_col() + threadIdx.x;
             zp_gl_rd =
                 zp_gl_stride * ((thread_k_blocks * slice_row) / group_blocks) +
-                zp_sh_stride * slice_col + threadIdx.x;
+                zp_sh_stride * weight_slice_col() + threadIdx.x;
           } else {
             s_gl_rd =
                 s_gl_stride * ((thread_k_blocks * slice_row) / group_blocks +
@@ -2113,7 +2117,7 @@ __global__ void Marlin(
             zp_gl_rd =
                 zp_gl_stride * ((thread_k_blocks * slice_row) / group_blocks +
                                 threadIdx.x / zp_sh_stride) +
-                zp_sh_stride * slice_col + threadIdx.x % zp_sh_stride;
+                zp_sh_stride * weight_slice_col() + threadIdx.x % zp_sh_stride;
           }
         }
         start_pipes();

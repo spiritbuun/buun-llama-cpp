@@ -287,6 +287,9 @@ void ggml_cuda_marlin_q4_a32_launch(
         const void * weight,
         const void * scale,
         const void * zero,
+        const void * weight_alt,
+        const void * scale_alt,
+        const void * zero_alt,
         void * output,
         bool out_f32,
         int32_t * locks,
@@ -296,6 +299,8 @@ void ggml_cuda_marlin_q4_a32_launch(
         int max_shared,
         int sms,
         cudaStream_t stream) {
+    // With weight_alt the kernel computes [weight | weight_alt] as one 2n-wide GEMM.
+    const int64_t out_n = weight_alt != nullptr ? 2 * n : n;
     const size_t out_elem = out_f32 ? sizeof(float) : sizeof(nv_bfloat16);
     int64_t remaining = m;
     int64_t offset = 0;
@@ -309,12 +314,14 @@ void ggml_cuda_marlin_q4_a32_launch(
         kernel<<<sms, 256, max_shared, stream>>>(
             reinterpret_cast<const int4 *>(input + offset * k),
             static_cast<const int4 *>(weight),
-            reinterpret_cast<int4 *>(static_cast<char *>(output) + offset * n * out_elem),
+            reinterpret_cast<int4 *>(static_cast<char *>(output) + offset * out_n * out_elem),
             nullptr, nullptr, nullptr,
             static_cast<const int4 *>(scale), nullptr,
             static_cast<const int4 *>(zero), nullptr,
-            k / QG4_A32, split, n, k, k, locks,
-            false, false, false, max_shared, nullptr, nullptr);
+            k / QG4_A32, split, out_n, k, k, locks,
+            false, false, false, max_shared,
+            static_cast<const int4 *>(weight_alt), static_cast<const int4 *>(scale_alt),
+            static_cast<const int4 *>(zero_alt));
         offset += split;
         remaining -= split;
     }

@@ -49,6 +49,9 @@ void ggml_cuda_marlin_q4_a32_launch(
     const void * weight,
     const void * scale,
     const void * zero,
+    const void * weight_alt, // optional second projection computed as the upper half of a 2n-wide output
+    const void * scale_alt,
+    const void * zero_alt,
     void * output,          // BF16, or F32 (BF16-rounded values) when out_f32
     bool out_f32,
     int32_t * locks,

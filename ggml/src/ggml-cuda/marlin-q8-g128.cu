@@ -253,7 +253,7 @@ void ggml_cuda_marlin_q8_g128_launch(
             nullptr, nullptr,
             k / QK8_0_G128, split, out_n, k, k, locks,
             false, false, false, max_shared,
-            static_cast<const int4 *>(weight_alt), static_cast<const int4 *>(scale_alt));
+            static_cast<const int4 *>(weight_alt), static_cast<const int4 *>(scale_alt), nullptr);
         offset += split;
         remaining -= split;
     }

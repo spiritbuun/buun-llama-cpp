@@ -191,8 +191,11 @@ bool ggml_cuda_mul_mat_marlin_q4_a32(
     const ggml_cuda_marlin_q4_a32_layout gate_entry = gate != nullptr ? prepare_weight(gate) :
         ggml_cuda_marlin_q4_a32_layout{};
 
+    // One 2n-wide gate|up launch only wins at decode-sized batches; prefill keeps
+    // two narrow launches (measured on the A100, see the architecture plan).
+    const bool pair_launch = gate != nullptr && m <= 8;
     auto & lock_storage = ctx.humming_fp8_locks[ctx.curr_stream_no];
-    const size_t required_locks = ((m + 15) / 16) * (((gate != nullptr ? 2 : 1) * n + 63) / 64);
+    const size_t required_locks = ((m + 15) / 16) * (((pair_launch ? 2 : 1) * n + 63) / 64);
     if (lock_storage.count < required_locks) {
         if (lock_storage.ptr != nullptr) {
             lock_storage.retired.push_back(lock_storage.ptr);
@@ -204,9 +207,9 @@ bool ggml_cuda_mul_mat_marlin_q4_a32(
 
     nv_bfloat16 * input = ggml_cuda_humming_get_input(ctx, src1, size_t(m) * k, stream);
     ggml_cuda_pool_alloc<nv_bfloat16> output_scratch(ctx.pool());
-    nv_bfloat16 * output = output_scratch.alloc(size_t(m) * n);
+    nv_bfloat16 * output = output_scratch.alloc(size_t(m) * n * (pair_launch ? 2 : 1));
     ggml_cuda_pool_alloc<nv_bfloat16> gate_output(ctx.pool());
-    if (gate != nullptr) {
+    if (gate != nullptr && !pair_launch) {
         gate_output.alloc(size_t(m) * n);
     }
     // Unfused projections take the GEMM result as F32 directly; fused epilogues
@@ -216,10 +219,22 @@ bool ggml_cuda_mul_mat_marlin_q4_a32(
     if (debug) {
         static int budget = 64;
         if (budget-- > 0) {
-            GGML_LOG_INFO("marlin-q4: %s n=%lld k=%lld m=%lld gate=%d residual=%d retain=%d\n", src0->name,
-                (long long) n, (long long) k, (long long) m, gate != nullptr,
+            GGML_LOG_INFO("marlin-q4: %s n=%lld k=%lld m=%lld gate=%d pair=%d residual=%d retain=%d\n", src0->name,
+                (long long) n, (long long) k, (long long) m, gate != nullptr, pair_launch,
                 fusion != nullptr && fusion->residual != nullptr, fusion != nullptr && fusion->retain_bf16_output);
         }
+    }
+    if (pair_launch) {
+        const bool retain_bf16 = fusion->retain_bf16_output;
+        ggml_cuda_marlin_q4_a32_launch(
+            input, entry.weight, entry.scale, entry.zero,
+            gate_entry.weight, gate_entry.scale, gate_entry.zero,
+            output, false, lock_storage.ptr, n, k, m, max_shared, sms, stream);
+        ggml_cuda_humming_fp8_swiglu_paired(output, dst->data, m, n, retain_bf16, stream);
+        if (retain_bf16) {
+            ctx.humming_bf16_activations.insert(dst);
+        }
+        return true;
     }
     if (m >= ggml_cuda_marlin::gemm_min_m()) {
         ggml_cuda_marlin_gemm_bf16(ctx, ggml_cuda_marlin_q4_a32_dequant_bf16, src0->data, input,
@@ -234,12 +249,12 @@ bool ggml_cuda_mul_mat_marlin_q4_a32(
     } else {
         // An unfused projection writes F32 straight into the graph tensor.
         ggml_cuda_marlin_q4_a32_launch(
-            input, entry.weight, entry.scale, entry.zero,
+            input, entry.weight, entry.scale, entry.zero, nullptr, nullptr, nullptr,
             direct_f32 ? dst->data : static_cast<void *>(output), direct_f32, lock_storage.ptr,
             n, k, m, max_shared, sms, stream);
         if (gate != nullptr) {
             ggml_cuda_marlin_q4_a32_launch(
-                input, gate_entry.weight, gate_entry.scale, gate_entry.zero,
+                input, gate_entry.weight, gate_entry.scale, gate_entry.zero, nullptr, nullptr, nullptr,
                 gate_output.get(), false, lock_storage.ptr, n, k, m, max_shared, sms, stream);
         }
         if (direct_f32) {

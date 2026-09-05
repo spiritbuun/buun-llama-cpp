@@ -20,7 +20,8 @@
       int max_shared_mem,                                                      \
       /* buun: optional second weight/scale pair presented as the upper half   \
          of one logical prob_n-wide GEMM (Q8-G128 gate/up); nullptr = unpaired */ \
-      const int4 *__restrict__ B_alt, const int4 *__restrict__ scales_alt
+      const int4 *__restrict__ B_alt, const int4 *__restrict__ scales_alt,  \
+      const int4 *__restrict__ zp_alt
 
 namespace MARLIN_NAMESPACE_NAME {
 template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
