@@ -5438,7 +5438,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 prefix->ne[1] == body->ne[1] && prefix->ne[2] == body->ne[2] &&
                 prefix->ne[3] == 1 && body->ne[3] == 1 && node->ne[0] == n_prefix + n_t &&
                 ggml_is_contiguous(prefix) && ggml_is_contiguous(node) &&
-                body->nb[0] == size_t(body->ne[1]) * sizeof(float) && body->nb[1] == sizeof(float) &&
+                body->nb[0] % sizeof(float) == 0 && body->nb[0] >= size_t(body->ne[1]) * sizeof(float) &&
+                body->nb[1] == sizeof(float) &&
                 view->op == GGML_OP_VIEW && view->view_src == node &&
                 view->ne[0] == n_prefix && view->ne[1] == node->ne[1] && view->ne[2] == node->ne[2] &&
                 view->view_offs == size_t(n_t) * sizeof(float) &&

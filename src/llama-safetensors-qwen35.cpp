@@ -46,6 +46,9 @@ struct source_spec {
     // Canonical targets whose rows are concatenated when the primary source
     // is absent (a fused Q|K|V projection assembled from separate ones).
     std::vector<std::string> part_targets;
+    // Concatenate the parts even when the primary source exists (the primary
+    // then only carries the transform for its own part).
+    bool parts_first = false;
 
     source_spec() = default;
     source_spec(
@@ -134,6 +137,17 @@ bool fuse_qkv_enabled() {
     static const bool enabled = [] {
         const char * value = std::getenv("LLAMA_SAFETENSORS_FUSE_QKV");
         return value == nullptr || std::atoi(value) != 0;
+    }();
+    return enabled;
+}
+
+// Opt-in: the recurrent qkv|z fusion removes one launch per recurrent layer
+// but still shifts W8A16 KLD at 2..32-token micro-batches (0.00015 -> 0.0007
+// on the A100, placement-dependent, not yet localized) — see the handoff log.
+bool fuse_qkvz_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("LLAMA_SAFETENSORS_FUSE_QKVZ");
+        return value != nullptr && std::atoi(value) != 0;
     }();
     return enabled;
 }
@@ -332,13 +346,28 @@ source_spec map_target_unchecked(
         return fused;
     }
 
+    if (is_recurrent_layer(layer, geometry) && suffix == "attn_qkv.weight" && fuse_qkvz_enabled()) {
+        // Recurrent layers: serve qkv|z as one projection; the graph splits it
+        // by views.  The parts carry their own row transforms.
+        llama_safetensors_source_name source {
+            prefix + "linear_attn.in_proj_qkv.weight", prefix + "linear_attn.in_proj_qkv",
+            llama_safetensors_quant_role::WEIGHT,
+        };
+        source_spec fused = bind_source_name(quant, std::move(source), { transform_kind::QKV_ROWS });
+        const std::string blk = "blk." + std::to_string(layer) + ".";
+        fused.part_targets = { blk + "attn_qkv_part.weight", blk + "attn_gate.weight" };
+        fused.parts_first  = true;
+        return fused;
+    }
+
     struct recurrent_name {
         std::string_view target;
         std::string_view source;
         transform_kind transform;
     };
-    static constexpr std::array<recurrent_name, 19> recurrent = {
+    static constexpr std::array<recurrent_name, 20> recurrent = {
         {
+         { "attn_qkv_part.weight", "linear_attn.in_proj_qkv.weight", transform_kind::QKV_ROWS },
          { "attn_gate.weight", "linear_attn.in_proj_z.weight",       transform_kind::V_ROWS },
          { "attn_gate.scale",  "linear_attn.in_proj_z.weight_scale", transform_kind::V_ROWS },
          { "attn_gate.input_scale", "linear_attn.in_proj_z.input_scale", transform_kind::NONE },
@@ -1314,10 +1343,10 @@ bool llama_safetensors_qwen35_importer::describe(
     } catch (const unsupported_target &) {
         return false;
     }
-    if (registry_.find(spec.name) == nullptr) {
-        if (spec.part_targets.empty()) {
-            return false;
-        }
+    if (spec.part_targets.empty() && registry_.find(spec.name) == nullptr) {
+        return false;
+    }
+    if (!spec.part_targets.empty() && (spec.parts_first || registry_.find(spec.name) == nullptr)) {
         // Row-concatenate the parts: same type, same width, summed rows.
         ne.fill(1);
         type = GGML_TYPE_COUNT;
@@ -1371,7 +1400,7 @@ void llama_safetensors_qwen35_importer::bind(const std::string & target_name) co
         full_attention_interval_, text_only_, moe_, executorch_flat_,
     };
     const source_spec spec = map_target(*quant_, geometry, target_name);
-    if (registry_.find(spec.name) == nullptr && !spec.part_targets.empty()) {
+    if (!spec.part_targets.empty() && (spec.parts_first || registry_.find(spec.name) == nullptr)) {
         for (const std::string & part : spec.part_targets) {
             bind(part);
         }
@@ -1389,7 +1418,7 @@ bool llama_safetensors_qwen35_importer::load(
         full_attention_interval_, text_only_, moe_, executorch_flat_,
     };
     const source_spec spec = map_target(*quant_, geometry, target_name);
-    if (registry_.find(spec.name) == nullptr && !spec.part_targets.empty()) {
+    if (!spec.part_targets.empty() && (spec.parts_first || registry_.find(spec.name) == nullptr)) {
         return false;
     }
     if (spec.transforms.empty() && spec.row_count == 0 && spec.hqq_scale.empty()) {
@@ -1431,7 +1460,7 @@ std::vector<uint8_t> llama_safetensors_qwen35_importer::materialize(const std::s
             full_attention_interval_, text_only_, moe_, executorch_flat_,
         };
         const source_spec spec = map_target(*quant_, geometry, target_name);
-        if (registry_.find(spec.name) == nullptr && !spec.part_targets.empty()) {
+        if (!spec.part_targets.empty() && (spec.parts_first || registry_.find(spec.name) == nullptr)) {
             std::vector<uint8_t> fused;
             fused.reserve(target_size);
             for (const std::string & part : spec.part_targets) {

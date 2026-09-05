@@ -341,6 +341,7 @@ static __global__ void conv_state_concat(
         int n_t,
         int64_t prefix_seq_stride,
         int64_t body_seq_stride,
+        int64_t body_row_stride,
         int64_t dst_seq_stride,
         int64_t state_seq_stride) {
     const int64_t channel = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -358,7 +359,7 @@ static __global__ void conv_state_concat(
         window[j] = prefix_row[j];
     }
     for (int t = 0; t < n_t; ++t) {
-        window[n_prefix + t] = body_col[t * channels];
+        window[n_prefix + t] = body_col[t * body_row_stride];
     }
     for (int j = 0; j < n_prefix + n_t; ++j) {
         dst_row[j] = window[j];
@@ -384,6 +385,6 @@ void ggml_cuda_op_conv_state_concat(
         static_cast<const float *>(prefix->data), static_cast<const float *>(body->data),
         static_cast<float *>(dst->data), static_cast<float *>(state->data),
         channels, int(n_prefix), int(n_t),
-        prefix->nb[2] / sizeof(float), body->nb[2] / sizeof(float),
+        prefix->nb[2] / sizeof(float), body->nb[2] / sizeof(float), body->nb[0] / sizeof(float),
         dst->nb[2] / sizeof(float), state->nb[1] / sizeof(float));
 }
