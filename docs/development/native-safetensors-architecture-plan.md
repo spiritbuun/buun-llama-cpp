@@ -1461,3 +1461,7 @@ Status 2026-09-04: the importer now serves a fused Q|K|V projection for attentio
 (`LLAMA_SAFETENSORS_FUSE_QKV=0` disables): AWQ 60→62 t/s, W8A16 44.6→46.2 t/s, fidelity unchanged.
 A recurrent qkv|z fusion gave no gain and was dropped. Remaining decode gap to vLLM is the
 per-layer launch count in the recurrent block and the output head.
+
+Status 2026-09-05: decode pass — paired Q4 gate|up, cuBLAS output head, conv-state fusion landed
+(AWQ 65.9 vs vLLM 71.0 t/s, W8A16 46.4 vs 48.7 on a clean A100). Recurrent qkv|z fusion is opt-in
+(`LLAMA_SAFETENSORS_FUSE_QKVZ=1`) until its W8A16 micro-batch fidelity shift is localized.
