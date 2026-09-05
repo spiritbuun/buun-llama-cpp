@@ -123,114 +123,6 @@ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, 
     }
 }
 
-// Long-prefill recurrent convolution directly over the graph's natural split
-// inputs: a short channel-major saved prefix and a token-major projection view.
-// This avoids transposing the entire projection merely to read it back during
-// convolution. Each CTA keeps the overlapping window in registers, so eight
-// outputs require only d_conv - 1 + 8 input loads per channel.
-template <typename body_t>
-static __device__ __forceinline__ float ssm_conv_split_load(const body_t * src, int64_t i) {
-    return float(src[i]);
-}
-
-template <>
-__device__ __forceinline__ float ssm_conv_split_load<nv_bfloat16>(const nv_bfloat16 * src, int64_t i) {
-    return __bfloat162float(src[i]);
-}
-
-template <typename out_t>
-static __device__ __forceinline__ void ssm_conv_split_store(out_t * dst, int64_t i, float value) {
-    dst[i] = value;
-}
-
-template <>
-__device__ __forceinline__ void ssm_conv_split_store<nv_bfloat16>(nv_bfloat16 * dst, int64_t i, float value) {
-    dst[i] = __float2bfloat16_rn(value);
-}
-
-template <typename body_t, typename out_t, int d_conv, int split_n_t>
-static __global__ void ssm_conv_split_input(
-        const float * __restrict__ prefix,
-        const body_t * __restrict__ body,
-        const float * __restrict__ weight,
-        out_t * __restrict__ dst,
-        int64_t channels,
-        int64_t n_t,
-        int64_t prefix_seq_stride,
-        int64_t body_seq_stride,
-        int64_t dst_seq_stride) {
-    const int64_t channel = int64_t(blockIdx.y) * blockDim.x + threadIdx.x;
-    const int64_t token0  = int64_t(blockIdx.z) * split_n_t;
-    const int64_t seq     = blockIdx.x;
-    if (channel >= channels || token0 >= n_t) {
-        return;
-    }
-
-    const float * prefix_seq = prefix + seq * prefix_seq_stride;
-    const body_t * body_seq  = body   + seq * body_seq_stride;
-    out_t *       dst_seq    = dst    + seq * dst_seq_stride;
-
-    float w[d_conv];
-#pragma unroll
-    for (int j = 0; j < d_conv; ++j) {
-        w[j] = weight[channel * d_conv + j];
-    }
-
-    float x[d_conv - 1 + split_n_t];
-#pragma unroll
-    for (int j = 0; j < d_conv - 1 + split_n_t; ++j) {
-        const int64_t col = token0 + j;
-        x[j] = col < d_conv - 1
-            ? prefix_seq[channel * (d_conv - 1) + col]
-            : ssm_conv_split_load(body_seq, (col - (d_conv - 1)) * channels + channel);
-    }
-
-#pragma unroll
-    for (int t = 0; t < split_n_t; ++t) {
-        if (token0 + t >= n_t) {
-            break;
-        }
-        float sum = 0.0f;
-#pragma unroll
-        for (int j = 0; j < d_conv; ++j) {
-            sum += x[t + j] * w[j];
-        }
-        ssm_conv_split_store(dst_seq, (token0 + t) * channels + channel,
-                             ggml_cuda_op_silu_single(sum));
-    }
-}
-
-// Preserve only the suffix observed by recurrent-state VIEW/CPY nodes. The
-// full concat has no other consumer when this optimization is selected.
-template <typename body_t>
-static __global__ void concat_split_input_tail(
-        const float * __restrict__ prefix,
-        const body_t * __restrict__ body,
-        float * __restrict__ dst,
-        int64_t prefix_cols,
-        int64_t body_cols,
-        int64_t channels,
-        int64_t tail_start,
-        int64_t prefix_seq_stride,
-        int64_t body_seq_stride,
-        int64_t dst_seq_stride) {
-    const int64_t tail_cols = prefix_cols + body_cols - tail_start;
-    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    const int64_t n = tail_cols * channels;
-    if (i >= n) {
-        return;
-    }
-    const int64_t seq = blockIdx.y;
-    const int64_t channel = i / tail_cols;
-    const int64_t col = tail_start + i % tail_cols;
-    const float * prefix_seq = prefix + seq * prefix_seq_stride;
-    const body_t * body_seq  = body   + seq * body_seq_stride;
-    float *       dst_seq    = dst    + seq * dst_seq_stride;
-    dst_seq[channel * (prefix_cols + body_cols) + col] = col < prefix_cols
-        ? prefix_seq[channel * prefix_cols + col]
-        : ssm_conv_split_load(body_seq, (col - prefix_cols) * channels + channel);
-}
-
 template <bool apply_silu>
 static void ssm_conv_f32_cuda(const float * src0, const float * src1, const float * bias, const int src0_nb0, const int src0_nb1,
                               const int src0_nb2, const int src1_nb1, float * dst, const int dst_nb0, const int dst_nb1,
@@ -436,94 +328,62 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
     }
 }
 
-void ggml_cuda_op_ssm_conv_split_input(
+// Decode-width recurrent conv state update: one pass reads the saved prefix
+// and the token-major projection, writes their concatenation for SSM_CONV and
+// the new saved prefix (the last columns) into the state slot.
+static __global__ void conv_state_concat(
+        const float * __restrict__ prefix,
+        const float * __restrict__ body,
+        float * __restrict__ dst,
+        float * __restrict__ state,
+        int64_t channels,
+        int n_prefix,
+        int n_t,
+        int64_t prefix_seq_stride,
+        int64_t body_seq_stride,
+        int64_t dst_seq_stride,
+        int64_t state_seq_stride) {
+    const int64_t channel = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t seq     = blockIdx.y;
+    if (channel >= channels) {
+        return;
+    }
+    const float * prefix_row = prefix + seq * prefix_seq_stride + channel * n_prefix;
+    const float * body_col   = body   + seq * body_seq_stride   + channel;
+    float *       dst_row    = dst    + seq * dst_seq_stride    + channel * (n_prefix + n_t);
+    float *       state_row  = state  + seq * state_seq_stride  + channel * n_prefix;
+
+    float window[16];
+    for (int j = 0; j < n_prefix; ++j) {
+        window[j] = prefix_row[j];
+    }
+    for (int t = 0; t < n_t; ++t) {
+        window[n_prefix + t] = body_col[t * channels];
+    }
+    for (int j = 0; j < n_prefix + n_t; ++j) {
+        dst_row[j] = window[j];
+    }
+    for (int j = 0; j < n_prefix; ++j) {
+        state_row[j] = window[n_t + j];
+    }
+}
+
+void ggml_cuda_op_conv_state_concat(
         ggml_backend_cuda_context & ctx,
         const ggml_tensor * prefix,
-        const ggml_tensor * body_transposed,
-        ggml_tensor * concat_dst,
-        const ggml_tensor * weight,
-        ggml_tensor * silu_dst,
-        int64_t tail_start,
-        bool body_bf16,
-        bool output_bf16) {
-    GGML_ASSERT(prefix->type == GGML_TYPE_F32 && body_transposed->type == GGML_TYPE_F32);
-    GGML_ASSERT(concat_dst->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F32);
-    GGML_ASSERT(silu_dst->type == GGML_TYPE_F32);
-
-    const int64_t d_conv  = weight->ne[0];
+        const ggml_tensor * body,
+        ggml_tensor * dst,
+        ggml_tensor * state) {
+    const int64_t n_prefix = prefix->ne[0];
     const int64_t channels = prefix->ne[1];
-    const int64_t n_t     = body_transposed->ne[0];
-    const int64_t n_s     = prefix->ne[2];
-    GGML_ASSERT(d_conv == 4);
-    GGML_ASSERT(prefix->ne[0] == d_conv - 1);
-    GGML_ASSERT(body_transposed->ne[1] == channels && body_transposed->ne[2] == n_s);
-    GGML_ASSERT(concat_dst->ne[0] == d_conv - 1 + n_t && concat_dst->ne[1] == channels && concat_dst->ne[2] == n_s);
-    GGML_ASSERT(weight->ne[1] == channels);
-    GGML_ASSERT(silu_dst->ne[0] == channels && silu_dst->ne[1] == n_t && silu_dst->ne[2] == n_s);
-
-    cudaStream_t stream = ctx.stream();
-    constexpr int threads = 256;
-    static const int requested_split = [] {
-        const char * value = std::getenv("GGML_CUDA_SSM_SPLIT_T");
-        return value ? std::atoi(value) : 8;
-    }();
-    auto launch_conv = [&](auto split, auto body_type, auto output_type) {
-        constexpr int split_n_t = decltype(split)::value;
-        using body_t = decltype(body_type);
-        using out_t  = decltype(output_type);
-        const dim3 conv_blocks(n_s, (channels + threads - 1) / threads, (n_t + split_n_t - 1) / split_n_t);
-        ssm_conv_split_input<body_t, out_t, 4, split_n_t><<<conv_blocks, threads, 0, stream>>>(
-            static_cast<const float *>(prefix->data),
-            static_cast<const body_t *>(body_transposed->data),
-            static_cast<const float *>(weight->data),
-            static_cast<out_t *>(silu_dst->data),
-            channels, n_t,
-            prefix->nb[2] / sizeof(float),
-            body_transposed->nb[2] / sizeof(float),
-            n_t * channels);
-    };
-    auto launch_for_type = [&](auto body_type, auto output_type) {
-        if (requested_split == 32) {
-            launch_conv(std::integral_constant<int, 32>{}, body_type, output_type);
-        } else if (requested_split == 16) {
-            launch_conv(std::integral_constant<int, 16>{}, body_type, output_type);
-        } else {
-            launch_conv(std::integral_constant<int, 8>{}, body_type, output_type);
-        }
-    };
-    if (body_bf16) {
-        if (output_bf16) {
-            launch_for_type(nv_bfloat16{}, nv_bfloat16{});
-        } else {
-            launch_for_type(nv_bfloat16{}, float{});
-        }
-    } else {
-        if (output_bf16) {
-            launch_for_type(float{}, nv_bfloat16{});
-        } else {
-            launch_for_type(float{}, float{});
-        }
-    }
-
-    if (tail_start < concat_dst->ne[0]) {
-        const int64_t tail_cols = concat_dst->ne[0] - tail_start;
-        const int64_t elems_per_seq = tail_cols * channels;
-        const dim3 tail_blocks((elems_per_seq + threads - 1) / threads, n_s, 1);
-        auto launch_tail = [&](auto body_type) {
-            using body_t = decltype(body_type);
-            concat_split_input_tail<body_t><<<tail_blocks, threads, 0, stream>>>(
-                static_cast<const float *>(prefix->data),
-                static_cast<const body_t *>(body_transposed->data),
-                static_cast<float *>(concat_dst->data),
-                prefix->ne[0], body_transposed->ne[0], channels, tail_start,
-                prefix->nb[2] / sizeof(float),
-                body_transposed->nb[2] / sizeof(float),
-                concat_dst->nb[2] / sizeof(float));
-        };
-        if (body_bf16) {
-            launch_tail(nv_bfloat16{});
-        } else {
-            launch_tail(float{});
-        }
-    }
+    const int64_t n_s      = prefix->ne[2];
+    const int64_t n_t      = body->ne[0];
+    GGML_ASSERT(n_prefix + n_t <= 16);
+    const dim3 blocks((channels + 255) / 256, n_s);
+    conv_state_concat<<<blocks, 256, 0, ctx.stream()>>>(
+        static_cast<const float *>(prefix->data), static_cast<const float *>(body->data),
+        static_cast<float *>(dst->data), static_cast<float *>(state->data),
+        channels, int(n_prefix), int(n_t),
+        prefix->nb[2] / sizeof(float), body->nb[2] / sizeof(float),
+        dst->nb[2] / sizeof(float), state->nb[1] / sizeof(float));
 }

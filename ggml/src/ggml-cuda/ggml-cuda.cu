@@ -5419,95 +5419,43 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-#if !defined(GGML_USE_HIP)
-    // Recurrent prefill: CONCAT(prefix, transposed projection) has only a tiny
-    // state-tail consumer plus SSM_CONV->SILU. Evaluate the convolution from
-    // the coalesced source layouts and materialize only the suffix observed by
-    // state VIEWs. Strict graph-use and layout checks keep the generic path as
-    // the fallback for every other concat.
-    static const bool qwen35_split_conv = std::getenv("GGML_CUDA_DISABLE_QWEN35_SPLIT_CONV") == nullptr;
-    if (qwen35_split_conv &&
-            node->op == GGML_OP_CONCAT && ggml_get_op_params_i32(node, 0) == 0 &&
-            node->type == GGML_TYPE_F32 && node->src[0] && node->src[1]) {
+    // Recurrent conv state at decode width: CONCAT(saved prefix, transposed
+    // projection) is followed by a VIEW of its last columns copied back into
+    // the state buffer. One kernel writes both the concatenation and the state
+    // slot from the two sources; SSM_CONV then reads the concatenation.
+    if (node->op == GGML_OP_CONCAT && ggml_get_op_params_i32(node, 0) == 0 &&
+            node->type == GGML_TYPE_F32 && i + 2 < cgraph->n_nodes) {
         const ggml_tensor * prefix = node->src[0];
         const ggml_tensor * body   = node->src[1];
-        ggml_tensor * conv = nullptr;
-        ggml_tensor * silu = nullptr;
-        int conv_index = -1;
-        int64_t tail_start = node->ne[0];
-        bool valid = prefix->type == GGML_TYPE_F32 && body->type == GGML_TYPE_F32 &&
-            prefix->ne[0] == 3 && prefix->ne[1] == body->ne[1] &&
-            prefix->ne[2] == body->ne[2] && prefix->ne[3] == body->ne[3] &&
-            node->ne[0] == prefix->ne[0] + body->ne[0] &&
-            ggml_is_contiguous(prefix) && ggml_is_contiguous(node) &&
-            body->nb[1] == sizeof(float) &&
-            body->nb[0] == size_t(body->ne[1]) * sizeof(float);
-        for (int j = i + 1; valid && j < cgraph->n_nodes; ++j) {
-            ggml_tensor * candidate = cgraph->nodes[j];
-            bool consumes = false;
-            for (int s = 0; s < GGML_MAX_SRC; ++s) {
-                consumes |= candidate->src[s] == node;
-            }
-            if (!consumes) {
-                continue;
-            }
-            if (candidate->op == GGML_OP_VIEW && candidate->view_src == node &&
-                    candidate->view_offs % sizeof(float) == 0) {
-                const int64_t start = candidate->view_offs / sizeof(float);
-                if (start < 0 || start + candidate->ne[0] > node->ne[0]) {
-                    valid = false;
-                    break;
-                }
-                tail_start = std::min(tail_start, start);
-                continue;
-            }
-            if (candidate->op == GGML_OP_SSM_CONV && candidate->src[0] == node && conv == nullptr &&
-                    j + 1 < cgraph->n_nodes) {
-                ggml_tensor * maybe_silu = cgraph->nodes[j + 1];
-                if (maybe_silu->op != GGML_OP_UNARY || maybe_silu->src[0] != candidate ||
-                        ggml_get_unary_op(maybe_silu) != GGML_UNARY_OP_SILU) {
-                    valid = false;
-                    break;
-                }
-                conv = candidate;
-                silu = maybe_silu;
-                conv_index = j;
-                continue;
-            }
-            valid = false;
-        }
-
-        const int fusion_out_nodes[] = { i, conv_index + 1 };
-        const bool fusion_ranges_ok = valid && conv && silu && conv_index > i &&
-            ggml_cuda_check_fusion_memory_ranges(
-                cgraph, i, conv_index + 2 - i, fusion_out_nodes, 2);
-        if (valid && conv && silu &&
-                !(node->flags & GGML_TENSOR_FLAG_OUTPUT) &&
-                !(conv->flags & GGML_TENSOR_FLAG_OUTPUT) &&
-                i + 1 < cgraph->n_nodes &&
-                cgraph->nodes[i + 1]->op == GGML_OP_VIEW &&
-                cgraph->nodes[i + 1]->view_src == node &&
-                conv->src[1] && conv->src[1]->type == GGML_TYPE_F32 &&
-                conv->src[1]->ne[0] == 4 && ggml_is_contiguous(conv->src[1]) &&
-                conv_index > i && ggml_is_contiguous(silu) &&
-                fusion_ranges_ok) {
-            ggml_cuda_op_ssm_conv_split_input(
-                *cuda_ctx, prefix, body, node, conv->src[1], silu, tail_start, false, false);
-            cuda_ctx->precomputed_ssm_convs.insert(conv);
-            // The immediate VIEW is metadata-only and would be skipped by the
-            // ordinary loop as well. Returning one suppresses generic CONCAT
-            // evaluation while leaving its following state CPY in place.
-            return 1;
+        ggml_tensor * view = cgraph->nodes[i + 1];
+        // The state-slot VIEW may sit between the tail VIEW and the CPY.
+        const int cpy_index = cgraph->nodes[i + 2]->op == GGML_OP_VIEW && i + 3 < cgraph->n_nodes ? i + 3 : i + 2;
+        ggml_tensor * cpy  = cgraph->nodes[cpy_index];
+        const int64_t n_prefix = prefix->ne[0];
+        const int64_t n_t      = body->ne[0];
+        if (prefix->type == GGML_TYPE_F32 && body->type == GGML_TYPE_F32 &&
+                n_prefix + n_t <= 16 && n_t <= 8 &&
+                prefix->ne[1] == body->ne[1] && prefix->ne[2] == body->ne[2] &&
+                prefix->ne[3] == 1 && body->ne[3] == 1 && node->ne[0] == n_prefix + n_t &&
+                ggml_is_contiguous(prefix) && ggml_is_contiguous(node) &&
+                body->nb[0] == size_t(body->ne[1]) * sizeof(float) && body->nb[1] == sizeof(float) &&
+                view->op == GGML_OP_VIEW && view->view_src == node &&
+                view->ne[0] == n_prefix && view->ne[1] == node->ne[1] && view->ne[2] == node->ne[2] &&
+                view->view_offs == size_t(n_t) * sizeof(float) &&
+                view->nb[1] == node->nb[1] && view->nb[2] == node->nb[2] &&
+                cpy->op == GGML_OP_CPY && cpy->src[0] == view && cpy->type == GGML_TYPE_F32 &&
+                cpy->ne[0] == n_prefix * node->ne[1] && cpy->ne[1] == node->ne[2] &&
+                ggml_nelements(cpy) == ggml_nelements(view) && cpy->nb[0] == sizeof(float) &&
+                !ggml_cuda_tensors_overlap(node, prefix) && !ggml_cuda_tensors_overlap(node, body) &&
+                !ggml_cuda_tensors_overlap(cpy, body) &&
+                // In steady-state decode the saved prefix is read from the very
+                // slot it is written back to; each thread owns one channel row.
+                (!ggml_cuda_tensors_overlap(cpy, prefix) ||
+                 (cpy->data == prefix->data && cpy->nb[1] == prefix->nb[2]))) {
+            ggml_cuda_op_conv_state_concat(*cuda_ctx, prefix, body, node, cpy);
+            return cpy_index - i;
         }
     }
-
-    if (node->op == GGML_OP_SSM_CONV && cuda_ctx->precomputed_ssm_convs.erase(node) != 0) {
-        GGML_ASSERT(i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_UNARY &&
-                    cgraph->nodes[i + 1]->src[0] == node &&
-                    ggml_get_unary_op(cgraph->nodes[i + 1]) == GGML_UNARY_OP_SILU);
-        return 1;
-    }
-#endif
     ggml_cuda_hc_grouped_rms_fusion hc_grouped_rms;
     if (node->op == GGML_OP_RMS_NORM &&
             ggml_cuda_match_hc_grouped_rms(cgraph, i, hc_grouped_rms)) {
@@ -7012,7 +6960,6 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     cuda_ctx->int8_channel_activations.clear();
     cuda_ctx->bf16_glu_outputs.clear();
     cuda_ctx->humming_prepared_active.clear();
-    cuda_ctx->precomputed_ssm_convs.clear();
 
     ggml_cuda_canonicalize_unserved_marlin_weights(cuda_ctx, cgraph);
 #endif

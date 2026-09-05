@@ -1609,12 +1609,6 @@ struct ggml_backend_cuda_context {
     std::unordered_set<const void *> gdn_deferred_l2;
     std::unordered_map<const ggml_tensor *, ggml_cuda_humming_prepared_activation> humming_prepared_activations;
     std::unordered_set<const ggml_tensor *> humming_prepared_active;
-    // A concat node may evaluate the directly-dependent recurrent convolution
-    // while its inputs are still in their coalesced source layouts. The later
-    // SSM_CONV node is then a graph-order marker only. Entries live for one
-    // graph evaluation/capture and are consumed exactly once.
-    std::unordered_set<const ggml_tensor *> precomputed_ssm_convs;
-
     bool consume_bf16_activation(const ggml_tensor * tensor) {
         auto it = humming_bf16_activation_uses.find(tensor);
         if (it != humming_bf16_activation_uses.end()) {
