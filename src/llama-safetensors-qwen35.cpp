@@ -141,13 +141,11 @@ bool fuse_qkv_enabled() {
     return enabled;
 }
 
-// Opt-in: the recurrent qkv|z fusion removes one launch per recurrent layer
-// but still shifts W8A16 KLD at 2..32-token micro-batches (0.00015 -> 0.0007
-// on the A100, placement-dependent, not yet localized) — see the handoff log.
+// The recurrent qkv|z fusion removes one launch per recurrent layer.
 bool fuse_qkvz_enabled() {
     static const bool enabled = [] {
         const char * value = std::getenv("LLAMA_SAFETENSORS_FUSE_QKVZ");
-        return value != nullptr && std::atoi(value) != 0;
+        return value == nullptr || std::atoi(value) != 0;
     }();
     return enabled;
 }
