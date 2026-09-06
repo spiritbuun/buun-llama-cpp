@@ -1089,6 +1089,58 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
+// Small host->device uploads (graph inputs: tokens, positions, masks, state
+// copies) are staged through a per-thread pinned ring and issued without a
+// synchronize; graph compute waits once on the thread's upload stream.  At
+// decode this replaces ~13 synchronizing copies per token with one event.
+namespace {
+struct ggml_cuda_upload_ring {
+    static constexpr size_t size       = size_t(8) << 20;
+    static constexpr size_t max_upload = size_t(1) << 20;
+    char *      host     = nullptr;
+    size_t      offset   = 0;
+    bool        disabled = false;
+    cudaEvent_t event    = nullptr;
+};
+thread_local ggml_cuda_upload_ring ggml_cuda_uploads;
+}
+
+static bool ggml_cuda_upload_async(void * dst, const void * data, size_t size) {
+    auto & ring = ggml_cuda_uploads;
+    if (ring.disabled || size > ring.max_upload) {
+        return false;
+    }
+    if (ring.host == nullptr) {
+        if (cudaHostAlloc(&ring.host, ring.size, cudaHostAllocPortable) != cudaSuccess) {
+            (void) cudaGetLastError();
+            ring.host = nullptr;
+            ring.disabled = true;
+            return false;
+        }
+    }
+    if (ring.offset + size > ring.size) {
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        ring.offset = 0;
+    }
+    memcpy(ring.host + ring.offset, data, size);
+    CUDA_CHECK(cudaMemcpyAsync(dst, ring.host + ring.offset, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+    ring.offset += size;
+    return true;
+}
+
+// Order a compute stream after every upload this thread has issued.
+static void ggml_cuda_wait_uploads(cudaStream_t stream) {
+    auto & ring = ggml_cuda_uploads;
+    if (ring.host == nullptr) {
+        return;
+    }
+    if (ring.event == nullptr) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&ring.event, cudaEventDisableTiming));
+    }
+    CUDA_CHECK(cudaEventRecord(ring.event, cudaStreamPerThread));
+    CUDA_CHECK(cudaStreamWaitEvent(stream, ring.event, 0));
+}
+
 static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
@@ -1141,6 +1193,9 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         return;
     }
 #endif
+    if (ggml_cuda_upload_async((char *) tensor->data + offset, data, size)) {
+        return;
+    }
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -3458,6 +3513,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     // device -> device copy
     ggml_backend_cuda_context * cuda_ctx_src = (ggml_backend_cuda_context *) backend_src->context;
     ggml_backend_cuda_context * cuda_ctx_dst = (ggml_backend_cuda_context *) backend_dst->context;
+    ggml_cuda_wait_uploads(cuda_ctx_src->stream());
 
     ggml_backend_cuda_buffer_context * buf_ctx_src = (ggml_backend_cuda_buffer_context *) buf_src->context;
     ggml_backend_cuda_buffer_context * buf_ctx_dst = (ggml_backend_cuda_buffer_context *) buf_dst->context;
@@ -7024,6 +7080,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_wait_uploads(cuda_ctx->stream());
 
 #if !defined(GGML_USE_HIP)
     // Humming projections in one graph can consume the same activation (for
