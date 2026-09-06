@@ -1465,3 +1465,9 @@ per-layer launch count in the recurrent block and the output head.
 Status 2026-09-05: decode pass — paired Q4 gate|up, cuBLAS output head, conv-state fusion landed
 (AWQ 65.9 vs vLLM 71.0 t/s, W8A16 46.4 vs 48.7 on a clean A100). Recurrent qkv|z fusion is opt-in
 (`LLAMA_SAFETENSORS_FUSE_QKVZ=1`) until its W8A16 micro-batch fidelity shift is localized.
+
+Status 2026-09-06: decode pass 2 — alias-safe BF16 retention, gated-RMS fusion, gate kernel split,
+prepare pairs kernel (Astra); async input uploads, width-general conv-state kernel with SSM_CONV+SiLU
+folded in, qkv|z fused by default, multi-rope rope+set_rows fusion (Fable). 822 launches/token.
+AWQ 69.96 t/s and W8A16 48.39 t/s on a clean A100-80GB against vLLM 71.0 / 48.7; KLD identical to
+the unfused graph at every width.
