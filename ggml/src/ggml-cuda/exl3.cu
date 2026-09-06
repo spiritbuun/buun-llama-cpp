@@ -134,19 +134,19 @@ int * exl3_int8_counters(int device, cudaStream_t stream) {
     return ws[device];
 }
 
-template <int M, bool RESID>
+template <int bits, int M, bool RESID>
 void exl3_gemv_int8_launch(const uint8_t * B, const half * xh, const half * svh, float * y, float * partials, int * counters,
         int k, int n, int colblocks, int ksplit, int nrows, size_t smem, cudaStream_t stream) {
     static bool attr_set = false;
     if (!attr_set) {
-        CUDA_CHECK(cudaFuncSetAttribute(exl3_int8::gemv_int8_kernel<M, RESID>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024));
+        CUDA_CHECK(cudaFuncSetAttribute(exl3_int8::gemv_int8_kernel<bits, M, RESID>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024));
         attr_set = true;
     }
-    exl3_int8::gemv_int8_kernel<M, RESID><<<dim3(colblocks, ksplit), exl3_int8::THREADS, smem, stream>>>(
+    exl3_int8::gemv_int8_kernel<bits, M, RESID><<<dim3(colblocks, ksplit), exl3_int8::THREADS, smem, stream>>>(
         B, xh, svh, y, partials, counters, k, n, nrows);
 }
 
-template <bool RESID>
+template <int bits, bool RESID>
 void exl3_int8_run(ggml_backend_cuda_context & ctx, const half * xh, const uint8_t * B, const half * svh,
         float * y, int m, int k, int n, cudaStream_t stream) {
     const int kslices = k / 16;
@@ -160,15 +160,16 @@ void exl3_int8_run(ggml_backend_cuda_context & ctx, const half * xh, const uint8
     ggml_cuda_pool_alloc<float> partials(ctx.pool(), size_t(ksplit) * m * n);
     int * counters = exl3_int8_counters(ctx.device, stream);
     switch (m) {
-        case 1: exl3_gemv_int8_launch<1, RESID>(B, xh, svh, y, partials.get(), counters, k, n, colblocks, ksplit, nrows, smem, stream); break;
-        case 2: exl3_gemv_int8_launch<2, RESID>(B, xh, svh, y, partials.get(), counters, k, n, colblocks, ksplit, nrows, smem, stream); break;
-        case 3: exl3_gemv_int8_launch<3, RESID>(B, xh, svh, y, partials.get(), counters, k, n, colblocks, ksplit, nrows, smem, stream); break;
-        default: exl3_gemv_int8_launch<4, RESID>(B, xh, svh, y, partials.get(), counters, k, n, colblocks, ksplit, nrows, smem, stream); break;
+        case 1: exl3_gemv_int8_launch<bits, 1, RESID>(B, xh, svh, y, partials.get(), counters, k, n, colblocks, ksplit, nrows, smem, stream); break;
+        case 2: exl3_gemv_int8_launch<bits, 2, RESID>(B, xh, svh, y, partials.get(), counters, k, n, colblocks, ksplit, nrows, smem, stream); break;
+        case 3: exl3_gemv_int8_launch<bits, 3, RESID>(B, xh, svh, y, partials.get(), counters, k, n, colblocks, ksplit, nrows, smem, stream); break;
+        default: exl3_gemv_int8_launch<bits, 4, RESID>(B, xh, svh, y, partials.get(), counters, k, n, colblocks, ksplit, nrows, smem, stream); break;
     }
 }
 
 bool exl3_int8_applicable(int bits, int m, int k, int n) {
-    return exl3_int8_mode() != 0 && bits == 4 && m >= 1 && m <= exl3_int8::MAX_M &&
+    // validated on K = 4 (layers) and K = 6 (lm_head) checkpoints so far
+    return exl3_int8_mode() != 0 && (bits == 4 || bits == 6) && m >= 1 && m <= exl3_int8::MAX_M &&
         n % exl3_int8::COLS == 0 && k % 128 == 0 && size_t(n) <= EXL3_INT8_MAX_N;
 }
 
@@ -218,10 +219,16 @@ void ggml_cuda_mul_mat_exl3(ggml_backend_cuda_context & ctx, const ggml_tensor *
 
     if (exl3_int8_applicable(bits, m, k, n)) {
         // int8 activation path: per-slice quantization, fused output transform
-        if (exl3_int8_mode() == 1) {
-            exl3_int8_run<true>(ctx, xh.get(), static_cast<const uint8_t *>(src0->data), svh, y, m, k, n, stream);
+        const uint8_t * B = static_cast<const uint8_t *>(src0->data);
+        // The 6-bit head feeds the logits directly and is DRAM-bound anyway, so it always takes the
+        // residual (error-feedback) pass; plain mode only drops it on the 4-bit layers.
+        const bool resid = exl3_int8_mode() == 1 || bits == 6;
+        if (bits == 4) {
+            resid ? exl3_int8_run<4, true>(ctx, xh.get(), B, svh, y, m, k, n, stream)
+                  : exl3_int8_run<4, false>(ctx, xh.get(), B, svh, y, m, k, n, stream);
         } else {
-            exl3_int8_run<false>(ctx, xh.get(), static_cast<const uint8_t *>(src0->data), svh, y, m, k, n, stream);
+            resid ? exl3_int8_run<6, true>(ctx, xh.get(), B, svh, y, m, k, n, stream)
+                  : exl3_int8_run<6, false>(ctx, xh.get(), B, svh, y, m, k, n, stream);
         }
         return;
     }
