@@ -3,6 +3,7 @@
 // The tile decode and the gemv structure follow exllamav3 (MIT, Copyright (c) 2025 Turboderp):
 // exllamav3_ext/quant/{exl3_gemv_kernel,hadamard_inner,reconstruct}.cu*.
 #include "exl3.cuh"
+#include <cstring>
 #include "exl3-dq.cuh"
 #include "exl3-had.cuh"
 #include "exl3-gemv.cuh"
@@ -187,8 +188,7 @@ void exl3_int8_run(ggml_backend_cuda_context & ctx, const float * x, const half 
 }
 
 bool exl3_int8_applicable(int bits, int m, int k, int n) {
-    // validated on K = 4 (layers) and K = 6 (lm_head) checkpoints so far
-    return exl3_int8_mode() != 0 && (bits == 4 || bits == 6) && m >= 1 && m <= exl3_int8::MAX_M &&
+    return exl3_int8_mode() != 0 && bits >= 1 && bits <= 8 && m >= 1 && m <= exl3_int8::MAX_M &&
         n % exl3_int8::COLS == 0 && k % 128 == 0 && size_t(n) <= EXL3_INT8_MAX_N;
 }
 
@@ -235,15 +235,16 @@ void ggml_cuda_mul_mat_exl3(ggml_backend_cuda_context & ctx, const ggml_tensor *
         // int8 activation path: fused input transform, per-slice quantization, fused output transform
         const uint8_t * B = static_cast<const uint8_t *>(src0->data);
         const float * x = static_cast<const float *>(src1->data);
-        // The 6-bit head feeds the logits directly and is DRAM-bound anyway, so it always takes the
-        // residual (error-feedback) pass; plain mode only drops it on the 4-bit layers.
-        const bool resid = exl3_int8_mode() == 1 || bits == 6;
-        if (bits == 4) {
-            resid ? exl3_int8_run<4, true>(ctx, x, suh, B, svh, y, m, k, n, stream)
-                  : exl3_int8_run<4, false>(ctx, x, suh, B, svh, y, m, k, n, stream);
-        } else {
-            resid ? exl3_int8_run<6, true>(ctx, x, suh, B, svh, y, m, k, n, stream)
-                  : exl3_int8_run<6, false>(ctx, x, suh, B, svh, y, m, k, n, stream);
+        // The head (output.weight) feeds the logits directly and is DRAM-bound anyway, so it always
+        // takes the residual (error-feedback) pass; plain mode only drops it on the layer weights.
+        const bool resid = exl3_int8_mode() == 1 || strcmp(src0->name, "output.weight") == 0;
+        switch (bits) {
+#define EXL3_INT8_CASE(K) case K: resid ? exl3_int8_run<K, true>(ctx, x, suh, B, svh, y, m, k, n, stream) \
+                                       : exl3_int8_run<K, false>(ctx, x, suh, B, svh, y, m, k, n, stream); break;
+            EXL3_INT8_CASE(1) EXL3_INT8_CASE(2) EXL3_INT8_CASE(3) EXL3_INT8_CASE(4)
+            EXL3_INT8_CASE(5) EXL3_INT8_CASE(6) EXL3_INT8_CASE(7) EXL3_INT8_CASE(8)
+#undef EXL3_INT8_CASE
+            default: GGML_ABORT("EXL3 int8 path: unsupported bit width %d", bits);
         }
         return;
     }

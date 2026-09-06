@@ -136,6 +136,74 @@ __device__ __forceinline__ void ext8w(const uint32_t * ptr, int t0, uint32_t & w
     }
 }
 
+// Register forms (exl3-gemv.cuh's dq8_regs_2bits / dq8_regs_3bits without the decode): the eight
+// windows of run t0..t0+7 from the two lane-selected words.
+__device__ __forceinline__ void regs2_windows(uint32_t a, uint32_t b, int t_offset, uint32_t * w) {
+    b = exl3::fshift(b, a, ((~t_offset) & 8) << 1);
+    w[7] = b & 0xffff;
+    EXL3_BFE16_IMM(w[6], b, 2); EXL3_BFE16_IMM(w[5], b, 4); EXL3_BFE16_IMM(w[4], b, 6); EXL3_BFE16_IMM(w[3], b, 8);
+    EXL3_BFE16_IMM(w[2], b, 10); EXL3_BFE16_IMM(w[1], b, 12); EXL3_BFE16_IMM(w[0], b, 14);
+}
+
+__device__ __forceinline__ void regs3_windows(uint32_t a, uint32_t b, int s2, uint32_t * w) {
+    w[7] = exl3::fshift(b, a, s2);
+    w[6] = w[7] >> 3; w[5] = w[6] >> 3; w[4] = w[5] >> 3;
+    w[3] = exl3::fshift(b, a, s2 + 12);
+    w[2] = w[3] >> 3; w[1] = w[2] >> 3; w[0] = w[1] >> 3;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) w[j] &= 0xffff;
+}
+
+// K = 5, 6, 8: ext4w with the two words fetched by lane shuffle instead of pointer (word q of the
+// tile lives in lane q/2, component q%2 of the uint2 each lane loaded).  K = 7 uses ext2w groups.
+template <int bits>
+__device__ __forceinline__ uint32_t shfl_word(uint2 r, int q) {
+    const uint32_t x = __shfl_sync(0xffffffffu, r.x, q >> 1);
+    const uint32_t y = __shfl_sync(0xffffffffu, r.y, q >> 1);
+    return (q & 1) ? y : x;
+}
+
+template <int bits>
+__device__ __forceinline__ void regsw4(uint2 r, int t0, uint32_t & w0, uint32_t & w1, uint32_t & w2, uint32_t & w3) {
+    const int b0 = (t0 + 257) * bits - 16;
+    const int b2 = b0 + 3 * bits + 16;
+    const int i0 = b0 / 32;
+    const int i2 = (b2 - 1) / 32;
+    const int s2 = (i2 + 1) * 32 - b2;
+    const uint32_t a = shfl_word<bits>(r, wrap_idx<bits>(i0));
+    const uint32_t b = shfl_word<bits>(r, wrap_idx<bits>(i2));
+    w3 = exl3::fshift(b, a, s2) & 0xffff;
+    w2 = exl3::fshift(b, a, s2 + bits) & 0xffff;
+    w1 = exl3::fshift(b, a, s2 + bits * 2) & 0xffff;
+    w0 = exl3::fshift(b, a, s2 + bits * 3) & 0xffff;
+}
+
+template <int bits>
+__device__ __forceinline__ void regsw2(uint2 r, int t0, uint32_t & w0, uint32_t & w1) {
+    const int b0 = (t0 + 257) * bits - 16;
+    const int b2 = b0 + bits + 16;
+    const int i0 = b0 / 32;
+    const int i2 = (b2 - 1) / 32;
+    const int s2 = (i2 + 1) * 32 - b2;
+    const uint32_t a = shfl_word<bits>(r, wrap_idx<bits>(i0));
+    const uint32_t b = shfl_word<bits>(r, wrap_idx<bits>(i2));
+    w1 = exl3::fshift(b, a, s2) & 0xffff;
+    w0 = exl3::fshift(b, a, s2 + bits) & 0xffff;
+}
+
+template <int bits>
+__device__ __forceinline__ void regsw_windows(uint2 r, int t0, uint32_t * w) {
+    if constexpr (bits == 7) {
+        regsw2<bits>(r, t0,     w[0], w[1]);
+        regsw2<bits>(r, t0 + 2, w[2], w[3]);
+        regsw2<bits>(r, t0 + 4, w[4], w[5]);
+        regsw2<bits>(r, t0 + 6, w[6], w[7]);
+    } else {
+        regsw4<bits>(r, t0,     w[0], w[1], w[2], w[3]);
+        regsw4<bits>(r, t0 + 4, w[4], w[5], w[6], w[7]);
+    }
+}
+
 // ---- gemv ------------------------------------------------------------------------------------
 
 // B: n-tile-major tile stream; x: [M][k] F32 activations, suh: [k] F16 input signs; y: [M][n] F32;
@@ -309,45 +377,109 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
             }
         }
     } else {
-        // narrow unit: lane = standard lane t0 = 8*lane for both tiles of the pair, windows read by
-        // pointer straight from the tile words (L1); four lanes share each column
+        // pair unit: lane = standard lane t0 = 8*lane for both tiles of the pair; four lanes share
+        // each column.  K = 2/3 stream one word per lane per tile through a two-row register ring
+        // and resolve the windows with lane shuffles; other K read the windows by pointer (L1).
+        constexpr bool REG  = bits == 2 || bits == 3;
+        constexpr bool REGW = bits >= 5;                 // two words per lane per tile
         const int ntA = blockIdx.x * 16 + warp * 2;
         const uint32_t * bpA = B32 + (size_t(ntA) * kslices + kb0) * TWORDS;
         const uint32_t * bpB = B32 + (size_t(ntA + 1) * kslices + kb0) * TWORDS;
         const int c2 = 2 * (lane & 3);
         const int t0 = lane << 3;
+        [[maybe_unused]] int x_src_a = 0, x_src_b = 0, x_s2 = 0;
+        if constexpr (bits == 2) {
+            const int i1 = lane >> 1;
+            x_src_b = i1;
+            x_src_a = (i1 + 15) & 15;
+        }
+        if constexpr (bits == 3) {
+            const int b1 = (t0 + 257) * 3;
+            const int b2 = b1 + 21;
+            const int i0 = (b1 - 16) / 32;
+            const int i2 = (b2 - 1) / 32;
+            x_s2 = (i2 + 1) * 32 - b2;
+            x_src_a = i0 % 24;
+            x_src_b = i2 % 24;
+        }
+        // K = 2: one word per lane covers both tiles (lanes 0..15 tile A, 16..31 tile B);
+        // K = 3: lanes 0..23 load word `lane` of tile A and of tile B
+        auto load_row = [&](int kb, uint32_t & wa, uint32_t & wb) {
+            if constexpr (bits == 2) {
+                wa = __ldcs((lane < 16 ? bpA : bpB) + size_t(kb) * TWORDS + (lane & 15));
+                wb = 0;
+            } else if constexpr (bits == 3) {
+                wa = lane < 24 ? __ldcs(bpA + size_t(kb) * TWORDS + lane) : 0u;
+                wb = lane < 24 ? __ldcs(bpB + size_t(kb) * TWORDS + lane) : 0u;
+            } else {
+                wa = 0; wb = 0;
+            }
+        };
+        constexpr int RING = 4;   // rows in flight per lane for the K = 2/3 unit
+        [[maybe_unused]] uint32_t pa[RING], pb[RING];
+        if constexpr (REG) {
+#pragma unroll
+            for (int d = 0; d < RING; ++d) { pa[d] = 0; pb[d] = 0; if (d < nrows) load_row(d, pa[d], pb[d]); }
+        }
+        auto load_row2 = [&](int kb, uint2 & wa, uint2 & wb) {
+            if (lane < TWORDS / 2) {
+                wa = __ldcs(reinterpret_cast<const uint2 *>(bpA + size_t(kb) * TWORDS + 2 * lane));
+                wb = __ldcs(reinterpret_cast<const uint2 *>(bpB + size_t(kb) * TWORDS + 2 * lane));
+            } else {
+                wa = make_uint2(0, 0); wb = make_uint2(0, 0);
+            }
+        };
+        [[maybe_unused]] uint2 qa0 = make_uint2(0, 0), qb0 = qa0, qa1 = qa0, qb1 = qa0;
+        if constexpr (REGW) {
+            if (nrows > 0) load_row2(0, qa0, qb0);
+            if (nrows > 1) load_row2(1, qa1, qb1);
+        }
+
         int ia0[NACC], ia1[NACC], ib0[NACC], ib1[NACC];
 #pragma unroll
         for (int p = 0; p < NACC; ++p) { ia0[p] = 0; ia1[p] = 0; ib0[p] = 0; ib1[p] = 0; }
-        for (int kb = 0; kb < nrows; ++kb) {
-            uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
+        for (int kb0i = 0; kb0i < nrows; kb0i += (REG ? RING : 1)) {
+#pragma unroll
+        for (int d = 0; d < (REG ? RING : 1); ++d) {
+            const int kb = kb0i + d;
+            if (kb >= nrows) break;
+            uint32_t wA[8], wB[8];
+            if constexpr (REG) {
+                const uint32_t ca = pa[d], cb = pb[d];
+                if (kb + RING < nrows) load_row(kb + RING, pa[d], pb[d]);
+                if constexpr (bits == 2) {
+                    regs2_windows(__shfl_sync(0xffffffffu, ca, x_src_a), __shfl_sync(0xffffffffu, ca, x_src_b), t0, wA);
+                    regs2_windows(__shfl_sync(0xffffffffu, ca, 16 + x_src_a), __shfl_sync(0xffffffffu, ca, 16 + x_src_b), t0, wB);
+                } else {
+                    regs3_windows(__shfl_sync(0xffffffffu, ca, x_src_a), __shfl_sync(0xffffffffu, ca, x_src_b), x_s2, wA);
+                    regs3_windows(__shfl_sync(0xffffffffu, cb, x_src_a), __shfl_sync(0xffffffffu, cb, x_src_b), x_s2, wB);
+                }
+            } else if constexpr (REGW) {
+                const uint2 ca = qa0, cb = qb0;
+                qa0 = qa1; qb0 = qb1;
+                if (kb + 2 < nrows) load_row2(kb + 2, qa1, qb1);
+                regsw_windows<bits>(ca, t0, wA);
+                regsw_windows<bits>(cb, t0, wB);
+            } else {
+                ext8w<bits>(bpA + size_t(kb) * TWORDS, t0, wA[0], wA[1], wA[2], wA[3], wA[4], wA[5], wA[6], wA[7]);
+                ext8w<bits>(bpB + size_t(kb) * TWORDS, t0, wB[0], wB[1], wB[2], wB[3], wB[4], wB[5], wB[6], wB[7]);
+            }
+#pragma unroll
+            for (int j = 0; j < 8; ++j) { wA[j] *= 0x83DCD12Du; wB[j] *= 0x83DCD12Du; }
             const uint32_t * as_kb = sh_as + (kb << 4);
-            ext8w<bits>(bpA + size_t(kb) * TWORDS, t0, w0, w1, w2, w3, w4, w5, w6, w7);
-            w0 *= 0x83DCD12Du; w1 *= 0x83DCD12Du; w2 *= 0x83DCD12Du; w3 *= 0x83DCD12Du;
-            w4 *= 0x83DCD12Du; w5 *= 0x83DCD12Du; w6 *= 0x83DCD12Du; w7 *= 0x83DCD12Du;
 #pragma unroll
             for (int p = 0; p < NACC; ++p) {
                 const uint32_t * as = as_kb + p * nrows_max * 16;
                 const uint2 as01 = *reinterpret_cast<const uint2 *>(as + c2);
                 const uint2 as89 = *reinterpret_cast<const uint2 *>(as + c2 + 8);
-                int i0 = ia0[p], i1 = ia1[p];
-                i0 = dp4a_us(w0, as01.x, i0); i0 = dp4a_us(w1, as01.y, i0); i0 = dp4a_us(w2, as89.x, i0); i0 = dp4a_us(w3, as89.y, i0);
-                i1 = dp4a_us(w4, as01.x, i1); i1 = dp4a_us(w5, as01.y, i1); i1 = dp4a_us(w6, as89.x, i1); i1 = dp4a_us(w7, as89.y, i1);
-                ia0[p] = i0; ia1[p] = i1;
+                int a0 = ia0[p], a1 = ia1[p], b0 = ib0[p], b1 = ib1[p];
+                a0 = dp4a_us(wA[0], as01.x, a0); a0 = dp4a_us(wA[1], as01.y, a0); a0 = dp4a_us(wA[2], as89.x, a0); a0 = dp4a_us(wA[3], as89.y, a0);
+                a1 = dp4a_us(wA[4], as01.x, a1); a1 = dp4a_us(wA[5], as01.y, a1); a1 = dp4a_us(wA[6], as89.x, a1); a1 = dp4a_us(wA[7], as89.y, a1);
+                b0 = dp4a_us(wB[0], as01.x, b0); b0 = dp4a_us(wB[1], as01.y, b0); b0 = dp4a_us(wB[2], as89.x, b0); b0 = dp4a_us(wB[3], as89.y, b0);
+                b1 = dp4a_us(wB[4], as01.x, b1); b1 = dp4a_us(wB[5], as01.y, b1); b1 = dp4a_us(wB[6], as89.x, b1); b1 = dp4a_us(wB[7], as89.y, b1);
+                ia0[p] = a0; ia1[p] = a1; ib0[p] = b0; ib1[p] = b1;
             }
-            ext8w<bits>(bpB + size_t(kb) * TWORDS, t0, w0, w1, w2, w3, w4, w5, w6, w7);
-            w0 *= 0x83DCD12Du; w1 *= 0x83DCD12Du; w2 *= 0x83DCD12Du; w3 *= 0x83DCD12Du;
-            w4 *= 0x83DCD12Du; w5 *= 0x83DCD12Du; w6 *= 0x83DCD12Du; w7 *= 0x83DCD12Du;
-#pragma unroll
-            for (int p = 0; p < NACC; ++p) {
-                const uint32_t * as = as_kb + p * nrows_max * 16;
-                const uint2 as01 = *reinterpret_cast<const uint2 *>(as + c2);
-                const uint2 as89 = *reinterpret_cast<const uint2 *>(as + c2 + 8);
-                int i0 = ib0[p], i1 = ib1[p];
-                i0 = dp4a_us(w0, as01.x, i0); i0 = dp4a_us(w1, as01.y, i0); i0 = dp4a_us(w2, as89.x, i0); i0 = dp4a_us(w3, as89.y, i0);
-                i1 = dp4a_us(w4, as01.x, i1); i1 = dp4a_us(w5, as01.y, i1); i1 = dp4a_us(w6, as89.x, i1); i1 = dp4a_us(w7, as89.y, i1);
-                ib0[p] = i0; ib1[p] = i1;
-            }
+        }
         }
         // lanes with equal lane/4 share the same columns (col lane/4 and +8 of each tile)
 #pragma unroll
