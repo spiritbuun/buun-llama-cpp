@@ -5536,9 +5536,47 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 // slot it is written back to; each thread owns one channel row.
                 (!ggml_cuda_tensors_overlap(cpy, prefix) ||
                  (cpy->data == prefix->data && cpy->nb[1] == prefix->nb[2]))) {
-            ggml_cuda_op_conv_state_concat(*cuda_ctx, prefix, body, node, cpy);
+            // At decode width the same kernel can also evaluate the following
+            // SSM_CONV + SiLU from its register window, provided the SiLU
+            // output does not alias the two sources (the allocator may reuse
+            // them) — a thread only owns its own channel row.
+            const ggml_tensor * conv_weight = nullptr;
+            ggml_tensor * silu = nullptr;
+            ggml_tensor * conv = nullptr;
+            if (n_t <= 8) {
+                for (int j = cpy_index + 1; j < cgraph->n_nodes; ++j) {
+                    ggml_tensor * cand = cgraph->nodes[j];
+                    if (cand->op != GGML_OP_SSM_CONV || cand->src[0] != node) {
+                        continue;
+                    }
+                    ggml_tensor * next = j + 1 < cgraph->n_nodes ? cgraph->nodes[j + 1] : nullptr;
+                    if (next != nullptr && next->op == GGML_OP_UNARY && next->src[0] == cand &&
+                            ggml_get_unary_op(next) == GGML_UNARY_OP_SILU &&
+                            ggml_node_get_use_count(cgraph, j) == 1 &&
+                            !(cand->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+                            cand->src[1]->type == GGML_TYPE_F32 && cand->src[1]->ne[0] == n_prefix + 1 &&
+                            cand->src[1]->ne[1] == node->ne[1] && cand->src[1]->nb[0] == sizeof(float) &&
+                            next->type == GGML_TYPE_F32 && ggml_is_contiguous(next) &&
+                            next->ne[0] == node->ne[1] && next->ne[1] == n_t && next->ne[2] == node->ne[2] &&
+                            !ggml_cuda_tensors_overlap(next, prefix) && !ggml_cuda_tensors_overlap(next, body) &&
+                            !ggml_cuda_tensors_overlap(next, node) && !ggml_cuda_tensors_overlap(next, cpy)) {
+                        conv_weight = cand->src[1];
+                        conv = cand;
+                        silu = next;
+                    }
+                    break;
+                }
+            }
+            ggml_cuda_op_conv_state_concat(*cuda_ctx, prefix, body, node, cpy, conv_weight, silu);
+            if (conv != nullptr) {
+                cuda_ctx->precomputed_ssm_convs.insert(conv);
+            }
             return cpy_index - i;
         }
+    }
+    if (node->op == GGML_OP_SSM_CONV && cuda_ctx->precomputed_ssm_convs.erase(node) != 0) {
+        // The conv-state fusion already wrote this convolution's SiLU output.
+        return 1;
     }
     ggml_cuda_hc_grouped_rms_fusion hc_grouped_rms;
     if (node->op == GGML_OP_RMS_NORM &&
@@ -7100,6 +7138,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     cuda_ctx->int8_channel_activations.clear();
     cuda_ctx->bf16_glu_outputs.clear();
     cuda_ctx->humming_prepared_active.clear();
+    cuda_ctx->precomputed_ssm_convs.clear();
 
     ggml_cuda_canonicalize_unserved_marlin_weights(cuda_ctx, cgraph);
 #endif

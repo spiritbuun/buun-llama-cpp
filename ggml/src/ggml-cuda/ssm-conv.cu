@@ -343,7 +343,11 @@ static __global__ void conv_state_concat(
         int64_t body_seq_stride,
         int64_t body_row_stride,
         int64_t dst_seq_stride,
-        int64_t state_seq_stride) {
+        int64_t state_seq_stride,
+        const float * __restrict__ weight,
+        int64_t weight_stride,
+        float * __restrict__ silu,
+        int64_t silu_seq_stride) {
     const int64_t channel = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     const int64_t seq     = blockIdx.y;
     if (channel >= channels) {
@@ -355,19 +359,33 @@ static __global__ void conv_state_concat(
     float *       state_row  = state  + seq * state_seq_stride  + channel * n_prefix;
 
     // The saved prefix may be read from the very slot it is written back to,
-    // so keep it in registers until the new prefix is known.
-    float saved[16];
+    // so the whole window stays in registers until everything is written.
+    float window[24];
     for (int j = 0; j < n_prefix; ++j) {
-        saved[j] = prefix_row[j];
-        dst_row[j] = saved[j];
+        window[j] = prefix_row[j];
     }
     for (int t = 0; t < n_t; ++t) {
-        dst_row[n_prefix + t] = body_col[t * body_row_stride];
+        window[n_prefix + t] = body_col[t * body_row_stride];
+    }
+    for (int j = 0; j < n_prefix + n_t; ++j) {
+        dst_row[j] = window[j];
     }
     // New prefix = the last n_prefix columns of the concatenation.
     for (int j = 0; j < n_prefix; ++j) {
-        const int col = n_t + j;
-        state_row[j] = col < n_prefix ? saved[col] : body_col[(col - n_prefix) * body_row_stride];
+        state_row[j] = window[n_t + j];
+    }
+    if (silu != nullptr) {
+        // Same accumulation order as ssm_conv_f32 (bias-free, then SiLU).
+        const float * w   = weight + channel * weight_stride;
+        float *       out = silu + seq * silu_seq_stride + channel;
+        for (int t = 0; t < n_t; ++t) {
+            float sum = 0.0f;
+            for (int j = 0; j <= n_prefix; ++j) {
+                sum += window[t + j] * w[j];
+            }
+            sum += 0.0f;
+            out[t * channels] = ggml_cuda_op_silu_single(sum);
+        }
     }
 }
 
@@ -434,12 +452,15 @@ void ggml_cuda_op_conv_state_concat(
         const ggml_tensor * prefix,
         const ggml_tensor * body,
         ggml_tensor * dst,
-        ggml_tensor * state) {
+        ggml_tensor * state,
+        const ggml_tensor * conv_weight,
+        ggml_tensor * silu) {
     const int64_t n_prefix = prefix->ne[0];
     const int64_t channels = prefix->ne[1];
     const int64_t n_s      = prefix->ne[2];
     const int64_t n_t      = body->ne[0];
     GGML_ASSERT(n_prefix <= 16);
+    GGML_ASSERT(silu == nullptr || (n_t <= 8 && conv_weight != nullptr && conv_weight->ne[0] == n_prefix + 1));
     if (n_t <= 8) {
         const dim3 blocks((channels + 255) / 256, n_s);
         conv_state_concat<<<blocks, 256, 0, ctx.stream()>>>(
@@ -447,7 +468,11 @@ void ggml_cuda_op_conv_state_concat(
             static_cast<float *>(dst->data), static_cast<float *>(state->data),
             channels, int(n_prefix), int(n_t),
             prefix->nb[2] / sizeof(float), body->nb[2] / sizeof(float), body->nb[0] / sizeof(float),
-            dst->nb[2] / sizeof(float), state->nb[1] / sizeof(float));
+            dst->nb[2] / sizeof(float), state->nb[1] / sizeof(float),
+            silu != nullptr ? static_cast<const float *>(conv_weight->data) : nullptr,
+            silu != nullptr ? conv_weight->nb[1] / sizeof(float) : 0,
+            silu != nullptr ? static_cast<float *>(silu->data) : nullptr,
+            silu != nullptr ? silu->nb[2] / sizeof(float) : 0);
         return;
     }
     const dim3 blocks((channels + 31) / 32, (n_t + 31) / 32, n_s);
