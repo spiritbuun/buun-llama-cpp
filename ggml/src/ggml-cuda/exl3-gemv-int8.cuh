@@ -138,16 +138,17 @@ __device__ __forceinline__ void ext8w(const uint32_t * ptr, int t0, uint32_t & w
 
 // ---- gemv ------------------------------------------------------------------------------------
 
-// B: n-tile-major 4 bpw tile stream; xh: [M][k] F16 (had128(x * suh) / sqrt(128)); y: [M][n] F32;
+// B: n-tile-major tile stream; x: [M][k] F32 activations, suh: [k] F16 input signs; y: [M][n] F32;
 // partials: [ksplit][M][n] F32 (fully overwritten); counters: n/256 ints, zero at rest.
 template <int bits, int M, bool RESID>
 __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __restrict__ B,
-        const half * __restrict__ xh, const half * __restrict__ svh, float * __restrict__ y,
+        const float * __restrict__ x, const half * __restrict__ suh, const half * __restrict__ svh, float * __restrict__ y,
         float * __restrict__ partials, int * __restrict__ counters, int k, int n, int nrows_max) {
     constexpr int TWORDS = 8 * bits;
     constexpr bool WIDE = bits == 4;   // uint2-per-lane block pair; other K use pointer extraction
     constexpr int NACC = (RESID ? 2 : 1) * M;
-    extern __shared__ uint32_t sh_as[];   // [NACC][nrows_max * 16] splats
+    extern __shared__ uint32_t sh_as[];   // [NACC][nrows_max * 16] splats, then [M][nrows_max * 16] F16 xh
+    half * sh_xh = reinterpret_cast<half *>(sh_as + size_t(NACC) * nrows_max * 16);
     __shared__ float sh_y[M][COLS];
     __shared__ float sh_redf[THREADS / 32][M];
     __shared__ int   sh_redi[THREADS / 32][NACC];
@@ -161,14 +162,30 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
     const int nrows = min(nrows_max, kslices - kb0);
     const int kn    = nrows * 16;
 
-    // per-slice scale: max |xh| over this block's k range, per row
+    // input transform of this block's own k range (128-aligned: nrows % 8 == 0): xh = had128(x * suh) / sqrt(128),
+    // F16 in smem, with the per-slice max |xh| per row
     {
         float amax[M];
 #pragma unroll
         for (int r = 0; r < M; ++r) amax[r] = 0.0f;
-        for (int i = threadIdx.x; i < kn; i += THREADS) {
-#pragma unroll
-            for (int r = 0; r < M; ++r) amax[r] = fmaxf(amax[r], fabsf(__half2float(xh[size_t(r) * k + kb0 * 16 + i])));
+        for (int b = warp; b < (kn / 128) * M; b += THREADS / 32) {
+            const int r   = b / (kn / 128);
+            const int col = kb0 * 16 + (b - r * (kn / 128)) * 128 + lane * 4;
+            const float4 xv = *reinterpret_cast<const float4 *>(x + size_t(r) * k + col);
+            const half2 s01 = *reinterpret_cast<const half2 *>(suh + col);
+            const half2 s23 = *reinterpret_cast<const half2 *>(suh + col + 2);
+            float v0 = xv.x * __low2float(s01);
+            float v1 = xv.y * __high2float(s01);
+            float v2 = xv.z * __low2float(s23);
+            float v3 = xv.w * __high2float(s23);
+            exl3_had::had128(v0, v1, v2, v3, lane);
+            const half2 h01 = __floats2half2_rn(v0 * exl3_had::SCALE, v1 * exl3_had::SCALE);
+            const half2 h23 = __floats2half2_rn(v2 * exl3_had::SCALE, v3 * exl3_had::SCALE);
+            half * dst = sh_xh + size_t(r) * nrows_max * 16 + (col - kb0 * 16);
+            *reinterpret_cast<half2 *>(dst)     = h01;
+            *reinterpret_cast<half2 *>(dst + 2) = h23;
+            amax[r] = fmaxf(amax[r], fmaxf(fmaxf(fabsf(__low2float(h01)), fabsf(__high2float(h01))),
+                                           fmaxf(fabsf(__low2float(h23)), fabsf(__high2float(h23)))));
         }
 #pragma unroll
         for (int r = 0; r < M; ++r) {
@@ -195,7 +212,7 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
 #pragma unroll
             for (int r = 0; r < M; ++r) {
                 const int p0 = RESID ? 2 * r : r;
-                const float a  = __half2float(xh[size_t(r) * k + kb0 * 16 + i]);
+                const float a  = __half2float(sh_xh[size_t(r) * nrows_max * 16 + i]);
                 const float q  = sh_q[p0];
                 int v = __float2int_rn(a / q);
                 v = max(-127, min(127, v));

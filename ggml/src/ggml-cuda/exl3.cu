@@ -34,16 +34,34 @@ __device__ __forceinline__ const uint32_t * exl3_tile(const uint8_t * data, int 
 
 // ---- reconstruct: rows [n0, n1) of W[n][k] as F16 ------------------------------------------
 
+// One warp per 16x16 tile: lane l decodes run t = 8l..8l+7 (rows (l%4)*2 + {0,1,8,9}, cols l/4 and
+// l/4 + 8) and writes W[n][k] as half2 pairs.  grid = tiles / 8, 256 threads.
 template <int bits>
-__global__ void exl3_reconstruct_kernel(const uint8_t * __restrict__ data, half * __restrict__ dst,
-        int k, int n0, int k_tiles) {
-    const int nt = blockIdx.x + n0 / 16;     // absolute n tile
-    const int kt = blockIdx.y;
-    const int idx = threadIdx.x;             // 0..255, one weight
-    int r, c;
-    exl3_tile_rc(idx, r, c);
-    const half v = exl3::dq<bits, EXL3_CB>(exl3_tile(data, bits, nt, kt, k_tiles), idx);
-    dst[size_t(blockIdx.x * 16 + c) * k + kt * 16 + r] = v;
+__global__ void __launch_bounds__(256) exl3_reconstruct_kernel(const uint8_t * __restrict__ data, half * __restrict__ dst,
+        int k, int nt0, int nt1) {
+    const int lane = threadIdx.x & 31;
+    const size_t tile = size_t(blockIdx.x) * 8 + (threadIdx.x >> 5);
+    const int k_tiles = k / 16;
+    const int nt = nt0 + int(tile / k_tiles);
+    const int kt = int(tile % k_tiles);
+    if (nt >= nt1) {
+        return;
+    }
+    const uint32_t * tp = reinterpret_cast<const uint32_t *>(exl3_tile(data, bits, nt, kt, k_tiles));
+    uint32_t w[8];
+    exl3_int8::ext8w<bits>(tp, lane << 3, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+    const half2 v01 = exl3_gemv::exl3_decode_pair_cb2(w[0], w[1]);   // rows r, r+1     col c
+    const half2 v23 = exl3_gemv::exl3_decode_pair_cb2(w[2], w[3]);   // rows r+8, r+9   col c
+    const half2 v45 = exl3_gemv::exl3_decode_pair_cb2(w[4], w[5]);   // rows r, r+1     col c+8
+    const half2 v67 = exl3_gemv::exl3_decode_pair_cb2(w[6], w[7]);   // rows r+8, r+9   col c+8
+    const int r = (lane & 3) * 2;
+    const int c = lane >> 2;
+    half * row0 = dst + (size_t(nt - nt0) * 16 + c) * k + size_t(kt) * 16 + r;
+    half * row8 = row0 + size_t(8) * k;
+    *reinterpret_cast<half2 *>(row0)     = v01;
+    *reinterpret_cast<half2 *>(row0 + 8) = v23;
+    *reinterpret_cast<half2 *>(row8)     = v45;
+    *reinterpret_cast<half2 *>(row8 + 8) = v67;
 }
 
 // xh[m][k] (F16) = had128(x[m][k] * suh) / sqrt(128); grid (k/128, m), block 32
@@ -93,8 +111,8 @@ void exl3_gemv_launch(const half * A, const uint8_t * B, float * C, int m, int k
 
 template <int bits>
 void exl3_reconstruct_launch(const uint8_t * data, half * dst, int k, int n0, int n1, cudaStream_t stream) {
-    const dim3 grid((n1 - n0) / 16, k / 16);
-    exl3_reconstruct_kernel<bits><<<grid, 256, 0, stream>>>(data, dst, k, n0, k / 16);
+    const size_t tiles = size_t(n1 - n0) / 16 * (k / 16);
+    exl3_reconstruct_kernel<bits><<<unsigned((tiles + 7) / 8), 256, 0, stream>>>(data, dst, k, n0 / 16, n1 / 16);
 }
 
 #define EXL3_DISPATCH(fn, bits, ...)                          \
@@ -135,7 +153,7 @@ int * exl3_int8_counters(int device, cudaStream_t stream) {
 }
 
 template <int bits, int M, bool RESID>
-void exl3_gemv_int8_launch(const uint8_t * B, const half * xh, const half * svh, float * y, float * partials, int * counters,
+void exl3_gemv_int8_launch(const uint8_t * B, const float * x, const half * suh, const half * svh, float * y, float * partials, int * counters,
         int k, int n, int colblocks, int ksplit, int nrows, size_t smem, cudaStream_t stream) {
     static bool attr_set = false;
     if (!attr_set) {
@@ -143,27 +161,28 @@ void exl3_gemv_int8_launch(const uint8_t * B, const half * xh, const half * svh,
         attr_set = true;
     }
     exl3_int8::gemv_int8_kernel<bits, M, RESID><<<dim3(colblocks, ksplit), exl3_int8::THREADS, smem, stream>>>(
-        B, xh, svh, y, partials, counters, k, n, nrows);
+        B, x, suh, svh, y, partials, counters, k, n, nrows);
 }
 
 template <int bits, bool RESID>
-void exl3_int8_run(ggml_backend_cuda_context & ctx, const half * xh, const uint8_t * B, const half * svh,
+void exl3_int8_run(ggml_backend_cuda_context & ctx, const float * x, const half * suh, const uint8_t * B, const half * svh,
         float * y, int m, int k, int n, cudaStream_t stream) {
     const int kslices = k / 16;
     const int colblocks = n / exl3_int8::COLS;
     const int nacc = (RESID ? 2 : 1) * m;
+    // slices are 128-aligned (nrows % 8) so each block can transform its own activations
     int ksplit = std::max(1, (640 + colblocks - 1) / colblocks);   // ~640 blocks keeps HBM busy
-    int nrows  = std::max(4, (kslices + ksplit - 1) / ksplit);
-    nrows  = std::min(nrows, (96 * 1024) / (nacc * 64));
+    int nrows  = std::max(8, ((kslices + ksplit - 1) / ksplit + 7) / 8 * 8);
+    nrows  = std::min(nrows, (96 * 1024) / (nacc * 64 + m * 32) / 8 * 8);
     ksplit = (kslices + nrows - 1) / nrows;
-    const size_t smem = size_t(nacc) * nrows * 64;
+    const size_t smem = size_t(nrows) * 16 * (size_t(nacc) * 4 + size_t(m) * 2);
     ggml_cuda_pool_alloc<float> partials(ctx.pool(), size_t(ksplit) * m * n);
     int * counters = exl3_int8_counters(ctx.device, stream);
     switch (m) {
-        case 1: exl3_gemv_int8_launch<bits, 1, RESID>(B, xh, svh, y, partials.get(), counters, k, n, colblocks, ksplit, nrows, smem, stream); break;
-        case 2: exl3_gemv_int8_launch<bits, 2, RESID>(B, xh, svh, y, partials.get(), counters, k, n, colblocks, ksplit, nrows, smem, stream); break;
-        case 3: exl3_gemv_int8_launch<bits, 3, RESID>(B, xh, svh, y, partials.get(), counters, k, n, colblocks, ksplit, nrows, smem, stream); break;
-        default: exl3_gemv_int8_launch<bits, 4, RESID>(B, xh, svh, y, partials.get(), counters, k, n, colblocks, ksplit, nrows, smem, stream); break;
+        case 1: exl3_gemv_int8_launch<bits, 1, RESID>(B, x, suh, svh, y, partials.get(), counters, k, n, colblocks, ksplit, nrows, smem, stream); break;
+        case 2: exl3_gemv_int8_launch<bits, 2, RESID>(B, x, suh, svh, y, partials.get(), counters, k, n, colblocks, ksplit, nrows, smem, stream); break;
+        case 3: exl3_gemv_int8_launch<bits, 3, RESID>(B, x, suh, svh, y, partials.get(), counters, k, n, colblocks, ksplit, nrows, smem, stream); break;
+        default: exl3_gemv_int8_launch<bits, 4, RESID>(B, x, suh, svh, y, partials.get(), counters, k, n, colblocks, ksplit, nrows, smem, stream); break;
     }
 }
 
@@ -212,26 +231,28 @@ void ggml_cuda_mul_mat_exl3(ggml_backend_cuda_context & ctx, const ggml_tensor *
     cudaStream_t stream = ctx.stream();
     float * y = static_cast<float *>(dst->data);
 
+    if (exl3_int8_applicable(bits, m, k, n)) {
+        // int8 activation path: fused input transform, per-slice quantization, fused output transform
+        const uint8_t * B = static_cast<const uint8_t *>(src0->data);
+        const float * x = static_cast<const float *>(src1->data);
+        // The 6-bit head feeds the logits directly and is DRAM-bound anyway, so it always takes the
+        // residual (error-feedback) pass; plain mode only drops it on the 4-bit layers.
+        const bool resid = exl3_int8_mode() == 1 || bits == 6;
+        if (bits == 4) {
+            resid ? exl3_int8_run<4, true>(ctx, x, suh, B, svh, y, m, k, n, stream)
+                  : exl3_int8_run<4, false>(ctx, x, suh, B, svh, y, m, k, n, stream);
+        } else {
+            resid ? exl3_int8_run<6, true>(ctx, x, suh, B, svh, y, m, k, n, stream)
+                  : exl3_int8_run<6, false>(ctx, x, suh, B, svh, y, m, k, n, stream);
+        }
+        return;
+    }
+
     // input transform: xh = had128(x * suh) / sqrt(128), F16 [m][k]
     ggml_cuda_pool_alloc<half> xh(ctx.pool(), size_t(m) * k);
     exl3_had_in_kernel<<<dim3(k / 128, m), 32, 0, stream>>>(
         static_cast<const float *>(src1->data), suh, xh.get(), k);
 
-    if (exl3_int8_applicable(bits, m, k, n)) {
-        // int8 activation path: per-slice quantization, fused output transform
-        const uint8_t * B = static_cast<const uint8_t *>(src0->data);
-        // The 6-bit head feeds the logits directly and is DRAM-bound anyway, so it always takes the
-        // residual (error-feedback) pass; plain mode only drops it on the 4-bit layers.
-        const bool resid = exl3_int8_mode() == 1 || bits == 6;
-        if (bits == 4) {
-            resid ? exl3_int8_run<4, true>(ctx, xh.get(), B, svh, y, m, k, n, stream)
-                  : exl3_int8_run<4, false>(ctx, xh.get(), B, svh, y, m, k, n, stream);
-        } else {
-            resid ? exl3_int8_run<6, true>(ctx, xh.get(), B, svh, y, m, k, n, stream)
-                  : exl3_int8_run<6, false>(ctx, xh.get(), B, svh, y, m, k, n, stream);
-        }
-        return;
-    }
     if (m <= EXL3_GEMV_MAX_M) {
         const int sms = ggml_cuda_info().devices[ctx.device].nsm;
         EXL3_DISPATCH(exl3_gemv_launch, bits, xh.get(), static_cast<const uint8_t *>(src0->data), y, m, k, n, sms, stream);
