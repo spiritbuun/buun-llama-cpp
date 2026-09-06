@@ -259,7 +259,9 @@ source_spec map_target(
             const std::string module = prefix + "mlp.experts." + std::to_string(expert) + "." + projection;
             if (quantized) {
                 auto weight = quant.bind(module, llama_safetensors_quant_role::WEIGHT);
-                if (weight && ggml_type_is_exl3(weight->target_type)) {
+                // self-contained rows (EXL3 tiles, GPTQ/AutoRound repacked to Q4_1/Q8_0, ...) stack
+                // directly; only block-FP8 needs the separate scale bridge below
+                if (weight && weight->target_type != GGML_TYPE_F8_E4M3 && weight->target_type != GGML_TYPE_GPTQ_AO) {
                     result.stack_exl3.push_back(std::move(*weight));
                     continue;
                 }
@@ -336,6 +338,13 @@ source_spec map_target(
         if (exl3_split(projection)) {
             return exl3_side_stack(projection, llama_safetensors_quant_role::INPUT_SCALE);
         }
+        if (split_experts && quant.applies(prefix + "mlp.experts.0." + projection)) {
+            // per-expert scalar activation scales (e.g. NVFP4 input_scale) stack to [n_expert]
+            auto in = quant.bind(prefix + "mlp.experts.0." + projection, llama_safetensors_quant_role::INPUT_SCALE);
+            if (in && in->target_type == GGML_TYPE_F32 && in->target_shape == std::vector<int64_t>{ 1 }) {
+                return exl3_side_stack(projection, llama_safetensors_quant_role::INPUT_SCALE);
+            }
+        }
     }
     if (suffix == "ffn_gate_exps.scale" || suffix == "ffn_up_exps.scale" ||
         suffix == "ffn_down_exps.scale") {
@@ -346,6 +355,11 @@ source_spec map_target(
                 return exl3_side_stack(projection, llama_safetensors_quant_role::WEIGHT_SCALE);
             }
             if (quant.applies(prefix + "mlp.experts.0." + projection)) {
+                // per-expert scalar output scales (e.g. NVFP4 weight_scale_2) stack to [n_expert]
+                auto scale = quant.bind(prefix + "mlp.experts.0." + projection, llama_safetensors_quant_role::WEIGHT_SCALE);
+                if (scale && scale->target_type == GGML_TYPE_F32 && scale->target_shape == std::vector<int64_t>{ 1 }) {
+                    return exl3_side_stack(projection, llama_safetensors_quant_role::WEIGHT_SCALE);
+                }
                 return {};
             }
         }
@@ -1017,12 +1031,16 @@ bool llama_safetensors_qwen4exp_importer::describe(
         const auto & first = spec.stack_exl3.front();
         for (const auto & item : spec.stack_exl3) {
             if (item.target_type != first.target_type || item.target_shape != first.target_shape) {
-                throw std::runtime_error("EXL3 experts must share bit width, codebook and shape");
+                throw std::runtime_error("stacked experts must share quantized type and shape");
             }
         }
         type  = first.target_type;
-        shape = first.target_shape;   // [k, n] weights or [n] / [k] side vectors
-        shape.push_back(static_cast<int64_t>(spec.stack_exl3.size()));
+        shape = first.target_shape;   // [k, n] weights, [n] / [k] side vectors, or [1] scalars
+        if (shape == std::vector<int64_t>{ 1 }) {
+            shape = { static_cast<int64_t>(spec.stack_exl3.size()) };   // scalar per expert -> [n_expert]
+        } else {
+            shape.push_back(static_cast<int64_t>(spec.stack_exl3.size()));
+        }
     } else if (!spec.stack_quant_weights.empty()) {
         const auto & first = spec.stack_quant_weights.front();
         if (first.target_shape.size() != 2 || first.target_shape[0] % 128 != 0 ||
@@ -1184,7 +1202,7 @@ std::vector<uint8_t> llama_safetensors_qwen4exp_importer::materialize(
         std::vector<uint8_t> result;
         const llama_safetensors_tensor * source_desc = nullptr;
         if (!spec.stack_exl3.empty()) {
-            // per-expert EXL3 repacks (or F16 side vectors) concatenated along the expert dimension
+            // per-expert repacks (EXL3 tiles, Q4_1/Q8_0 rows, or F16 side vectors) concatenated along the expert dimension
             result.reserve(target_size);
             for (const auto & binding : spec.stack_exl3) {
                 auto bytes = quant_->finalize(binding, quant_->read(binding));

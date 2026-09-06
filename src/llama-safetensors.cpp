@@ -1,4 +1,5 @@
 #include "llama-safetensors.h"
+#include "llama-impl.h"
 
 #include "nlohmann/json.hpp"
 
@@ -1082,9 +1083,11 @@ llama_safetensors_quant_config llama_safetensors_quant_config::from_json(const l
         std::transform(quant_algo.begin(), quant_algo.end(), quant_algo.begin(),
                        [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
         if (quant_algo == "NVFP4") {
-            throw std::runtime_error(
-                "native safetensors does not yet support ModelOpt NVFP4 W4A4 activations; "
-                "use a W4A16_NVFP4 checkpoint");
+            // W4A4 checkpoints carry the same NVFP4 weights as W4A16 plus per-module activation
+            // scales; we run the activations at full precision and ignore those scales, which is
+            // strictly more accurate than the intended W4A4 execution.
+            LLAMA_LOG_WARN("%s: ModelOpt NVFP4 W4A4 checkpoint: activation scales are ignored (activations stay unquantized)\n", __func__);
+            quant_algo = "W4A16_NVFP4";
         }
         if (quant_algo != "W4A16_NVFP4" && quant_algo != "MIXED_PRECISION" &&
             quant_algo != "FP8" && quant_algo != "FP8_PER_CHANNEL_PER_TOKEN" &&
@@ -1578,12 +1581,20 @@ llama_safetensors_registry llama_safetensors_registry::load(
             expected_shards.emplace(tensor_name, shard_name);
             shard_names.insert(shard_name);
         }
+    } else if (std::filesystem::is_regular_file(model_dir / "model.safetensors")) {
+        shard_names.insert("model.safetensors");
     } else {
-        const auto single = model_dir / "model.safetensors";
-        if (!std::filesystem::is_regular_file(single)) {
+        // no index and no single file: every *.safetensors in the directory is a shard
+        bool any = false;
+        for (const auto & entry : std::filesystem::directory_iterator(model_dir)) {
+            if (entry.is_regular_file() && entry.path().extension() == ".safetensors") {
+                shard_names.insert(entry.path().filename().string());
+                any = true;
+            }
+        }
+        if (!any) {
             throw std::runtime_error("model directory has neither model.safetensors nor model.safetensors.index.json");
         }
-        shard_names.insert("model.safetensors");
     }
     // Side files outside the index (exllamav3's ngram_embedding.safetensors, MTP patches, ...):
     // any other *.safetensors in the directory joins the registry; their tensors are accepted
@@ -1609,7 +1620,9 @@ llama_safetensors_registry llama_safetensors_registry::load(
         for (const auto & [key, value] : parsed.metadata) {
             const auto [it, inserted] = result.metadata_.emplace(key, value);
             if (!inserted && it->second != value) {
-                throw std::runtime_error("conflicting safetensors metadata value for '" + key + "'");
+                // per-shard bookkeeping keys (e.g. expert ranges of per-layer expert files) differ
+                // legitimately; the first value stands and the registry only uses format-level keys
+                continue;
             }
         }
 
