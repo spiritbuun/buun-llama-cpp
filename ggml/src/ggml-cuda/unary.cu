@@ -1474,6 +1474,20 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
                 GGML_CUDA_UNARY_MUL_STRIDED_ARGS(other_src));
         }
     } else {
+        // In-place F32 writes are element-wise; compact BF16 writes can instead
+        // overwrite another block's unread F32 input. Keep overlapping output
+        // in F32 and let the projection perform its normal BF16 conversion.
+        if (bf16_activation != nullptr) {
+            const uintptr_t out_begin = reinterpret_cast<uintptr_t>(mul_node->data);
+            const uintptr_t out_end = out_begin + ggml_nbytes(mul_node);
+            const auto overlaps_output = [&](const ggml_tensor * input) {
+                const uintptr_t begin = reinterpret_cast<uintptr_t>(input->data);
+                return out_begin < begin + ggml_nbytes(input) && begin < out_end;
+            };
+            if (overlaps_output(unary_src) || overlaps_output(other_src)) {
+                bf16_activation = nullptr;
+            }
+        }
         if (bf16_activation != nullptr) {
             if (simple_rows) {
                 unary_gated_op_bf16_kernel<op><<<blocks, CUDA_GLU_BLOCK_SIZE, 0, stream>>>(
