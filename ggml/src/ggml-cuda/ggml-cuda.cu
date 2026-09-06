@@ -5380,7 +5380,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                             gdn->src[3]->ne[0] == v->ne[0],
                             ggml_get_op_params_i32(gdn, 0) > 1,
                             v->ne[0], v->ne[1], node->ne[1], v->ne[2], v->ne[3]);
-                    if (supported) {
+#if !defined(GGML_USE_HIP)
+                    // The standard kernel also normalizes q/k in place (bit-
+                    // identical to l2_norm_pair) when the gate is scalar.
+                    const bool standard = gdn->src[3] && gdn->src[3]->ne[0] == 1;
+#else
+                    const bool standard = false;
+#endif
+                    if (supported || standard) {
                         cuda_ctx->gdn_deferred_l2.insert(node->data);
                         cuda_ctx->gdn_deferred_l2.insert(k_norm->data);
                         return 2;
