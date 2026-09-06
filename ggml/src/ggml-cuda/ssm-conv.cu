@@ -354,18 +354,78 @@ static __global__ void conv_state_concat(
     float *       dst_row    = dst    + seq * dst_seq_stride    + channel * (n_prefix + n_t);
     float *       state_row  = state  + seq * state_seq_stride  + channel * n_prefix;
 
-    float window[16];
+    // The saved prefix may be read from the very slot it is written back to,
+    // so keep it in registers until the new prefix is known.
+    float saved[16];
     for (int j = 0; j < n_prefix; ++j) {
-        window[j] = prefix_row[j];
+        saved[j] = prefix_row[j];
+        dst_row[j] = saved[j];
     }
     for (int t = 0; t < n_t; ++t) {
-        window[n_prefix + t] = body_col[t * body_row_stride];
+        dst_row[n_prefix + t] = body_col[t * body_row_stride];
     }
-    for (int j = 0; j < n_prefix + n_t; ++j) {
-        dst_row[j] = window[j];
-    }
+    // New prefix = the last n_prefix columns of the concatenation.
     for (int j = 0; j < n_prefix; ++j) {
-        state_row[j] = window[n_t + j];
+        const int col = n_t + j;
+        state_row[j] = col < n_prefix ? saved[col] : body_col[(col - n_prefix) * body_row_stride];
+    }
+}
+
+// Wide batches: 32x32 tiles through shared memory so the token-major reads
+// and the channel-major writes both coalesce.  The blocks of the first token
+// tile also copy the saved prefix and write the new one.
+static __global__ void conv_state_concat_tiled(
+        const float * __restrict__ prefix,
+        const float * __restrict__ body,
+        float * __restrict__ dst,
+        float * __restrict__ state,
+        int64_t channels,
+        int n_prefix,
+        int n_t,
+        int64_t prefix_seq_stride,
+        int64_t body_seq_stride,
+        int64_t body_row_stride,
+        int64_t dst_seq_stride,
+        int64_t state_seq_stride) {
+    __shared__ float tile[32][33];
+    const int seq = blockIdx.z;
+    const int c0  = blockIdx.x * 32;
+    const int t0  = blockIdx.y * 32;
+    const int tx  = threadIdx.x;
+    const int ty  = threadIdx.y;
+    prefix += seq * prefix_seq_stride;
+    body   += seq * body_seq_stride;
+    dst    += seq * dst_seq_stride;
+    state  += seq * state_seq_stride;
+    const int64_t row = n_prefix + n_t;
+
+    for (int j = ty; j < 32; j += blockDim.y) {
+        const int t = t0 + j;
+        const int c = c0 + tx;
+        if (t < n_t && c < channels) {
+            tile[j][tx] = body[int64_t(t) * body_row_stride + c];
+        }
+    }
+    __syncthreads();
+    for (int j = ty; j < 32; j += blockDim.y) {
+        const int c = c0 + j;
+        const int t = t0 + tx;
+        if (t < n_t && c < channels) {
+            dst[c * row + n_prefix + t] = tile[tx][j];
+        }
+    }
+    if (blockIdx.y == 0) {
+        for (int j = ty; j < 32; j += blockDim.y) {
+            const int c = c0 + j;
+            if (c < channels && tx < n_prefix) {
+                // Read the old prefix before the new one is written: the two
+                // may share the slot, and each thread owns one (c, tx) element.
+                const float old = prefix[c * n_prefix + tx];
+                dst[c * row + tx] = old;
+                const int col = n_t + tx;
+                state[c * n_prefix + tx] = col < n_prefix ? old : body[int64_t(col - n_prefix) * body_row_stride + c];
+            }
+        }
     }
 }
 
@@ -379,9 +439,19 @@ void ggml_cuda_op_conv_state_concat(
     const int64_t channels = prefix->ne[1];
     const int64_t n_s      = prefix->ne[2];
     const int64_t n_t      = body->ne[0];
-    GGML_ASSERT(n_prefix + n_t <= 16);
-    const dim3 blocks((channels + 255) / 256, n_s);
-    conv_state_concat<<<blocks, 256, 0, ctx.stream()>>>(
+    GGML_ASSERT(n_prefix <= 16);
+    if (n_t <= 8) {
+        const dim3 blocks((channels + 255) / 256, n_s);
+        conv_state_concat<<<blocks, 256, 0, ctx.stream()>>>(
+            static_cast<const float *>(prefix->data), static_cast<const float *>(body->data),
+            static_cast<float *>(dst->data), static_cast<float *>(state->data),
+            channels, int(n_prefix), int(n_t),
+            prefix->nb[2] / sizeof(float), body->nb[2] / sizeof(float), body->nb[0] / sizeof(float),
+            dst->nb[2] / sizeof(float), state->nb[1] / sizeof(float));
+        return;
+    }
+    const dim3 blocks((channels + 31) / 32, (n_t + 31) / 32, n_s);
+    conv_state_concat_tiled<<<blocks, dim3(32, 8), 0, ctx.stream()>>>(
         static_cast<const float *>(prefix->data), static_cast<const float *>(body->data),
         static_cast<float *>(dst->data), static_cast<float *>(state->data),
         channels, int(n_prefix), int(n_t),

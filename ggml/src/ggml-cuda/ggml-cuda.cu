@@ -5516,7 +5516,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const int64_t n_prefix = prefix->ne[0];
         const int64_t n_t      = body->ne[0];
         if (prefix->type == GGML_TYPE_F32 && body->type == GGML_TYPE_F32 &&
-                n_prefix + n_t <= 16 && n_t <= 8 &&
+                n_prefix <= 16 &&
                 prefix->ne[1] == body->ne[1] && prefix->ne[2] == body->ne[2] &&
                 prefix->ne[3] == 1 && body->ne[3] == 1 && node->ne[0] == n_prefix + n_t &&
                 ggml_is_contiguous(prefix) && ggml_is_contiguous(node) &&
