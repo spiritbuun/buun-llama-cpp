@@ -5338,7 +5338,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     // Qwen3.5/3.6 recurrent decode computes two small BF16 projections from
     // the same activation, then immediately applies their gate epilogues.
-    // Reading the activation once and eliding four launch-sized epilogues is
+    // Pairing the projections and eliding four launch-sized epilogues is
     // worthwhile at batch one. Keep the structural and layout checks strict
     // so all other graphs retain the ordinary implementation.
     static const bool qwen35_gates = std::getenv("GGML_CUDA_DISABLE_QWEN35_GATES") == nullptr;
@@ -5349,8 +5349,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             GGML_OP_UNARY,
         };
         const int out_nodes[] = { i + 5, i + 8 };
-        if (ggml_can_fuse_subgraph(cgraph, i, 9, ops, out_nodes, 2) &&
-                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 9, out_nodes, 2)) {
+        if (ggml_can_fuse_subgraph(cgraph, i, 9, ops, out_nodes, 2)) {
             ggml_tensor * alpha_mm = cgraph->nodes[i + 0];
             ggml_tensor * alpha_reshape = cgraph->nodes[i + 1];
             ggml_tensor * alpha_add = cgraph->nodes[i + 2];
@@ -5394,9 +5393,36 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_nelements(a) == alpha_mm->src[0]->ne[1];
             if (layout_ok) {
                 if (input->ne[1] == 1) {
+                    const bool gate_direct = ggml_cuda_check_fusion_memory_ranges(cgraph, i, 9, out_nodes, 1);
+                    const bool beta_direct = ggml_cuda_check_fusion_memory_ranges(cgraph, i, 9, out_nodes + 1, 1);
+                    if ((!gate_direct || !beta_direct) && ggml_cuda_tensors_overlap(gate, beta)) {
+                        return 0;
+                    }
+                    // The unfused schedule may reuse the input for a gate result.
+                    // Stage only overlapping outputs until every fused block has
+                    // finished reading, then copy back on the same stream.
+                    ggml_cuda_pool_alloc<float> gate_scratch(cuda_ctx->pool());
+                    ggml_cuda_pool_alloc<float> beta_scratch(cuda_ctx->pool());
+                    ggml_tensor gate_tmp = *gate;
+                    ggml_tensor beta_tmp = *beta;
+                    if (!gate_direct) {
+                        gate_tmp.data = gate_scratch.alloc(ggml_nelements(gate));
+                    }
+                    if (!beta_direct) {
+                        beta_tmp.data = beta_scratch.alloc(ggml_nelements(beta));
+                    }
                     ggml_cuda_op_qwen35_recurrent_gates(
-                        *cuda_ctx, alpha_mm->src[0], beta_mm->src[0], input, dt, a, gate, beta);
-                } else if (input->ne[1] > 16) {
+                        *cuda_ctx, alpha_mm->src[0], beta_mm->src[0], input, dt, a, &gate_tmp, &beta_tmp);
+                    if (!gate_direct) {
+                        CUDA_CHECK(cudaMemcpyAsync(gate->data, gate_tmp.data, ggml_nbytes(gate),
+                            cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
+                    }
+                    if (!beta_direct) {
+                        CUDA_CHECK(cudaMemcpyAsync(beta->data, beta_tmp.data, ggml_nbytes(beta),
+                            cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
+                    }
+                } else if (input->ne[1] > 16 &&
+                        ggml_cuda_check_fusion_memory_ranges(cgraph, i, 9, out_nodes, 2)) {
                     // The ordinary graph consumes alpha before producing beta,
                     // so its planner may alias their temporary destinations.
                     // This fused schedule needs both values at once.

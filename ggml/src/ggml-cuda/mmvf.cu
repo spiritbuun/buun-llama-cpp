@@ -4,61 +4,61 @@
 #include "mmvf.cuh"
 #include "convert.cuh"
 
-template <int block_size>
+template <int block_size, int fixed_ncols = 0>
 static __global__ void qwen35_recurrent_gates_bf16(
         const nv_bfloat16 * alpha_weight, const nv_bfloat16 * beta_weight,
         const float * input, const float * dt, const float * a,
-        float * gate, float * beta, int ncols) {
+        float * gate, float * beta, int ncols_arg) {
+    const int ncols = fixed_ncols == 0 ? ncols_arg : fixed_ncols;
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
+    const bool is_beta = blockIdx.y != 0;
 
-    const nv_bfloat162 * alpha2 = reinterpret_cast<const nv_bfloat162 *>(alpha_weight + row*ncols);
-    const nv_bfloat162 * beta2  = reinterpret_cast<const nv_bfloat162 *>(beta_weight  + row*ncols);
+    // Independent projection rows share a launch, not a block. This exposes
+    // twice as many blocks without changing either dot product's order.
+    const nv_bfloat16 * weight = is_beta ? beta_weight : alpha_weight;
+    const nv_bfloat162 * weight2 = reinterpret_cast<const nv_bfloat162 *>(weight + row*ncols);
     const float2 * input2 = reinterpret_cast<const float2 *>(input);
 
-    float alpha_sum = 0.0f;
-    float beta_sum  = 0.0f;
+    float sum = 0.0f;
+#pragma unroll
     for (int col2 = tid; col2 < ncols/2; col2 += block_size) {
         const float2 x = input2[col2];
-        const nv_bfloat162 aw = alpha2[col2];
-        const nv_bfloat162 bw = beta2[col2];
-        ggml_cuda_mad(alpha_sum, aw.x, x.x);
-        ggml_cuda_mad(alpha_sum, aw.y, x.y);
-        ggml_cuda_mad(beta_sum,  bw.x, x.x);
-        ggml_cuda_mad(beta_sum,  bw.y, x.y);
+        const nv_bfloat162 w = weight2[col2];
+        ggml_cuda_mad(sum, w.x, x.x);
+        ggml_cuda_mad(sum, w.y, x.y);
     }
 
-    alpha_sum = warp_reduce_sum<warp_size>(alpha_sum);
-    beta_sum  = warp_reduce_sum<warp_size>(beta_sum);
+    sum = warp_reduce_sum<warp_size>(sum);
 
-    __shared__ float warp_alpha[warp_size];
-    __shared__ float warp_beta[warp_size];
-    if (tid < warp_size) {
-        warp_alpha[tid] = 0.0f;
-        warp_beta[tid]  = 0.0f;
+    __shared__ float warp_sum[warp_size];
+    // Only unused slots need zeros. Warp leaders write the remaining slots,
+    // so initialization and publication can share one barrier.
+    if (tid >= block_size/warp_size && tid < warp_size) {
+        warp_sum[tid] = 0.0f;
     }
-    __syncthreads();
     // The XOR warp reduction returns a mathematically complete sum in every
     // lane, but floating-point association differs by lane. Letting all lanes
     // race on one shared slot therefore made the selected value scheduling-
     // dependent. Publish exactly one result per warp.
     if (tid % warp_size == 0) {
-        warp_alpha[tid/warp_size] = alpha_sum;
-        warp_beta[tid/warp_size]  = beta_sum;
+        warp_sum[tid/warp_size] = sum;
     }
     __syncthreads();
 
     if (tid < warp_size) {
-        alpha_sum = warp_reduce_sum<warp_size>(warp_alpha[tid]);
-        beta_sum  = warp_reduce_sum<warp_size>(warp_beta[tid]);
+        sum = warp_reduce_sum<warp_size>(warp_sum[tid]);
     }
     if (tid == 0) {
-        const float alpha_biased = alpha_sum + dt[row];
-        const float alpha_softplus = alpha_biased > 20.0f
-            ? alpha_biased : logf(1.0f + expf(alpha_biased));
-        gate[row] = alpha_softplus * a[row];
-        beta[row] = 1.0f / (1.0f + expf(-beta_sum));
+        if (is_beta) {
+            beta[row] = 1.0f / (1.0f + expf(-sum));
+        } else {
+            const float alpha_biased = sum + dt[row];
+            const float alpha_softplus = alpha_biased > 20.0f
+                ? alpha_biased : logf(1.0f + expf(alpha_biased));
+            gate[row] = alpha_softplus * a[row];
+        }
     }
 }
 
@@ -80,7 +80,10 @@ void ggml_cuda_op_qwen35_recurrent_gates(
     GGML_ASSERT(alpha_weight->ne[0] % 2 == 0);
 
     constexpr int block_size = 256;
-    qwen35_recurrent_gates_bf16<block_size><<<alpha_weight->ne[1], block_size, 0, ctx.stream()>>>(
+    auto kernel = alpha_weight->ne[0] == 5120
+        ? qwen35_recurrent_gates_bf16<block_size, 5120>
+        : qwen35_recurrent_gates_bf16<block_size>;
+    kernel<<<dim3(alpha_weight->ne[1], 2), block_size, 0, ctx.stream()>>>(
         static_cast<const nv_bfloat16 *>(alpha_weight->data),
         static_cast<const nv_bfloat16 *>(beta_weight->data),
         static_cast<const float *>(input->data),
