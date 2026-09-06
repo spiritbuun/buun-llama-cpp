@@ -28,6 +28,19 @@ constexpr int THREADS = 256;
 constexpr int COLS    = 256;   // columns per block: 8 warps x 2 tiles
 constexpr int MAX_M   = 4;
 
+__device__ __forceinline__ void cp_async16(void * smem, const void * glob) {
+    const unsigned s = unsigned(__cvta_generic_to_shared(smem));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(s), "l"(glob));
+}
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+template <int N>
+__device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" :: "n"(N)); }
+
+// pair-row staging depth (rows in flight per warp) for the smem unit (K = 5..8)
+constexpr int STAGE_D = 4;
+__host__ __device__ constexpr bool stage_smem(int bits) { return bits >= 5; }
+__host__ __device__ constexpr int stage_bytes(int bits) { return stage_smem(bits) ? 8 * STAGE_D * 16 * bits * 4 : 0; }
+
 __device__ __forceinline__ int dp4a_us(uint32_t a, uint32_t b, int c) {
     int d;
     asm("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
@@ -217,6 +230,7 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
     constexpr int NACC = (RESID ? 2 : 1) * M;
     extern __shared__ uint32_t sh_as[];   // [NACC][nrows_max * 16] splats, then [M][nrows_max * 16] F16 xh
     half * sh_xh = reinterpret_cast<half *>(sh_as + size_t(NACC) * nrows_max * 16);
+    uint32_t * sh_stage = reinterpret_cast<uint32_t *>(sh_xh + size_t(M) * nrows_max * 16);   // [8 warps][STAGE_D][2*TWORDS]
     __shared__ float sh_y[M][COLS];
     __shared__ float sh_redf[THREADS / 32][M];
     __shared__ int   sh_redi[THREADS / 32][NACC];
@@ -380,8 +394,9 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
         // pair unit: lane = standard lane t0 = 8*lane for both tiles of the pair; four lanes share
         // each column.  K = 2/3 stream one word per lane per tile through a two-row register ring
         // and resolve the windows with lane shuffles; other K read the windows by pointer (L1).
-        constexpr bool REG  = bits == 2 || bits == 3;
-        constexpr bool REGW = bits >= 5;                 // two words per lane per tile
+        constexpr bool REG   = bits == 2 || bits == 3;
+        constexpr bool STAGE = stage_smem(bits);         // cp.async pair rows into warp-private smem
+        constexpr bool REGW  = bits >= 5 && !STAGE;      // two words per lane per tile
         const int ntA = blockIdx.x * 16 + warp * 2;
         const uint32_t * bpA = B32 + (size_t(ntA) * kslices + kb0) * TWORDS;
         const uint32_t * bpB = B32 + (size_t(ntA + 1) * kslices + kb0) * TWORDS;
@@ -434,6 +449,24 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
             if (nrows > 0) load_row2(0, qa0, qb0);
             if (nrows > 1) load_row2(1, qa1, qb1);
         }
+        // smem unit: pair row = [TWORDS words tile A][TWORDS words tile B], 16-byte cp.async chunks
+        constexpr int PAIRW = 2 * TWORDS;
+        [[maybe_unused]] uint32_t * sb = sh_stage + warp * (STAGE_D * PAIRW);
+        auto stage_row = [&](int kb) {
+            if constexpr (STAGE) {
+                constexpr int CHUNKS = PAIRW / 4;
+                if (kb < nrows && lane < CHUNKS) {
+                    const uint32_t * src = lane < TWORDS / 4 ? bpA + size_t(kb) * TWORDS + 4 * lane
+                                                             : bpB + size_t(kb) * TWORDS + 4 * (lane - TWORDS / 4);
+                    cp_async16(sb + (kb % STAGE_D) * PAIRW + 4 * lane, src);
+                }
+                cp_async_commit();
+            }
+        };
+        if constexpr (STAGE) {
+#pragma unroll
+            for (int r = 0; r < STAGE_D - 1; ++r) stage_row(r);
+        }
 
         int ia0[NACC], ia1[NACC], ib0[NACC], ib1[NACC];
 #pragma unroll
@@ -454,6 +487,13 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
                     regs3_windows(__shfl_sync(0xffffffffu, ca, x_src_a), __shfl_sync(0xffffffffu, ca, x_src_b), x_s2, wA);
                     regs3_windows(__shfl_sync(0xffffffffu, cb, x_src_a), __shfl_sync(0xffffffffu, cb, x_src_b), x_s2, wB);
                 }
+            } else if constexpr (STAGE) {
+                cp_async_wait<STAGE_D - 2>();
+                __syncwarp();   // also orders last iteration's smem reads before the overwrite
+                stage_row(kb + STAGE_D - 1);
+                const uint32_t * rowp = sb + (kb % STAGE_D) * PAIRW;
+                ext8w<bits>(rowp, t0, wA[0], wA[1], wA[2], wA[3], wA[4], wA[5], wA[6], wA[7]);
+                ext8w<bits>(rowp + TWORDS, t0, wB[0], wB[1], wB[2], wB[3], wB[4], wB[5], wB[6], wB[7]);
             } else if constexpr (REGW) {
                 const uint2 ca = qa0, cb = qb0;
                 qa0 = qa1; qb0 = qb1;

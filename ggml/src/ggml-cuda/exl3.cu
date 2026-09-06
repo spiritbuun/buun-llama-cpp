@@ -174,9 +174,9 @@ void exl3_int8_run(ggml_backend_cuda_context & ctx, const float * x, const half 
     // slices are 128-aligned (nrows % 8) so each block can transform its own activations
     int ksplit = std::max(1, (640 + colblocks - 1) / colblocks);   // ~640 blocks keeps HBM busy
     int nrows  = std::max(8, ((kslices + ksplit - 1) / ksplit + 7) / 8 * 8);
-    nrows  = std::min(nrows, (96 * 1024) / (nacc * 64 + m * 32) / 8 * 8);
+    nrows  = std::min(nrows, (96 * 1024 - exl3_int8::stage_bytes(bits)) / (nacc * 64 + m * 32) / 8 * 8);
     ksplit = (kslices + nrows - 1) / nrows;
-    const size_t smem = size_t(nrows) * 16 * (size_t(nacc) * 4 + size_t(m) * 2);
+    const size_t smem = size_t(nrows) * 16 * (size_t(nacc) * 4 + size_t(m) * 2) + exl3_int8::stage_bytes(bits);
     ggml_cuda_pool_alloc<float> partials(ctx.pool(), size_t(ksplit) * m * n);
     int * counters = exl3_int8_counters(ctx.device, stream);
     switch (m) {
