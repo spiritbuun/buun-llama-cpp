@@ -2,7 +2,11 @@
 // https://github.com/turboderp-org/exllamav3 (exllamav3_ext/quant/{codebook,exl3_dq}.cuh)
 // MIT License, Copyright (c) 2025 Turboderp.  Adapted to ggml: standalone types, no torch.
 #pragma once
+#ifndef EXL3_STANDALONE
 #include "common.cuh"
+#endif
+#include <cuda_fp16.h>
+#include <cstdint>
 
 namespace exl3 {
 

@@ -4,6 +4,9 @@
 // exllamav3_ext/quant/{exl3_gemv_kernel,hadamard_inner,reconstruct}.cu*.
 #include "exl3.cuh"
 #include "exl3-dq.cuh"
+#include "exl3-had.cuh"
+#include "exl3-gemv.cuh"
+#include "exl3-gemv-int8.cuh"
 
 #if !defined(GGML_USE_HIP)
 
@@ -13,7 +16,7 @@ using exl3::FragB;
 using exl3::FragC_h;
 
 constexpr int EXL3_CB = 2; // "mul1" codebook (the only one current exllamav3 checkpoints use)
-constexpr float EXL3_HAD_SCALE = 0.088388347648f; // 1/sqrt(128)
+constexpr float EXL3_HAD_SCALE = exl3_had::SCALE;
 constexpr int EXL3_GEMV_MAX_M = 8;
 
 // tile element order (exllamav3 tensor_core_perm): lane t = idx/8, slot j = idx%8
@@ -43,42 +46,6 @@ __global__ void exl3_reconstruct_kernel(const uint8_t * __restrict__ data, half 
     dst[size_t(blockIdx.x * 16 + c) * k + kt * 16 + r] = v;
 }
 
-// ---- Hadamard: 128 elements per warp, Sylvester order (had_hf_r_128_inner) ---------------
-
-__device__ __forceinline__ void exl3_shuffle_had_f4x32(float & h0, float & h1, float & h2, float & h3, const int lane_id) {
-#pragma unroll
-    for (int i = 1; i < 32; i <<= 1) {
-        uint32_t i0 = __float_as_uint(h0);
-        uint32_t i1 = __float_as_uint(h1);
-        uint32_t i2 = __float_as_uint(h2);
-        uint32_t i3 = __float_as_uint(h3);
-        const float ph0 = __shfl_xor_sync(0xffffffff, h0, i);
-        const float ph1 = __shfl_xor_sync(0xffffffff, h1, i);
-        const float ph2 = __shfl_xor_sync(0xffffffff, h2, i);
-        const float ph3 = __shfl_xor_sync(0xffffffff, h3, i);
-        const int32_t sfm = -static_cast<int32_t>(lane_id & i) >> 31;
-        i0 ^= sfm & 0x80000000;
-        i1 ^= sfm & 0x80000000;
-        i2 ^= sfm & 0x80000000;
-        i3 ^= sfm & 0x80000000;
-        h0 = __uint_as_float(i0) + ph0;
-        h1 = __uint_as_float(i1) + ph1;
-        h2 = __uint_as_float(i2) + ph2;
-        h3 = __uint_as_float(i3) + ph3;
-    }
-}
-
-__device__ __forceinline__ void exl3_had4(float & v0, float & v1, float & v2, float & v3) {
-    const float s0 = v0 + v1;
-    const float d0 = v0 - v1;
-    const float s1 = v2 + v3;
-    const float d1 = v2 - v3;
-    v0 = s0 + s1;
-    v1 = d0 + d1;
-    v2 = s0 - s1;
-    v3 = d0 - d1;
-}
-
 // xh[m][k] (F16) = had128(x[m][k] * suh) / sqrt(128); grid (k/128, m), block 32
 __global__ void exl3_had_in_kernel(const float * __restrict__ x, const half * __restrict__ suh,
         half * __restrict__ xh, int k) {
@@ -92,8 +59,7 @@ __global__ void exl3_had_in_kernel(const float * __restrict__ x, const half * __
     float v1 = xv.y * __high2float(s01);
     float v2 = xv.z * __low2float(s23);
     float v3 = xv.w * __high2float(s23);
-    exl3_had4(v0, v1, v2, v3);
-    exl3_shuffle_had_f4x32(v0, v1, v2, v3, lane);
+    exl3_had::had128(v0, v1, v2, v3, lane);
     half2 * out = reinterpret_cast<half2 *>(xh + base);
     out[0] = __floats2half2_rn(v0 * EXL3_HAD_SCALE, v1 * EXL3_HAD_SCALE);
     out[1] = __floats2half2_rn(v2 * EXL3_HAD_SCALE, v3 * EXL3_HAD_SCALE);
@@ -105,8 +71,7 @@ __global__ void exl3_had_out_kernel(float * __restrict__ y, const half * __restr
     const int col  = blockIdx.x * 128 + lane * 4;
     const size_t base = size_t(blockIdx.y) * n + col;
     float4 v = *reinterpret_cast<const float4 *>(y + base);
-    exl3_had4(v.x, v.y, v.z, v.w);
-    exl3_shuffle_had_f4x32(v.x, v.y, v.z, v.w, lane);
+    exl3_had::had128(v.x, v.y, v.z, v.w, lane);
     const half2 s01 = *reinterpret_cast<const half2 *>(svh + col);
     const half2 s23 = *reinterpret_cast<const half2 *>(svh + col + 2);
     v.x = v.x * EXL3_HAD_SCALE * __low2float(s01);
@@ -116,125 +81,14 @@ __global__ void exl3_had_out_kernel(float * __restrict__ y, const half * __restr
     *reinterpret_cast<float4 *>(y + base) = v;
 }
 
-// ---- decode gemv (m <= 8): warps split k, one m16n8k16 MMA pair per tile ------------------
-
-__device__ __forceinline__ void exl3_mma_ab_h(const FragB & a01, const FragB & a23, const FragB & b, FragC_h & c) {
-    const uint32_t * a0 = reinterpret_cast<const uint32_t *>(&a01);
-    const uint32_t * a1 = reinterpret_cast<const uint32_t *>(&a23);
-    const uint32_t * bb = reinterpret_cast<const uint32_t *>(&b);
-    uint32_t * cc = reinterpret_cast<uint32_t *>(&c);
-    asm("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
-        "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
-        : "+r"(cc[0]), "+r"(cc[1])
-        : "r"(a0[0]), "r"(a0[1]), "r"(a1[0]), "r"(a1[1]), "r"(bb[0]), "r"(bb[1]));
-}
-
-// A: xh [m][k] F16; B: tile stream (n-tile-major); C: y_inner [m][n] F32.
-// 256 threads = 8 warps splitting k; each warp covers 4 adjacent n tiles (64 columns).
-template <int bits>
-__global__ void __launch_bounds__(256) exl3_gemv_kernel(const half * __restrict__ A, const uint8_t * __restrict__ B,
-        float * __restrict__ C, int size_m, int size_k, int size_n) {
-    constexpr int WK     = 8;
-    constexpr int WNT    = 4;
-    constexpr int COLS   = WNT * 16;
-    constexpr int ROWS   = EXL3_GEMV_MAX_M;
-    constexpr int TWORDS = 8 * bits;   // uint32 per tile
-    constexpr int FOLD   = 2;
-
-    const int warp = threadIdx.x / 32;
-    const int lane = threadIdx.x % 32;
-    const int kslices = size_k / 16;
-    const int num_groups = size_n / COLS;
-    const int chunk = (kslices + WK - 1) / WK;
-    const int ks0 = warp * chunk;
-    const int myn = max(0, min(chunk, kslices - ks0));
-
-    const uint32_t * B32 = reinterpret_cast<const uint32_t *>(B);
-    const half2 * A2 = reinterpret_cast<const half2 *>(A);
-    const half2 hzero = __half2half2(__ushort_as_half(0));
-
-    const int r0 = lane >> 2;
-    const size_t a_row0 = size_t(r0) * (size_k / 2);
-    const bool r0_ok = r0 < size_m;
-
-    __shared__ float    sh_red[WK][ROWS][COLS];
-    __shared__ uint32_t sh_stage[WK][WNT * TWORDS];
-
-    for (int group = blockIdx.x; group < num_groups; group += gridDim.x) {
-        FragC_h ch[WNT][2] = {};
-        float2  acc[WNT][2] = {};
-        for (int i = 0; i < myn; ++i) {
-            const int kt = ks0 + i;
-            // stage the four tiles of this k slice (tile (nt, kt) is contiguous)
-            __syncwarp();
-#pragma unroll
-            for (int t = 0; t < WNT; ++t) {
-                const uint32_t * tp = B32 + (size_t(group * WNT + t) * kslices + kt) * TWORDS;
-                for (int w = lane; w < TWORDS; w += 32) {
-                    sh_stage[warp][t * TWORDS + w] = __ldcs(tp + w);
-                }
-            }
-            __syncwarp();
-            // A fragment: lane covers row lane/4, k pairs (2(lane%4), +1) and (+8, +9)
-            const size_t a_col = size_t(kt) * 8 + (lane & 3);
-            FragB a01, a23;
-            a01[0] = r0_ok ? A2[a_row0 + a_col] : hzero;
-            a23[0] = r0_ok ? A2[a_row0 + a_col + 4] : hzero;
-            a01[1] = hzero;
-            a23[1] = hzero;
-#pragma unroll
-            for (int t = 0; t < WNT; ++t) {
-                FragB f0, f1;
-                exl3::dq_dispatch<bits, EXL3_CB>(&sh_stage[warp][t * TWORDS], lane * 8, f0, f1);
-                exl3_mma_ab_h(a01, a23, f0, ch[t][0]);
-                exl3_mma_ab_h(a01, a23, f1, ch[t][1]);
-            }
-            if ((i + 1) % FOLD == 0 || i + 1 == myn) {
-#pragma unroll
-                for (int t = 0; t < WNT; ++t) {
-#pragma unroll
-                    for (int f = 0; f < 2; ++f) {
-                        acc[t][f].x += __low2float(ch[t][f][0]);
-                        acc[t][f].y += __high2float(ch[t][f][0]);
-                        ch[t][f][0] = hzero;
-                    }
-                }
-            }
-        }
-        // cross-warp reduction over the k splits; lane holds row r0, cols t*16 + f*8 + 2(lane%4) (+1)
-        if (r0 < ROWS) {
-            const int c0 = 2 * (lane & 3);
-#pragma unroll
-            for (int t = 0; t < WNT; ++t) {
-#pragma unroll
-                for (int f = 0; f < 2; ++f) {
-                    const int col = t * 16 + f * 8 + c0;
-                    sh_red[warp][r0][col + 0] = acc[t][f].x;
-                    sh_red[warp][r0][col + 1] = acc[t][f].y;
-                }
-            }
-        }
-        __syncthreads();
-        const int rows_out = min(size_m, ROWS);
-        for (int idx = threadIdx.x; idx < COLS * rows_out; idx += 256) {
-            const int r = idx / COLS;
-            const int c = idx % COLS;
-            float sum = 0.0f;
-#pragma unroll
-            for (int j = 0; j < WK; ++j) {
-                sum += sh_red[j][r][c];
-            }
-            C[size_t(r) * size_n + group * COLS + c] = sum;
-        }
-        __syncthreads();
-    }
-}
-
 template <int bits>
 void exl3_gemv_launch(const half * A, const uint8_t * B, float * C, int m, int k, int n, int sms, cudaStream_t stream) {
-    const int groups = n / 64;
-    const int grid = std::min(groups, 2 * sms);
-    exl3_gemv_kernel<bits><<<grid, 256, 0, stream>>>(A, B, C, m, k, n);
+    // Micro-benchmarked on A100 (bench_gemv.cu): 16 k-splits x 2 tiles/warp with a 4-deep prefetch
+    // ring and one block per 32-column group is the best single config across the Qwen3.8 shapes.
+    constexpr int WK = 16, WNT = 2, PF = 4;
+    const int grid = n / (WNT * 16);
+    GGML_UNUSED(sms);
+    exl3_gemv::exl3_gemv_kernel<bits, WK, WNT, PF, false><<<grid, WK * 32, 0, stream>>>(A, B, C, m, k, n);
 }
 
 template <int bits>
@@ -255,6 +109,68 @@ void exl3_reconstruct_launch(const uint8_t * data, half * dst, int k, int n0, in
         case 8: fn<8>(__VA_ARGS__); break;                    \
         default: GGML_ABORT("invalid EXL3 bit width");        \
     }
+
+// ---- int8 activation path (4 bpw, m <= 4) ---------------------------------------------------
+// GGML_EXL3_INT8: 0 = off (fp16 tensor-core gemv), 1 = int8 + error-feedback residual, 2 = plain int8.
+
+int exl3_int8_mode() {
+    static const int mode = [] {
+        const char * e = getenv("GGML_EXL3_INT8");
+        return e ? atoi(e) : 2;
+    }();
+    return mode;
+}
+
+// Self-cleaning per-device counter block (one int per 256-column group), zero at rest.
+constexpr size_t EXL3_INT8_MAX_N = 262144;
+
+int * exl3_int8_counters(int device, cudaStream_t stream) {
+    static int * ws[GGML_CUDA_MAX_DEVICES] = {};
+    if (ws[device] == nullptr) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaMalloc(&ws[device], EXL3_INT8_MAX_N / exl3_int8::COLS * sizeof(int)));
+        CUDA_CHECK(cudaMemsetAsync(ws[device], 0, EXL3_INT8_MAX_N / exl3_int8::COLS * sizeof(int), stream));
+    }
+    return ws[device];
+}
+
+template <int M, bool RESID>
+void exl3_gemv_int8_launch(const uint8_t * B, const half * xh, const half * svh, float * y, float * partials, int * counters,
+        int k, int n, int colblocks, int ksplit, int nrows, size_t smem, cudaStream_t stream) {
+    static bool attr_set = false;
+    if (!attr_set) {
+        CUDA_CHECK(cudaFuncSetAttribute(exl3_int8::gemv_int8_kernel<M, RESID>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024));
+        attr_set = true;
+    }
+    exl3_int8::gemv_int8_kernel<M, RESID><<<dim3(colblocks, ksplit), exl3_int8::THREADS, smem, stream>>>(
+        B, xh, svh, y, partials, counters, k, n, nrows);
+}
+
+template <bool RESID>
+void exl3_int8_run(ggml_backend_cuda_context & ctx, const half * xh, const uint8_t * B, const half * svh,
+        float * y, int m, int k, int n, cudaStream_t stream) {
+    const int kslices = k / 16;
+    const int colblocks = n / exl3_int8::COLS;
+    const int nacc = (RESID ? 2 : 1) * m;
+    int ksplit = std::max(1, (640 + colblocks - 1) / colblocks);   // ~640 blocks keeps HBM busy
+    int nrows  = std::max(4, (kslices + ksplit - 1) / ksplit);
+    nrows  = std::min(nrows, (96 * 1024) / (nacc * 64));
+    ksplit = (kslices + nrows - 1) / nrows;
+    const size_t smem = size_t(nacc) * nrows * 64;
+    ggml_cuda_pool_alloc<float> partials(ctx.pool(), size_t(ksplit) * m * n);
+    int * counters = exl3_int8_counters(ctx.device, stream);
+    switch (m) {
+        case 1: exl3_gemv_int8_launch<1, RESID>(B, xh, svh, y, partials.get(), counters, k, n, colblocks, ksplit, nrows, smem, stream); break;
+        case 2: exl3_gemv_int8_launch<2, RESID>(B, xh, svh, y, partials.get(), counters, k, n, colblocks, ksplit, nrows, smem, stream); break;
+        case 3: exl3_gemv_int8_launch<3, RESID>(B, xh, svh, y, partials.get(), counters, k, n, colblocks, ksplit, nrows, smem, stream); break;
+        default: exl3_gemv_int8_launch<4, RESID>(B, xh, svh, y, partials.get(), counters, k, n, colblocks, ksplit, nrows, smem, stream); break;
+    }
+}
+
+bool exl3_int8_applicable(int bits, int m, int k, int n) {
+    return exl3_int8_mode() != 0 && bits == 4 && m >= 1 && m <= exl3_int8::MAX_M &&
+        n % exl3_int8::COLS == 0 && k % 128 == 0 && size_t(n) <= EXL3_INT8_MAX_N;
+}
 
 } // namespace
 
@@ -293,13 +209,22 @@ void ggml_cuda_mul_mat_exl3(ggml_backend_cuda_context & ctx, const ggml_tensor *
     const half * suh = static_cast<const half *>(dst->src[3]->data);
     const half * svh = static_cast<const half *>(dst->src[2]->data);
     cudaStream_t stream = ctx.stream();
+    float * y = static_cast<float *>(dst->data);
 
     // input transform: xh = had128(x * suh) / sqrt(128), F16 [m][k]
     ggml_cuda_pool_alloc<half> xh(ctx.pool(), size_t(m) * k);
     exl3_had_in_kernel<<<dim3(k / 128, m), 32, 0, stream>>>(
         static_cast<const float *>(src1->data), suh, xh.get(), k);
 
-    float * y = static_cast<float *>(dst->data);
+    if (exl3_int8_applicable(bits, m, k, n)) {
+        // int8 activation path: per-slice quantization, fused output transform
+        if (exl3_int8_mode() == 1) {
+            exl3_int8_run<true>(ctx, xh.get(), static_cast<const uint8_t *>(src0->data), svh, y, m, k, n, stream);
+        } else {
+            exl3_int8_run<false>(ctx, xh.get(), static_cast<const uint8_t *>(src0->data), svh, y, m, k, n, stream);
+        }
+        return;
+    }
     if (m <= EXL3_GEMV_MAX_M) {
         const int sms = ggml_cuda_info().devices[ctx.device].nsm;
         EXL3_DISPATCH(exl3_gemv_launch, bits, xh.get(), static_cast<const uint8_t *>(src0->data), y, m, k, n, sms, stream);
