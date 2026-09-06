@@ -2844,7 +2844,10 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
-    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ggml_cuda_is_exl3(src0->type)) {
+    if (ggml_cuda_is_exl3(src0->type)) {
+        return !ggml_cuda_exl3_mul_mat_id_fast(dst);
+    }
+    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return true;
     }
 
@@ -2880,6 +2883,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
+    if (ggml_cuda_is_exl3(src0->type) && ggml_cuda_exl3_mul_mat_id_fast(dst)) {
+        ggml_cuda_mul_mat_id_exl3(ctx, dst);
+        return;
+    }
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && !ggml_cuda_is_exl3(src0->type)) {

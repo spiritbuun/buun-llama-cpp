@@ -21,6 +21,7 @@
 
 #include "exl3-dq.cuh"
 #include "exl3-had.cuh"
+#include "exl3-gemv.cuh"
 
 namespace exl3_int8 {
 
@@ -40,6 +41,11 @@ __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_gr
 constexpr int STAGE_D = 4;
 __host__ __device__ constexpr bool stage_smem(int bits) { return bits >= 5; }
 __host__ __device__ constexpr int stage_bytes(int bits) { return stage_smem(bits) ? 8 * STAGE_D * 16 * bits * 4 : 0; }
+
+__device__ __forceinline__ float dot2(half2 w, half2 x) {
+    const float2 wf = __half22float2(w), xf = __half22float2(x);
+    return wf.x * xf.x + wf.y * xf.y;
+}
 
 __device__ __forceinline__ int dp4a_us(uint32_t a, uint32_t b, int c) {
     int d;
@@ -221,13 +227,39 @@ __device__ __forceinline__ void regsw_windows(uint2 r, int t0, uint32_t * w) {
 
 // B: n-tile-major tile stream; x: [M][k] F32 activations, suh: [k] F16 input signs; y: [M][n] F32;
 // partials: [ksplit][M][n] F32 (fully overwritten); counters: n/256 ints, zero at rest.
-template <int bits, int M, bool RESID>
+// Routing descriptor for the grouped (MoE) launch: block z = (token, expert slot) pair.
+struct grouped_args {
+    const int32_t * ids;        // [n_expert_used, n_tokens], row stride ids_nb1 (elements)
+    int    ids_nb1;
+    int    n_expert_used;
+    int    ne11;                // activation rows per token (1 = broadcast, or n_expert_used)
+    size_t x_nb1, x_nb2;        // activation strides (elements)
+    size_t expert_stride;       // bytes between expert weight blocks
+};
+
+// cb == 2 (mul1): int8 activations, dp4a; other codebooks: F16 activations, decoded weights, fp32 FMA.
+template <int bits, int cb, int M, bool RESID, bool GROUPED>
 __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __restrict__ B,
         const float * __restrict__ x, const half * __restrict__ suh, const half * __restrict__ svh, float * __restrict__ y,
-        float * __restrict__ partials, int * __restrict__ counters, int k, int n, int nrows_max) {
+        float * __restrict__ partials, int * __restrict__ counters, int k, int n, int nrows_max, grouped_args ga) {
     constexpr int TWORDS = 8 * bits;
     constexpr bool WIDE = bits == 4;   // uint2-per-lane block pair; other K use pointer extraction
+    constexpr bool INT8 = cb == 2;
+    static_assert(INT8 || !RESID, "residual pass is an int8-mode feature");
     constexpr int NACC = (RESID ? 2 : 1) * M;
+    if constexpr (GROUPED) {
+        // this block's (token, expert slot) pair selects the expert's weights, scales and rows
+        const int pair = blockIdx.z;
+        const int t = pair / ga.n_expert_used, e = pair - t * ga.n_expert_used;
+        const int expert = ga.ids[size_t(t) * ga.ids_nb1 + e];
+        B   += size_t(expert) * ga.expert_stride;
+        svh += size_t(expert) * n;
+        suh += size_t(expert) * k;
+        x   += size_t(t) * ga.x_nb2 + (ga.ne11 == 1 ? 0 : size_t(e) * ga.x_nb1);
+        y   += size_t(pair) * n;
+        partials += size_t(pair) * gridDim.y * M * n;
+        counters += size_t(pair) * gridDim.x;
+    }
     extern __shared__ uint32_t sh_as[];   // [NACC][nrows_max * 16] splats, then [M][nrows_max * 16] F16 xh
     half * sh_xh = reinterpret_cast<half *>(sh_as + size_t(NACC) * nrows_max * 16);
     uint32_t * sh_stage = reinterpret_cast<uint32_t *>(sh_xh + size_t(M) * nrows_max * 16);   // [8 warps][STAGE_D][2*TWORDS]
@@ -286,7 +318,7 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
         __syncthreads();
     }
     // quantize inline while staging the splats; exact int sums per plane
-    {
+    if constexpr (INT8) {
         int sum[NACC];
 #pragma unroll
         for (int p = 0; p < NACC; ++p) sum[p] = 0;
@@ -336,8 +368,11 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
         const int shfl_src = (lane & 16) | ((lane + 15) & 15);
 
         int acc0[NACC], acc1[NACC];
+        float facc0[M], facc1[M];
 #pragma unroll
         for (int p = 0; p < NACC; ++p) { acc0[p] = 0; acc1[p] = 0; }
+#pragma unroll
+        for (int r = 0; r < M; ++r) { facc0[r] = 0.0f; facc1[r] = 0.0f; }
 
         uint2 r0 = nrows > 0 ? __ldcs(reinterpret_cast<const uint2 *>(bp)) : make_uint2(0, 0);
         uint2 r1 = nrows > 1 ? __ldcs(reinterpret_cast<const uint2 *>(bp + TWORDS)) : make_uint2(0, 0);
@@ -348,6 +383,24 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
             uint32_t w0, w1, w2, w3, w4, w5, w6, w7, v0, v1, v2, v3, v4, v5, v6, v7;
             extract8_4bits(prev, r0.x, w0, w1, w2, w3, w4, w5, w6, w7);   // run t = 8*(2m)
             extract8_4bits(r0.x, r0.y, v0, v1, v2, v3, v4, v5, v6, v7);   // run t = 8*(2m+1)
+            if constexpr (!INT8) {
+                // rows c2+{0,1,8,9} for the w run, c2+{2,3,10,11} for the v run
+#pragma unroll
+                for (int r = 0; r < M; ++r) {
+                    const half * xr = sh_xh + size_t(r) * nrows_max * 16 + (kb << 4) + c2;
+                    const half2 x01 = *reinterpret_cast<const half2 *>(xr);
+                    const half2 x89 = *reinterpret_cast<const half2 *>(xr + 8);
+                    const half2 x23 = *reinterpret_cast<const half2 *>(xr + 2);
+                    const half2 xab = *reinterpret_cast<const half2 *>(xr + 10);
+                    facc0[r] += dot2(exl3_gemv::exl3_decode_pair<cb>(w0, w1), x01) + dot2(exl3_gemv::exl3_decode_pair<cb>(w2, w3), x89)
+                              + dot2(exl3_gemv::exl3_decode_pair<cb>(v0, v1), x23) + dot2(exl3_gemv::exl3_decode_pair<cb>(v2, v3), xab);
+                    facc1[r] += dot2(exl3_gemv::exl3_decode_pair<cb>(w4, w5), x01) + dot2(exl3_gemv::exl3_decode_pair<cb>(w6, w7), x89)
+                              + dot2(exl3_gemv::exl3_decode_pair<cb>(v4, v5), x23) + dot2(exl3_gemv::exl3_decode_pair<cb>(v6, v7), xab);
+                }
+                r0 = r1;
+                r1 = r2;
+                continue;
+            }
             w0 *= 0x83DCD12Du; w1 *= 0x83DCD12Du; w2 *= 0x83DCD12Du; w3 *= 0x83DCD12Du;
             w4 *= 0x83DCD12Du; w5 *= 0x83DCD12Du; w6 *= 0x83DCD12Du; w7 *= 0x83DCD12Du;
             v0 *= 0x83DCD12Du; v1 *= 0x83DCD12Du; v2 *= 0x83DCD12Du; v3 *= 0x83DCD12Du;
@@ -374,16 +427,27 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
             acc0[p] += __shfl_xor_sync(0xffffffffu, acc0[p], 1);
             acc1[p] += __shfl_xor_sync(0xffffffffu, acc1[p], 1);
         }
+#pragma unroll
+        for (int r = 0; r < M; ++r) {
+            facc0[r] += __shfl_xor_sync(0xffffffffu, facc0[r], 1);
+            facc1[r] += __shfl_xor_sync(0xffffffffu, facc1[r], 1);
+        }
         if (!(lane & 1)) {
             const int n0 = nt * 16 + (lq >> 1);
 #pragma unroll
             for (int r = 0; r < M; ++r) {
                 const int p0 = RESID ? 2 * r : r;
-                float o0 = sh_q[p0] * (k_inv * float(acc0[p0]) + cbias * float(sh_s[p0]));
-                float o1 = sh_q[p0] * (k_inv * float(acc1[p0]) + cbias * float(sh_s[p0]));
-                if constexpr (RESID) {
-                    o0 += sh_q[p0 + 1] * (k_inv * float(acc0[p0 + 1]) + cbias * float(sh_s[p0 + 1]));
-                    o1 += sh_q[p0 + 1] * (k_inv * float(acc1[p0 + 1]) + cbias * float(sh_s[p0 + 1]));
+                float o0, o1;
+                if constexpr (INT8) {
+                    o0 = sh_q[p0] * (k_inv * float(acc0[p0]) + cbias * float(sh_s[p0]));
+                    o1 = sh_q[p0] * (k_inv * float(acc1[p0]) + cbias * float(sh_s[p0]));
+                    if constexpr (RESID) {
+                        o0 += sh_q[p0 + 1] * (k_inv * float(acc0[p0 + 1]) + cbias * float(sh_s[p0 + 1]));
+                        o1 += sh_q[p0 + 1] * (k_inv * float(acc1[p0 + 1]) + cbias * float(sh_s[p0 + 1]));
+                    }
+                } else {
+                    o0 = facc0[r];
+                    o1 = facc1[r];
                 }
                 float * part = partials + (size_t(blockIdx.y) * M + r) * n;
                 part[n0]     = o0;
@@ -469,8 +533,11 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
         }
 
         int ia0[NACC], ia1[NACC], ib0[NACC], ib1[NACC];
+        float fa0[M], fa1[M], fb0[M], fb1[M];
 #pragma unroll
         for (int p = 0; p < NACC; ++p) { ia0[p] = 0; ia1[p] = 0; ib0[p] = 0; ib1[p] = 0; }
+#pragma unroll
+        for (int r = 0; r < M; ++r) { fa0[r] = 0.0f; fa1[r] = 0.0f; fb0[r] = 0.0f; fb1[r] = 0.0f; }
         for (int kb0i = 0; kb0i < nrows; kb0i += (REG ? RING : 1)) {
 #pragma unroll
         for (int d = 0; d < (REG ? RING : 1); ++d) {
@@ -504,6 +571,20 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
                 ext8w<bits>(bpA + size_t(kb) * TWORDS, t0, wA[0], wA[1], wA[2], wA[3], wA[4], wA[5], wA[6], wA[7]);
                 ext8w<bits>(bpB + size_t(kb) * TWORDS, t0, wB[0], wB[1], wB[2], wB[3], wB[4], wB[5], wB[6], wB[7]);
             }
+            if constexpr (!INT8) {
+                // rows c2+{0,1,8,9}: the same windows for tile A (cols cA, cA+8) and tile B
+#pragma unroll
+                for (int r = 0; r < M; ++r) {
+                    const half * xr = sh_xh + size_t(r) * nrows_max * 16 + (kb << 4) + c2;
+                    const half2 x01 = *reinterpret_cast<const half2 *>(xr);
+                    const half2 x89 = *reinterpret_cast<const half2 *>(xr + 8);
+                    fa0[r] += dot2(exl3_gemv::exl3_decode_pair<cb>(wA[0], wA[1]), x01) + dot2(exl3_gemv::exl3_decode_pair<cb>(wA[2], wA[3]), x89);
+                    fa1[r] += dot2(exl3_gemv::exl3_decode_pair<cb>(wA[4], wA[5]), x01) + dot2(exl3_gemv::exl3_decode_pair<cb>(wA[6], wA[7]), x89);
+                    fb0[r] += dot2(exl3_gemv::exl3_decode_pair<cb>(wB[0], wB[1]), x01) + dot2(exl3_gemv::exl3_decode_pair<cb>(wB[2], wB[3]), x89);
+                    fb1[r] += dot2(exl3_gemv::exl3_decode_pair<cb>(wB[4], wB[5]), x01) + dot2(exl3_gemv::exl3_decode_pair<cb>(wB[6], wB[7]), x89);
+                }
+                continue;
+            }
 #pragma unroll
             for (int j = 0; j < 8; ++j) { wA[j] *= 0x83DCD12Du; wB[j] *= 0x83DCD12Du; }
             const uint32_t * as_kb = sh_as + (kb << 4);
@@ -529,6 +610,13 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
             ib0[p] += __shfl_xor_sync(0xffffffffu, ib0[p], 1); ib0[p] += __shfl_xor_sync(0xffffffffu, ib0[p], 2);
             ib1[p] += __shfl_xor_sync(0xffffffffu, ib1[p], 1); ib1[p] += __shfl_xor_sync(0xffffffffu, ib1[p], 2);
         }
+#pragma unroll
+        for (int r = 0; r < M; ++r) {
+            fa0[r] += __shfl_xor_sync(0xffffffffu, fa0[r], 1); fa0[r] += __shfl_xor_sync(0xffffffffu, fa0[r], 2);
+            fa1[r] += __shfl_xor_sync(0xffffffffu, fa1[r], 1); fa1[r] += __shfl_xor_sync(0xffffffffu, fa1[r], 2);
+            fb0[r] += __shfl_xor_sync(0xffffffffu, fb0[r], 1); fb0[r] += __shfl_xor_sync(0xffffffffu, fb0[r], 2);
+            fb1[r] += __shfl_xor_sync(0xffffffffu, fb1[r], 1); fb1[r] += __shfl_xor_sync(0xffffffffu, fb1[r], 2);
+        }
         if (!(lane & 3)) {
             const int cA = ntA * 16 + (lane >> 2);
             const int cB = cA + 16;
@@ -536,10 +624,15 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
             for (int r = 0; r < M; ++r) {
                 const int p0 = RESID ? 2 * r : r;
                 auto fold = [&](int a, int p) { return sh_q[p] * (k_inv * float(a) + cbias * float(sh_s[p])); };
-                float oa0 = fold(ia0[p0], p0), oa1 = fold(ia1[p0], p0), ob0 = fold(ib0[p0], p0), ob1 = fold(ib1[p0], p0);
-                if constexpr (RESID) {
-                    oa0 += fold(ia0[p0 + 1], p0 + 1); oa1 += fold(ia1[p0 + 1], p0 + 1);
-                    ob0 += fold(ib0[p0 + 1], p0 + 1); ob1 += fold(ib1[p0 + 1], p0 + 1);
+                float oa0, oa1, ob0, ob1;
+                if constexpr (INT8) {
+                    oa0 = fold(ia0[p0], p0); oa1 = fold(ia1[p0], p0); ob0 = fold(ib0[p0], p0); ob1 = fold(ib1[p0], p0);
+                    if constexpr (RESID) {
+                        oa0 += fold(ia0[p0 + 1], p0 + 1); oa1 += fold(ia1[p0 + 1], p0 + 1);
+                        ob0 += fold(ib0[p0 + 1], p0 + 1); ob1 += fold(ib1[p0 + 1], p0 + 1);
+                    }
+                } else {
+                    oa0 = fa0[r]; oa1 = fa1[r]; ob0 = fb0[r]; ob1 = fb1[r];
                 }
                 float * part = partials + (size_t(blockIdx.y) * M + r) * n;
                 part[cA] = oa0; part[cA + 8] = oa1;

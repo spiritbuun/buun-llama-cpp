@@ -23,5 +23,10 @@ bool ggml_cuda_exl3_supports_mul_mat(const ggml_tensor * dst);
 
 void ggml_cuda_mul_mat_exl3(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 
+// MUL_MAT_ID with EXL3 experts: grouped kernel (no host sync) for decode shapes; src[3] = svh
+// [n, n_expert], src[4] = suh [k, n_expert].
+bool ggml_cuda_exl3_mul_mat_id_fast(const ggml_tensor * dst);
+void ggml_cuda_mul_mat_id_exl3(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
 // Dequantize the whole tensor to F16 rows W[n][k] (row n contiguous over k); rows [n0, n1).
 void ggml_cuda_exl3_reconstruct_rows(const ggml_tensor * src0, int64_t n0, int64_t n1, half * dst, cudaStream_t stream);
