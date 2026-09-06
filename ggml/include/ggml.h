@@ -483,7 +483,16 @@ extern "C" {
         GGML_TYPE_EXL3T_6 = 81,
         GGML_TYPE_EXL3T_7 = 82,
         GGML_TYPE_EXL3T_8 = 83,
-        GGML_TYPE_COUNT   = 84,
+        // exllamav3 n-gram embedding rows (exl3_ngram_trellis): 160-element rows, K bits each,
+        // fp16 row scale in word 0 (rows are independent, so the CPU can gather them)
+        GGML_TYPE_EXL3N_2 = 84,
+        GGML_TYPE_EXL3N_3 = 85,
+        GGML_TYPE_EXL3N_4 = 86,
+        GGML_TYPE_EXL3N_5 = 87,
+        GGML_TYPE_EXL3N_6 = 88,
+        GGML_TYPE_EXL3N_7 = 89,
+        GGML_TYPE_EXL3N_8 = 90,
+        GGML_TYPE_COUNT   = 91,
     };
 
     // EXL3 helpers: the type encodes the bit width and the codebook.
@@ -497,6 +506,12 @@ extern "C" {
     static inline int ggml_exl3_codebook(enum ggml_type type) {
         const int family = ((int) type - (int) GGML_TYPE_EXL3_1) / 8;
         return family == 0 ? 2 : family == 1 ? 1 : 0;
+    }
+    static inline bool ggml_type_is_exl3_ngram(enum ggml_type type) {
+        return type >= GGML_TYPE_EXL3N_2 && type <= GGML_TYPE_EXL3N_8;
+    }
+    static inline int ggml_exl3_ngram_bits(enum ggml_type type) {
+        return (int) type - (int) GGML_TYPE_EXL3N_2 + 2;
     }
     static inline enum ggml_type ggml_exl3_type(int bits, int codebook) {
         const int family = codebook == 2 ? 0 : codebook == 1 ? 1 : 2;

@@ -1076,6 +1076,8 @@ void llama_safetensors_quant_adapters::validate() {
             } else {
                 throw std::runtime_error("quantization contract does not match source tensor '" + tensor.name + "'");
             }
+        } else if (ends_with(tensor.name, ".trellis") && tensor.name.find(".ngram_embedding.shard_") != std::string::npos) {
+            continue;   // exllamav3 n-gram row trellis: an embedding table, not a quantized projection
         } else if (ends_with(tensor.name, ".trellis")) {
             module = tensor.name.substr(0, tensor.name.size() - std::string_view(".trellis").size());
             const llama_safetensors_quant_group * group = match(module);

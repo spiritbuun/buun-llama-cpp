@@ -361,8 +361,10 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
     const float cbias = 1024.0f * k_inv + bias;
     const uint32_t * B32 = reinterpret_cast<const uint32_t *>(B);
 
+    const int n_tiles = n / 16;
     if constexpr (WIDE) {
         const int nt = blockIdx.x * 16 + warp * 2 + (lane >> 4);
+        const bool active = nt < n_tiles;   // partial last block: warps beyond n idle (whole warp)
         const uint32_t * bp = B32 + (size_t(nt) * kslices + kb0) * TWORDS + 2 * lq;
         const int c2 = (lane & 1) ? 4 : 0;
         const int shfl_src = (lane & 16) | ((lane + 15) & 15);
@@ -374,9 +376,9 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
 #pragma unroll
         for (int r = 0; r < M; ++r) { facc0[r] = 0.0f; facc1[r] = 0.0f; }
 
-        uint2 r0 = nrows > 0 ? __ldcs(reinterpret_cast<const uint2 *>(bp)) : make_uint2(0, 0);
-        uint2 r1 = nrows > 1 ? __ldcs(reinterpret_cast<const uint2 *>(bp + TWORDS)) : make_uint2(0, 0);
-        for (int kb = 0; kb < nrows; ++kb) {
+        uint2 r0 = (active && nrows > 0) ? __ldcs(reinterpret_cast<const uint2 *>(bp)) : make_uint2(0, 0);
+        uint2 r1 = (active && nrows > 1) ? __ldcs(reinterpret_cast<const uint2 *>(bp + TWORDS)) : make_uint2(0, 0);
+        for (int kb = 0; kb < (active ? nrows : 0); ++kb) {
             uint2 r2 = make_uint2(0, 0);
             if (kb + 2 < nrows) r2 = __ldcs(reinterpret_cast<const uint2 *>(bp + size_t(kb + 2) * TWORDS));
             const uint32_t prev = __shfl_sync(0xffffffffu, r0.y, shfl_src);
@@ -432,7 +434,7 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
             facc0[r] += __shfl_xor_sync(0xffffffffu, facc0[r], 1);
             facc1[r] += __shfl_xor_sync(0xffffffffu, facc1[r], 1);
         }
-        if (!(lane & 1)) {
+        if (active && !(lane & 1)) {
             const int n0 = nt * 16 + (lq >> 1);
 #pragma unroll
             for (int r = 0; r < M; ++r) {
@@ -462,6 +464,7 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
         constexpr bool STAGE = stage_smem(bits);         // cp.async pair rows into warp-private smem
         constexpr bool REGW  = bits >= 5 && !STAGE;      // two words per lane per tile
         const int ntA = blockIdx.x * 16 + warp * 2;
+        const bool active = ntA < n_tiles;   // partial last block: idle warps skip loads and stores
         const uint32_t * bpA = B32 + (size_t(ntA) * kslices + kb0) * TWORDS;
         const uint32_t * bpB = B32 + (size_t(ntA + 1) * kslices + kb0) * TWORDS;
         const int c2 = 2 * (lane & 3);
@@ -498,7 +501,7 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
         [[maybe_unused]] uint32_t pa[RING], pb[RING];
         if constexpr (REG) {
 #pragma unroll
-            for (int d = 0; d < RING; ++d) { pa[d] = 0; pb[d] = 0; if (d < nrows) load_row(d, pa[d], pb[d]); }
+            for (int d = 0; d < RING; ++d) { pa[d] = 0; pb[d] = 0; if (active && d < nrows) load_row(d, pa[d], pb[d]); }
         }
         auto load_row2 = [&](int kb, uint2 & wa, uint2 & wb) {
             if (lane < TWORDS / 2) {
@@ -510,8 +513,8 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
         };
         [[maybe_unused]] uint2 qa0 = make_uint2(0, 0), qb0 = qa0, qa1 = qa0, qb1 = qa0;
         if constexpr (REGW) {
-            if (nrows > 0) load_row2(0, qa0, qb0);
-            if (nrows > 1) load_row2(1, qa1, qb1);
+            if (active && nrows > 0) load_row2(0, qa0, qb0);
+            if (active && nrows > 1) load_row2(1, qa1, qb1);
         }
         // smem unit: pair row = [TWORDS words tile A][TWORDS words tile B], 16-byte cp.async chunks
         constexpr int PAIRW = 2 * TWORDS;
@@ -519,7 +522,7 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
         auto stage_row = [&](int kb) {
             if constexpr (STAGE) {
                 constexpr int CHUNKS = PAIRW / 4;
-                if (kb < nrows && lane < CHUNKS) {
+                if (active && kb < nrows && lane < CHUNKS) {
                     const uint32_t * src = lane < TWORDS / 4 ? bpA + size_t(kb) * TWORDS + 4 * lane
                                                              : bpB + size_t(kb) * TWORDS + 4 * (lane - TWORDS / 4);
                     cp_async16(sb + (kb % STAGE_D) * PAIRW + 4 * lane, src);
@@ -538,7 +541,7 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
         for (int p = 0; p < NACC; ++p) { ia0[p] = 0; ia1[p] = 0; ib0[p] = 0; ib1[p] = 0; }
 #pragma unroll
         for (int r = 0; r < M; ++r) { fa0[r] = 0.0f; fa1[r] = 0.0f; fb0[r] = 0.0f; fb1[r] = 0.0f; }
-        for (int kb0i = 0; kb0i < nrows; kb0i += (REG ? RING : 1)) {
+        for (int kb0i = 0; kb0i < (active ? nrows : 0); kb0i += (REG ? RING : 1)) {
 #pragma unroll
         for (int d = 0; d < (REG ? RING : 1); ++d) {
             const int kb = kb0i + d;
@@ -617,7 +620,7 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
             fb0[r] += __shfl_xor_sync(0xffffffffu, fb0[r], 1); fb0[r] += __shfl_xor_sync(0xffffffffu, fb0[r], 2);
             fb1[r] += __shfl_xor_sync(0xffffffffu, fb1[r], 1); fb1[r] += __shfl_xor_sync(0xffffffffu, fb1[r], 2);
         }
-        if (!(lane & 3)) {
+        if (active && !(lane & 3)) {
             const int cA = ntA * 16 + (lane >> 2);
             const int cB = cA + 16;
 #pragma unroll
@@ -655,8 +658,10 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
 #pragma unroll
     for (int r = 0; r < M; ++r) {
         float v = 0.0f;
-        for (int sl = 0; sl < int(gridDim.y); ++sl) {
-            v += __ldcg(partials + (size_t(sl) * M + r) * n + col);
+        if (col < n) {
+            for (int sl = 0; sl < int(gridDim.y); ++sl) {
+                v += __ldcg(partials + (size_t(sl) * M + r) * n + col);
+            }
         }
         sh_y[r][threadIdx.x] = v;
     }
@@ -666,6 +671,7 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
     for (int b = warp; b < 2 * M; b += THREADS / 32) {
         const int r = b >> 1;
         const int c = (b & 1) * 128 + lane * 4;
+        if (blockIdx.x * COLS + (b & 1) * 128 >= n) continue;   // partial block: second 128-half absent
         float v0 = sh_y[r][c], v1 = sh_y[r][c + 1], v2 = sh_y[r][c + 2], v3 = sh_y[r][c + 3];
         exl3_had::had128(v0, v1, v2, v3, lane);
         const int gc = blockIdx.x * COLS + c;

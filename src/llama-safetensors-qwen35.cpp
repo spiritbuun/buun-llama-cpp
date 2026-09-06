@@ -849,7 +849,7 @@ std::vector<uint8_t> apply_quantized_layout_transform(
     if (ggml_type_is_exl3(type)) {
         // EXL3 tile stream [n/16][k/16][tile]: permute whole 16-row (n) tile groups, or the
         // 16-column (k) tiles inside every group.  Head blocks are 128 wide, so both are tile aligned.
-        const size_t tile_bytes = ggml_type_size(type);
+        const size_t tile_bytes = 16 * ggml_type_size(type);   // ggml block = one 16-element tile row
         const size_t k_tiles = cols / 16;
         const size_t n_tiles = rows / 16;
         if (cols % 16 != 0 || rows % 16 != 0 || source.size() != k_tiles * n_tiles * tile_bytes) {

@@ -232,8 +232,12 @@ static_assert(sizeof(block_q4_1) == 2 * sizeof(ggml_half) + QK4_1 / 2, "wrong q4
 #define QR4_A32 1
 
 // EXL3: one 16x16 trellis tile = 256 weights = 32*K bytes (K bits per weight).
-#define QK_EXL3 256
-#define GGML_EXL3_TILE_BYTES(K) (32 * (K))
+// EXL3: a 16x16 tile holds 256 weights in 32*K bytes; the ggml block is one 16-element row
+// segment of a tile (2*K bytes) so row sizes stay exact for any k that is a multiple of 16.
+#define QK_EXL3 16
+#define GGML_EXL3_TILE_BYTES(K) (2 * (K))
+#define QK_EXL3N 160
+#define GGML_EXL3N_ROW_BYTES(K) (2 * (1 + 10 * (K)))
 typedef struct {
     uint16_t d[QK4_A32 / QG4_A32]; // BF16 scales
     uint8_t  z[QK4_A32 / QG4_A32 / 2]; // two 4-bit zero points per byte

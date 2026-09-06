@@ -187,7 +187,7 @@ void exl3_int8_geometry(int bits, int nacc, int m, int k, int colblocks, int pai
 template <int bits, bool RESID>
 void exl3_int8_run(ggml_backend_cuda_context & ctx, const float * x, const half * suh, const uint8_t * B, const half * svh,
         float * y, int m, int k, int n, cudaStream_t stream) {
-    const int colblocks = n / exl3_int8::COLS;
+    const int colblocks = (n + exl3_int8::COLS - 1) / exl3_int8::COLS;
     const int nacc = (RESID ? 2 : 1) * m;
     int ksplit, nrows; size_t smem;
     exl3_int8_geometry(bits, nacc, m, k, colblocks, 1, ksplit, nrows, smem);
@@ -207,7 +207,7 @@ template <int bits, int cb>
 void exl3_moe_run(ggml_backend_cuda_context & ctx, const float * x, const half * suh, const uint8_t * B, const half * svh,
         float * y, int k, int n, int pairs, exl3_int8::grouped_args ga, cudaStream_t stream) {
     constexpr bool INT8 = cb == 2;
-    const int colblocks = n / exl3_int8::COLS;
+    const int colblocks = (n + exl3_int8::COLS - 1) / exl3_int8::COLS;
     int ksplit, nrows; size_t smem;
     exl3_int8_geometry(bits, INT8 ? 1 : 0, 1, k, colblocks, pairs, ksplit, nrows, smem);
     ggml_cuda_pool_alloc<float> partials(ctx.pool(), size_t(ksplit) * pairs * n);
@@ -219,16 +219,16 @@ void exl3_moe_run(ggml_backend_cuda_context & ctx, const float * x, const half *
 bool exl3_mul_mat_id_fast_shape(const ggml_tensor * dst) {
     const ggml_tensor * w = dst->src[0], * x = dst->src[1], * ids = dst->src[2];
     const int64_t pairs = ids->ne[0] * ids->ne[1];
-    return w->ne[0] % 128 == 0 && w->ne[1] % exl3_int8::COLS == 0 && w->ne[1] <= int64_t(EXL3_INT8_MAX_N) &&
+    return w->ne[0] % 128 == 0 && w->ne[1] % 128 == 0 && w->ne[1] <= int64_t(EXL3_INT8_MAX_N) &&
         x->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float) && dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst) &&
         ids->type == GGML_TYPE_I32 && ids->nb[0] == sizeof(int32_t) &&
-        pairs >= 1 && pairs <= 64 && size_t(pairs) * (w->ne[1] / exl3_int8::COLS) <= EXL3_INT8_COUNTERS &&
+        pairs >= 1 && pairs <= 64 && size_t(pairs) * ((w->ne[1] + exl3_int8::COLS - 1) / exl3_int8::COLS) <= EXL3_INT8_COUNTERS &&
         dst->src[3] != nullptr && dst->src[4] != nullptr;
 }
 
 bool exl3_int8_applicable(int bits, int m, int k, int n) {
     return exl3_int8_mode() != 0 && bits >= 1 && bits <= 8 && m >= 1 && m <= exl3_int8::MAX_M &&
-        n % exl3_int8::COLS == 0 && k % 128 == 0 && size_t(n) <= EXL3_INT8_MAX_N;
+        n % 128 == 0 && k % 128 == 0 && size_t(n) <= EXL3_INT8_MAX_N;
 }
 
 } // namespace

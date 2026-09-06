@@ -1585,6 +1585,21 @@ llama_safetensors_registry llama_safetensors_registry::load(
         }
         shard_names.insert("model.safetensors");
     }
+    // Side files outside the index (exllamav3's ngram_embedding.safetensors, MTP patches, ...):
+    // any other *.safetensors in the directory joins the registry; their tensors are accepted
+    // when the index does not already name them.
+    std::set<std::string> side_shards;
+    for (const auto & entry : std::filesystem::directory_iterator(model_dir)) {
+        if (!entry.is_regular_file() || entry.path().extension() != ".safetensors") {
+            continue;
+        }
+        const std::string name = entry.path().filename().string();
+        if (name.rfind("model", 0) == 0 || shard_names.count(name)) {
+            continue;   // index shards (or the single model file) are already covered
+        }
+        shard_names.insert(name);
+        side_shards.insert(name);
+    }
 
     for (const std::string & shard_name : shard_names) {
         const uint32_t shard_index = result.shards_.size();
@@ -1606,7 +1621,8 @@ llama_safetensors_registry llama_safetensors_registry::load(
                 // to that shard; only the indexed copy belongs to this model.
                 // The completeness pass below still rejects an assignment
                 // whose named shard does not actually contain the tensor.
-                if (expected == expected_shards.end() || expected->second != shard_name) {
+                const bool side = side_shards.count(shard_name) != 0 && expected == expected_shards.end();
+                if (!side && (expected == expected_shards.end() || expected->second != shard_name)) {
                     continue;
                 }
             }
@@ -1617,7 +1633,7 @@ llama_safetensors_registry llama_safetensors_registry::load(
         }
     }
 
-    if (!expected_shards.empty() && result.tensor_index_.size() != expected_shards.size()) {
+    if (!expected_shards.empty() && result.tensor_index_.size() < expected_shards.size()) {
         for (const auto & [name, shard] : expected_shards) {
             (void) shard;
             if (result.tensor_index_.find(name) == result.tensor_index_.end()) {

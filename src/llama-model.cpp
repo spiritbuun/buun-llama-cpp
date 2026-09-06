@@ -1865,6 +1865,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (!layer.nextn.eh_proj_s && layer.nextn.eh_proj) {
                 layer.nextn.eh_proj_s = load_weight_scale(tn(LLM_TENSOR_NEXTN_EH_PROJ, "scale", i), layer.nextn.eh_proj);
             }
+            if (!layer.index_q_proj_s && layer.index_q_proj) {
+                layer.index_q_proj_s = load_weight_scale(tn(LLM_TENSOR_INDEXER_Q_PROJ, "scale", i), layer.index_q_proj);
+            }
+            if (!layer.index_k_proj_s && layer.index_k_proj) {
+                layer.index_k_proj_s = load_weight_scale(tn(LLM_TENSOR_INDEXER_K_PROJ, "scale", i), layer.index_k_proj);
+            }
             if (!layer.nextn.shared_head_head_s && layer.nextn.shared_head_head) {
                 layer.nextn.shared_head_head_s = load_weight_scale(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "scale", i), layer.nextn.shared_head_head);
             }
@@ -1948,6 +1954,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             if (!layer.ssm_beta_in_s && layer.ssm_beta) {
                 layer.ssm_beta_in_s = create_tensor(tn(LLM_TENSOR_SSM_BETA, "input_scale", i), {input_scale_ne(tn(LLM_TENSOR_SSM_BETA, "input_scale", i))}, TENSOR_NOT_REQUIRED);
+            }
+            if (!layer.index_q_proj_in_s && layer.index_q_proj) {
+                layer.index_q_proj_in_s = create_tensor(tn(LLM_TENSOR_INDEXER_Q_PROJ, "input_scale", i), {input_scale_ne(tn(LLM_TENSOR_INDEXER_Q_PROJ, "input_scale", i))}, TENSOR_NOT_REQUIRED);
+            }
+            if (!layer.index_k_proj_in_s && layer.index_k_proj) {
+                layer.index_k_proj_in_s = create_tensor(tn(LLM_TENSOR_INDEXER_K_PROJ, "input_scale", i), {input_scale_ne(tn(LLM_TENSOR_INDEXER_K_PROJ, "input_scale", i))}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.nextn.eh_proj_in_s && layer.nextn.eh_proj) {
                 layer.nextn.eh_proj_in_s = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "input_scale", i), {input_scale_ne(tn(LLM_TENSOR_NEXTN_EH_PROJ, "input_scale", i))}, TENSOR_NOT_REQUIRED);

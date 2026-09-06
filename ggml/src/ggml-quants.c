@@ -625,6 +625,60 @@ void dequantize_row_exl3(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, 
     GGML_ABORT("EXL3 weights are only served by the CUDA backend");
 }
 
+// exllamav3 n-gram rows: word 0 = fp16 row scale, then 160 K-bit chunks (LSB-first words);
+// element i is mul1(state_i) * scale where state_i concatenates the chunks of positions
+// i, i-1, i-2, ... (tail-biting) into 16 bits.
+static inline float ggml_exl3_mul1_value(uint32_t state) {
+    const uint32_t x = state * 0x83DCD12Du;
+    const uint32_t s = (x & 255) + ((x >> 8) & 255) + ((x >> 16) & 255) + ((x >> 24) & 255);
+    // fp16 arithmetic of the reference: h = 1024 + bytesum exactly; v = h * k_inv + k_bias rounded to fp16
+    const float h = (float) (1024 + s);
+    const float k_inv  = GGML_FP16_TO_FP32(0x1eee);
+    const float k_bias = GGML_FP16_TO_FP32(0xc931);
+    return GGML_FP16_TO_FP32(GGML_FP32_TO_FP16(h * k_inv + k_bias));
+}
+
+static void dequantize_row_exl3n(const uint16_t * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k, int K) {
+    const int words = 1 + 10 * K;
+    for (int64_t r = 0; r < k / QK_EXL3N; ++r) {
+        const uint16_t * row = x + r * words;
+        const float scale = GGML_FP16_TO_FP32(row[0]);
+        const uint16_t * bits = row + 1;
+        for (int i = 0; i < QK_EXL3N; ++i) {
+            // state bit m comes from position (i - m/K) (mod 160), bit m%K of its K-bit chunk
+            uint32_t state = 0;
+            for (int m = 0; m < 16; ++m) {
+                int pos = i - m / K;
+                if (pos < 0) pos += QK_EXL3N;
+                const int b = pos * K + m % K;
+                state |= (uint32_t) ((bits[b >> 4] >> (b & 15)) & 1) << m;
+            }
+            y[r * QK_EXL3N + i] = ggml_exl3_mul1_value(state) * scale;
+        }
+    }
+}
+void dequantize_row_exl3n_2(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    dequantize_row_exl3n((const uint16_t *) x, y, k, 2);
+}
+void dequantize_row_exl3n_3(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    dequantize_row_exl3n((const uint16_t *) x, y, k, 3);
+}
+void dequantize_row_exl3n_4(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    dequantize_row_exl3n((const uint16_t *) x, y, k, 4);
+}
+void dequantize_row_exl3n_5(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    dequantize_row_exl3n((const uint16_t *) x, y, k, 5);
+}
+void dequantize_row_exl3n_6(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    dequantize_row_exl3n((const uint16_t *) x, y, k, 6);
+}
+void dequantize_row_exl3n_7(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    dequantize_row_exl3n((const uint16_t *) x, y, k, 7);
+}
+void dequantize_row_exl3n_8(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    dequantize_row_exl3n((const uint16_t *) x, y, k, 8);
+}
+
 void dequantize_row_q4_a32(const block_q4_a32 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     GGML_ASSERT(k % QK4_A32 == 0);
 

@@ -43,6 +43,8 @@ struct source_spec {
     std::vector<std::string> stack_sources;
     std::vector<llama_safetensors_quant_binding> stack_quant_weights;
     std::vector<llama_safetensors_quant_binding> stack_quant_scales;
+    // EXL3 experts: stacked per-expert bindings (weights, or svh/suh side vectors alone)
+    std::vector<llama_safetensors_quant_binding> stack_exl3;
     bool ple_table = false;
     bool ple_scale = false;
 };
@@ -69,6 +71,14 @@ struct qwen4_geometry {
     uint32_t ple_layer;
     uint32_t ple_shards;
 };
+
+constexpr int64_t EXL3_NGRAM_DIM = 160;   // exllamav3 n-gram row width (QK_EXL3N)
+
+// n-gram table shard: BF16/F8 source (.weight) or exllamav3 row-trellis (.trellis)
+std::string ple_shard_name(const llama_safetensors_registry & registry, const std::string & prefix, uint32_t i) {
+    const std::string trellis = prefix + std::to_string(i) + ".trellis";
+    return registry.find(trellis) != nullptr ? trellis : prefix + std::to_string(i) + ".weight";
+}
 
 bool ends_with(std::string_view value, std::string_view suffix) {
     return value.size() >= suffix.size() && value.substr(value.size() - suffix.size()) == suffix;
@@ -174,6 +184,11 @@ source_spec map_target(
         result.ple_scale = true;
         return result;
     }
+    if (target == "per_layer_token_embd.bias") {
+        // exllamav3 n-gram tables carry a per-hash-head bias (F16 [heads, 160]) removed before quantization
+        return { std::string(geometry.model_prefix) + ".layers." + std::to_string(geometry.ple_layer) +
+                 ".ple.ple_embedding.ngram_embedding.head_bias" };
+    }
 
     static const std::regex layer_pattern(R"(^blk\.([0-9]+)\.(.+)$)");
     std::smatch match;
@@ -223,11 +238,19 @@ source_spec map_target(
         return bind_projection(quant, prefix + "mlp.shared_expert.down_proj",
                                llama_safetensors_quant_role::WEIGHT);
     }
+    for (const char * proj : { "gate", "up", "down" }) {
+        const std::string shexp = std::string("ffn_") + proj + "_shexp.";
+        if (suffix == shexp + "scale" || suffix == shexp + "input_scale") {
+            return bind_projection(quant, prefix + "mlp.shared_expert." + proj + "_proj",
+                suffix == shexp + "scale" ? llama_safetensors_quant_role::WEIGHT_SCALE : llama_safetensors_quant_role::INPUT_SCALE);
+        }
+    }
 
     const std::string gate_up_module = prefix + "mlp.experts.gate_up_proj";
     const std::string down_module    = prefix + "mlp.experts.down_proj";
     const bool gate_up_quantized = quant.applies(gate_up_module);
-    const bool split_experts = registry.find(prefix + "mlp.experts.0.gate_proj.weight") != nullptr;
+    const bool split_experts = registry.find(prefix + "mlp.experts.0.gate_proj.weight") != nullptr ||
+                               quant.applies(prefix + "mlp.experts.0.gate_proj");
     const auto bind_split_experts = [&](const char * projection) {
         source_spec result;
         const std::string first_module = prefix + "mlp.experts.0." + projection;
@@ -236,6 +259,10 @@ source_spec map_target(
             const std::string module = prefix + "mlp.experts." + std::to_string(expert) + "." + projection;
             if (quantized) {
                 auto weight = quant.bind(module, llama_safetensors_quant_role::WEIGHT);
+                if (weight && ggml_type_is_exl3(weight->target_type)) {
+                    result.stack_exl3.push_back(std::move(*weight));
+                    continue;
+                }
                 auto scale  = quant.bind(module, llama_safetensors_quant_role::WEIGHT_SCALE);
                 if (!weight || !scale || weight->target_type != GGML_TYPE_F8_E4M3 ||
                         scale->target_type != GGML_TYPE_F32 ||
@@ -284,11 +311,40 @@ source_spec map_target(
         }
         return { down_module };
     }
+    const auto exl3_side_stack = [&](const char * projection, llama_safetensors_quant_role role) {
+        source_spec result;
+        for (uint32_t expert = 0; expert < geometry.n_expert; ++expert) {
+            const std::string module = prefix + "mlp.experts." + std::to_string(expert) + "." + projection;
+            auto side = quant.bind(module, role);
+            if (!side) {
+                throw std::runtime_error("missing EXL3 expert side tensor for '" + module + "'");
+            }
+            result.stack_exl3.push_back(std::move(*side));
+        }
+        return result;
+    };
+    const auto exl3_split = [&](const char * projection) {
+        if (!split_experts) {
+            return false;
+        }
+        auto weight = quant.bind(prefix + "mlp.experts.0." + projection, llama_safetensors_quant_role::WEIGHT);
+        return weight && ggml_type_is_exl3(weight->target_type);
+    };
+    if (ends_with(suffix, "_exps.input_scale")) {
+        const char * projection = suffix == "ffn_down_exps.input_scale" ? "down_proj" :
+            suffix == "ffn_gate_exps.input_scale" ? "gate_proj" : "up_proj";
+        if (exl3_split(projection)) {
+            return exl3_side_stack(projection, llama_safetensors_quant_role::INPUT_SCALE);
+        }
+    }
     if (suffix == "ffn_gate_exps.scale" || suffix == "ffn_up_exps.scale" ||
         suffix == "ffn_down_exps.scale") {
         if (split_experts) {
             const char * projection = suffix == "ffn_down_exps.scale" ? "down_proj" :
                 suffix == "ffn_gate_exps.scale" ? "gate_proj" : "up_proj";
+            if (exl3_split(projection)) {
+                return exl3_side_stack(projection, llama_safetensors_quant_role::WEIGHT_SCALE);
+            }
             if (quant.applies(prefix + "mlp.experts.0." + projection)) {
                 return {};
             }
@@ -302,19 +358,63 @@ source_spec map_target(
         return {};
     }
 
+    // EXL3 side vectors of the recurrent projections (svh follows the permuted output rows,
+    // suh the permuted input columns); the fused-QKV names of the ordinary map do not apply here
+    if (recurrent_layer(layer, geometry) && (ends_with(suffix, ".scale") || ends_with(suffix, ".input_scale"))) {
+        struct side_name { std::string_view target; std::string_view module; int out_rows; };   // 0 none, 1 QKV_ROWS, 2 V_ROWS
+        static constexpr std::array<side_name, 3> sides = {{
+            { "attn_qkv", "linear_attn.in_proj_qkv", 1 },
+            { "attn_gate", "linear_attn.in_proj_z", 2 },
+            { "ssm_out", "linear_attn.out_proj", 0 },
+        }};
+        for (const side_name & side : sides) {
+            const std::string base(side.target);
+            if (suffix != base + ".scale" && suffix != base + ".input_scale") {
+                continue;
+            }
+            const bool input = ends_with(suffix, ".input_scale");
+            source_spec result = bind_projection(quant, prefix + std::string(side.module),
+                input ? llama_safetensors_quant_role::INPUT_SCALE : llama_safetensors_quant_role::WEIGHT_SCALE);
+            if (result.quant && result.quant->target_type == GGML_TYPE_F16 && result.quant->target_shape.size() == 1) {
+                // out_proj: inputs are the permuted value rows; the others permute outputs only
+                const int t = input ? (side.out_rows == 0 ? 2 : 0) : side.out_rows;
+                if (t == 1) {
+                    result.transforms.push_back(transform_kind::QKV_ROWS);
+                } else if (t == 2) {
+                    result.transforms.push_back(transform_kind::V_ROWS);
+                }
+                return result;
+            }
+            if (base == "ssm_out" && !input) {
+                break;   // non-EXL3: the recurrent table below handles ssm_out.scale
+            }
+            return result;
+        }
+    }
+
     if (auto ordinary = llama_safetensors_map_decoder_tensor(prefix, suffix)) {
         std::vector<transform_kind> transforms;
         if (suffix == "attn_q_norm.weight" || suffix == "attn_k_norm.weight") {
             transforms.push_back(transform_kind::OFFSET_NORM);
         }
-        return bind_decoder_source(quant, std::move(*ordinary), std::move(transforms));
+        source_spec result = bind_decoder_source(quant, std::move(*ordinary), std::move(transforms));
+        return result;
     }
 
-    if (suffix == "indexer.q_proj.weight" || suffix == "indexer.k_proj.weight") {
-        source_spec result { prefix + "self_attn.indexer.index_qk_proj.weight" };
+    if (suffix.rfind("indexer.q_proj.", 0) == 0 || suffix.rfind("indexer.k_proj.", 0) == 0) {
+        // fused index_qk_proj: q rows [0, n_q), k rows [n_q, n_q + head_dim); EXL3 slices the
+        // quantized rows and the svh vector alike, suh is shared
+        const std::string module = prefix + "self_attn.indexer.index_qk_proj";
+        const bool is_q = suffix.rfind("indexer.q_proj.", 0) == 0;
+        const std::string role_s = suffix.substr(std::string_view("indexer.q_proj.").size());
         const size_t n_q = static_cast<size_t>(geometry.indexer_n_heads) * geometry.indexer_head_dim;
-        result.row_offset = suffix == "indexer.q_proj.weight" ? 0 : n_q;
-        result.row_count  = suffix == "indexer.q_proj.weight" ? n_q : geometry.indexer_head_dim;
+        const llama_safetensors_quant_role role = role_s == "input_scale" ? llama_safetensors_quant_role::INPUT_SCALE :
+            role_s == "scale" ? llama_safetensors_quant_role::WEIGHT_SCALE : llama_safetensors_quant_role::WEIGHT;
+        source_spec result = bind_projection(quant, module, role);
+        if (role != llama_safetensors_quant_role::INPUT_SCALE) {
+            result.row_offset = is_q ? 0 : n_q;
+            result.row_count  = is_q ? n_q : geometry.indexer_head_dim;
+        }
         return result;
     }
     if (suffix == "indexer.q_norm.weight" || suffix == "indexer.k_norm.weight") {
@@ -431,7 +531,7 @@ ggml_type plain_type(const llama_safetensors_tensor & source, const source_spec 
         transform_kind::OFFSET_NORM) != spec.transforms.end() ||
         std::find(spec.transforms.begin(), spec.transforms.end(),
         transform_kind::A_LOG) != spec.transforms.end();
-    const bool backend_requires_f32 = ends_with(target, "ssm_conv1d.weight");
+    const bool backend_requires_f32 = ends_with(target, "ssm_conv1d.weight") || target == "per_layer_token_embd.bias";
     switch (source.dtype) {
         case llama_safetensors_dtype::BF16:
             if (numerical_transform || backend_requires_f32 || source.shape.size() < 2) {
@@ -477,6 +577,78 @@ std::vector<uint8_t> permute_rows(
                     source.data() + (prefix_rows + permutation[row]) * row_size, row_size);
     }
     return result;
+}
+
+// EXL3 tile stream [n/16][k/16][tile]: permute 16-row (n) tile groups or the 16-column (k) tiles.
+std::vector<uint8_t> transform_exl3(
+        transform_kind transform, const qwen4_geometry & geometry, ggml_type type,
+        const std::vector<int64_t> & shape, std::vector<uint8_t> source) {
+    if (shape.size() != 2 || shape[0] % 16 != 0 || shape[1] % 16 != 0) {
+        throw std::runtime_error("EXL3 Qwen4 layout transform requires a tile-aligned rank-two tensor");
+    }
+    const size_t tile_bytes = 16 * ggml_type_size(type);   // ggml block = one 16-element tile row
+    const size_t k_tiles = size_t(shape[0]) / 16;
+    const size_t n_tiles = size_t(shape[1]) / 16;
+    if (source.size() != k_tiles * n_tiles * tile_bytes) {
+        throw std::runtime_error("EXL3 Qwen4 layout transform has an inconsistent tile shape");
+    }
+    const auto tile_permutation = [&](const std::vector<size_t> & elements) {
+        if (elements.size() % 16 != 0) {
+            throw std::runtime_error("EXL3 Qwen4 layout transform is not tile aligned");
+        }
+        std::vector<size_t> tiles(elements.size() / 16);
+        for (size_t dst = 0; dst < tiles.size(); ++dst) {
+            const size_t src = elements[dst * 16];
+            for (size_t lane = 0; lane < 16; ++lane) {
+                if (src % 16 != 0 || elements[dst * 16 + lane] != src + lane) {
+                    throw std::runtime_error("EXL3 Qwen4 layout transform splits a tile");
+                }
+            }
+            tiles[dst] = src / 16;
+        }
+        return tiles;
+    };
+    const size_t row_size = k_tiles * tile_bytes;   // one n tile
+    switch (transform) {
+        case transform_kind::QKV_ROWS:
+        case transform_kind::CONV_ROWS: {
+            const size_t qk_rows = 2 * geometry.n_key_heads * geometry.key_head_dim;
+            return permute_rows(source, row_size, qk_rows / 16,
+                tile_permutation(v_permutation(geometry, geometry.value_head_dim)));
+        }
+        case transform_kind::V_ROWS:
+            return permute_rows(source, row_size, 0,
+                tile_permutation(v_permutation(geometry, geometry.value_head_dim)));
+        case transform_kind::V_COLUMNS: {
+            const std::vector<size_t> tiles = tile_permutation(v_permutation(geometry, geometry.value_head_dim));
+            if (tiles.size() != k_tiles) {
+                throw std::runtime_error("EXL3 Qwen4 value-column permutation shape mismatch");
+            }
+            std::vector<uint8_t> result(source.size());
+            for (size_t nt = 0; nt < n_tiles; ++nt) {
+                for (size_t kt = 0; kt < k_tiles; ++kt) {
+                    std::memcpy(result.data() + (nt * k_tiles + kt) * tile_bytes,
+                                source.data() + (nt * k_tiles + tiles[kt]) * tile_bytes, tile_bytes);
+                }
+            }
+            return result;
+        }
+        default:
+            throw std::runtime_error("unsupported EXL3 Qwen4 layout transform");
+    }
+}
+
+// F16 side vector (EXL3 suh) permuted like the projection's columns
+std::vector<uint8_t> transform_exl3_vector(
+        transform_kind transform, const qwen4_geometry & geometry, std::vector<uint8_t> source) {
+    if (transform == transform_kind::V_ROWS) {
+        return permute_rows(source, sizeof(uint16_t), 0, v_permutation(geometry, geometry.value_head_dim));
+    }
+    if (transform == transform_kind::QKV_ROWS) {
+        return permute_rows(source, sizeof(uint16_t), 2 * geometry.n_key_heads * geometry.key_head_dim,
+            v_permutation(geometry, geometry.value_head_dim));
+    }
+    throw std::runtime_error("unsupported EXL3 Qwen4 side-vector transform");
 }
 
 std::vector<uint8_t> transform_plain(
@@ -575,6 +747,22 @@ std::vector<uint8_t> slice_rows_2d(
     return { data.begin() + offset * row_size, data.begin() + (offset + count) * row_size };
 }
 
+// rows of a rank-one or rank-two quantized target (EXL3 n-tile-major streams slice at 16-row
+// granularity, which ggml_row_size makes byte-exact for tile-aligned offsets)
+std::vector<uint8_t> slice_quant_rows_2d(
+        ggml_type type, const std::vector<int64_t> & shape,
+        size_t offset, size_t count, const std::vector<uint8_t> & data) {
+    if (shape.empty() || shape.size() > 2) {
+        throw std::runtime_error("invalid Qwen4 quantized row slice rank");
+    }
+    const size_t row_size = shape.size() == 2 ? ggml_row_size(type, shape[0]) : ggml_type_size(type);
+    const size_t rows = static_cast<size_t>(shape.size() == 2 ? shape[1] : shape[0]);
+    if (offset + count > rows || data.size() != row_size * rows) {
+        throw std::runtime_error("invalid Qwen4 quantized row slice");
+    }
+    return std::vector<uint8_t>(data.begin() + offset * row_size, data.begin() + (offset + count) * row_size);
+}
+
 std::vector<uint8_t> slice_quant_rows_3d(
         ggml_type type, const std::vector<int64_t> & shape,
         size_t offset, size_t count, const std::vector<uint8_t> & data) {
@@ -662,6 +850,11 @@ llama_safetensors_qwen4exp_importer::llama_safetensors_qwen4exp_importer(
             [](const llama_safetensors_tensor & tensor) { return tensor.name.rfind("mtp.", 0) == 0; })) {
         n_mtp_ = 0;
     }
+    if (n_mtp_ != 0 && registry_.find("mtp.fc_hidden.trellis") != nullptr) {
+        // EXL3 MTP head: fc_embedding | fc_hidden carry separate output scales and cannot be fused
+        // into one eh_proj; the MTP block is skipped until the graph takes them separately.
+        n_mtp_ = 0;
+    }
 }
 
 bool llama_safetensors_qwen4exp_importer::probe(const llama_safetensors_json & config) {
@@ -729,15 +922,18 @@ gguf_context * llama_safetensors_qwen4exp_importer::build_metadata() const {
         sink.set_u32(arch + ".ple.eos_token_id", eos);
         if (config_.contains("image_token_id")) sink.set_u32(arch + ".ple.image_token_id", config_.at("image_token_id").get<uint32_t>());
         const std::string ple = model_prefix_ + ".layers." + std::to_string(ple_layer_) + ".ple.ple_embedding.";
-        const std::string first_shard_name = ple + "ngram_embedding.shard_0.weight";
+        // source table: BF16/F8 shards (.weight) or exllamav3's row-trellis shards (.trellis, 160 wide)
+        const bool trellis = registry_.find(ple + "ngram_embedding.shard_0.trellis") != nullptr;
+        const std::string first_shard_name = ple + (trellis ? "ngram_embedding.shard_0.trellis" : "ngram_embedding.shard_0.weight");
         const auto & first_shard = require_tensor(registry_, first_shard_name);
         if (first_shard.shape.size() != 2 || first_shard.shape[1] == 0 || first_shard.shape[1] > UINT32_MAX) {
             throw std::runtime_error("Qwen4 PLE shard has an invalid row dimension");
         }
-        sink.set_u32(arch + ".embedding_length_per_layer_input", static_cast<uint32_t>(first_shard.shape[1]));
-        const auto multipliers = read_u64_vector(registry_, ple + "layer_multipliers");
-        const auto offsets = read_u64_vector(registry_, ple + "ngram_heads_offsets");
-        const auto vocab_sizes = read_u64_vector(registry_, ple + "ngram_heads_vocab_sizes");
+        sink.set_u32(arch + ".embedding_length_per_layer_input", trellis ? EXL3_NGRAM_DIM : static_cast<uint32_t>(first_shard.shape[1]));
+        const std::string aux = trellis ? ple + "ngram_embedding." : ple;
+        const auto multipliers = read_u64_vector(registry_, aux + "layer_multipliers");
+        const auto offsets = read_u64_vector(registry_, aux + (trellis ? "head_offsets" : "ngram_heads_offsets"));
+        const auto vocab_sizes = read_u64_vector(registry_, aux + (trellis ? "head_vocab_sizes" : "ngram_heads_vocab_sizes"));
         sink.set_u64_array(arch + ".ple.layer_multipliers", multipliers.data(), multipliers.size());
         sink.set_u64_array(arch + ".ple.head_offsets", offsets.data(), offsets.size());
         sink.set_u64_array(arch + ".ple.head_vocab_sizes", vocab_sizes.data(), vocab_sizes.size());
@@ -770,8 +966,30 @@ bool llama_safetensors_qwen4exp_importer::describe(
         llama_safetensors_dtype dtype = llama_safetensors_dtype::F32;
         const std::string prefix = model_prefix_ + ".layers." + std::to_string(ple_layer_) +
             ".ple.ple_embedding.ngram_embedding.shard_";
+        if (registry_.find(prefix + "0.trellis") != nullptr) {
+            // exl3_ngram_trellis rows: [rows, 1 + 10K] int16 per shard
+            uint64_t words = 0;
+            for (uint32_t i = 0; i < ple_shards_; ++i) {
+                const auto & shard = require_tensor(registry_, prefix + std::to_string(i) + ".trellis");
+                if (shard.shape.size() != 2 || shard.dtype != llama_safetensors_dtype::I16 ||
+                    (i != 0 && shard.shape[1] != words)) {
+                    throw std::runtime_error("invalid Qwen4 EXL3 n-gram shard contract");
+                }
+                words = shard.shape[1]; rows += shard.shape[0];
+            }
+            const int K = int((words - 1) * 16 / EXL3_NGRAM_DIM);
+            if (K < 2 || K > 8 || uint64_t(1 + 10 * K) != words || rows > INT64_MAX) {
+                throw std::runtime_error("unsupported Qwen4 EXL3 n-gram bit width");
+            }
+            type  = static_cast<ggml_type>(int(GGML_TYPE_EXL3N_2) + K - 2);
+            shape = std::vector<int64_t>{ int64_t(EXL3_NGRAM_DIM), static_cast<int64_t>(rows) };
+            if (shape.size() > GGML_MAX_DIMS) return false;
+            ne.fill(1);
+            std::copy(shape.begin(), shape.end(), ne.begin());
+            return true;
+        }
         for (uint32_t i = 0; i < ple_shards_; ++i) {
-            const std::string shard_name = prefix + std::to_string(i) + ".weight";
+            const std::string shard_name = ple_shard_name(registry_, prefix, i);
             const auto & shard = require_tensor(registry_, shard_name);
             if (shard.shape.size() != 2 || (i != 0 && (shard.shape[1] != dim || shard.dtype != dtype)) ||
                 (shard.dtype != llama_safetensors_dtype::BF16 && shard.dtype != llama_safetensors_dtype::F16 &&
@@ -788,12 +1006,23 @@ bool llama_safetensors_qwen4exp_importer::describe(
         if (ple_layer_ == UINT32_MAX || ple_shards_ == 0) return false;
         const std::string name = model_prefix_ + ".layers." + std::to_string(ple_layer_) +
             ".ple.ple_embedding.ngram_embedding.weight_scale";
+        if (registry_.find(name) == nullptr) return false;   // only F8 tables carry a scale
         const auto & scale = require_tensor(registry_, name);
         if (scale.dtype != llama_safetensors_dtype::BF16 || scale.shape != std::vector<uint64_t>{1}) {
             throw std::runtime_error("invalid Qwen4 PLE scale contract");
         }
         type = GGML_TYPE_F32;
         shape = { 1 };
+    } else if (!spec.stack_exl3.empty()) {
+        const auto & first = spec.stack_exl3.front();
+        for (const auto & item : spec.stack_exl3) {
+            if (item.target_type != first.target_type || item.target_shape != first.target_shape) {
+                throw std::runtime_error("EXL3 experts must share bit width, codebook and shape");
+            }
+        }
+        type  = first.target_type;
+        shape = first.target_shape;   // [k, n] weights or [n] / [k] side vectors
+        shape.push_back(static_cast<int64_t>(spec.stack_exl3.size()));
     } else if (!spec.stack_quant_weights.empty()) {
         const auto & first = spec.stack_quant_weights.front();
         if (first.target_shape.size() != 2 || first.target_shape[0] % 128 != 0 ||
@@ -842,8 +1071,8 @@ bool llama_safetensors_qwen4exp_importer::describe(
         shape = spec.quant ? spec.quant->target_shape : reverse_shape(source);
         if (spec.row_count != 0) {
             if (spec.quant) {
-                if (shape.size() < 2) throw std::runtime_error("Qwen4 quantized slice has invalid rank");
-                shape[1] = static_cast<int64_t>(spec.row_count);
+                if (shape.empty()) throw std::runtime_error("Qwen4 quantized slice has invalid rank");
+                shape[shape.size() == 1 ? 0 : 1] = static_cast<int64_t>(spec.row_count);   // 1-D: EXL3 svh slice
             } else {
                 if (shape.size() != 2) throw std::runtime_error("Qwen4 plain slice has invalid rank");
                 shape[1] = static_cast<int64_t>(spec.row_count);
@@ -876,14 +1105,30 @@ bool llama_safetensors_qwen4exp_importer::load(
         indexer_n_heads_, indexer_head_dim_, full_attention_interval_, text.at("num_experts").get<uint32_t>(), text.at("moe_intermediate_size").get<uint32_t>(), ple_layer_, ple_shards_ };
     const source_spec spec = map_target(registry_, *quant_, geometry, target);
     if (spec.ple_table) {
+        const std::string prefix = model_prefix_ + ".layers." + std::to_string(ple_layer_) +
+            ".ple.ple_embedding.ngram_embedding.shard_";
+        if (ggml_type_is_exl3_ngram(destination->type)) {
+            size_t offset = 0;
+            for (uint32_t i = 0; i < ple_shards_; ++i) {
+                const auto & desc = require_tensor(registry_, prefix + std::to_string(i) + ".trellis");
+                const uint8_t * data = registry_.data(desc);
+                std::vector<uint8_t> owned;
+                if (data == nullptr) { owned = registry_.read(desc); data = owned.data(); }
+                const size_t size = static_cast<size_t>(desc.size);
+                if (offset > ggml_nbytes(destination) || size > ggml_nbytes(destination) - offset)
+                    throw std::runtime_error("Qwen4 EXL3 n-gram shard exceeds destination");
+                ggml_backend_tensor_set(destination, data, offset, size);
+                offset += size;
+            }
+            if (offset != ggml_nbytes(destination)) throw std::runtime_error("Qwen4 EXL3 n-gram table is incomplete");
+            return true;
+        }
         if (destination->type != GGML_TYPE_F32 && destination->type != GGML_TYPE_F8_E4M3) {
             throw std::runtime_error("Qwen4 PLE destination has an unsupported type");
         }
         size_t offset = 0;
-        const std::string prefix = model_prefix_ + ".layers." + std::to_string(ple_layer_) +
-            ".ple.ple_embedding.ngram_embedding.shard_";
         for (uint32_t i = 0; i < ple_shards_; ++i) {
-            const std::string shard_name = prefix + std::to_string(i) + ".weight";
+            const std::string shard_name = ple_shard_name(registry_, prefix, i);
             const auto & desc = require_tensor(registry_, shard_name);
             std::vector<uint8_t> owned;
             const uint8_t * data = nullptr;
@@ -915,7 +1160,7 @@ bool llama_safetensors_qwen4exp_importer::load(
     }
     if (!spec.transforms.empty() || spec.row_count != 0 || spec.scale_broadcast != 0 ||
         !spec.stack_quant_weights.empty() ||
-        !spec.concat_sources.empty() || !spec.stack_sources.empty()) return false;
+        !spec.concat_sources.empty() || !spec.stack_sources.empty() || !spec.stack_exl3.empty()) return false;
     return llama_safetensors_load_tensor_direct(registry_, { spec.source, spec.quant }, destination, check_tensor);
 }
 
@@ -938,7 +1183,18 @@ std::vector<uint8_t> llama_safetensors_qwen4exp_importer::materialize(
         if (spec.ple_table) throw std::runtime_error("PLE table must use bounded direct upload");
         std::vector<uint8_t> result;
         const llama_safetensors_tensor * source_desc = nullptr;
-        if (!spec.stack_quant_weights.empty()) {
+        if (!spec.stack_exl3.empty()) {
+            // per-expert EXL3 repacks (or F16 side vectors) concatenated along the expert dimension
+            result.reserve(target_size);
+            for (const auto & binding : spec.stack_exl3) {
+                auto bytes = quant_->finalize(binding, quant_->read(binding));
+                result.insert(result.end(), bytes.begin(), bytes.end());
+            }
+            if (result.size() != target_size) {
+                throw std::runtime_error("EXL3 expert stack produced " + std::to_string(result.size()) + " bytes, expected " + std::to_string(target_size));
+            }
+            return result;
+        } else if (!spec.stack_quant_weights.empty()) {
             if (target_type != GGML_TYPE_Q8_0_G128 || spec.stack_quant_weights.size() != spec.stack_quant_scales.size()) {
                 throw std::runtime_error("split-expert FP8 repack has an invalid target");
             }
@@ -1046,9 +1302,10 @@ std::vector<uint8_t> llama_safetensors_qwen4exp_importer::materialize(
             if (spec.quant) result = quant_->finalize(*spec.quant, std::move(result));
         }
         if (spec.row_count != 0) {
-            result = spec.quant ? slice_quant_rows_3d(spec.quant->target_type, spec.quant->target_shape,
-                spec.row_offset, spec.row_count, result) :
-                slice_rows_2d(*source_desc, spec.row_offset, spec.row_count, result);
+            result = !spec.quant ? slice_rows_2d(*source_desc, spec.row_offset, spec.row_count, result) :
+                spec.quant->target_shape.size() == 3 ? slice_quant_rows_3d(spec.quant->target_type, spec.quant->target_shape,
+                    spec.row_offset, spec.row_count, result) :
+                slice_quant_rows_2d(spec.quant->target_type, spec.quant->target_shape, spec.row_offset, spec.row_count, result);
         }
         if (spec.scale_broadcast != 0) {
             if (result.size() != sizeof(float) || target_type != GGML_TYPE_F32) throw std::runtime_error("Qwen4 expert scale is not scalar F32");
@@ -1057,8 +1314,15 @@ std::vector<uint8_t> llama_safetensors_qwen4exp_importer::materialize(
             for (size_t i = 0; i < spec.scale_broadcast; ++i) std::memcpy(result.data() + i * sizeof(float), scalar.data(), sizeof(float));
         }
         for (transform_kind transform : spec.transforms) {
-            if (spec.quant) throw std::runtime_error("Qwen4 transformed quantized projection is not supported");
-            result = transform_plain(transform, geometry, *source_desc, std::move(result));
+            if (spec.quant && ggml_type_is_exl3(spec.quant->target_type)) {
+                result = transform_exl3(transform, geometry, spec.quant->target_type, spec.quant->target_shape, std::move(result));
+            } else if (spec.quant && spec.quant->target_type == GGML_TYPE_F16 && spec.quant->target_shape.size() == 1) {
+                result = transform_exl3_vector(transform, geometry, std::move(result));
+            } else if (spec.quant) {
+                throw std::runtime_error("Qwen4 transformed quantized projection is not supported");
+            } else {
+                result = transform_plain(transform, geometry, *source_desc, std::move(result));
+            }
         }
         const bool numerically_transformed = std::find(spec.transforms.begin(), spec.transforms.end(),
             transform_kind::OFFSET_NORM) != spec.transforms.end() ||
