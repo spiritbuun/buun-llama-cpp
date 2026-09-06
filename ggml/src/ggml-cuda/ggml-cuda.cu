@@ -6612,6 +6612,61 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    // Gated RMS normalization: preserve the original per-row reduction and
+    // F32 roundings, but avoid materializing the two intermediate products.
+    if (node->op == GGML_OP_RMS_NORM && i + 3 < cgraph->n_nodes) {
+        static const bool d128_block = [] {
+            const char * value = std::getenv("GGML_CUDA_RMS_D128_BLOCK");
+            return value == nullptr || std::atoi(value) != 0;
+        }();
+        int unary_idx = i + 2;
+        while (unary_idx < cgraph->n_nodes &&
+                (cgraph->nodes[unary_idx]->op == GGML_OP_VIEW ||
+                 cgraph->nodes[unary_idx]->op == GGML_OP_RESHAPE)) {
+            ++unary_idx;
+        }
+        const int indices[] = {i, i + 1, unary_idx, unary_idx + 1};
+        const ggml_op ops[] = {GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL};
+        const int outputs[] = {unary_idx + 1};
+        if (ggml_can_fuse_subgraph_ext(cgraph, indices, 4, ops, outputs, 1)) {
+            ggml_tensor * norm = cgraph->nodes[i + 1];
+            ggml_tensor * unary = cgraph->nodes[unary_idx];
+            ggml_tensor * dst = cgraph->nodes[unary_idx + 1];
+            const ggml_tensor * x = node->src[0];
+            const ggml_tensor * gamma = norm->src[1];
+            const ggml_tensor * gate = unary->src[0];
+            if (norm->src[0] == node && dst->src[0] == norm && dst->src[1] == unary &&
+                    ggml_get_unary_op(unary) == GGML_UNARY_OP_SILU &&
+                    x->type == GGML_TYPE_F32 && gamma->type == GGML_TYPE_F32 &&
+                    gate->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+                    (x->ne[0] == 256 || (x->ne[0] == 128 && d128_block)) &&
+                    x->ne[2] == 1 && x->ne[3] == 1 &&
+                    ggml_are_same_shape(x, gate) && ggml_are_same_shape(x, dst) &&
+                    ggml_is_contiguous(x) && ggml_is_contiguous(dst) &&
+                    ggml_is_contiguous(gamma) && gamma->ne[0] == x->ne[0] &&
+                    ggml_nelements(gamma) == x->ne[0] &&
+                    gate->nb[0] == sizeof(float) &&
+                    (!ggml_cuda_tensors_overlap(dst, x) || dst->data == x->data) &&
+                    !ggml_cuda_tensors_overlap(dst, gamma) &&
+                    (!ggml_cuda_tensors_overlap(dst, gate) ||
+                     (dst->data == gate->data && ggml_is_contiguous(gate)))) {
+                const ggml_tensor * bf16_activation = nullptr;
+#if !defined(GGML_USE_HIP)
+                // Unlike the separate unary kernel, this fusion reads x, not
+                // the intermediate normalized tensor sharing dst's allocation.
+                // Compact writes remain forbidden if they overlap a real input.
+                if (!(dst->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+                        !ggml_cuda_tensors_overlap(dst, x) && !ggml_cuda_tensors_overlap(dst, gate)) {
+                    bf16_activation = ggml_cuda_find_bf16_projection_input(
+                        cgraph, dst, ggml_cuda_info().devices[cuda_ctx->device].cc);
+                }
+#endif
+                ggml_cuda_op_rms_norm_silu(*cuda_ctx, node, gamma, gate, dst, bf16_activation);
+                return unary_idx + 1 - i;
+            }
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
         ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;

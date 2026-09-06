@@ -27,3 +27,8 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_l2_norm_pair(
         ggml_backend_cuda_context & ctx, ggml_tensor * q_dst, ggml_tensor * k_dst);
+
+void ggml_cuda_op_rms_norm_silu(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * rms,
+        const ggml_tensor * gamma, const ggml_tensor * gate, ggml_tensor * dst,
+        const ggml_tensor * bf16_activation);
