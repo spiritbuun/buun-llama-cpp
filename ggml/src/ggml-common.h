@@ -230,6 +230,10 @@ static_assert(sizeof(block_q4_1) == 2 * sizeof(ggml_half) + QK4_1 / 2, "wrong q4
 #define QK4_A32 128
 #define QG4_A32 32
 #define QR4_A32 1
+
+// EXL3: one 16x16 trellis tile = 256 weights = 32*K bytes (K bits per weight).
+#define QK_EXL3 256
+#define GGML_EXL3_TILE_BYTES(K) (32 * (K))
 typedef struct {
     uint16_t d[QK4_A32 / QG4_A32]; // BF16 scales
     uint8_t  z[QK4_A32 / QG4_A32 / 2]; // two 4-bit zero points per byte

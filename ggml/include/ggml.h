@@ -454,7 +454,18 @@ extern "C" {
         // matrix. Per-column group indices/scales/zeros are an attached
         // MUL_MAT auxiliary rather than being flattened into Q4_1.
         GGML_TYPE_GPTQ_AO = 59,
-        GGML_TYPE_COUNT   = 60,
+        // EXL3 (exllamav3) trellis-coded weights: 16x16 tiles of 256 weights, K bits per
+        // weight through a procedural codebook; per-tensor Hadamard sign/scale vectors are
+        // attached as MUL_MAT sources. Rows are not independently decodable (GPU only).
+        GGML_TYPE_EXL3_1  = 60,
+        GGML_TYPE_EXL3_2  = 61,
+        GGML_TYPE_EXL3_3  = 62,
+        GGML_TYPE_EXL3_4  = 63,
+        GGML_TYPE_EXL3_5  = 64,
+        GGML_TYPE_EXL3_6  = 65,
+        GGML_TYPE_EXL3_7  = 66,
+        GGML_TYPE_EXL3_8  = 67,
+        GGML_TYPE_COUNT   = 68,
     };
 
     // Serialized auxiliary for GGML_TYPE_BNB_{NF4,FP4}. Offsets are from the

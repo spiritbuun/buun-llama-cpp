@@ -283,6 +283,8 @@ bool llama_safetensors_quant_adapters::format_applies(
             const auto * weight = registry_.find(module + ".weight");
             return weight != nullptr && weight->dtype == llama_safetensors_dtype::F8_E4M3;
         }
+        case llama_safetensors_quant_format::EXL3:
+            return registry_.find(module + ".trellis") != nullptr;
         case llama_safetensors_quant_format::AWQ_GROUP:
         case llama_safetensors_quant_format::GPTQ_GROUP:
             return registry_.find(module + ".qweight") != nullptr;
@@ -637,6 +639,37 @@ std::optional<llama_safetensors_quant_binding> llama_safetensors_quant_adapters:
         return result;
     }
 
+    if (group->format == llama_safetensors_quant_format::EXL3) {
+        const auto & trellis = require_tensor(registry_, module + ".trellis");
+        if (trellis.shape.size() != 3 || trellis.dtype != llama_safetensors_dtype::I16 ||
+                trellis.shape[2] % 16 != 0 || trellis.shape[2] / 16 < 1 || trellis.shape[2] / 16 > 8 ||
+                (trellis.shape[0] * 16) % 128 != 0 || (trellis.shape[1] * 16) % 128 != 0) {
+            throw std::runtime_error("unsupported EXL3 trellis geometry for '" + module + "'");
+        }
+        if (registry_.find(module + ".mcg") != nullptr || registry_.find(module + ".mul1") == nullptr) {
+            throw std::runtime_error("EXL3 module '" + module + "' does not use the mul1 codebook");
+        }
+        const int64_t k = int64_t(trellis.shape[0]) * 16;
+        const int64_t n = int64_t(trellis.shape[1]) * 16;
+        const int bits  = int(trellis.shape[2] / 16);
+        if (role == llama_safetensors_quant_role::WEIGHT) {
+            result.primary         = module + ".trellis";
+            result.target_type     = ggml_type(int(GGML_TYPE_EXL3_1) + bits - 1);
+            result.target_shape    = { k, n };
+            result.materialization = llama_safetensors_quant_materialization::EXL3_REPACK;
+            return result;
+        }
+        const bool input = role == llama_safetensors_quant_role::INPUT_SCALE;
+        result.primary      = module + (input ? ".suh" : ".svh");
+        const auto & vec    = require_tensor(registry_, result.primary);
+        if (vec.dtype != llama_safetensors_dtype::F16 || vec.shape.size() != 1 ||
+                int64_t(vec.shape[0]) != (input ? k : n)) {
+            throw std::runtime_error("invalid EXL3 sign vector '" + result.primary + "'");
+        }
+        result.target_type  = GGML_TYPE_F16;
+        result.target_shape = { input ? k : n };
+        return result;
+    }
     if (group->format == llama_safetensors_quant_format::AWQ_GROUP) {
         if (role != llama_safetensors_quant_role::WEIGHT) {
             return std::nullopt;
@@ -932,7 +965,7 @@ uint32_t llama_safetensors_quant_adapters::file_type() const {
         return LLAMA_FTYPE_ALL_F32;
     }
     if (summary_.awq + summary_.quark_w4a16 + summary_.gptq + summary_.quanto_int4 + summary_.torchao_int4 +
-            summary_.hqq_int4 + summary_.bnb_nf4 + summary_.bnb_fp4 +
+            summary_.hqq_int4 + summary_.bnb_nf4 + summary_.bnb_fp4 + summary_.exl3 +
             summary_.packed_int4 + summary_.w4a8 + summary_.w4a8_fp8 != 0) {
         return LLAMA_FTYPE_MOSTLY_Q4_1;
     }
@@ -1043,6 +1076,14 @@ void llama_safetensors_quant_adapters::validate() {
             } else {
                 throw std::runtime_error("quantization contract does not match source tensor '" + tensor.name + "'");
             }
+        } else if (ends_with(tensor.name, ".trellis")) {
+            module = tensor.name.substr(0, tensor.name.size() - std::string_view(".trellis").size());
+            const llama_safetensors_quant_group * group = match(module);
+            if (group == nullptr || group->format != llama_safetensors_quant_format::EXL3) {
+                throw std::runtime_error("quantization contract does not match source tensor '" + tensor.name + "'");
+            }
+            expected = group->format;
+            ++summary_.exl3;
         } else if (ends_with(tensor.name, ".qweight")) {
             module = tensor.name.substr(0, tensor.name.size() - std::string_view(".qweight").size());
             const llama_safetensors_quant_group * group = match(module);
@@ -1667,6 +1708,20 @@ void llama_safetensors_quant_adapters::validate() {
             if (!source_scale_valid) {
                 throw std::runtime_error("invalid 128x128 block-scale contract for source tensor '" + tensor.name + "'");
             }
+        } else if (expected == llama_safetensors_quant_format::EXL3) {
+            const std::string suh_name = module + ".suh";
+            const std::string svh_name = module + ".svh";
+            const auto & suh = require_tensor(registry_, suh_name);
+            const auto & svh = require_tensor(registry_, svh_name);
+            require_tensor(registry_, module + ".mul1");
+            dependencies_[tensor.name] = { suh_name, svh_name };
+            if (tensor.dtype != llama_safetensors_dtype::I16 || tensor.shape.size() != 3 ||
+                tensor.shape[2] % 16 != 0 || tensor.shape[2] < 16 || tensor.shape[2] > 128 ||
+                suh.dtype != llama_safetensors_dtype::F16 || svh.dtype != llama_safetensors_dtype::F16 ||
+                suh.shape != std::vector<uint64_t>({ tensor.shape[0] * 16 }) ||
+                svh.shape != std::vector<uint64_t>({ tensor.shape[1] * 16 })) {
+                throw std::runtime_error("invalid EXL3 trellis contract for source tensor '" + tensor.name + "'");
+            }
         } else {
             const std::string scale_name = module + ".weight_scale";
             const auto & scale = require_tensor(registry_, scale_name);
@@ -1695,7 +1750,7 @@ void llama_safetensors_quant_adapters::validate() {
         }
     }
     if (has_quantization_config_ &&
-        summary_.nvfp4 + summary_.mxfp4 + summary_.mxfp8 + summary_.fp8_group + summary_.fp8_tensor + summary_.fp8_channel + summary_.fp8_block + summary_.w8a8 + summary_.w4a8 + summary_.w4a8_fp8 + summary_.awq + summary_.quark_w4a16 + summary_.gptq + summary_.gptq_int8 + summary_.eetq + summary_.quanto_int4 + summary_.quanto_int8 + summary_.quanto_fp8 + summary_.torchao_int4 + summary_.torchao_intx + summary_.hqq_int4 + summary_.bnb_int8 + summary_.bnb_nf4 + summary_.bnb_fp4 +
+        summary_.nvfp4 + summary_.mxfp4 + summary_.mxfp8 + summary_.fp8_group + summary_.fp8_tensor + summary_.fp8_channel + summary_.fp8_block + summary_.w8a8 + summary_.w4a8 + summary_.w4a8_fp8 + summary_.awq + summary_.quark_w4a16 + summary_.gptq + summary_.gptq_int8 + summary_.eetq + summary_.quanto_int4 + summary_.quanto_int8 + summary_.quanto_fp8 + summary_.torchao_int4 + summary_.torchao_intx + summary_.hqq_int4 + summary_.bnb_int8 + summary_.bnb_nf4 + summary_.bnb_fp4 + summary_.exl3 +
                 summary_.packed_int4 + summary_.packed_int8 == 0) {
         throw std::runtime_error("native safetensors model contains no supported quantized weights");
     }
@@ -3067,6 +3122,22 @@ std::vector<uint8_t> llama_safetensors_quant_adapters::read(
         const source_bytes weight(registry_, primary);
         const source_bytes scale(registry_, auxiliary);
         return repack_mxfp4(primary, weight.data(), auxiliary, scale.data());
+    }
+    if (binding.materialization == llama_safetensors_quant_materialization::EXL3_REPACK) {
+        // [k/16][n/16][tile] -> [n/16][k/16][tile] so each 16-row group is contiguous.
+        const llama_safetensors_tensor & desc = require_tensor(registry_, binding.primary);
+        const source_bytes trellis(registry_, desc);
+        const int64_t k_tiles = desc.shape[0];
+        const int64_t n_tiles = desc.shape[1];
+        const size_t tile_bytes = size_t(desc.shape[2]) * sizeof(uint16_t);
+        std::vector<uint8_t> result(size_t(k_tiles) * n_tiles * tile_bytes);
+        for (int64_t kt = 0; kt < k_tiles; ++kt) {
+            for (int64_t nt = 0; nt < n_tiles; ++nt) {
+                std::memcpy(result.data() + (size_t(nt) * k_tiles + kt) * tile_bytes,
+                            trellis.data() + (size_t(kt) * n_tiles + nt) * tile_bytes, tile_bytes);
+            }
+        }
+        return result;
     }
     if (binding.materialization == llama_safetensors_quant_materialization::AWQ_REPACK) {
         const llama_safetensors_tensor & qzeros_desc = require_tensor(registry_, binding.auxiliaries.at(0));

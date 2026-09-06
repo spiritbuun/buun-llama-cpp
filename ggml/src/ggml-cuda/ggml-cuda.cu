@@ -34,6 +34,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/exl3.cuh"
 #include "ggml-cuda/mmvq-post-silu-match.h"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -2527,6 +2528,11 @@ __global__ void dequantize_quanto_f8_bf16(
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
+
+    if (ggml_cuda_is_exl3(src0->type)) {
+        ggml_cuda_mul_mat_exl3(ctx, src0, src1, dst);
+        return;
+    }
 
     if (src0->type == GGML_TYPE_BNB_NF4 || src0->type == GGML_TYPE_BNB_FP4) {
         GGML_ASSERT(ggml_cuda_mul_mat_bnb4(ctx, src0, src1, dst));
@@ -5253,6 +5259,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+    // EXL3 projections have their own executor (Hadamard + trellis gemv); no matcher applies.
+    if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) &&
+            node->src[0] != nullptr && ggml_cuda_is_exl3(node->src[0]->type)) {
+        return 0;
+    }
     // No matcher below may read a private Marlin layout as canonical blocks;
     // only the gate/up/GLU and residual + RMS-norm matchers, which dispatch
     // to the Marlin executors, may see a repacked weight.
@@ -7867,6 +7878,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             {
                 struct ggml_tensor * a = op->src[0];
                 struct ggml_tensor * b = op->src[1];
+                if (ggml_cuda_is_exl3(a->type)) {
+                    return op->op == GGML_OP_MUL_MAT && ggml_cuda_exl3_supports_mul_mat(op);
+                }
                 if (op->op == GGML_OP_MUL_MAT && op->src[3] != nullptr) {
 #if defined(GGML_USE_HIP)
                     return false;

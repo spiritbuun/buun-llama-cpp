@@ -1156,6 +1156,14 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_NVFP4:   ftype = LLAMA_FTYPE_MOSTLY_NVFP4;   break;
             case GGML_TYPE_F8_E4M3: ftype = LLAMA_FTYPE_MOSTLY_F8_E4M3; break;
             case GGML_TYPE_Q4_A32:   ftype = LLAMA_FTYPE_MOSTLY_Q4_1;    break;
+            case GGML_TYPE_EXL3_1:
+            case GGML_TYPE_EXL3_2:   ftype = LLAMA_FTYPE_MOSTLY_Q2_0;    break;
+            case GGML_TYPE_EXL3_3:
+            case GGML_TYPE_EXL3_4:   ftype = LLAMA_FTYPE_MOSTLY_Q4_1;    break;
+            case GGML_TYPE_EXL3_5:
+            case GGML_TYPE_EXL3_6:
+            case GGML_TYPE_EXL3_7:
+            case GGML_TYPE_EXL3_8:   ftype = LLAMA_FTYPE_MOSTLY_Q8_0;    break;
             case GGML_TYPE_Q8_0_G128: ftype = LLAMA_FTYPE_MOSTLY_Q8_0;   break;
             case GGML_TYPE_Q1_0:    ftype = LLAMA_FTYPE_MOSTLY_Q1_0;    break;
             case GGML_TYPE_Q2_0:        ftype = LLAMA_FTYPE_MOSTLY_Q2_0;    break;

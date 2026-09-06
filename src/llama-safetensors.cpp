@@ -768,6 +768,20 @@ llama_safetensors_quant_config llama_safetensors_quant_config::from_json(const l
         return result;
     }
 
+    if (quant_method == "exl3") {
+        // exllamav3 trellis weights: per-module trellis/suh/svh tensors, codebook fixed per model.
+        const std::string codebook = quant.value("codebook", std::string("mul1"));
+        if (codebook != "mul1") {
+            throw std::runtime_error("unsupported EXL3 codebook '" + codebook + "' (only mul1 is implemented)");
+        }
+        llama_safetensors_quant_group group;
+        group.name   = "exl3";
+        group.format = llama_safetensors_quant_format::EXL3;
+        result.groups_.push_back(std::move(group));
+        result.rules_.push_back(make_rule("re:.*", 0));
+        return result;
+    }
+
     if (quant_method == "gptq" || quant_method == "auto-round") {
         const bool autoround = quant_method == "auto-round";
         const int64_t group_size = require_json_value(quant, "group_size", "quantization_config").get<int64_t>();

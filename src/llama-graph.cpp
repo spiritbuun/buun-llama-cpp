@@ -1886,8 +1886,10 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         const bool i4_scale = w->type == GGML_TYPE_Q4_A32 &&
             (in_s->type == GGML_TYPE_F32 || in_s->type == GGML_TYPE_I32 || in_s->type == GGML_TYPE_I16);
         const bool mxfp4_scale = w->type == GGML_TYPE_MXFP4 && in_s->type == GGML_TYPE_I32;
-        if ((!fp8_scale && !i8_scale && !i4_scale && !mxfp4_scale) ||
-            ggml_nelements(in_s) != 1) {
+        const bool exl3_signs = w->type >= GGML_TYPE_EXL3_1 && w->type <= GGML_TYPE_EXL3_8 &&
+            in_s->type == GGML_TYPE_F16 && ggml_nelements(in_s) == w->ne[0];
+        if (!exl3_signs && ((!fp8_scale && !i8_scale && !i4_scale && !mxfp4_scale) ||
+            ggml_nelements(in_s) != 1)) {
             throw std::runtime_error(format(
                 "unsupported static activation scale '%s' for weight '%s'", in_s->name, w->name));
         }
@@ -1907,11 +1909,13 @@ ggml_tensor * llm_graph_context::build_lora_mm(
             ggml_nelements(w_s) == 1;
         const bool w8a16_scale = w->type == GGML_TYPE_I8 && w_s->type == GGML_TYPE_I8 &&
             w_s->ne[0] >= static_cast<int64_t>(sizeof(ggml_w8a16_scale_header));
+        const bool exl3_scale = w->type >= GGML_TYPE_EXL3_1 && w->type <= GGML_TYPE_EXL3_8 &&
+            w_s->type == GGML_TYPE_F16 && ggml_nelements(w_s) == w->ne[1];
         if ((w->type == GGML_TYPE_F8_E4M3 &&
              (w_s->type == GGML_TYPE_F32 || w_s->type == GGML_TYPE_I8 || fp8_group_scale)) ||
             (w->type == GGML_TYPE_I8 &&
              (w_s->type == GGML_TYPE_F32 || w_s->type == GGML_TYPE_F16 || w_s->type == GGML_TYPE_BF16)) ||
-            bnb_scale || gptq_ao_scale || quanto_w4a16 || w8a16_scale) {
+            bnb_scale || gptq_ao_scale || quanto_w4a16 || w8a16_scale || exl3_scale) {
             // A 128x128 FP8 block scale participates inside the dot-product and
             // INT8's per-token activation scale also participates inside the
             // dot-product. Keep either contract as an explicit third MUL_MAT
@@ -2147,6 +2151,8 @@ ggml_tensor * llm_graph_context::build_ffn(
              ((weight->type == GGML_TYPE_BNB_NF4 || weight->type == GGML_TYPE_BNB_FP4) &&
               scale->type == GGML_TYPE_I8) ||
              (weight->type == GGML_TYPE_GPTQ_AO && scale->type == GGML_TYPE_I8) ||
+             (weight->type >= GGML_TYPE_EXL3_1 && weight->type <= GGML_TYPE_EXL3_8 &&
+              scale->type == GGML_TYPE_F16) ||
              (weight->type == GGML_TYPE_Q4_1 && scale->type == GGML_TYPE_I8 &&
               ggml_nelements(scale) == 1));
     };

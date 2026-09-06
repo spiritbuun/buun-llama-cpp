@@ -93,6 +93,7 @@ enum class llama_safetensors_quant_format {
     BNB_FP4,
     PACKED_INT,
     PACKED_INT4_FP8,
+    EXL3,
 };
 
 struct llama_safetensors_quant_group {

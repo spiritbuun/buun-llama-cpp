@@ -133,6 +133,11 @@ source_spec quantized_or_plain(
     return { plain_name, std::move(transforms), std::nullopt };
 }
 
+bool quant_is_exl3(const llama_safetensors_quant_adapters & quant, const std::string & module) {
+    const auto binding = quant.bind(module, llama_safetensors_quant_role::WEIGHT);
+    return binding && binding->materialization == llama_safetensors_quant_materialization::EXL3_REPACK;
+}
+
 bool fuse_qkv_enabled() {
     static const bool enabled = [] {
         const char * value = std::getenv("LLAMA_SAFETENSORS_FUSE_QKV");
@@ -336,7 +341,8 @@ source_spec map_target_unchecked(
         const std::string module = prefix + "self_attn.qkv_proj";
         source_spec fused = quantized_or_plain(
             quant, module, llama_safetensors_quant_role::WEIGHT, {}, module + ".weight");
-        if (fuse_qkv_enabled()) {
+        // EXL3 modules each carry their own input sign vector, so they cannot share one projection.
+        if (fuse_qkv_enabled() && !quant_is_exl3(quant, prefix + "self_attn.q_proj")) {
             for (const char * part : { "attn_q.weight", "attn_k.weight", "attn_v.weight" }) {
                 fused.part_targets.push_back("blk." + std::to_string(layer) + "." + part);
             }
@@ -344,7 +350,8 @@ source_spec map_target_unchecked(
         return fused;
     }
 
-    if (is_recurrent_layer(layer, geometry) && suffix == "attn_qkv.weight" && fuse_qkvz_enabled()) {
+    if (is_recurrent_layer(layer, geometry) && suffix == "attn_qkv.weight" && fuse_qkvz_enabled() &&
+            !quant_is_exl3(quant, prefix + "linear_attn.in_proj_qkv")) {
         // Recurrent layers: serve qkv|z as one projection; the graph splits it
         // by views.  The parts carry their own row transforms.
         llama_safetensors_source_name source {
@@ -413,6 +420,11 @@ source_spec map_target_unchecked(
                 transforms.push_back(name.transform);
             }
             source_spec result = bind_source_name(quant, std::move(source), std::move(transforms));
+            if (suffix == "ssm_out.input_scale" && result.quant &&
+                result.quant->target_shape.size() == 1 && result.quant->target_shape[0] > 1) {
+                // EXL3 input sign vector: permute its elements like the projection's columns
+                result.transforms.push_back(transform_kind::V_ROWS);
+            }
             if (suffix == "ssm_out.scale" && result.quant &&
                 (result.quant->materialization == llama_safetensors_quant_materialization::FP8_BLOCK_SCALE ||
                  result.quant->materialization == llama_safetensors_quant_materialization::BNB_SCALE_BUNDLE)) {
@@ -423,9 +435,17 @@ source_spec map_target_unchecked(
     }
 
     if (static_cast<uint32_t>(layer) >= geometry.n_layer) {
-        const std::array<std::pair<std::string_view, std::string_view>, 4> mtp = {
+        if (suffix == "nextn.eh_proj.weight") {
+            return quantized_or_plain(quant, "mtp.fc", llama_safetensors_quant_role::WEIGHT, {}, "mtp.fc.weight");
+        }
+        if (suffix == "nextn.eh_proj.scale") {
+            return quantized_or_plain(quant, "mtp.fc", llama_safetensors_quant_role::WEIGHT_SCALE, {}, "mtp.fc.weight_scale");
+        }
+        if (suffix == "nextn.eh_proj.input_scale") {
+            return quantized_or_plain(quant, "mtp.fc", llama_safetensors_quant_role::INPUT_SCALE, {}, "mtp.fc.input_scale");
+        }
+        const std::array<std::pair<std::string_view, std::string_view>, 3> mtp = {
             {
-             { "nextn.eh_proj.weight", "mtp.fc.weight" },
              { "nextn.enorm.weight", "mtp.pre_fc_norm_embedding.weight" },
              { "nextn.hnorm.weight", "mtp.pre_fc_norm_hidden.weight" },
              { "nextn.shared_head_norm.weight", "mtp.norm.weight" },
@@ -433,12 +453,7 @@ source_spec map_target_unchecked(
         };
         for (const auto & [target, source] : mtp) {
             if (suffix == target) {
-                const bool offset_norm = suffix != "nextn.eh_proj.weight";
-                std::vector<transform_kind> transforms;
-                if (offset_norm) {
-                    transforms.push_back(transform_kind::OFFSET_NORM);
-                }
-                return { std::string(source), std::move(transforms), std::nullopt };
+                return { std::string(source), { transform_kind::OFFSET_NORM }, std::nullopt };
             }
         }
     }
@@ -776,6 +791,60 @@ std::vector<uint8_t> apply_quantized_layout_transform(
     }
     const size_t cols = shape[0];
     const size_t rows = shape[1];
+    if (type >= GGML_TYPE_EXL3_1 && type <= GGML_TYPE_EXL3_8) {
+        // EXL3 tile stream [n/16][k/16][tile]: permute whole 16-row (n) tile groups, or the
+        // 16-column (k) tiles inside every group.  Head blocks are 128 wide, so both are tile aligned.
+        const size_t tile_bytes = ggml_type_size(type);
+        const size_t k_tiles = cols / 16;
+        const size_t n_tiles = rows / 16;
+        if (cols % 16 != 0 || rows % 16 != 0 || source.size() != k_tiles * n_tiles * tile_bytes) {
+            throw std::runtime_error("EXL3 Qwen layout transform has an inconsistent tile shape");
+        }
+        const auto tile_permutation = [&](const std::vector<size_t> & elements, size_t prefix) {
+            if (elements.size() % 16 != 0 || prefix % 16 != 0) {
+                throw std::runtime_error("EXL3 Qwen layout transform is not tile aligned");
+            }
+            std::vector<size_t> tiles(elements.size() / 16);
+            for (size_t dst = 0; dst < tiles.size(); ++dst) {
+                const size_t src = elements[dst * 16];
+                if (src % 16 != 0) {
+                    throw std::runtime_error("EXL3 Qwen layout transform splits a tile");
+                }
+                for (size_t lane = 1; lane < 16; ++lane) {
+                    if (elements[dst * 16 + lane] != src + lane) {
+                        throw std::runtime_error("EXL3 Qwen layout transform splits a tile");
+                    }
+                }
+                tiles[dst] = src / 16;
+            }
+            return tiles;
+        };
+        switch (transform) {
+            case transform_kind::QKV_ROWS:
+            case transform_kind::CONV_ROWS: {
+                const size_t qk_rows = 2 * geometry.n_key_heads * geometry.key_head_dim;
+                return permute_rows(source, k_tiles * tile_bytes, qk_rows / 16,
+                    tile_permutation(v_head_row_permutation(geometry, geometry.value_head_dim), qk_rows));
+            }
+            case transform_kind::V_ROWS:
+                return permute_rows(source, k_tiles * tile_bytes, 0,
+                    tile_permutation(v_head_row_permutation(geometry, geometry.value_head_dim), 0));
+            case transform_kind::V_COLUMNS: {
+                const std::vector<size_t> tiles =
+                    tile_permutation(v_head_row_permutation(geometry, geometry.value_head_dim), 0);
+                if (tiles.size() != k_tiles) {
+                    throw std::runtime_error("EXL3 value-column permutation shape mismatch");
+                }
+                return permute_columns(source, n_tiles, k_tiles, tile_bytes, tiles);
+            }
+            case transform_kind::HEAD_ROWS:
+            case transform_kind::NONE:
+            case transform_kind::OFFSET_NORM:
+            case transform_kind::A_LOG:
+                break;
+        }
+        throw std::runtime_error("unsupported EXL3 Qwen layout transform");
+    }
     const size_t block_width = ggml_blck_size(type);
     const size_t block_size = ggml_type_size(type);
     if (block_width == 0 || cols % block_width != 0 ||
@@ -1502,6 +1571,7 @@ std::vector<uint8_t> llama_safetensors_qwen35_importer::materialize(const std::s
             spec.quant->materialization == llama_safetensors_quant_materialization::BNB_SCALE_BUNDLE;
         const bool canonical_quant_blocks = spec.quant &&
             (spec.quant->materialization == llama_safetensors_quant_materialization::AWQ_REPACK ||
+             spec.quant->materialization == llama_safetensors_quant_materialization::EXL3_REPACK ||
              spec.quant->materialization == llama_safetensors_quant_materialization::GPTQ_REPACK ||
              spec.quant->materialization == llama_safetensors_quant_materialization::PACKED_INT4_REPACK ||
              spec.quant->materialization == llama_safetensors_quant_materialization::PACKED_INT8_REPACK ||

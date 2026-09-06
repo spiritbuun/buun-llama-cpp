@@ -619,6 +619,12 @@ void dequantize_row_q4_1(const block_q4_1 * GGML_RESTRICT x, float * GGML_RESTRI
     }
 }
 
+// EXL3 tiles span 16 rows; a single row cannot be decoded from its own bytes.
+void dequantize_row_exl3(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    GGML_UNUSED(x); GGML_UNUSED(y); GGML_UNUSED(k);
+    GGML_ABORT("EXL3 weights are only served by the CUDA backend");
+}
+
 void dequantize_row_q4_a32(const block_q4_a32 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     GGML_ASSERT(k % QK4_A32 == 0);
 

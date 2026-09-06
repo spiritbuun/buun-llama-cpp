@@ -39,6 +39,7 @@ struct llama_safetensors_quant_summary {
     size_t packed_int4  = 0;
     size_t packed_int8  = 0;
     size_t w4a8_fp8     = 0;
+    size_t exl3         = 0;
 };
 
 enum class llama_safetensors_quant_role {
@@ -52,6 +53,7 @@ enum class llama_safetensors_quant_materialization {
     NVFP4_REPACK,
     MXFP4_REPACK,
     AWQ_REPACK,
+    EXL3_REPACK,
     QUARK_W4A16_REPACK,
     GPTQ_REPACK,
     GPTQ8_REPACK,
