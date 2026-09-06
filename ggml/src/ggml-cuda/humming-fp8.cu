@@ -372,6 +372,46 @@ __global__ void residual_rms_prepare_cached(
     }
 }
 
+__global__ void residual_rms_prepare_pairs_5120(
+        const nv_bfloat162 * src, const float2 * residual, const float2 * norm_weight,
+        float2 * residual_out, float2 * norm_out, nv_bfloat162 * norm_bf16, int ncols, float eps) {
+    const int tid = threadIdx.x;
+    float2 values[5];
+    float2 sums = make_float2(0.0f, 0.0f);
+#pragma unroll
+    for (int j = 0; j < 5; ++j) {
+        const int col = tid + j * 512;
+        float2 value = __bfloat1622float2(src[col]);
+        const float2 r = residual[col];
+        value.x += r.x;
+        value.y += r.y;
+        residual_out[col] = value;
+        sums.x += value.x * value.x;
+        sums.y += value.y * value.y;
+        values[j] = value;
+    }
+    // Each lane owns two adjacent lanes of the original 1024-thread tree.
+    // Preserve its XOR16/8/4/2/1 order: reduce parity groups, then join them.
+    sums = warp_reduce_sum<16>(sums);
+    extern __shared__ float s_sum[];
+    if (tid % 16 == 0) {
+        s_sum[tid / 16] = sums.x + sums.y;
+    }
+    __syncthreads();
+    const float sum = warp_reduce_sum(s_sum[tid % 32]);
+    const float scale = rsqrtf(sum / ncols + eps);
+#pragma unroll
+    for (int j = 0; j < 5; ++j) {
+        const int col = tid + j * 512;
+        const float2 w = norm_weight[col];
+        const float2 value = make_float2(values[j].x * scale * w.x, values[j].y * scale * w.y);
+        if (norm_out != nullptr) {
+            norm_out[col] = value;
+        }
+        norm_bf16[col] = __float22bfloat162_rn(value);
+    }
+}
+
 } // namespace
 
 bool ggml_cuda_humming_fp8_enabled() {
@@ -623,7 +663,14 @@ void ggml_cuda_humming_residual_rms_prepare(
         const char * value = std::getenv("GGML_CUDA_HUMMING_RMS_BLOCK");
         return value ? std::atoi(value) : 1024;
     }();
-    if (requested_block == 1024 && ncols == 5120) {
+    const bool pair_aligned = ((uintptr_t(src) | uintptr_t(norm_bf16)) % 4 == 0) &&
+        ((uintptr_t(residual) | uintptr_t(norm_weight) | uintptr_t(residual_out) | uintptr_t(norm_out)) % 8 == 0);
+    if (requested_block == 1024 && nrows == 1 && ncols == 5120 && pair_aligned) {
+        residual_rms_prepare_pairs_5120<<<1, 512, 32 * sizeof(float), stream>>>(
+            reinterpret_cast<const nv_bfloat162 *>(src), reinterpret_cast<const float2 *>(residual),
+            reinterpret_cast<const float2 *>(norm_weight), reinterpret_cast<float2 *>(residual_out),
+            reinterpret_cast<float2 *>(norm_out), reinterpret_cast<nv_bfloat162 *>(norm_bf16), ncols, eps);
+    } else if (requested_block == 1024 && ncols == 5120) {
         residual_rms_prepare_cached<1024, 5><<<nrows, 1024, 32 * sizeof(float), stream>>>(
             src, residual, norm_weight, residual_out, norm_out, norm_bf16, ncols, eps);
     } else if (requested_block == 1024 && ncols <= 8192) {
