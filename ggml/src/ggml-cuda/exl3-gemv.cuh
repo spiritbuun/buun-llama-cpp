@@ -11,7 +11,6 @@
 
 namespace exl3_gemv {
 
-constexpr int EXL3_CB = 2;         // "mul1" codebook
 constexpr int EXL3_GEMV_MAX_M = 8;
 
 using exl3::FragB;
@@ -41,16 +40,27 @@ __device__ __forceinline__ half2 exl3_decode_pair_cb2(uint32_t x0, uint32_t x1) 
     return __hfma2(__halves2half2(__ushort_as_half(uint16_t(sum0)), __ushort_as_half(uint16_t(sum1))), k_inv, k_bias);
 }
 
+template <int cb>
+__device__ __forceinline__ half2 exl3_decode_pair(uint32_t w0, uint32_t w1) {
+    if constexpr (cb == 2) {
+        return exl3_decode_pair_cb2(w0, w1);
+    } else {
+        return exl3::decode_3inst_2<cb>(w0, w1);
+    }
+}
+
+template <int cb>
 __device__ __forceinline__ void exl3_decode8(uint32_t w0, uint32_t w1, uint32_t w2, uint32_t w3,
         uint32_t w4, uint32_t w5, uint32_t w6, uint32_t w7, FragB & f0, FragB & f1) {
-    f0[0] = exl3_decode_pair_cb2(w0, w1);
-    f0[1] = exl3_decode_pair_cb2(w2, w3);
-    f1[0] = exl3_decode_pair_cb2(w4, w5);
-    f1[1] = exl3_decode_pair_cb2(w6, w7);
+    f0[0] = exl3_decode_pair<cb>(w0, w1);
+    f0[1] = exl3_decode_pair<cb>(w2, w3);
+    f1[0] = exl3_decode_pair<cb>(w4, w5);
+    f1[1] = exl3_decode_pair<cb>(w6, w7);
 }
 
 // Register forms of the aligned window extraction (exl3_gemv_kernel.cuh): each lane resolves its
 // eight 16-bit windows from two already-loaded tile words instead of a shared-memory stage.
+template <int cb>
 __device__ __forceinline__ void exl3_dq8_regs_4bits(uint32_t a, uint32_t b, FragB & f0, FragB & f1) {
     uint32_t s, w0, w1, w2, w3, w4, w5, w6, w7;
     EXL3_FSHF_IMM(s, b, a, 20);
@@ -62,9 +72,10 @@ __device__ __forceinline__ void exl3_dq8_regs_4bits(uint32_t a, uint32_t b, Frag
     w2 = s & 0xffff;
     EXL3_BFE16_IMM(w1, s, 4);
     EXL3_BFE16_IMM(w0, s, 8);
-    exl3_decode8(w0, w1, w2, w3, w4, w5, w6, w7, f0, f1);
+    exl3_decode8<cb>(w0, w1, w2, w3, w4, w5, w6, w7, f0, f1);
 }
 
+template <int cb>
 __device__ __forceinline__ void exl3_dq8_regs_2bits(uint32_t a, uint32_t b, int t_offset, FragB & f0, FragB & f1) {
     uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
     b = exl3::fshift(b, a, ((~t_offset) & 8) << 1);
@@ -76,9 +87,10 @@ __device__ __forceinline__ void exl3_dq8_regs_2bits(uint32_t a, uint32_t b, int 
     EXL3_BFE16_IMM(w2, b, 10);
     EXL3_BFE16_IMM(w1, b, 12);
     EXL3_BFE16_IMM(w0, b, 14);
-    exl3_decode8(w0, w1, w2, w3, w4, w5, w6, w7, f0, f1);
+    exl3_decode8<cb>(w0, w1, w2, w3, w4, w5, w6, w7, f0, f1);
 }
 
+template <int cb>
 __device__ __forceinline__ void exl3_dq8_regs_3bits(uint32_t a, uint32_t b, int s2, FragB & f0, FragB & f1) {
     uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
     w7 = exl3::fshift(b, a, s2);
@@ -89,15 +101,15 @@ __device__ __forceinline__ void exl3_dq8_regs_3bits(uint32_t a, uint32_t b, int 
     w2 = w3 >> 3;
     w1 = w2 >> 3;
     w0 = w1 >> 3;
-    exl3_decode8(w0 & 0xffff, w1 & 0xffff, w2 & 0xffff, w3 & 0xffff,
-                 w4 & 0xffff, w5 & 0xffff, w6 & 0xffff, w7 & 0xffff, f0, f1);
+    exl3_decode8<cb>(w0 & 0xffff, w1 & 0xffff, w2 & 0xffff, w3 & 0xffff,
+                     w4 & 0xffff, w5 & 0xffff, w6 & 0xffff, w7 & 0xffff, f0, f1);
 }
 
 // A: xh [m][k] F16; B: tile stream (n-tile-major); C: y_inner [m][n] F32.
 // 256 threads = 8 warps splitting k; each warp covers 4 adjacent n tiles (64 columns).
 // 2/3/4 bpw stream the tile words straight to registers behind a prefetch ring and resolve the
 // windows with lane shuffles; other widths stage each tile through warp-private shared memory.
-template <int bits, int WK, int WNT, int PF, bool VEC4>
+template <int bits, int cb, int WK, int WNT, int PF, bool VEC4>
 __global__ void __launch_bounds__(WK * 32) exl3_gemv_kernel(const half * __restrict__ A, const uint8_t * __restrict__ B,
         float * __restrict__ C, int size_m, int size_k, int size_n) {
     static_assert(!VEC4 || bits == 4, "VEC4 layout is 4 bpw only");
@@ -267,20 +279,20 @@ __global__ void __launch_bounds__(WK * 32) exl3_gemv_kernel(const half * __restr
                     FragB f0, f1;
                     if constexpr (bits == 4) {
                         const uint32_t aw = __shfl_sync(0xffffffffu, bw[t], (lane + 31) & 31);
-                        exl3_dq8_regs_4bits(aw, bw[t], f0, f1);
+                        exl3_dq8_regs_4bits<cb>(aw, bw[t], f0, f1);
                     } else if constexpr (bits == 2) {
                         // two tiles per loaded word group: tile t lives in lanes (t&1)*16 .. +15
                         const uint32_t w = bw[t >> 1];
                         const int base = (t & 1) << 4;
                         const uint32_t bwv = __shfl_sync(0xffffffffu, w, base + x_src_b);
                         const uint32_t awv = __shfl_sync(0xffffffffu, w, base + x_src_a);
-                        exl3_dq8_regs_2bits(awv, bwv, lane << 3, f0, f1);
+                        exl3_dq8_regs_2bits<cb>(awv, bwv, lane << 3, f0, f1);
                     } else if constexpr (bits == 3) {
                         const uint32_t awv = __shfl_sync(0xffffffffu, bw[t], x_src_a);
                         const uint32_t bwv = __shfl_sync(0xffffffffu, bw[t], x_src_b);
-                        exl3_dq8_regs_3bits(awv, bwv, x_s2, f0, f1);
+                        exl3_dq8_regs_3bits<cb>(awv, bwv, x_s2, f0, f1);
                     } else {
-                        exl3::dq_dispatch<bits, EXL3_CB>(&sh_stage[warp][t * TWORDS], lane * 8, f0, f1);
+                        exl3::dq_dispatch<bits, cb>(&sh_stage[warp][t * TWORDS], lane * 8, f0, f1);
                     }
                     exl3_mma_ab_h(a01, a23, f0, ch[t][0]);
                     exl3_mma_ab_h(a01, a23, f1, ch[t][1]);

@@ -1886,7 +1886,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         const bool i4_scale = w->type == GGML_TYPE_Q4_A32 &&
             (in_s->type == GGML_TYPE_F32 || in_s->type == GGML_TYPE_I32 || in_s->type == GGML_TYPE_I16);
         const bool mxfp4_scale = w->type == GGML_TYPE_MXFP4 && in_s->type == GGML_TYPE_I32;
-        const bool exl3_signs = w->type >= GGML_TYPE_EXL3_1 && w->type <= GGML_TYPE_EXL3_8 &&
+        const bool exl3_signs = ggml_type_is_exl3(w->type) &&
             in_s->type == GGML_TYPE_F16 && ggml_nelements(in_s) == w->ne[0];
         if (!exl3_signs && ((!fp8_scale && !i8_scale && !i4_scale && !mxfp4_scale) ||
             ggml_nelements(in_s) != 1)) {
@@ -1909,7 +1909,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
             ggml_nelements(w_s) == 1;
         const bool w8a16_scale = w->type == GGML_TYPE_I8 && w_s->type == GGML_TYPE_I8 &&
             w_s->ne[0] >= static_cast<int64_t>(sizeof(ggml_w8a16_scale_header));
-        const bool exl3_scale = w->type >= GGML_TYPE_EXL3_1 && w->type <= GGML_TYPE_EXL3_8 &&
+        const bool exl3_scale = ggml_type_is_exl3(w->type) &&
             w_s->type == GGML_TYPE_F16 && ggml_nelements(w_s) == w->ne[1];
         if ((w->type == GGML_TYPE_F8_E4M3 &&
              (w_s->type == GGML_TYPE_F32 || w_s->type == GGML_TYPE_I8 || fp8_group_scale)) ||
@@ -1951,8 +1951,19 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w,   // ggml_tensor * as
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
-          ggml_tensor * w_s) const {
+          ggml_tensor * w_s,
+          ggml_tensor * w_in_s) const {
     ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+
+    if (ggml_type_is_exl3(w->type)) {
+        // EXL3 experts: per-expert output scales (svh, F16 [n, n_expert]) and input signs
+        // (suh, F16 [k, n_expert]) ride on the op as src[3] / src[4]; the executor applies them.
+        GGML_ASSERT(w_s && w_s->type == GGML_TYPE_F16 && w_s->ne[0] == w->ne[1] && w_s->ne[1] == w->ne[2]);
+        GGML_ASSERT(w_in_s && w_in_s->type == GGML_TYPE_F16 && w_in_s->ne[0] == w->ne[0] && w_in_s->ne[1] == w->ne[2]);
+        res->src[3] = w_s;
+        res->src[4] = w_in_s;
+        w_s = nullptr;
+    }
 
     if (w_s) {
         const int64_t n_expert = w_s->ne[0];
@@ -2151,7 +2162,7 @@ ggml_tensor * llm_graph_context::build_ffn(
              ((weight->type == GGML_TYPE_BNB_NF4 || weight->type == GGML_TYPE_BNB_FP4) &&
               scale->type == GGML_TYPE_I8) ||
              (weight->type == GGML_TYPE_GPTQ_AO && scale->type == GGML_TYPE_I8) ||
-             (weight->type >= GGML_TYPE_EXL3_1 && weight->type <= GGML_TYPE_EXL3_8 &&
+             (ggml_type_is_exl3(weight->type) &&
               scale->type == GGML_TYPE_F16) ||
              (weight->type == GGML_TYPE_Q4_1 && scale->type == GGML_TYPE_I8 &&
               ggml_nelements(scale) == 1));
@@ -2346,7 +2357,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         ggml_tensor * up_exps_in_s,
+         ggml_tensor * gate_exps_in_s,
+         ggml_tensor * down_exps_in_s) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -2367,7 +2381,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         up_exps_s,
         gate_exps_s,
         down_exps_s,
-        selected_experts_in
+        selected_experts_in,
+        up_exps_in_s,
+        gate_exps_in_s,
+        down_exps_in_s
     );
 }
 
@@ -2395,7 +2412,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         ggml_tensor * up_exps_in_s,
+         ggml_tensor * gate_exps_in_s,
+         ggml_tensor * down_exps_in_s) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -2549,7 +2569,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
+        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s, up_exps_in_s); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
 
         if (up_exps_s) {
@@ -2568,7 +2588,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
+        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s, up_exps_in_s); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_s) {
@@ -2581,7 +2601,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
+            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s, gate_exps_in_s); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
@@ -2686,7 +2706,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s, down_exps_in_s); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
 
     if (down_exps_s) {

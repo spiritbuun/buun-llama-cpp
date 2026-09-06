@@ -465,8 +465,43 @@ extern "C" {
         GGML_TYPE_EXL3_6  = 65,
         GGML_TYPE_EXL3_7  = 66,
         GGML_TYPE_EXL3_8  = 67,
-        GGML_TYPE_COUNT   = 68,
+        // same tiles with the "mcg" codebook (exllamav3 < 0.0.x checkpoints) ...
+        GGML_TYPE_EXL3M_1 = 68,
+        GGML_TYPE_EXL3M_2 = 69,
+        GGML_TYPE_EXL3M_3 = 70,
+        GGML_TYPE_EXL3M_4 = 71,
+        GGML_TYPE_EXL3M_5 = 72,
+        GGML_TYPE_EXL3M_6 = 73,
+        GGML_TYPE_EXL3M_7 = 74,
+        GGML_TYPE_EXL3M_8 = 75,
+        // ... and the original "3inst" codebook
+        GGML_TYPE_EXL3T_1 = 76,
+        GGML_TYPE_EXL3T_2 = 77,
+        GGML_TYPE_EXL3T_3 = 78,
+        GGML_TYPE_EXL3T_4 = 79,
+        GGML_TYPE_EXL3T_5 = 80,
+        GGML_TYPE_EXL3T_6 = 81,
+        GGML_TYPE_EXL3T_7 = 82,
+        GGML_TYPE_EXL3T_8 = 83,
+        GGML_TYPE_COUNT   = 84,
     };
+
+    // EXL3 helpers: the type encodes the bit width and the codebook.
+    // GGML_TYPE_EXL3_* = mul1 (codebook 2), EXL3M_* = mcg (1), EXL3T_* = 3inst (0)
+    static inline bool ggml_type_is_exl3(enum ggml_type type) {
+        return type >= GGML_TYPE_EXL3_1 && type <= GGML_TYPE_EXL3T_8;
+    }
+    static inline int ggml_exl3_bits(enum ggml_type type) {
+        return ((int) type - (int) GGML_TYPE_EXL3_1) % 8 + 1;
+    }
+    static inline int ggml_exl3_codebook(enum ggml_type type) {
+        const int family = ((int) type - (int) GGML_TYPE_EXL3_1) / 8;
+        return family == 0 ? 2 : family == 1 ? 1 : 0;
+    }
+    static inline enum ggml_type ggml_exl3_type(int bits, int codebook) {
+        const int family = codebook == 2 ? 0 : codebook == 1 ? 1 : 2;
+        return (enum ggml_type) ((int) GGML_TYPE_EXL3_1 + family * 8 + bits - 1);
+    }
 
     // Serialized auxiliary for GGML_TYPE_BNB_{NF4,FP4}. Offsets are from the
     // beginning of this header and keep the checkpoint's optional nested

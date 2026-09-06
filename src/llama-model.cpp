@@ -1651,13 +1651,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             std::array<int64_t, GGML_MAX_DIMS> ne{};
             return ml.get_tensor_info(name.str().c_str(), type, ne) && type == GGML_TYPE_F16 ? ne[0] : 1;
         };
+        // per-expert side tensors: scalar per expert, or an F16 vector per expert (EXL3 svh/suh)
+        const auto expert_side_vec = [&](const LLM_TN_IMPL & name, int64_t n_exp) -> int64_t {
+            ggml_type type = GGML_TYPE_COUNT;
+            std::array<int64_t, GGML_MAX_DIMS> ne{};
+            return ml.get_tensor_info(name.str().c_str(), type, ne) && type == GGML_TYPE_F16 && ne[1] == n_exp ? ne[0] : 0;
+        };
+        const auto create_expert_side = [&](const LLM_TN_IMPL & name, int64_t n_exp) -> ggml_tensor * {
+            const int64_t vec = expert_side_vec(name, n_exp);
+            return vec ? create_tensor(name, {vec, n_exp}, TENSOR_NOT_REQUIRED)
+                       : create_tensor(name, {n_exp}, TENSOR_NOT_REQUIRED);
+        };
         const auto load_weight_scale = [&](const LLM_TN_IMPL & scale_name, ggml_tensor * weight) {
             const std::string scale_tensor_name = scale_name.str();
             const bool f8_scaled = weight->type == GGML_TYPE_F8_E4M3;
             const bool i8_scaled = weight->type == GGML_TYPE_I8;
             const bool bnb_scaled = weight->type == GGML_TYPE_BNB_NF4 || weight->type == GGML_TYPE_BNB_FP4;
             const bool gptq_ao_scaled = weight->type == GGML_TYPE_GPTQ_AO;
-            const bool exl3_scaled = weight->type >= GGML_TYPE_EXL3_1 && weight->type <= GGML_TYPE_EXL3_8;
+            const bool exl3_scaled = ggml_type_is_exl3(weight->type);
             ggml_type scale_type = GGML_TYPE_COUNT;
             std::array<int64_t, GGML_MAX_DIMS> scale_ne{};
             const bool quant_scaled = f8_scaled || i8_scaled || bnb_scaled || gptq_ao_scaled || exl3_scaled;
@@ -1829,13 +1840,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
             // MoE expert weight scales (per-expert, shape {n_expert})
             if (!layer.ffn_gate_exps_s && layer.ffn_gate_exps) {
-                layer.ffn_gate_exps_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                layer.ffn_gate_exps_s = create_expert_side(tn(LLM_TENSOR_FFN_GATE_EXPS, "scale", i), n_expert);
             }
             if (!layer.ffn_down_exps_s && layer.ffn_down_exps) {
-                layer.ffn_down_exps_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                layer.ffn_down_exps_s = create_expert_side(tn(LLM_TENSOR_FFN_DOWN_EXPS, "scale", i), n_expert);
             }
             if (!layer.ffn_up_exps_s && layer.ffn_up_exps) {
-                layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                layer.ffn_up_exps_s = create_expert_side(tn(LLM_TENSOR_FFN_UP_EXPS, "scale", i), n_expert);
             }
 
             // recurrent / linear-attention weight scales (per-tensor, shape {1})
@@ -1909,13 +1920,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 layer.ffn_up_in_s = create_tensor(tn(LLM_TENSOR_FFN_UP, "input_scale", i), {input_scale_ne(tn(LLM_TENSOR_FFN_UP, "input_scale", i))}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.ffn_gate_exps_in_s && layer.ffn_gate_exps) {
-                layer.ffn_gate_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                layer.ffn_gate_exps_in_s = create_expert_side(tn(LLM_TENSOR_FFN_GATE_EXPS, "input_scale", i), n_expert);
             }
             if (!layer.ffn_down_exps_in_s && layer.ffn_down_exps) {
-                layer.ffn_down_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                layer.ffn_down_exps_in_s = create_expert_side(tn(LLM_TENSOR_FFN_DOWN_EXPS, "input_scale", i), n_expert);
             }
             if (!layer.ffn_up_exps_in_s && layer.ffn_up_exps) {
-                layer.ffn_up_exps_in_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "input_scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                layer.ffn_up_exps_in_s = create_expert_side(tn(LLM_TENSOR_FFN_UP_EXPS, "input_scale", i), n_expert);
             }
             if (!layer.ffn_gate_shexp_in_s && layer.ffn_gate_shexp) {
                 layer.ffn_gate_shexp_in_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "input_scale", i), {input_scale_ne(tn(LLM_TENSOR_FFN_GATE_SHEXP, "input_scale", i))}, TENSOR_NOT_REQUIRED);
@@ -1948,7 +1959,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // output scales
         if (output && (output->type == GGML_TYPE_NVFP4 || output->type == GGML_TYPE_F8_E4M3 ||
                        output->type == GGML_TYPE_I8 ||
-                       (output->type >= GGML_TYPE_EXL3_1 && output->type <= GGML_TYPE_EXL3_8))) {
+                       ggml_type_is_exl3(output->type))) {
             // weight scale
             if (!output_s) {
                 output_s = load_weight_scale(tn(LLM_TENSOR_OUTPUT, "scale"), output);

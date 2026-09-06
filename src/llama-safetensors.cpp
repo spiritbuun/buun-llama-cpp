@@ -771,8 +771,8 @@ llama_safetensors_quant_config llama_safetensors_quant_config::from_json(const l
     if (quant_method == "exl3") {
         // exllamav3 trellis weights: per-module trellis/suh/svh tensors, codebook fixed per model.
         const std::string codebook = quant.value("codebook", std::string("mul1"));
-        if (codebook != "mul1") {
-            throw std::runtime_error("unsupported EXL3 codebook '" + codebook + "' (only mul1 is implemented)");
+        if (codebook != "mul1" && codebook != "mcg" && codebook != "3inst") {
+            throw std::runtime_error("unsupported EXL3 codebook '" + codebook + "'");
         }
         llama_safetensors_quant_group group;
         group.name   = "exl3";

@@ -49,6 +49,9 @@ struct source_spec {
     // Concatenate the parts even when the primary source exists (the primary
     // then only carries the transform for its own part).
     bool parts_first = false;
+    // Stack the parts along a third dimension (per-expert targets of equal
+    // shape) instead of concatenating rows.
+    bool stack_parts = false;
 
     source_spec() = default;
     source_spec(
@@ -77,6 +80,7 @@ struct qwen_geometry {
     bool     text_only;
     bool     moe;
     bool     executorch_flat;
+    uint32_t n_expert = 0;
 
     uint32_t values_per_key() const {
         return n_value_heads / n_key_heads;
@@ -316,8 +320,59 @@ source_spec map_target_unchecked(
         throw unsupported_target(target_name);
     }
     const int         layer  = std::stoi(match[1].str());
-    const std::string suffix = match[2].str();
+    std::string       suffix = match[2].str();
     const std::string prefix = layer_source_prefix(layer, geometry);
+
+    // HF-layout MoE (per-expert modules mlp.experts.<i>.<proj>): the routed expert tensors are
+    // stacked from per-expert virtual targets "<suffix>@e<i>".
+    if (geometry.moe && !geometry.executorch_flat) {
+        static const std::regex expert_pattern(R"(^(ffn_(?:gate|up|down)_exps\.(?:weight|scale|input_scale))@e([0-9]+)$)");
+        std::smatch ematch;
+        if (std::regex_match(suffix, ematch, expert_pattern)) {
+            const std::string base = ematch[1].str();
+            const std::string proj = base.rfind("ffn_gate", 0) == 0 ? "gate_proj" :
+                                     base.rfind("ffn_up", 0) == 0 ? "up_proj" : "down_proj";
+            const std::string module = prefix + "mlp.experts." + ematch[2].str() + "." + proj;
+            const llama_safetensors_quant_role role = ends_with(base, ".input_scale") ?
+                llama_safetensors_quant_role::INPUT_SCALE : ends_with(base, ".scale") ?
+                llama_safetensors_quant_role::WEIGHT_SCALE : llama_safetensors_quant_role::WEIGHT;
+            const char * plain = role == llama_safetensors_quant_role::WEIGHT ? ".weight" :
+                role == llama_safetensors_quant_role::WEIGHT_SCALE ? ".weight_scale" : ".input_scale";
+            return quantized_or_plain(quant, module, role, {}, module + plain);
+        }
+        if (suffix == "ffn_gate_inp.weight") {
+            return { prefix + "mlp.gate.weight", {}, std::nullopt };
+        }
+        if (suffix == "ffn_gate_inp_shexp.weight") {
+            return { prefix + "mlp.shared_expert_gate.weight", {}, std::nullopt };
+        }
+        if (suffix == "ffn_gate_up_exps.weight") {
+            throw unsupported_target(target_name);   // gate and up stay separate
+        }
+        for (const char * proj : { "gate", "up", "down" }) {
+            const std::string shexp = std::string("ffn_") + proj + "_shexp.";
+            if (suffix.rfind(shexp, 0) == 0) {
+                const std::string module = prefix + "mlp.shared_expert." + proj + "_proj";
+                const std::string role_s = suffix.substr(shexp.size());
+                const llama_safetensors_quant_role role = role_s == "input_scale" ?
+                    llama_safetensors_quant_role::INPUT_SCALE : role_s == "scale" ?
+                    llama_safetensors_quant_role::WEIGHT_SCALE : llama_safetensors_quant_role::WEIGHT;
+                const char * plain = role == llama_safetensors_quant_role::WEIGHT ? ".weight" :
+                    role == llama_safetensors_quant_role::WEIGHT_SCALE ? ".weight_scale" : ".input_scale";
+                return quantized_or_plain(quant, module, role, {}, module + plain);
+            }
+            const std::string exps = std::string("ffn_") + proj + "_exps.";
+            if (suffix.rfind(exps, 0) == 0) {
+                source_spec result;
+                result.stack_parts = true;
+                result.parts_first = true;
+                for (uint32_t e = 0; e < geometry.n_expert; ++e) {
+                    result.part_targets.push_back(target_name + "@e" + std::to_string(e));
+                }
+                return result;
+            }
+        }
+    }
 
     if (geometry.moe && geometry.executorch_flat) {
         if (auto mapped = map_executorch_moe_target(quant, geometry, layer, suffix, prefix)) {
@@ -791,7 +846,7 @@ std::vector<uint8_t> apply_quantized_layout_transform(
     }
     const size_t cols = shape[0];
     const size_t rows = shape[1];
-    if (type >= GGML_TYPE_EXL3_1 && type <= GGML_TYPE_EXL3_8) {
+    if (ggml_type_is_exl3(type)) {
         // EXL3 tile stream [n/16][k/16][tile]: permute whole 16-row (n) tile groups, or the
         // 16-column (k) tiles inside every group.  Head blocks are 128 wide, so both are tile aligned.
         const size_t tile_bytes = ggml_type_size(type);
@@ -1245,6 +1300,7 @@ qwen_geometry validate_model_contract(const json & root) {
         root_is_text,
         moe,
         false,
+        moe ? text.value("num_experts", 0U) : 0U,
     };
     constexpr std::array<uint32_t, 4> supported_layers = { 24, 32, 40, 64 };
     if (std::find(supported_layers.begin(), supported_layers.end(), geometry.n_layer) == supported_layers.end() ||
@@ -1275,6 +1331,7 @@ llama_safetensors_qwen35_importer::llama_safetensors_qwen35_importer(
     full_attention_interval_ = geometry.full_attention_interval;
     text_only_      = geometry.text_only;
     moe_            = geometry.moe;
+    n_expert_       = geometry.n_expert;
     const auto generation_path = model_dir_ / "generation_config.json";
     generation_    = std::filesystem::is_regular_file(generation_path) ?
         llama_safetensors_read_json(generation_path) : llama_safetensors_json::object();
@@ -1402,7 +1459,7 @@ bool llama_safetensors_qwen35_importer::describe(
         std::array<int64_t, GGML_MAX_DIMS> & ne) const {
     const qwen_geometry geometry {
         n_layer_, n_mtp_, n_key_heads_, n_value_heads_, key_head_dim_, value_head_dim_,
-        full_attention_interval_, text_only_, moe_, executorch_flat_,
+        full_attention_interval_, text_only_, moe_, executorch_flat_, n_expert_,
     };
     source_spec spec;
     try {
@@ -1412,6 +1469,28 @@ bool llama_safetensors_qwen35_importer::describe(
     }
     if (spec.part_targets.empty() && registry_.find(spec.name) == nullptr) {
         return false;
+    }
+    if (!spec.part_targets.empty() && spec.stack_parts) {
+        // Stack equal-shape parts (per-expert tensors) along the third dimension.
+        ne.fill(1);
+        type = GGML_TYPE_COUNT;
+        for (const std::string & part : spec.part_targets) {
+            ggml_type part_type;
+            std::array<int64_t, GGML_MAX_DIMS> part_ne;
+            if (!describe(part, part_type, part_ne) || part_ne[2] != 1 || part_ne[3] != 1) {
+                return false;
+            }
+            if (type == GGML_TYPE_COUNT) {
+                type  = part_type;
+                ne[0] = part_ne[0];
+                ne[1] = part_ne[1];
+            } else if (part_type != type || part_ne[0] != ne[0] || part_ne[1] != ne[1]) {
+                return false;
+            }
+        }
+        // vectors (per-expert scales) stack into [n, n_expert], matrices into [k, n, n_expert]
+        ne[ne[1] == 1 ? 1 : 2] = int64_t(spec.part_targets.size());
+        return true;
     }
     if (!spec.part_targets.empty() && (spec.parts_first || registry_.find(spec.name) == nullptr)) {
         // Row-concatenate the parts: same type, same width, summed rows.
@@ -1464,7 +1543,7 @@ size_t llama_safetensors_qwen35_importer::tensor_capacity_hint() const {
 void llama_safetensors_qwen35_importer::bind(const std::string & target_name) const {
     const qwen_geometry geometry {
         n_layer_, n_mtp_, n_key_heads_, n_value_heads_, key_head_dim_, value_head_dim_,
-        full_attention_interval_, text_only_, moe_, executorch_flat_,
+        full_attention_interval_, text_only_, moe_, executorch_flat_, n_expert_,
     };
     const source_spec spec = map_target(*quant_, geometry, target_name);
     if (!spec.part_targets.empty() && (spec.parts_first || registry_.find(spec.name) == nullptr)) {
@@ -1482,10 +1561,10 @@ bool llama_safetensors_qwen35_importer::load(
         const std::string & target_name, ggml_tensor * destination, bool check_tensor) const {
     const qwen_geometry geometry {
         n_layer_, n_mtp_, n_key_heads_, n_value_heads_, key_head_dim_, value_head_dim_,
-        full_attention_interval_, text_only_, moe_, executorch_flat_,
+        full_attention_interval_, text_only_, moe_, executorch_flat_, n_expert_,
     };
     const source_spec spec = map_target(*quant_, geometry, target_name);
-    if (!spec.part_targets.empty() && (spec.parts_first || registry_.find(spec.name) == nullptr)) {
+    if (!spec.part_targets.empty() && (spec.parts_first || spec.stack_parts || registry_.find(spec.name) == nullptr)) {
         return false;
     }
     if (spec.transforms.empty() && spec.row_count == 0 && spec.hqq_scale.empty()) {
@@ -1524,7 +1603,7 @@ std::vector<uint8_t> llama_safetensors_qwen35_importer::materialize(const std::s
     try {
         const qwen_geometry geometry {
             n_layer_, n_mtp_, n_key_heads_, n_value_heads_, key_head_dim_, value_head_dim_,
-            full_attention_interval_, text_only_, moe_, executorch_flat_,
+            full_attention_interval_, text_only_, moe_, executorch_flat_, n_expert_,
         };
         const source_spec spec = map_target(*quant_, geometry, target_name);
         if (!spec.part_targets.empty() && (spec.parts_first || registry_.find(spec.name) == nullptr)) {

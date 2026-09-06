@@ -424,7 +424,7 @@ static ggml_backend_buffer_t ggml_backend_cpu_device_buffer_from_host_ptr(ggml_b
 static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     // EXL3 trellis tiles are GPU-only (rows are not independently decodable).
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
-        if (op->src[i] != nullptr && op->src[i]->type >= GGML_TYPE_EXL3_1 && op->src[i]->type <= GGML_TYPE_EXL3_8) {
+        if (op->src[i] != nullptr && ggml_type_is_exl3(op->src[i]->type)) {
             return false;
         }
     }

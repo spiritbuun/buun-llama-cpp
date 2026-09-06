@@ -16,7 +16,6 @@ namespace {
 using exl3::FragB;
 using exl3::FragC_h;
 
-constexpr int EXL3_CB = 2; // "mul1" codebook (the only one current exllamav3 checkpoints use)
 constexpr float EXL3_HAD_SCALE = exl3_had::SCALE;
 constexpr int EXL3_GEMV_MAX_M = 8;
 
@@ -37,7 +36,7 @@ __device__ __forceinline__ const uint32_t * exl3_tile(const uint8_t * data, int 
 
 // One warp per 16x16 tile: lane l decodes run t = 8l..8l+7 (rows (l%4)*2 + {0,1,8,9}, cols l/4 and
 // l/4 + 8) and writes W[n][k] as half2 pairs.  grid = tiles / 8, 256 threads.
-template <int bits>
+template <int bits, int cb>
 __global__ void __launch_bounds__(256) exl3_reconstruct_kernel(const uint8_t * __restrict__ data, half * __restrict__ dst,
         int k, int nt0, int nt1) {
     const int lane = threadIdx.x & 31;
@@ -51,10 +50,10 @@ __global__ void __launch_bounds__(256) exl3_reconstruct_kernel(const uint8_t * _
     const uint32_t * tp = reinterpret_cast<const uint32_t *>(exl3_tile(data, bits, nt, kt, k_tiles));
     uint32_t w[8];
     exl3_int8::ext8w<bits>(tp, lane << 3, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
-    const half2 v01 = exl3_gemv::exl3_decode_pair_cb2(w[0], w[1]);   // rows r, r+1     col c
-    const half2 v23 = exl3_gemv::exl3_decode_pair_cb2(w[2], w[3]);   // rows r+8, r+9   col c
-    const half2 v45 = exl3_gemv::exl3_decode_pair_cb2(w[4], w[5]);   // rows r, r+1     col c+8
-    const half2 v67 = exl3_gemv::exl3_decode_pair_cb2(w[6], w[7]);   // rows r+8, r+9   col c+8
+    const half2 v01 = exl3_gemv::exl3_decode_pair<cb>(w[0], w[1]);   // rows r, r+1     col c
+    const half2 v23 = exl3_gemv::exl3_decode_pair<cb>(w[2], w[3]);   // rows r+8, r+9   col c
+    const half2 v45 = exl3_gemv::exl3_decode_pair<cb>(w[4], w[5]);   // rows r, r+1     col c+8
+    const half2 v67 = exl3_gemv::exl3_decode_pair<cb>(w[6], w[7]);   // rows r+8, r+9   col c+8
     const int r = (lane & 3) * 2;
     const int c = lane >> 2;
     half * row0 = dst + (size_t(nt - nt0) * 16 + c) * k + size_t(kt) * 16 + r;
@@ -100,33 +99,42 @@ __global__ void exl3_had_out_kernel(float * __restrict__ y, const half * __restr
     *reinterpret_cast<float4 *>(y + base) = v;
 }
 
-template <int bits>
+template <int bits, int cb>
 void exl3_gemv_launch(const half * A, const uint8_t * B, float * C, int m, int k, int n, int sms, cudaStream_t stream) {
     // Micro-benchmarked on A100 (bench_gemv.cu): 16 k-splits x 2 tiles/warp with a 4-deep prefetch
     // ring and one block per 32-column group is the best single config across the Qwen3.8 shapes.
     constexpr int WK = 16, WNT = 2, PF = 4;
     const int grid = n / (WNT * 16);
     GGML_UNUSED(sms);
-    exl3_gemv::exl3_gemv_kernel<bits, WK, WNT, PF, false><<<grid, WK * 32, 0, stream>>>(A, B, C, m, k, n);
+    exl3_gemv::exl3_gemv_kernel<bits, cb, WK, WNT, PF, false><<<grid, WK * 32, 0, stream>>>(A, B, C, m, k, n);
 }
 
-template <int bits>
+template <int bits, int cb>
 void exl3_reconstruct_launch(const uint8_t * data, half * dst, int k, int n0, int n1, cudaStream_t stream) {
     const size_t tiles = size_t(n1 - n0) / 16 * (k / 16);
-    exl3_reconstruct_kernel<bits><<<unsigned((tiles + 7) / 8), 256, 0, stream>>>(data, dst, k, n0 / 16, n1 / 16);
+    exl3_reconstruct_kernel<bits, cb><<<unsigned((tiles + 7) / 8), 256, 0, stream>>>(data, dst, k, n0 / 16, n1 / 16);
 }
 
-#define EXL3_DISPATCH(fn, bits, ...)                          \
+#define EXL3_DISPATCH_CB(fn, bits, cb, ...)                   \
     switch (bits) {                                           \
-        case 1: fn<1>(__VA_ARGS__); break;                    \
-        case 2: fn<2>(__VA_ARGS__); break;                    \
-        case 3: fn<3>(__VA_ARGS__); break;                    \
-        case 4: fn<4>(__VA_ARGS__); break;                    \
-        case 5: fn<5>(__VA_ARGS__); break;                    \
-        case 6: fn<6>(__VA_ARGS__); break;                    \
-        case 7: fn<7>(__VA_ARGS__); break;                    \
-        case 8: fn<8>(__VA_ARGS__); break;                    \
+        case 1: fn<1, cb>(__VA_ARGS__); break;                \
+        case 2: fn<2, cb>(__VA_ARGS__); break;                \
+        case 3: fn<3, cb>(__VA_ARGS__); break;                \
+        case 4: fn<4, cb>(__VA_ARGS__); break;                \
+        case 5: fn<5, cb>(__VA_ARGS__); break;                \
+        case 6: fn<6, cb>(__VA_ARGS__); break;                \
+        case 7: fn<7, cb>(__VA_ARGS__); break;                \
+        case 8: fn<8, cb>(__VA_ARGS__); break;                \
         default: GGML_ABORT("invalid EXL3 bit width");        \
+    }
+
+// bits x codebook (2 = mul1, 1 = mcg, 0 = 3inst)
+#define EXL3_DISPATCH(fn, bits, cb, ...)                      \
+    switch (cb) {                                             \
+        case 2: EXL3_DISPATCH_CB(fn, bits, 2, __VA_ARGS__); break; \
+        case 1: EXL3_DISPATCH_CB(fn, bits, 1, __VA_ARGS__); break; \
+        case 0: EXL3_DISPATCH_CB(fn, bits, 0, __VA_ARGS__); break; \
+        default: GGML_ABORT("invalid EXL3 codebook");         \
     }
 
 // ---- int8 activation path (4 bpw, m <= 4) ---------------------------------------------------
@@ -213,7 +221,8 @@ bool ggml_cuda_exl3_supports_mul_mat(const ggml_tensor * dst) {
 
 void ggml_cuda_exl3_reconstruct_rows(const ggml_tensor * src0, int64_t n0, int64_t n1, half * dst, cudaStream_t stream) {
     const int bits = ggml_cuda_exl3_bits(src0->type);
-    EXL3_DISPATCH(exl3_reconstruct_launch, bits, static_cast<const uint8_t *>(src0->data), dst,
+    const int cb   = ggml_cuda_exl3_codebook(src0->type);
+    EXL3_DISPATCH(exl3_reconstruct_launch, bits, cb, static_cast<const uint8_t *>(src0->data), dst,
         int(src0->ne[0]), int(n0), int(n1), stream);
 }
 
@@ -226,12 +235,14 @@ void ggml_cuda_mul_mat_exl3(ggml_backend_cuda_context & ctx, const ggml_tensor *
     const int n = int(src0->ne[1]);
     const int m = int(src1->ne[1]);
     const int bits = ggml_cuda_exl3_bits(src0->type);
+    const int cb   = ggml_cuda_exl3_codebook(src0->type);
     const half * suh = static_cast<const half *>(dst->src[3]->data);
     const half * svh = static_cast<const half *>(dst->src[2]->data);
     cudaStream_t stream = ctx.stream();
     float * y = static_cast<float *>(dst->data);
 
-    if (exl3_int8_applicable(bits, m, k, n)) {
+    // the int8 path relies on the mul1 codebook being affine in the byte sum
+    if (cb == 2 && exl3_int8_applicable(bits, m, k, n)) {
         // int8 activation path: fused input transform, per-slice quantization, fused output transform
         const uint8_t * B = static_cast<const uint8_t *>(src0->data);
         const float * x = static_cast<const float *>(src1->data);
@@ -256,7 +267,7 @@ void ggml_cuda_mul_mat_exl3(ggml_backend_cuda_context & ctx, const ggml_tensor *
 
     if (m <= EXL3_GEMV_MAX_M) {
         const int sms = ggml_cuda_info().devices[ctx.device].nsm;
-        EXL3_DISPATCH(exl3_gemv_launch, bits, xh.get(), static_cast<const uint8_t *>(src0->data), y, m, k, n, sms, stream);
+        EXL3_DISPATCH(exl3_gemv_launch, bits, cb, xh.get(), static_cast<const uint8_t *>(src0->data), y, m, k, n, sms, stream);
     } else {
         // prefill: reconstruct row chunks to F16 and multiply with cuBLAS (F32 accumulate)
         constexpr size_t chunk_bytes = size_t(256) << 20;

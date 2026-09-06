@@ -2844,7 +2844,7 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
-    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ggml_cuda_is_exl3(src0->type)) {
         return true;
     }
 
@@ -2882,7 +2882,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
-    if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+    if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && !ggml_cuda_is_exl3(src0->type)) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_cuda_should_use_mmvq(src0->type, cc, ne2)) {
@@ -3012,6 +3012,23 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         dst_slice.nb[2]  = dst_slice.ne[1] * dst_slice.nb[1];
         dst_slice.nb[3]  = dst_slice.ne[2] * dst_slice.nb[2];
         dst_slice.data   = dst_data_cur;
+
+        // EXL3 experts: this expert's output scale / input sign columns as the mul_mat's src[2]/src[3]
+        ggml_tensor svh_slice, suh_slice;
+        if (ggml_cuda_is_exl3(src0->type)) {
+            GGML_ASSERT(dst->src[3] != nullptr && dst->src[4] != nullptr);
+            svh_slice = *dst->src[3];
+            svh_slice.ne[1] = 1; svh_slice.nb[2] = svh_slice.nb[1]; svh_slice.nb[3] = svh_slice.nb[1];
+            svh_slice.data  = (char *) dst->src[3]->data + i02*dst->src[3]->nb[1];
+            suh_slice = *dst->src[4];
+            suh_slice.ne[1] = 1; suh_slice.nb[2] = suh_slice.nb[1]; suh_slice.nb[3] = suh_slice.nb[1];
+            suh_slice.data  = (char *) dst->src[4]->data + i02*dst->src[4]->nb[1];
+            dst_slice.src[0] = &src0_slice;
+            dst_slice.src[1] = &src1_slice;
+            dst_slice.src[2] = &svh_slice;
+            dst_slice.src[3] = &suh_slice;
+            dst_slice.op     = GGML_OP_MUL_MAT;
+        }
 
         ggml_cuda_mul_mat(ctx, &src0_slice, &src1_slice, &dst_slice);
         CUDA_CHECK(cudaGetLastError());
@@ -7879,6 +7896,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 struct ggml_tensor * a = op->src[0];
                 struct ggml_tensor * b = op->src[1];
                 if (ggml_cuda_is_exl3(a->type)) {
+                    if (op->op == GGML_OP_MUL_MAT_ID) {
+                        // per-expert dispatch through the EXL3 mul_mat; scales are src[3]/src[4]
+                        return op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                            a->ne[0] % 128 == 0 && a->ne[1] % 128 == 0;
+                    }
                     return op->op == GGML_OP_MUL_MAT && ggml_cuda_exl3_supports_mul_mat(op);
                 }
                 if (op->op == GGML_OP_MUL_MAT && op->src[3] != nullptr) {

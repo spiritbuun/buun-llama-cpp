@@ -61,5 +61,6 @@ class llama_safetensors_qwen35_importer final : public llama_safetensors_importe
     uint32_t full_attention_interval_ = 4;
     bool     text_only_       = false;
     bool     moe_             = false;
+    uint32_t n_expert_        = 0;
     bool     executorch_flat_ = false;
 };

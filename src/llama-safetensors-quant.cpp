@@ -646,15 +646,15 @@ std::optional<llama_safetensors_quant_binding> llama_safetensors_quant_adapters:
                 (trellis.shape[0] * 16) % 128 != 0 || (trellis.shape[1] * 16) % 128 != 0) {
             throw std::runtime_error("unsupported EXL3 trellis geometry for '" + module + "'");
         }
-        if (registry_.find(module + ".mcg") != nullptr || registry_.find(module + ".mul1") == nullptr) {
-            throw std::runtime_error("EXL3 module '" + module + "' does not use the mul1 codebook");
-        }
+        // per-module codebook marker: .mul1 (2), .mcg (1), neither = original 3inst (0)
+        const int codebook = registry_.find(module + ".mul1") != nullptr ? 2 :
+                             registry_.find(module + ".mcg")  != nullptr ? 1 : 0;
         const int64_t k = int64_t(trellis.shape[0]) * 16;
         const int64_t n = int64_t(trellis.shape[1]) * 16;
         const int bits  = int(trellis.shape[2] / 16);
         if (role == llama_safetensors_quant_role::WEIGHT) {
             result.primary         = module + ".trellis";
-            result.target_type     = ggml_type(int(GGML_TYPE_EXL3_1) + bits - 1);
+            result.target_type     = ggml_exl3_type(int(bits), codebook);
             result.target_shape    = { k, n };
             result.materialization = llama_safetensors_quant_materialization::EXL3_REPACK;
             return result;
@@ -1713,7 +1713,6 @@ void llama_safetensors_quant_adapters::validate() {
             const std::string svh_name = module + ".svh";
             const auto & suh = require_tensor(registry_, suh_name);
             const auto & svh = require_tensor(registry_, svh_name);
-            require_tensor(registry_, module + ".mul1");
             dependencies_[tensor.name] = { suh_name, svh_name };
             if (tensor.dtype != llama_safetensors_dtype::I16 || tensor.shape.size() != 3 ||
                 tensor.shape[2] % 16 != 0 || tensor.shape[2] < 16 || tensor.shape[2] > 128 ||

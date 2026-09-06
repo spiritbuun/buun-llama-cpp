@@ -7,11 +7,16 @@
 // [n/16][k/16][32*K bytes].  MUL_MAT sources: src[2] = svh (F16 [n]), src[3] = suh (F16 [k]).
 
 static inline bool ggml_cuda_is_exl3(ggml_type type) {
-    return type >= GGML_TYPE_EXL3_1 && type <= GGML_TYPE_EXL3_8;
+    return ggml_type_is_exl3(type);
 }
 
 static inline int ggml_cuda_exl3_bits(ggml_type type) {
-    return int(type) - int(GGML_TYPE_EXL3_1) + 1;
+    return ggml_exl3_bits(type);
+}
+
+// 2 = mul1, 1 = mcg, 0 = 3inst
+static inline int ggml_cuda_exl3_codebook(ggml_type type) {
+    return ggml_exl3_codebook(type);
 }
 
 bool ggml_cuda_exl3_supports_mul_mat(const ggml_tensor * dst);
