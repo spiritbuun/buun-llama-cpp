@@ -1865,6 +1865,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (!layer.nextn.eh_proj_s && layer.nextn.eh_proj) {
                 layer.nextn.eh_proj_s = load_weight_scale(tn(LLM_TENSOR_NEXTN_EH_PROJ, "scale", i), layer.nextn.eh_proj);
             }
+            if (!layer.nextn.eh_proj_embd_s && layer.nextn.eh_proj_embd) {
+                layer.nextn.eh_proj_embd_s = load_weight_scale(tn(LLM_TENSOR_NEXTN_EH_PROJ_EMBD, "scale", i), layer.nextn.eh_proj_embd);
+            }
+            if (!layer.nextn.eh_proj_hidden_s && layer.nextn.eh_proj_hidden) {
+                layer.nextn.eh_proj_hidden_s = load_weight_scale(tn(LLM_TENSOR_NEXTN_EH_PROJ_HIDDEN, "scale", i), layer.nextn.eh_proj_hidden);
+            }
             if (!layer.index_q_proj_s && layer.index_q_proj) {
                 layer.index_q_proj_s = load_weight_scale(tn(LLM_TENSOR_INDEXER_Q_PROJ, "scale", i), layer.index_q_proj);
             }
@@ -1895,6 +1901,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             validate_weight_scale(layer.ssm_alpha, layer.ssm_alpha_s);
             validate_weight_scale(layer.ssm_beta, layer.ssm_beta_s);
             validate_weight_scale(layer.nextn.eh_proj, layer.nextn.eh_proj_s);
+            validate_weight_scale(layer.nextn.eh_proj_embd, layer.nextn.eh_proj_embd_s);
+            validate_weight_scale(layer.nextn.eh_proj_hidden, layer.nextn.eh_proj_hidden_s);
             validate_weight_scale(layer.nextn.shared_head_head, layer.nextn.shared_head_head_s);
 
             // input scales
@@ -1963,6 +1971,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             if (!layer.nextn.eh_proj_in_s && layer.nextn.eh_proj) {
                 layer.nextn.eh_proj_in_s = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "input_scale", i), {input_scale_ne(tn(LLM_TENSOR_NEXTN_EH_PROJ, "input_scale", i))}, TENSOR_NOT_REQUIRED);
+            }
+            if (!layer.nextn.eh_proj_embd_in_s && layer.nextn.eh_proj_embd) {
+                layer.nextn.eh_proj_embd_in_s = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ_EMBD, "input_scale", i), {input_scale_ne(tn(LLM_TENSOR_NEXTN_EH_PROJ_EMBD, "input_scale", i))}, TENSOR_NOT_REQUIRED);
+            }
+            if (!layer.nextn.eh_proj_hidden_in_s && layer.nextn.eh_proj_hidden) {
+                layer.nextn.eh_proj_hidden_in_s = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ_HIDDEN, "input_scale", i), {input_scale_ne(tn(LLM_TENSOR_NEXTN_EH_PROJ_HIDDEN, "input_scale", i))}, TENSOR_NOT_REQUIRED);
             }
             if (!layer.nextn.shared_head_head_in_s && layer.nextn.shared_head_head) {
                 layer.nextn.shared_head_head_in_s = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "input_scale", i), {input_scale_ne(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "input_scale", i))}, TENSOR_NOT_REQUIRED);

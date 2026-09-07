@@ -220,6 +220,14 @@ struct llama_layer_nextn {
     struct ggml_tensor * eh_proj               = nullptr;
     struct ggml_tensor * eh_proj_s             = nullptr;
     struct ggml_tensor * eh_proj_in_s          = nullptr;
+    // EXL3 checkpoints split the fc over its two inputs (separate output scales), so the
+    // draft head applies fc_embedding(e_norm) + fc_hidden(h_norm) instead of one eh_proj.
+    struct ggml_tensor * eh_proj_embd          = nullptr;
+    struct ggml_tensor * eh_proj_embd_s        = nullptr;
+    struct ggml_tensor * eh_proj_embd_in_s     = nullptr;
+    struct ggml_tensor * eh_proj_hidden        = nullptr;
+    struct ggml_tensor * eh_proj_hidden_s      = nullptr;
+    struct ggml_tensor * eh_proj_hidden_in_s   = nullptr;
     struct ggml_tensor * embed_tokens          = nullptr;
     struct ggml_tensor * enorm                 = nullptr;
     struct ggml_tensor * hnorm                 = nullptr;

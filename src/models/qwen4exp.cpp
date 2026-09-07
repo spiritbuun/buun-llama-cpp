@@ -318,7 +318,13 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
         layer.nextn.enorm   = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,   "weight", il), { n_embd }, flags);
         layer.nextn.hnorm   = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,   "weight", il), { hc_dim }, flags);
-        layer.nextn.eh_proj = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", il), { 2 * n_embd, n_embd }, flags);
+        // one fused eh_proj over [e_norm | h_norm], or (EXL3) the fc split per input
+        layer.nextn.eh_proj        = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,        "weight", il), { 2 * n_embd, n_embd }, flags | TENSOR_NOT_REQUIRED);
+        layer.nextn.eh_proj_embd   = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ_EMBD,   "weight", il), { n_embd, n_embd },     flags | TENSOR_NOT_REQUIRED);
+        layer.nextn.eh_proj_hidden = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ_HIDDEN, "weight", il), { n_embd, n_embd },     flags | TENSOR_NOT_REQUIRED);
+        if (ml.load_mtp && !layer.nextn.eh_proj && !(layer.nextn.eh_proj_embd && layer.nextn.eh_proj_hidden)) {
+            throw std::runtime_error("qwen4exp MTP block needs nextn.eh_proj or the nextn.eh_proj_embd + nextn.eh_proj_hidden pair");
+        }
         layer.nextn.hc_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", il), { hc_dim }, flags);
         layer.nextn.hc_head_down = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_DOWN, "weight", il), { hc_dim, hc_lr }, flags);
         layer.nextn.hc_head_up   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_UP,   "weight", il), { hc_lr, hc_dim }, flags);
@@ -384,7 +390,8 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     const int il = hparams.n_layer();
     const auto & layer = model.layers[il];
 
-    GGML_ASSERT(layer.nextn.eh_proj && "qwen4exp MTP is missing nextn.eh_proj");
+    GGML_ASSERT((layer.nextn.eh_proj || (layer.nextn.eh_proj_embd && layer.nextn.eh_proj_hidden)) &&
+                "qwen4exp MTP is missing nextn.eh_proj (or the EXL3 eh_proj_embd/eh_proj_hidden pair)");
     GGML_ASSERT(layer.nextn.enorm   && "qwen4exp MTP is missing nextn.enorm");
     GGML_ASSERT(layer.nextn.hnorm   && "qwen4exp MTP is missing nextn.hnorm");
     GGML_ASSERT(layer.nextn.hc_head_norm && "qwen4exp MTP is missing nextn.hc_head_norm");
@@ -431,13 +438,23 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
             n_embd, hc, n_tokens, 1);
     cb(e_norm, "mtp_enorm", il);
 
-    ggml_tensor * eh_input = ggml_concat(ctx0, e_norm, h_norm, 0);
-    eh_input = ggml_reshape_2d(ctx0, eh_input, 2*n_embd, hc*n_tokens);
-    ggml_tensor * inpL = build_lora_mm(
-            layer.nextn.eh_proj,
-            eh_input,
-            layer.nextn.eh_proj_s,
-            layer.nextn.eh_proj_in_s);
+    ggml_tensor * inpL = nullptr;
+    if (layer.nextn.eh_proj) {
+        ggml_tensor * eh_input = ggml_concat(ctx0, e_norm, h_norm, 0);
+        eh_input = ggml_reshape_2d(ctx0, eh_input, 2*n_embd, hc*n_tokens);
+        inpL = build_lora_mm(
+                layer.nextn.eh_proj,
+                eh_input,
+                layer.nextn.eh_proj_s,
+                layer.nextn.eh_proj_in_s);
+    } else {
+        // EXL3: fc([e|h]) == fc_embedding(e) + fc_hidden(h), each with its own output scale
+        ggml_tensor * e2 = ggml_reshape_2d(ctx0, ggml_cont(ctx0, e_norm), n_embd, hc*n_tokens);
+        ggml_tensor * h2 = ggml_reshape_2d(ctx0, ggml_cont(ctx0, h_norm), n_embd, hc*n_tokens);
+        inpL = ggml_add(ctx0,
+                build_lora_mm(layer.nextn.eh_proj_embd,   e2, layer.nextn.eh_proj_embd_s,   layer.nextn.eh_proj_embd_in_s),
+                build_lora_mm(layer.nextn.eh_proj_hidden, h2, layer.nextn.eh_proj_hidden_s, layer.nextn.eh_proj_hidden_in_s));
+    }
     inpL = ggml_reshape_3d(ctx0, inpL, n_embd, hc, n_tokens);
     cb(inpL, "mtp_eh_proj", il);
 

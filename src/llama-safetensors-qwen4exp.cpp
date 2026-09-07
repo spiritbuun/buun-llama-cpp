@@ -507,10 +507,32 @@ source_spec map_target(
         if (suffix == "nextn.hnorm.weight") {
             return { "mtp.pre_fc_norm_hidden.weight", std::nullopt, { transform_kind::OFFSET_NORM } };
         }
+        // fc over [e_norm | h_norm]: plain checkpoints fuse fc_embedding|fc_hidden into one eh_proj;
+        // EXL3 quantizes the two halves separately (own svh/suh), so they load as two projections.
+        const bool exl3_fc = registry.find("mtp.fc_hidden.trellis") != nullptr;
         if (suffix == "nextn.eh_proj.weight") {
+            if (exl3_fc) {
+                throw unsupported_target(target);
+            }
             source_spec result;
             result.concat_sources = { "mtp.fc_embedding.weight", "mtp.fc_hidden.weight" };
             return result;
+        }
+        for (const auto & [head, module] : { std::pair<const char *, const char *>{ "nextn.eh_proj_embd.", "mtp.fc_embedding" },
+                                             std::pair<const char *, const char *>{ "nextn.eh_proj_hidden.", "mtp.fc_hidden" } }) {
+            if (suffix.rfind(head, 0) != 0) {
+                continue;
+            }
+            if (!exl3_fc) {
+                throw unsupported_target(target);
+            }
+            const std::string role_s = suffix.substr(std::string(head).size());
+            const llama_safetensors_quant_role role = role_s == "input_scale" ? llama_safetensors_quant_role::INPUT_SCALE :
+                role_s == "scale" ? llama_safetensors_quant_role::WEIGHT_SCALE : llama_safetensors_quant_role::WEIGHT;
+            if (role_s != "weight" && role_s != "scale" && role_s != "input_scale") {
+                throw unsupported_target(target);
+            }
+            return bind_projection(quant, module, role);
         }
         if (suffix == "nextn.hc_head_norm.weight" || suffix == "nextn.hc_head_down.weight" ||
             suffix == "nextn.hc_head_up.weight") {
@@ -865,11 +887,6 @@ llama_safetensors_qwen4exp_importer::llama_safetensors_qwen4exp_importer(
     quant_ = std::make_unique<llama_safetensors_quant_adapters>(config_, registry_);
     if (n_mtp_ != 0 && std::none_of(registry_.tensors().begin(), registry_.tensors().end(),
             [](const llama_safetensors_tensor & tensor) { return tensor.name.rfind("mtp.", 0) == 0; })) {
-        n_mtp_ = 0;
-    }
-    if (n_mtp_ != 0 && registry_.find("mtp.fc_hidden.trellis") != nullptr) {
-        // EXL3 MTP head: fc_embedding | fc_hidden carry separate output scales and cannot be fused
-        // into one eh_proj; the MTP block is skipped until the graph takes them separately.
         n_mtp_ = 0;
     }
 }
