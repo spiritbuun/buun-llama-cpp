@@ -134,14 +134,27 @@ class llama_safetensors_quant_config {
         bool        is_regex = false;
         std::regex  pattern;
         uint32_t    group = 0;
+        // Fast path for regexes that are literal pieces joined by ".*" (AutoRound/INC keys such as
+        // ".*layers\.3\.mlp\.gate.*"): pieces must occur in order, the first at the module start
+        // unless the pattern opened with ".*"; an unescaped '.' is kept as '\x01' (any char).
+        bool                     simple   = false;
+        bool                     anchored = true;
+        std::vector<std::string> pieces;
     };
 
     static rule make_rule(const std::string & target, uint32_t group);
     static bool rule_matches(const rule & candidate, const std::string & module_name);
+    static bool compile_simple(rule & candidate);
+    static bool simple_matches(const rule & candidate, const std::string & module_name);
+    const llama_safetensors_quant_group * match_uncached(const std::string & module_name) const;
 
     std::vector<llama_safetensors_quant_group> groups_;
     std::vector<rule>                          rules_;
     std::vector<rule>                          ignore_;
+    // match() is called several times per module (validate, bind, read) and from parallel
+    // expert repacks; the memo is keyed by module name. Heap-held mutex keeps the config movable.
+    mutable std::unordered_map<std::string, const llama_safetensors_quant_group *> match_cache_;
+    std::unique_ptr<std::mutex> match_mutex_ = std::make_unique<std::mutex>();
 };
 
 // Strict, read-only index over a local safetensors model directory. Tensor

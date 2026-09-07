@@ -7,6 +7,7 @@
 #include <array>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -134,10 +135,12 @@ parsed_shard parse_shard(const std::filesystem::path & path, uint32_t shard_inde
         throw std::runtime_error("failed to read safetensors header from '" + path.string() + "'");
     }
 
-    json parsed;
+    // Plain (unordered) json here: ordered_json's insert is a linear key scan, quadratic on a
+    // 73k-tensor header. Tensor order is restored by file offset below.
+    nlohmann::json parsed;
     try {
-        parsed = json::parse(header);
-    } catch (const json::exception & e) {
+        parsed = nlohmann::json::parse(header);
+    } catch (const nlohmann::json::exception & e) {
         throw std::runtime_error("invalid safetensors JSON header in '" + path.string() + "': " + e.what());
     }
     if (!parsed.is_object()) {
@@ -216,6 +219,8 @@ parsed_shard parse_shard(const std::filesystem::path & path, uint32_t shard_inde
         ranges.push_back({ relative_begin, relative_end, name });
         result.tensors.push_back(std::move(tensor));
     }
+    std::stable_sort(result.tensors.begin(), result.tensors.end(),
+                     [](const llama_safetensors_tensor & a, const llama_safetensors_tensor & b) { return a.offset < b.offset; });
 
     std::sort(ranges.begin(), ranges.end(), [](const range & a, const range & b) { return a.begin < b.begin; });
     uint64_t next = 0;
@@ -280,8 +285,74 @@ llama_safetensors_quant_config::rule llama_safetensors_quant_config::make_rule(c
         } catch (const std::regex_error & e) {
             throw std::runtime_error("invalid compressed-tensors target regex '" + target + "': " + e.what());
         }
+        result.simple = compile_simple(result);
     }
     return result;
+}
+
+bool llama_safetensors_quant_config::compile_simple(rule & candidate) {
+    std::string body = candidate.target.substr(3);
+    candidate.anchored = true;
+    // override_rule() wraps INC search regexes as ".*(?:BODY)"
+    if (body.size() >= 6 && body.compare(0, 5, ".*(?:") == 0 && body.back() == ')') {
+        body = body.substr(5, body.size() - 6);
+        candidate.anchored = false;
+    }
+    if (body.compare(0, 2, ".*") == 0) {
+        body = body.substr(2);
+        candidate.anchored = false;
+    }
+    std::vector<std::string> pieces(1);
+    for (size_t i = 0; i < body.size(); ++i) {
+        const char c = body[i];
+        if (c == '\\') {
+            if (i + 1 >= body.size()) return false;
+            const char e = body[++i];
+            if (std::isalnum(static_cast<unsigned char>(e))) return false; // \d, \w, ... are classes
+            pieces.back().push_back(e);
+        } else if (c == '.') {
+            if (i + 1 < body.size() && body[i + 1] == '*') {
+                pieces.emplace_back();
+                ++i;
+            } else {
+                pieces.back().push_back('\x01');
+            }
+        } else if (std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-' || c == '/' || c == ':' || c == '@') {
+            pieces.back().push_back(c);
+        } else {
+            return false;
+        }
+    }
+    while (!pieces.empty() && pieces.back().empty()) pieces.pop_back(); // trailing ".*" is free-end anyway
+    candidate.pieces = std::move(pieces);
+    return true;
+}
+
+// Same truth value as regex_search(match_continuous) on the original pattern: the first piece
+// starts at position 0 when anchored, later pieces follow in order, the end is unconstrained.
+bool llama_safetensors_quant_config::simple_matches(const rule & candidate, const std::string & name) {
+    const auto piece_at = [&](const std::string & piece, size_t at) {
+        if (at + piece.size() > name.size()) return false;
+        for (size_t j = 0; j < piece.size(); ++j) {
+            if (piece[j] != '\x01' && piece[j] != name[at + j]) return false;
+        }
+        return true;
+    };
+    size_t pos = 0;
+    for (size_t i = 0; i < candidate.pieces.size(); ++i) {
+        const std::string & piece = candidate.pieces[i];
+        if (i == 0 && candidate.anchored) {
+            if (!piece_at(piece, 0)) return false;
+            pos = piece.size();
+            continue;
+        }
+        bool found = false;
+        for (size_t at = pos; at + piece.size() <= name.size(); ++at) {
+            if (piece_at(piece, at)) { pos = at + piece.size(); found = true; break; }
+        }
+        if (!found) return false;
+    }
+    return true;
 }
 
 static std::string module_prefix_rule(const std::string & module) {
@@ -300,9 +371,17 @@ bool llama_safetensors_quant_config::rule_matches(const rule & candidate, const 
     if (!candidate.is_regex) {
         return candidate.target == module_name;
     }
+    static const bool verify = std::getenv("LLAMA_SAFETENSORS_VERIFY_RULES") != nullptr;
+    if (candidate.simple && !verify) {
+        return simple_matches(candidate, module_name);
+    }
     std::match_results<std::string::const_iterator> match;
-    return std::regex_search(module_name.begin(), module_name.end(), match, candidate.pattern,
-                             std::regex_constants::match_continuous);
+    const bool matched = std::regex_search(module_name.begin(), module_name.end(), match, candidate.pattern,
+                                           std::regex_constants::match_continuous);
+    if (candidate.simple && matched != simple_matches(candidate, module_name)) {
+        throw std::runtime_error("rule fast path disagrees with regex '" + candidate.target + "' on '" + module_name + "'");
+    }
+    return matched;
 }
 
 static std::vector<int64_t> standard_projection_shape(
@@ -1549,7 +1628,7 @@ bool llama_safetensors_quant_config::ignored(const std::string & module_name) co
                        [&](const rule & candidate) { return rule_matches(candidate, module_name); });
 }
 
-const llama_safetensors_quant_group * llama_safetensors_quant_config::match(const std::string & module_name) const {
+const llama_safetensors_quant_group * llama_safetensors_quant_config::match_uncached(const std::string & module_name) const {
     if (ignored(module_name)) {
         return nullptr;
     }
@@ -1561,6 +1640,20 @@ const llama_safetensors_quant_group * llama_safetensors_quant_config::match(cons
     return nullptr;
 }
 
+const llama_safetensors_quant_group * llama_safetensors_quant_config::match(const std::string & module_name) const {
+    {
+        std::lock_guard<std::mutex> lock(*match_mutex_);
+        const auto it = match_cache_.find(module_name);
+        if (it != match_cache_.end()) {
+            return it->second;
+        }
+    }
+    const llama_safetensors_quant_group * group = match_uncached(module_name);
+    std::lock_guard<std::mutex> lock(*match_mutex_);
+    match_cache_.emplace(module_name, group);
+    return group;
+}
+
 llama_safetensors_registry llama_safetensors_registry::load(
         const std::filesystem::path & model_dir, llama_safetensors_io_mode io_mode) {
     llama_safetensors_registry result;
@@ -1569,7 +1662,18 @@ llama_safetensors_registry llama_safetensors_registry::load(
     std::map<std::string, std::string> expected_shards;
     std::set<std::string>              shard_names;
     if (std::filesystem::is_regular_file(index_path)) {
-        const json index = llama_safetensors_read_json(index_path);
+        nlohmann::json index;  // unordered: weight_map has one key per tensor (see parse_shard)
+        {
+            std::ifstream input(index_path);
+            if (!input) {
+                throw std::runtime_error("failed to open JSON file '" + index_path.string() + "'");
+            }
+            try {
+                index = nlohmann::json::parse(input);
+            } catch (const nlohmann::json::exception & e) {
+                throw std::runtime_error("invalid JSON in '" + index_path.string() + "': " + e.what());
+            }
+        }
         if (!index.is_object() || !index.contains("weight_map") || !index.at("weight_map").is_object()) {
             throw std::runtime_error("safetensors index is missing an object-valued weight_map");
         }
