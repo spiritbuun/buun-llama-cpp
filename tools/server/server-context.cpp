@@ -2151,10 +2151,12 @@ struct server_slot {
         server_cache_slot_drop_impl();
     }
 
-    bool prompt_clear_after_vbr_publication() {
+    bool prompt_clear_after_vbr_publication(
+            server_cache_destruction_reason reason =
+                server_cache_destruction_reason::idle_reclaim) {
         const auto admission = observe_full_slot(
             server_cache_destruction_class::slot_drop,
-            server_cache_destruction_reason::idle_reclaim);
+            reason);
         if (admission.verdict ==
                 server_cache_destruction_verdict::would_refuse_hard_leased ||
             admission.verdict ==
@@ -3288,6 +3290,28 @@ static bool server_vbr_apply_occupied_restore_failure_to_slot(
             server_cache_destruction_reason::restore_failure);
     }
     return quarantined;
+}
+
+bool server_vbr_empty_handoff_lookup_allowed(
+        const server_vbr_empty_handoff_gate & gate) noexcept {
+    return gate.slot_count == 1 && !gate.hard_lease &&
+        !gate.recovery_pin && !gate.deferred_task &&
+        gate.incumbent_supported;
+}
+
+bool server_vbr_empty_handoff_allowed(
+        const server_vbr_empty_handoff_gate & gate) noexcept {
+    return server_vbr_empty_handoff_lookup_allowed(gate) &&
+        gate.incoming_prefix > gate.incumbent_lcp &&
+        gate.durable_incumbent_prefix > gate.incumbent_lcp &&
+        !gate.exact_incumbent_durable && gate.family_matches;
+}
+
+bool server_vbr_stem_matches_capture_source(
+        bool valid,
+        const std::array<uint8_t, 32> & stem_source,
+        const std::array<uint8_t, 32> & capture_source) noexcept {
+    return valid && stem_source == capture_source;
 }
 
 server_vbr_occupied_quarantine_reset_result
@@ -10529,15 +10553,16 @@ private:
                     common_cache_plan_provider::host_cache_entry);
             };
             llama_memory_i * memory = nullptr;
+            bool cleared_for_empty_handoff = false;
+            const bool occupied_prefix_projection =
+                occupied_candidate && candidate.requires_prefix_projection();
+            vbr_artifact_attention_prefix_projection occupied_projection;
             if (occupied_candidate) {
-                const bool occupied_prefix_projection =
-                    candidate.requires_prefix_projection();
-                vbr_artifact_attention_prefix_projection prefix_projection;
                 if (occupied_prefix_projection &&
                     vbr_artifact_store->prepare_host_prefix_projection(
                         candidate.payload(),
                         task.tokens.retention_token_ids(),
-                        candidate.prefix_tokens(), prefix_projection) !=
+                        candidate.prefix_tokens(), occupied_projection) !=
                             vbr_artifact_prefix_projection_status::projected) {
                     vbr_automatic_restore_occupied_fallbacks++;
                     return false;
@@ -10560,6 +10585,74 @@ private:
                             "automatic occupied VBR restore refused: live sequence absent\n");
                     return false;
                 }
+
+                // Exact rollback keeps the existing atomic occupied path. A
+                // one-slot server may instead hand off through an empty target
+                // when the idle incumbent and incoming request both have
+                // useful durable host prefixes. This is the same destructive
+                // rebind the subsequent cold path would perform, moved before
+                // import so failure naturally falls through to cold prefill.
+                server_vbr_empty_handoff_gate handoff_gate;
+                handoff_gate.slot_count = slots.size();
+                handoff_gate.incoming_prefix = candidate.prefix_tokens();
+                handoff_gate.hard_lease =
+                    slot.hard_lease_blocks_live_prefix();
+                handoff_gate.recovery_pin =
+                    slot.cache_plan_destruction_recovery_pin.valid();
+                handoff_gate.deferred_task =
+                    queue_tasks.has_deferred_for_slot(slot.id);
+                handoff_gate.incumbent_supported =
+                    automatic_vbr_cache_support(
+                        slot.prompt.tokens, slot.lora,
+                        slot.can_speculate()) ==
+                    server_vbr_prompt_cache_support_status::supported;
+                server_prompt_cache_vbr_restore_candidate durable_incumbent;
+                bool durable_incumbent_prepared = false;
+                if (server_vbr_empty_handoff_lookup_allowed(handoff_gate)) {
+                    handoff_gate.incumbent_lcp =
+                        slot.prompt.tokens.get_common_prefix(task.tokens);
+                    if (candidate.prefix_tokens() >
+                            handoff_gate.incumbent_lcp) {
+                        // The incumbent witness must itself be a sealed host
+                        // frontier. A projection from some longer artifact is
+                        // not recovery authority for destructive handoff.
+                        durable_incumbent_prepared =
+                            prompt_cache->prepare_vbr_restore(
+                                slot.prompt.tokens,
+                                frontier_execution_identity,
+                                adapter_identity, durable_incumbent, false,
+                                &slot.cache_family);
+                        handoff_gate.durable_incumbent_prefix =
+                            durable_incumbent.prefix_tokens();
+                        handoff_gate.exact_incumbent_durable =
+                            durable_incumbent_prepared &&
+                            durable_incumbent.prefix_tokens() ==
+                                uint64_t(slot.prompt.n_tokens());
+                        handoff_gate.family_matches =
+                            durable_incumbent.cache_family() ==
+                                slot.cache_family;
+                    }
+                }
+                const bool handoff_eligible = durable_incumbent_prepared &&
+                    server_vbr_empty_handoff_allowed(handoff_gate);
+                if (handoff_eligible &&
+                    slot.prompt_clear_after_vbr_publication(
+                        server_cache_destruction_reason::live_prefix_replace)) {
+                    // Hybrid/iSWA memory may contain payload-complete children
+                    // which a per-sequence erase cannot empty. With one slot,
+                    // clearing the whole tree cannot affect another request.
+                    llama_memory_clear(memory, false);
+                    memory->breathe();
+                    cleared_for_empty_handoff = true;
+                    SLT_INF(
+                        slot,
+                        "automatic VBR host handoff cleared idle source "
+                        "prefix=%" PRIu64 " incoming=%" PRIu64 "\n",
+                        durable_incumbent.prefix_tokens(),
+                        candidate.prefix_tokens());
+                }
+            }
+            if (occupied_candidate && !cleared_for_empty_handoff) {
                 server_prompt_cache_vbr_replacement_ticket ticket;
                 server_prompt_cache_vbr_replacement_diagnostics
                     replacement_diagnostics;
@@ -10644,7 +10737,7 @@ private:
                         import_host_occupied_prefix_replacement(
                             std::move(request), ticket.incoming_payload(),
                             ticket.recovery_payload(),
-                            std::move(prefix_projection))
+                            std::move(occupied_projection))
                     : vbr_artifact_store->import_host_occupied_replacement(
                             std::move(request), ticket.incoming_payload(),
                             ticket.recovery_payload());
@@ -10724,16 +10817,26 @@ private:
                 return true;
             }
 
-            vbr_artifact_attention_prefix_projection prefix_projection;
-            const auto prepare_prefix_projection = [&]() noexcept {
+            vbr_artifact_attention_prefix_projection prefix_projection =
+                cleared_for_empty_handoff
+                    ? std::move(occupied_projection)
+                    : vbr_artifact_attention_prefix_projection {};
+            bool prefix_projection_ready =
+                cleared_for_empty_handoff && candidate.requires_prefix_projection();
+            const auto prepare_prefix_projection = [&](bool refresh = false) noexcept {
                 if (!candidate.requires_prefix_projection()) {
                     return true;
                 }
-                return vbr_artifact_store->prepare_host_prefix_projection(
+                if (prefix_projection_ready && !refresh) {
+                    return true;
+                }
+                prefix_projection_ready =
+                    vbr_artifact_store->prepare_host_prefix_projection(
                            candidate.payload(),
                            task.tokens.retention_token_ids(),
                            candidate.prefix_tokens(), prefix_projection) ==
                     vbr_artifact_prefix_projection_status::projected;
+                return prefix_projection_ready;
             };
             if (!prepare_prefix_projection()) {
                 return false;
@@ -10749,11 +10852,13 @@ private:
             // recurrent/QSA companion state.  Clear this destination across
             // every child now; failure remains a soft cold-replay fallback.
             // Other unified-KV sequences are untouched.
-            if (construction_empty &&
+            const bool empty_destination =
+                construction_empty || cleared_for_empty_handoff;
+            if (empty_destination &&
                 !memory->seq_rm(slot.id, -1, -1)) {
                 return false;
             }
-            if (construction_empty) {
+            if (empty_destination) {
                 // seq_rm drops membership immediately; dynamic VBR releases
                 // its now-phantom pool watermark at the idle boundary.  Run
                 // that boundary before snapshotting so the target is truly an
@@ -10834,7 +10939,7 @@ private:
             if (server_vbr_artifact_import_variant_fallback_safe(imported) &&
                 candidate.use_fallback_payload()) {
                 GGML_ASSERT(!state.published);
-                if (!prepare_prefix_projection()) {
+                if (!prepare_prefix_projection(true)) {
                     return false;
                 }
                 imported = import_selected();
@@ -13608,7 +13713,13 @@ private:
             bool checkpoint_candidate_seen = false;
             std::array<uint8_t, 32> attempt_identity =
                 full_source_identity;
-            const bool stem_already_durable = idle.id >= 0 &&
+            const bool matching_stem_source =
+                server_vbr_stem_matches_capture_source(
+                    idle.vbr_idle_stem_source_valid,
+                    idle.vbr_idle_stem_source_identity,
+                    full_source_identity);
+            const bool stem_already_durable = matching_stem_source &&
+                idle.id >= 0 &&
                 size_t(idle.id) < vbr_durable_stems_by_seq.size() &&
                 vbr_durable_stems_by_seq[size_t(idle.id)] != 0;
             // Reuse demand reopens checkpoint selection when the durable stem
@@ -13628,7 +13739,7 @@ private:
             if (!durable &&
                 (!stem_already_durable ||
                  idle.vbr_reuse_capture_frontier != 0) &&
-                (!idle.vbr_idle_stem_source_valid ||
+                (!matching_stem_source ||
                  idle.vbr_reuse_capture_frontier != 0) &&
                 n_swa == 0 &&
                 (llama_model_is_hybrid(model_tgt) || ctx_dft ||
@@ -13716,14 +13827,17 @@ private:
             bool checkpoint_stem = checkpoint_frontier != nullptr;
 
             bool stem_retry = false;
-            const bool matching_stem_source =
-                idle.vbr_idle_stem_source_valid &&
-                idle.vbr_idle_stem_source_identity == attempt_identity;
+            const bool matching_attempt_stem_source =
+                server_vbr_stem_matches_capture_source(
+                    idle.vbr_idle_stem_source_valid,
+                    idle.vbr_idle_stem_source_identity,
+                    attempt_identity);
             const bool durable_stem = idle.id >= 0 &&
                 size_t(idle.id) < vbr_durable_stems_by_seq.size() &&
                 vbr_durable_stems_by_seq[size_t(idle.id)] != 0;
             if (!checkpoint_stem && !durable &&
-                !idle.prompt.tokens.has_media() && matching_stem_source) {
+                !idle.prompt.tokens.has_media() &&
+                matching_attempt_stem_source) {
                 if (idle.vbr_idle_stem_coverage_tokens != 0 &&
                     durable_stem) {
                     continue;

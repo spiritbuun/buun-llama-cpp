@@ -1466,6 +1466,8 @@ struct server_prompt_cache {
     // as a bounded pre-adoption fallback.
     // Media-bearing automatic restore is deliberately deferred until lookup
     // owns a frontier-media authority.
+    // A non-null required_family constrains selection at the index owner so a
+    // higher-ranked foreign-family row cannot mask a compatible candidate.
     // This is deliberately separate
     // from fixed-state load()/contains(): VBR restoration is an adopt
     // transaction, not a serialized state-image restore.
@@ -1474,7 +1476,8 @@ struct server_prompt_cache {
         const std::string & execution_identity,
         const std::string & adapter_config_key,
         server_prompt_cache_vbr_restore_candidate & candidate,
-        bool allow_prefix_projection = true) noexcept;
+        bool allow_prefix_projection = true,
+        const common_cache_family_binding * required_family = nullptr) noexcept;
     // Fallible retention/lease preparation for a construction-empty live
     // destination. Cancellation rolls this provisional association back;
     // commit consumes it only after successful artifact adoption.

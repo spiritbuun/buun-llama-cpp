@@ -6,6 +6,7 @@
 
 #include "json.h"
 
+#include <array>
 #include <cstddef>
 #include <memory>
 #include <mutex>
@@ -90,6 +91,30 @@ struct server_vbr_occupied_quarantine_reset_result {
 
 server_vbr_occupied_quarantine_reset_result
 server_vbr_occupied_quarantine_reset_for_test();
+
+struct server_vbr_empty_handoff_gate {
+    size_t slot_count = 0;
+    uint64_t incoming_prefix = 0;
+    uint64_t incumbent_lcp = 0;
+    uint64_t durable_incumbent_prefix = 0;
+    bool exact_incumbent_durable = false;
+    bool hard_lease = false;
+    bool recovery_pin = false;
+    bool deferred_task = false;
+    bool incumbent_supported = false;
+    bool family_matches = false;
+};
+
+bool server_vbr_empty_handoff_lookup_allowed(
+    const server_vbr_empty_handoff_gate & gate) noexcept;
+
+bool server_vbr_empty_handoff_allowed(
+    const server_vbr_empty_handoff_gate & gate) noexcept;
+
+bool server_vbr_stem_matches_capture_source(
+    bool valid,
+    const std::array<uint8_t, 32> & stem_source,
+    const std::array<uint8_t, 32> & capture_source) noexcept;
 
 // TEST-ONLY door. It constructs the private server_slot, resolves a
 // scheduler family token, exercises the real no-restore cache load, and then
