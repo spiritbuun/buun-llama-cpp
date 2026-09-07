@@ -1014,7 +1014,11 @@ bool llama_safetensors_qwen4exp_importer::describe(
             dtype = shard.dtype; dim = shard.shape[1]; rows += shard.shape[0];
         }
         if (dim > INT64_MAX || rows > INT64_MAX) throw std::runtime_error("Qwen4 PLE table exceeds runtime limits");
-        type = dtype == llama_safetensors_dtype::F8_E4M3 ? GGML_TYPE_F8_E4M3 : GGML_TYPE_F32;
+        // the table is gathered on the CPU; keep BF16/F16 sources as-is (an F32 copy would double
+        // the 100 GB table in host RAM)
+        type = dtype == llama_safetensors_dtype::F8_E4M3 ? GGML_TYPE_F8_E4M3 :
+               dtype == llama_safetensors_dtype::BF16    ? GGML_TYPE_BF16 :
+               dtype == llama_safetensors_dtype::F16     ? GGML_TYPE_F16 : GGML_TYPE_F32;
         shape = { static_cast<int64_t>(dim), static_cast<int64_t>(rows) };
     } else if (spec.ple_scale) {
         if (ple_layer_ == UINT32_MAX || ple_shards_ == 0) return false;
@@ -1141,7 +1145,8 @@ bool llama_safetensors_qwen4exp_importer::load(
             if (offset != ggml_nbytes(destination)) throw std::runtime_error("Qwen4 EXL3 n-gram table is incomplete");
             return true;
         }
-        if (destination->type != GGML_TYPE_F32 && destination->type != GGML_TYPE_F8_E4M3) {
+        if (destination->type != GGML_TYPE_F32 && destination->type != GGML_TYPE_F8_E4M3 &&
+            destination->type != GGML_TYPE_BF16 && destination->type != GGML_TYPE_F16) {
             throw std::runtime_error("Qwen4 PLE destination has an unsupported type");
         }
         size_t offset = 0;
@@ -1157,7 +1162,9 @@ bool llama_safetensors_qwen4exp_importer::load(
                 else if (desc.dtype == llama_safetensors_dtype::F16) owned = llama_safetensors_f16_to_f32(owned);
                 data = owned.data();
                 size = owned.size();
-            } else if (desc.dtype != llama_safetensors_dtype::F8_E4M3) {
+            } else if ((destination->type == GGML_TYPE_F8_E4M3 && desc.dtype != llama_safetensors_dtype::F8_E4M3) ||
+                       (destination->type == GGML_TYPE_BF16    && desc.dtype != llama_safetensors_dtype::BF16) ||
+                       (destination->type == GGML_TYPE_F16     && desc.dtype != llama_safetensors_dtype::F16)) {
                 throw std::runtime_error("Qwen4 PLE shard type does not match its destination");
             } else if ((data = registry_.data(desc)) == nullptr) {
                 owned = registry_.read(desc);
