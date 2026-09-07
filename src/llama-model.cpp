@@ -1651,6 +1651,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             std::array<int64_t, GGML_MAX_DIMS> ne{};
             return ml.get_tensor_info(name.str().c_str(), type, ne) && type == GGML_TYPE_F16 ? ne[0] : 1;
         };
+        // Only the formats whose executors consume a static activation scale / sign vector get the
+        // optional input_scale side tensor (mirrors build_lora_mm); synthetic sources would otherwise
+        // materialize one for plain F32/F16 weights and the graph would reject it.
+        const auto create_input_scale = [&](const LLM_TN_IMPL & name, const ggml_tensor * weight) -> ggml_tensor * {
+            if (weight == nullptr) {
+                return nullptr;
+            }
+            const ggml_type t = weight->type;
+            const bool takes_input_scale = t == GGML_TYPE_F8_E4M3 || t == GGML_TYPE_I8 || t == GGML_TYPE_Q4_A32 ||
+                                           t == GGML_TYPE_MXFP4 || ggml_type_is_exl3(t);
+            if (!takes_input_scale) {
+                return nullptr;
+            }
+            return create_tensor(name, {input_scale_ne(name)}, TENSOR_NOT_REQUIRED);
+        };
         // per-expert side tensors: scalar per expert, or an F16 vector per expert (EXL3 svh/suh)
         const auto expert_side_vec = [&](const LLM_TN_IMPL & name, int64_t n_exp) -> int64_t {
             ggml_type type = GGML_TYPE_COUNT;
@@ -1907,31 +1922,31 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
             // input scales
             if (!layer.wq_in_s && layer.wq) {
-                layer.wq_in_s = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "input_scale", i), {input_scale_ne(tn(LLM_TENSOR_ATTN_Q,   "input_scale", i))}, TENSOR_NOT_REQUIRED);
+                layer.wq_in_s = create_input_scale(tn(LLM_TENSOR_ATTN_Q, "input_scale", i), layer.wq);
             }
             if (!layer.wk_in_s && layer.wk) {
-                layer.wk_in_s = create_tensor(tn(LLM_TENSOR_ATTN_K,   "input_scale", i), {input_scale_ne(tn(LLM_TENSOR_ATTN_K,   "input_scale", i))}, TENSOR_NOT_REQUIRED);
+                layer.wk_in_s = create_input_scale(tn(LLM_TENSOR_ATTN_K, "input_scale", i), layer.wk);
             }
             if (!layer.wv_in_s && layer.wv) {
-                layer.wv_in_s = create_tensor(tn(LLM_TENSOR_ATTN_V,   "input_scale", i), {input_scale_ne(tn(LLM_TENSOR_ATTN_V,   "input_scale", i))}, TENSOR_NOT_REQUIRED);
+                layer.wv_in_s = create_input_scale(tn(LLM_TENSOR_ATTN_V, "input_scale", i), layer.wv);
             }
             if (!layer.wo_in_s && layer.wo) {
-                layer.wo_in_s = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "input_scale", i), {input_scale_ne(tn(LLM_TENSOR_ATTN_OUT, "input_scale", i))}, TENSOR_NOT_REQUIRED);
+                layer.wo_in_s = create_input_scale(tn(LLM_TENSOR_ATTN_OUT, "input_scale", i), layer.wo);
             }
             if (!layer.wqkv_in_s && layer.wqkv) {
-                layer.wqkv_in_s = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "input_scale", i), {input_scale_ne(tn(LLM_TENSOR_ATTN_QKV, "input_scale", i))}, TENSOR_NOT_REQUIRED);
+                layer.wqkv_in_s = create_input_scale(tn(LLM_TENSOR_ATTN_QKV, "input_scale", i), layer.wqkv);
             }
             if (!layer.wqkv_gate_in_s && layer.wqkv_gate) {
-                layer.wqkv_gate_in_s = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "input_scale", i), {input_scale_ne(tn(LLM_TENSOR_ATTN_GATE, "input_scale", i))}, TENSOR_NOT_REQUIRED);
+                layer.wqkv_gate_in_s = create_input_scale(tn(LLM_TENSOR_ATTN_GATE, "input_scale", i), layer.wqkv_gate);
             }
             if (!layer.ffn_gate_in_s && layer.ffn_gate) {
-                layer.ffn_gate_in_s = create_tensor(tn(LLM_TENSOR_FFN_GATE, "input_scale", i), {input_scale_ne(tn(LLM_TENSOR_FFN_GATE, "input_scale", i))}, TENSOR_NOT_REQUIRED);
+                layer.ffn_gate_in_s = create_input_scale(tn(LLM_TENSOR_FFN_GATE, "input_scale", i), layer.ffn_gate);
             }
             if (!layer.ffn_down_in_s && layer.ffn_down) {
-                layer.ffn_down_in_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "input_scale", i), {input_scale_ne(tn(LLM_TENSOR_FFN_DOWN, "input_scale", i))}, TENSOR_NOT_REQUIRED);
+                layer.ffn_down_in_s = create_input_scale(tn(LLM_TENSOR_FFN_DOWN, "input_scale", i), layer.ffn_down);
             }
             if (!layer.ffn_up_in_s && layer.ffn_up) {
-                layer.ffn_up_in_s = create_tensor(tn(LLM_TENSOR_FFN_UP, "input_scale", i), {input_scale_ne(tn(LLM_TENSOR_FFN_UP, "input_scale", i))}, TENSOR_NOT_REQUIRED);
+                layer.ffn_up_in_s = create_input_scale(tn(LLM_TENSOR_FFN_UP, "input_scale", i), layer.ffn_up);
             }
             if (!layer.ffn_gate_exps_in_s && layer.ffn_gate_exps) {
                 layer.ffn_gate_exps_in_s = create_expert_side(tn(LLM_TENSOR_FFN_GATE_EXPS, "input_scale", i), n_expert);
@@ -1943,43 +1958,43 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 layer.ffn_up_exps_in_s = create_expert_side(tn(LLM_TENSOR_FFN_UP_EXPS, "input_scale", i), n_expert);
             }
             if (!layer.ffn_gate_shexp_in_s && layer.ffn_gate_shexp) {
-                layer.ffn_gate_shexp_in_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "input_scale", i), {input_scale_ne(tn(LLM_TENSOR_FFN_GATE_SHEXP, "input_scale", i))}, TENSOR_NOT_REQUIRED);
+                layer.ffn_gate_shexp_in_s = create_input_scale(tn(LLM_TENSOR_FFN_GATE_SHEXP, "input_scale", i), layer.ffn_gate_shexp);
             }
             if (!layer.ffn_down_shexp_in_s && layer.ffn_down_shexp) {
-                layer.ffn_down_shexp_in_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "input_scale", i), {input_scale_ne(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "input_scale", i))}, TENSOR_NOT_REQUIRED);
+                layer.ffn_down_shexp_in_s = create_input_scale(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "input_scale", i), layer.ffn_down_shexp);
             }
             if (!layer.ffn_up_shexp_in_s && layer.ffn_up_shexp) {
-                layer.ffn_up_shexp_in_s = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP, "input_scale", i), {input_scale_ne(tn(LLM_TENSOR_FFN_UP_SHEXP, "input_scale", i))}, TENSOR_NOT_REQUIRED);
+                layer.ffn_up_shexp_in_s = create_input_scale(tn(LLM_TENSOR_FFN_UP_SHEXP, "input_scale", i), layer.ffn_up_shexp);
             }
             if (!layer.ssm_in_in_s && layer.ssm_in) {
-                layer.ssm_in_in_s = create_tensor(tn(LLM_TENSOR_SSM_IN, "input_scale", i), {input_scale_ne(tn(LLM_TENSOR_SSM_IN, "input_scale", i))}, TENSOR_NOT_REQUIRED);
+                layer.ssm_in_in_s = create_input_scale(tn(LLM_TENSOR_SSM_IN, "input_scale", i), layer.ssm_in);
             }
             if (!layer.ssm_out_in_s && layer.ssm_out) {
-                layer.ssm_out_in_s = create_tensor(tn(LLM_TENSOR_SSM_OUT, "input_scale", i), {input_scale_ne(tn(LLM_TENSOR_SSM_OUT, "input_scale", i))}, TENSOR_NOT_REQUIRED);
+                layer.ssm_out_in_s = create_input_scale(tn(LLM_TENSOR_SSM_OUT, "input_scale", i), layer.ssm_out);
             }
             if (!layer.ssm_alpha_in_s && layer.ssm_alpha) {
-                layer.ssm_alpha_in_s = create_tensor(tn(LLM_TENSOR_SSM_ALPHA, "input_scale", i), {input_scale_ne(tn(LLM_TENSOR_SSM_ALPHA, "input_scale", i))}, TENSOR_NOT_REQUIRED);
+                layer.ssm_alpha_in_s = create_input_scale(tn(LLM_TENSOR_SSM_ALPHA, "input_scale", i), layer.ssm_alpha);
             }
             if (!layer.ssm_beta_in_s && layer.ssm_beta) {
-                layer.ssm_beta_in_s = create_tensor(tn(LLM_TENSOR_SSM_BETA, "input_scale", i), {input_scale_ne(tn(LLM_TENSOR_SSM_BETA, "input_scale", i))}, TENSOR_NOT_REQUIRED);
+                layer.ssm_beta_in_s = create_input_scale(tn(LLM_TENSOR_SSM_BETA, "input_scale", i), layer.ssm_beta);
             }
             if (!layer.index_q_proj_in_s && layer.index_q_proj) {
-                layer.index_q_proj_in_s = create_tensor(tn(LLM_TENSOR_INDEXER_Q_PROJ, "input_scale", i), {input_scale_ne(tn(LLM_TENSOR_INDEXER_Q_PROJ, "input_scale", i))}, TENSOR_NOT_REQUIRED);
+                layer.index_q_proj_in_s = create_input_scale(tn(LLM_TENSOR_INDEXER_Q_PROJ, "input_scale", i), layer.index_q_proj);
             }
             if (!layer.index_k_proj_in_s && layer.index_k_proj) {
-                layer.index_k_proj_in_s = create_tensor(tn(LLM_TENSOR_INDEXER_K_PROJ, "input_scale", i), {input_scale_ne(tn(LLM_TENSOR_INDEXER_K_PROJ, "input_scale", i))}, TENSOR_NOT_REQUIRED);
+                layer.index_k_proj_in_s = create_input_scale(tn(LLM_TENSOR_INDEXER_K_PROJ, "input_scale", i), layer.index_k_proj);
             }
             if (!layer.nextn.eh_proj_in_s && layer.nextn.eh_proj) {
-                layer.nextn.eh_proj_in_s = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "input_scale", i), {input_scale_ne(tn(LLM_TENSOR_NEXTN_EH_PROJ, "input_scale", i))}, TENSOR_NOT_REQUIRED);
+                layer.nextn.eh_proj_in_s = create_input_scale(tn(LLM_TENSOR_NEXTN_EH_PROJ, "input_scale", i), layer.nextn.eh_proj);
             }
             if (!layer.nextn.eh_proj_embd_in_s && layer.nextn.eh_proj_embd) {
-                layer.nextn.eh_proj_embd_in_s = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ_EMBD, "input_scale", i), {input_scale_ne(tn(LLM_TENSOR_NEXTN_EH_PROJ_EMBD, "input_scale", i))}, TENSOR_NOT_REQUIRED);
+                layer.nextn.eh_proj_embd_in_s = create_input_scale(tn(LLM_TENSOR_NEXTN_EH_PROJ_EMBD, "input_scale", i), layer.nextn.eh_proj_embd);
             }
             if (!layer.nextn.eh_proj_hidden_in_s && layer.nextn.eh_proj_hidden) {
-                layer.nextn.eh_proj_hidden_in_s = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ_HIDDEN, "input_scale", i), {input_scale_ne(tn(LLM_TENSOR_NEXTN_EH_PROJ_HIDDEN, "input_scale", i))}, TENSOR_NOT_REQUIRED);
+                layer.nextn.eh_proj_hidden_in_s = create_input_scale(tn(LLM_TENSOR_NEXTN_EH_PROJ_HIDDEN, "input_scale", i), layer.nextn.eh_proj_hidden);
             }
             if (!layer.nextn.shared_head_head_in_s && layer.nextn.shared_head_head) {
-                layer.nextn.shared_head_head_in_s = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "input_scale", i), {input_scale_ne(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "input_scale", i))}, TENSOR_NOT_REQUIRED);
+                layer.nextn.shared_head_head_in_s = create_input_scale(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "input_scale", i), layer.nextn.shared_head_head);
             }
         }
         // output scales
@@ -1992,7 +2007,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             // input scale
             if (!output_in_s) {
-                output_in_s = create_tensor(tn(LLM_TENSOR_OUTPUT, "input_scale"), {input_scale_ne(tn(LLM_TENSOR_OUTPUT, "input_scale"))}, TENSOR_NOT_REQUIRED);
+                output_in_s = create_input_scale(tn(LLM_TENSOR_OUTPUT, "input_scale"), output);
             }
         }
         validate_weight_scale(output, output_s);
@@ -4145,7 +4160,9 @@ void llama_model_base::create_tensor_qkv(llama_layer & layer, int bid,
     // A virtual source may expose either a fused QKV tensor or the three
     // canonical projections. Probe the fused form first just like GGUF; a
     // source that does not provide it naturally falls back below.
-    layer.wqkv = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "weight", bid), {n_embd_, n_embd_qkv}, TENSOR_NOT_REQUIRED);
+    // synthetic (virtual) sources answer "present" for every optional name; there the split form is
+    // authoritative, otherwise the fused projection would shadow wq/wk/wv and leave them null
+    layer.wqkv = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "weight", bid), {n_embd_, n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
     if (layer.wqkv) {
         layer.wqkv_b = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "bias", bid), {n_embd_qkv}, TENSOR_NOT_REQUIRED);
     } else {

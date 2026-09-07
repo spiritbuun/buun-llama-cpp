@@ -3037,7 +3037,9 @@ static file_ptr make_qwen4_mtp_combined(
                     extra_ctx.get(), GGML_TYPE_F32, source->hparams.n_embd, n_qkv);
             ggml_set_name(qkv, "blk.1.attn_qkv.weight");
             saver.add_tensor(qkv);
-            for (const char * suffix : { "scale", "input_scale" }) {
+            // an F32 projection takes an output scale but no static activation scale
+            // (input_scale is only created for FP8/I8/Q4_A32/MXFP4/EXL3 weights)
+            for (const char * suffix : { "scale" }) {
                 ggml_tensor * scale = ggml_new_tensor_1d(extra_ctx.get(), GGML_TYPE_F32, 1);
                 ggml_set_name(scale, format("blk.1.attn_qkv.%s", suffix).c_str());
                 saver.add_tensor(scale);

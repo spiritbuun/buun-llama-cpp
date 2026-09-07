@@ -14,7 +14,9 @@
 #include <cstring>
 #include <map>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
 
@@ -75,6 +77,10 @@ struct llama_model_loader {
     int n_tensors = 0;
     int n_created = 0;
     int tensor_capacity = 0;
+    // names touched by create_tensor: created (incl. skipped) and the subset that was skipped;
+    // lets done_getting_tensors forgive .scale/.input_scale side tensors of skipped weights
+    std::unordered_set<std::string> created_tensors;
+    std::unordered_set<std::string> skipped_tensors;
 
     uint64_t n_elements = 0;
     size_t   n_bytes    = 0;

@@ -532,6 +532,19 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (scalar_only && ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
             ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
         }
+        if (ret.axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN) {
+            // name the node and its sources before aborting: "axis unknown" alone is undebuggable
+            fprintf(stderr, "ggml_backend_meta: no split rule for %s '%s' [%lld,%lld,%lld,%lld] (scalar_only=%d):\n",
+                    ggml_op_name(tensor->op), tensor->name,
+                    (long long) tensor->ne[0], (long long) tensor->ne[1], (long long) tensor->ne[2], (long long) tensor->ne[3], scalar_only);
+            for (size_t i = 0; i < GGML_MAX_SRC; i++) {
+                if (tensor->src[i] == nullptr || tensor->src[i] == tensor) continue;
+                fprintf(stderr, "    src%zu %s '%s' [%lld,%lld,%lld,%lld] axis=%d n_segments=%zu\n", i,
+                        ggml_op_name(tensor->src[i]->op), tensor->src[i]->name,
+                        (long long) tensor->src[i]->ne[0], (long long) tensor->src[i]->ne[1], (long long) tensor->src[i]->ne[2], (long long) tensor->src[i]->ne[3],
+                        (int) src_ss[i].axis, (size_t) src_ss[i].n_segments);
+            }
+        }
         GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
         return ret;
     };

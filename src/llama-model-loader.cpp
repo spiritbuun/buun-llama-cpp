@@ -1654,6 +1654,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 size_data -= nbytes;
             }
             n_created++;
+            created_tensors.insert(tn.str());
+            skipped_tensors.insert(tn.str());
 
             return nullptr;
         }
@@ -1761,7 +1763,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     };
 
     if (files.empty()) {
-        if (flags & TENSOR_SKIP_IF_VIRTUAL) {
+        // "virtual" = a synthetic (user-callback) source that answers every name; a native
+        // safetensors source is a real checkpoint and keeps its optional tensors
+        if ((flags & TENSOR_SKIP_IF_VIRTUAL) && tensor_source == nullptr) {
             return nullptr;
         }
         ggml_type type = GGML_TYPE_F32;
@@ -1858,6 +1862,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
         if (tensor_source != nullptr && !(flags & TENSOR_DUPLICATED)) {
             n_created++;
+            created_tensors.insert(tn.str());
             n_elements += ggml_nelements(ret);
             n_bytes    += ggml_nbytes(ret);
         }
@@ -1933,6 +1938,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         size_data += ggml_nbytes(&t_meta);
     } else {
         n_created++;
+        created_tensors.insert(ggml_get_name(&t_meta));
     }
 
     return tensor;
@@ -1940,15 +1946,35 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
 void llama_model_loader::done_getting_tensors(bool partial) const {
     if (!files.empty()) {
-        if (n_created > n_tensors) {
-            throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_created));
-        }
+        int n_created_eff = n_created;
         if (n_created < n_tensors) {
+            // .scale / .input_scale side tensors ride on their weight; when the weight was skipped
+            // (e.g. the MTP block of a target-only load) nothing asks for them, so count them as skipped
+            for (const auto & it : weights_map) {
+                const std::string & name = it.first;
+                if (created_tensors.count(name)) {
+                    continue;
+                }
+                const size_t dot = name.rfind('.');
+                if (dot == std::string::npos) {
+                    continue;
+                }
+                const std::string suffix = name.substr(dot + 1);
+                if ((suffix == "scale" || suffix == "input_scale") && skipped_tensors.count(name.substr(0, dot) + ".weight")) {
+                    LLAMA_LOG_DEBUG("%s: side tensor %s belongs to a skipped weight -- ignoring\n", __func__, name.c_str());
+                    n_created_eff++;
+                }
+            }
+        }
+        if (n_created_eff > n_tensors) {
+            throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_created_eff));
+        }
+        if (n_created_eff < n_tensors) {
             if (!partial) {
-                throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created));
+                throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created_eff));
             }
             LLAMA_LOG_INFO("%s: partial load — used %d of %d tensors in the file (rest belong to a sibling model on the same .gguf)\n",
-                    __func__, n_created, n_tensors);
+                    __func__, n_created_eff, n_tensors);
         }
     }
     if (n_tensors_moved > 0) {
