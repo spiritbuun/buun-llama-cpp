@@ -1,6 +1,8 @@
 #include "llama-safetensors.h"
 
 #include "llama-safetensors-importer.h"
+#include "llama-safetensors-tensor.h"
+#include "llama-impl.h"
 #include "llama-safetensors-qwen3.h"
 #include "llama-safetensors-qwen35.h"
 #include "llama-safetensors-qwen4exp.h"
@@ -12,6 +14,7 @@
 #include "gguf.h"
 
 #include <array>
+#include <chrono>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -191,7 +194,16 @@ llama_model * llama_model_load_from_safetensors_dir(
                 throw std::runtime_error("excess safetensors target load for '" + canonical_name + "'");
             }
             ++target->second.loaded;
+            const auto t_start = std::chrono::steady_clock::now();
+            const auto log_slow = [&](const char * path) {
+                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
+                if (ms >= 500.0) {
+                    LLAMA_LOG_DEBUG("%s: %s %s %.1f MiB in %.0f ms (%.2f GB/s)\n", __func__, path, canonical_name.c_str(),
+                                    ggml_nbytes(tensor) / (1024.0 * 1024.0), ms, ggml_nbytes(tensor) / ms / 1e6);
+                }
+            };
             if (importer_->load(canonical_name, tensor, check_tensors_)) {
+                log_slow("direct");
                 return;
             }
             std::vector<uint8_t> data = importer_->materialize(
@@ -199,7 +211,8 @@ llama_model * llama_model_load_from_safetensors_dir(
             if (check_tensors_ && !ggml_validate_row_data(tensor->type, data.data(), data.size())) {
                 throw std::runtime_error(std::string("tensor '") + tensor->name + "' has invalid data");
             }
-            ggml_backend_tensor_set(tensor, data.data(), 0, data.size());
+            llama_safetensors_tensor_set_parallel(tensor, data.data(), 0, data.size());
+            log_slow("materialize");
         }
 
         void validate_complete() const override {

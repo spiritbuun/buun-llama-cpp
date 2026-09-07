@@ -27,6 +27,11 @@ bool llama_safetensors_describe_tensor(const llama_safetensors_registry &       
 void llama_safetensors_consume_tensor(const llama_safetensors_quant_adapters & quant,
                                       const llama_safetensors_tensor_binding & binding);
 
+// ggml_backend_tensor_set spread over host threads for large host-resident destinations: the
+// source is usually an mmap whose pages fault in on first touch, so one memcpy runs at ~1 GB/s.
+// Device destinations and small copies fall through to a plain ggml_backend_tensor_set.
+void llama_safetensors_tensor_set_parallel(ggml_tensor * destination, const void * data, size_t offset, size_t size);
+
 std::vector<uint8_t> llama_safetensors_bf16_to_f32(const std::vector<uint8_t> & source);
 std::vector<uint8_t> llama_safetensors_f16_to_f32(const std::vector<uint8_t> & source);
 

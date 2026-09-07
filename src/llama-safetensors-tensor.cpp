@@ -6,6 +6,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <thread>
 
 namespace {
 
@@ -112,6 +113,27 @@ void llama_safetensors_consume_tensor(const llama_safetensors_quant_adapters & q
     if (binding.quant) {
         quant.consume(*binding.quant);
     }
+}
+
+void llama_safetensors_tensor_set_parallel(ggml_tensor * destination, const void * data, size_t offset, size_t size) {
+    constexpr size_t chunk_min = 32ull << 20;
+    const size_t n_threads = std::min<size_t>(std::thread::hardware_concurrency(), size / chunk_min);
+    if (n_threads < 2 || destination->buffer == nullptr || !ggml_backend_buffer_is_host(destination->buffer)) {
+        ggml_backend_tensor_set(destination, data, offset, size);
+        return;
+    }
+    const size_t chunk = (size + n_threads - 1) / n_threads;
+    std::vector<std::thread> workers;
+    workers.reserve(n_threads);
+    for (size_t t = 0; t < n_threads; ++t) {
+        const size_t begin = t * chunk;
+        const size_t end   = std::min(size, begin + chunk);
+        if (begin >= end) break;
+        workers.emplace_back([=]() {
+            ggml_backend_tensor_set(destination, static_cast<const uint8_t *>(data) + begin, offset + begin, end - begin);
+        });
+    }
+    for (auto & worker : workers) worker.join();
 }
 
 bool llama_safetensors_load_tensor_direct(const llama_safetensors_registry &       registry,

@@ -1142,7 +1142,7 @@ bool llama_safetensors_qwen4exp_importer::load(
                 const size_t size = static_cast<size_t>(desc.size);
                 if (offset > ggml_nbytes(destination) || size > ggml_nbytes(destination) - offset)
                     throw std::runtime_error("Qwen4 EXL3 n-gram shard exceeds destination");
-                ggml_backend_tensor_set(destination, data, offset, size);
+                llama_safetensors_tensor_set_parallel(destination, data, offset, size);
                 offset += size;
             }
             if (offset != ggml_nbytes(destination)) throw std::runtime_error("Qwen4 EXL3 n-gram table is incomplete");
@@ -1177,7 +1177,7 @@ bool llama_safetensors_qwen4exp_importer::load(
                 throw std::runtime_error("Qwen4 PLE shard contains invalid data");
             if (offset > ggml_nbytes(destination) || size > ggml_nbytes(destination) - offset)
                 throw std::runtime_error("Qwen4 PLE shard exceeds destination");
-            ggml_backend_tensor_set(destination, data, offset, size);
+            llama_safetensors_tensor_set_parallel(destination, data, offset, size);
             offset += size;
         }
         if (offset != ggml_nbytes(destination)) throw std::runtime_error("Qwen4 PLE upload is incomplete");
@@ -1258,26 +1258,47 @@ std::vector<uint8_t> llama_safetensors_qwen4exp_importer::materialize(
             const size_t target_row_size = ggml_row_size(target_type, n_cols);
             std::vector<uint8_t> weights(n_expert * n_rows * source_row_size);
             std::vector<float> scales(n_expert * n_row_blocks * n_col_blocks);
-            for (size_t expert = 0; expert < n_expert; ++expert) {
-                const auto weight = quant_->read(spec.stack_quant_weights[expert]);
-                if (weight.size() != n_rows * source_row_size) {
-                    throw std::runtime_error("split-expert FP8 weight has the wrong size");
+            {
+                // per-expert source reads are independent (and fault mmap pages in), so spread them
+                std::atomic<size_t> next{0};
+                std::exception_ptr error;
+                std::mutex error_mutex;
+                const size_t n_threads = std::max<size_t>(1, std::min<size_t>(std::thread::hardware_concurrency(), n_expert));
+                std::vector<std::thread> workers;
+                workers.reserve(n_threads);
+                for (size_t thread = 0; thread < n_threads; ++thread) {
+                    workers.emplace_back([&]() {
+                        for (size_t expert = next.fetch_add(1); expert < n_expert; expert = next.fetch_add(1)) {
+                            try {
+                                const auto weight = quant_->read(spec.stack_quant_weights[expert]);
+                                if (weight.size() != n_rows * source_row_size) {
+                                    throw std::runtime_error("split-expert FP8 weight has the wrong size");
+                                }
+                                std::memcpy(weights.data() + expert * n_rows * source_row_size,
+                                            weight.data(), weight.size());
+                                const auto scale = quant_->finalize(
+                                    spec.stack_quant_scales[expert], quant_->read(spec.stack_quant_scales[expert]));
+                                if (scale.size() != n_row_blocks * n_col_blocks * sizeof(float)) {
+                                    throw std::runtime_error("split-expert FP8 scale has the wrong size");
+                                }
+                                for (size_t i = 0; i < n_row_blocks * n_col_blocks; ++i) {
+                                    float value;
+                                    std::memcpy(&value, scale.data() + i * sizeof(value), sizeof(value));
+                                    if (!(value > 0.0f) || !std::isfinite(value)) {
+                                        throw std::runtime_error("split-expert FP8 scale must be finite and positive");
+                                    }
+                                    scales[expert * n_row_blocks * n_col_blocks + i] = value;
+                                }
+                            } catch (...) {
+                                std::lock_guard<std::mutex> lock(error_mutex);
+                                if (!error) error = std::current_exception();
+                                next.store(n_expert);
+                            }
+                        }
+                    });
                 }
-                std::memcpy(weights.data() + expert * n_rows * source_row_size,
-                            weight.data(), weight.size());
-                const auto scale = quant_->finalize(
-                    spec.stack_quant_scales[expert], quant_->read(spec.stack_quant_scales[expert]));
-                if (scale.size() != n_row_blocks * n_col_blocks * sizeof(float)) {
-                    throw std::runtime_error("split-expert FP8 scale has the wrong size");
-                }
-                for (size_t i = 0; i < n_row_blocks * n_col_blocks; ++i) {
-                    float value;
-                    std::memcpy(&value, scale.data() + i * sizeof(value), sizeof(value));
-                    if (!(value > 0.0f) || !std::isfinite(value)) {
-                        throw std::runtime_error("split-expert FP8 scale must be finite and positive");
-                    }
-                    scales[expert * n_row_blocks * n_col_blocks + i] = value;
-                }
+                for (auto & worker : workers) worker.join();
+                if (error) std::rethrow_exception(error);
             }
             result.resize(n_expert * n_rows * target_row_size);
             const auto * source_traits = ggml_get_type_traits(GGML_TYPE_F8_E4M3);
