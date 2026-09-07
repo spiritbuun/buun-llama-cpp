@@ -7,7 +7,7 @@ static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_p
                                     const float * bias_ptr,
                                     const int src0_nb0, const int src0_nb1, const int src0_nb2, const int src1_nb1,
                                     float * dst_ptr, const int dst_nb0, const int dst_nb1, const int dst_nb2,
-                                    const int64_t n_t) {
+                                    const int64_t n_t, const int64_t nr) {
     ggml_cuda_pdl_lc();
     const float * GGML_CUDA_RESTRICT src0 = src0_ptr;
     const float * GGML_CUDA_RESTRICT src1 = src1_ptr;
@@ -17,6 +17,10 @@ static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_p
     const int tid  = threadIdx.x;
     const int bidx = blockIdx.x;
     const int bidy = blockIdx.y;
+    // ragged tail: a tensor-split shard of the channels need not be a multiple of the block
+    if ((int64_t) bidy * split_d_inner + tid >= nr) {
+        return;
+    }
 
     const float * x_block = (const float *) ((const char *) src0 + bidx * src0_nb2 + bidy * split_d_inner * src0_nb1);
     const float * w_block = (const float *) ((const char *) src1 + bidy * split_d_inner * src1_nb1);
@@ -62,11 +66,13 @@ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, 
                                                const float * __restrict__ bias,
                                                const int src0_nb0, const int src0_nb1, const int src0_nb2,
                                                const int src1_nb1, float * __restrict__ dst, const int dst_nb0,
-                                               const int dst_nb1, const int dst_nb2, const int64_t n_t) {
+                                               const int dst_nb1, const int dst_nb2, const int64_t n_t, const int64_t nr) {
     const int tid  = threadIdx.x;
     const int bidx = blockIdx.x;
     const int bidy = blockIdx.y;
     const int bidz = blockIdx.z;
+    // ragged tail (tensor-split shards): inactive threads still join the barrier, but touch nothing
+    const bool active = (int64_t) bidy * split_d_inner + tid < nr;
 
     const float * x_block = (const float *) ((const char *) src0 + bidx * src0_nb2 + bidy * split_d_inner * src0_nb1 +
                                              bidz * split_n_t * src0_nb0);
@@ -89,7 +95,7 @@ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, 
     int col = tid % load_cols;
 #pragma unroll
     for (int idx = 0; idx < total_elems; idx += split_d_inner) {
-        if (row < (int)split_d_inner) {
+        if (row < (int)split_d_inner && (int64_t) bidy * split_d_inner + row < nr) {
             smem[row * n_cols + col] = x_block[row * stride_x + col];
         }
 
@@ -101,6 +107,9 @@ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, 
         }
     }
     __syncthreads();
+    if (!active) {
+        return;
+    }
 
     // Load weights into registers (done once, small)
     float w[d_conv] = { 0.0f };
@@ -129,7 +138,8 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const floa
                               const int dst_nb2, const int64_t nc, const int64_t nr, const int64_t n_t,
                               const int64_t n_s, cudaStream_t stream) {
     constexpr int short_threads = 128;
-    GGML_ASSERT(nr % short_threads == 0);
+    // nr need not be a multiple of the block: a tensor-split shard of the conv channels can be
+    // ragged; both kernels bounds-check their channel.
 
     auto launch_kernel = [&](auto NC) {
         constexpr int kNC = decltype(NC)::value;
@@ -137,7 +147,7 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const floa
             const dim3 blocks(n_s, (nr + short_threads - 1) / short_threads, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks, short_threads, 0, stream);
             ggml_cuda_kernel_launch(ssm_conv_f32<apply_silu, short_threads, kNC>, launch_params, src0, src1, bias, src0_nb0, src0_nb1,
-                                                                        src0_nb2, src1_nb1, dst, dst_nb0, dst_nb1, dst_nb2, n_t);
+                                                                        src0_nb2, src1_nb1, dst, dst_nb0, dst_nb1, dst_nb2, n_t, nr);
         } else {
             // Prefill is latency-bound by the long serial token loop at 32
             // tokens per CTA. Match the successful channel-last scheduling
@@ -145,11 +155,10 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const floa
             // 8 tokens. The arithmetic for every output element is unchanged.
             constexpr int long_threads = 256;
             constexpr int64_t split_n_t = 8;
-            GGML_ASSERT(nr % long_threads == 0);
             dim3          blocks(n_s, (nr + long_threads - 1) / long_threads, (n_t + split_n_t - 1) / split_n_t);
             const size_t  smem_size = long_threads * (kNC - 1 + split_n_t) * sizeof(float);
             ssm_conv_long_token_f32<apply_silu, long_threads, kNC, split_n_t><<<blocks, long_threads, smem_size, stream>>>(
-                src0, src1, bias, src0_nb0, src0_nb1, src0_nb2, src1_nb1, dst, dst_nb0, dst_nb1, dst_nb2, n_t);
+                src0, src1, bias, src0_nb0, src0_nb1, src0_nb2, src1_nb1, dst, dst_nb0, dst_nb1, dst_nb2, n_t, nr);
         }
     };
 
@@ -175,11 +184,14 @@ static __global__ void ssm_conv_tree_f32(const float * __restrict__ src0,
                                          const int src1_nb1,
                                          float * __restrict__ dst, const int dst_nb0, const int dst_nb1,
                                          const int dst_nb2,
-                                         const int64_t n_t) {
+                                         const int64_t n_t, const int64_t nr) {
     GGML_UNUSED(src0_nb0);
     const int tid  = threadIdx.x;
     const int bidx = blockIdx.x;
     const int bidy = blockIdx.y;
+    if ((int64_t) bidy * split_d_inner + tid >= nr) {
+        return; // ragged tail of a tensor-split channel shard
+    }
 
     const float * x_block = (const float *) ((const char *) src0 + bidx * src0_nb2 + bidy * split_d_inner * src0_nb1);
     const float * w_block = (const float *) ((const char *) src1 + bidy * split_d_inner * src1_nb1);
@@ -231,14 +243,13 @@ static void ssm_conv_tree_f32_cuda(const float * src0, const float * src1, const
                                    const int dst_nb2, const int64_t nc, const int64_t nr, const int64_t n_t,
                                    const int64_t n_s, cudaStream_t stream) {
     const int threads = 128;
-    GGML_ASSERT(nr % threads == 0);
     const dim3 blocks(n_s, (nr + threads - 1) / threads, 1);
 
     auto launch_kernel = [&](auto NC) {
         constexpr int kNC = decltype(NC)::value;
         ssm_conv_tree_f32<apply_silu, threads, kNC><<<blocks, threads, 0, stream>>>(
             src0, src1, parent_ids, src0_nb0, src0_nb1, src0_nb2, src1_nb1,
-            dst, dst_nb0, dst_nb1, dst_nb2, n_t);
+            dst, dst_nb0, dst_nb1, dst_nb2, n_t, nr);
     };
 
     switch (nc) {

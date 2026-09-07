@@ -1104,11 +1104,14 @@ struct ggml_cuda_upload_ring {
     bool        disabled = false;
     cudaEvent_t event    = nullptr;
 };
-thread_local ggml_cuda_upload_ring ggml_cuda_uploads;
+// One ring per (thread, device): cudaStreamPerThread and the event belong to the current device's
+// context, and a shared host ring would let a wrap-around sync on one device race pending copies
+// issued from another.
+thread_local ggml_cuda_upload_ring ggml_cuda_uploads[GGML_CUDA_MAX_DEVICES];
 }
 
 static bool ggml_cuda_upload_async(void * dst, const void * data, size_t size) {
-    auto & ring = ggml_cuda_uploads;
+    auto & ring = ggml_cuda_uploads[ggml_cuda_get_device()];
     if (ring.disabled || size > ring.max_upload) {
         return false;
     }
@@ -1132,7 +1135,7 @@ static bool ggml_cuda_upload_async(void * dst, const void * data, size_t size) {
 
 // Order a compute stream after every upload this thread has issued.
 static void ggml_cuda_wait_uploads(cudaStream_t stream) {
-    auto & ring = ggml_cuda_uploads;
+    auto & ring = ggml_cuda_uploads[ggml_cuda_get_device()];
     if (ring.host == nullptr) {
         return;
     }
