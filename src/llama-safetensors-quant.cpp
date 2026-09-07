@@ -796,7 +796,10 @@ std::optional<llama_safetensors_quant_binding> llama_safetensors_quant_adapters:
             if (!group->symmetric) {
                 result.auxiliaries.push_back(module + ".weight_zero_point");
             }
-            result.target_type     = GGML_TYPE_Q4_A32;
+            // Routed experts live in the MoE cache / host expert path, which only
+            // handles canonical ggml blocks; Q4_A32 is a dense-GPU-only layout.
+            result.target_type     = module.find(".experts.") != std::string::npos ?
+                GGML_TYPE_Q4_1 : GGML_TYPE_Q4_A32;
             result.materialization = llama_safetensors_quant_materialization::PACKED_INT4_REPACK;
         } else {
             result.target_type     = GGML_TYPE_Q8_0_G128;
@@ -2215,7 +2218,8 @@ std::vector<uint8_t> llama_safetensors_quant_adapters::repack_packed_int4(
         const uint8_t * zero,
         const std::array<uint64_t, 2> & weight_shape,
         uint32_t group_size,
-        bool symmetric) const {
+        bool symmetric,
+        ggml_type target_type) const {
     constexpr size_t pack_factor = 8;
     const size_t rows = weight_shape[0];
     const size_t cols = weight_shape[1];
@@ -2236,6 +2240,56 @@ std::vector<uint8_t> llama_safetensors_quant_adapters::repack_packed_int4(
         throw std::runtime_error("inconsistent compressed-tensors INT4 group source tensors");
     }
 
+    const auto read_scale = [&](size_t row, size_t group) {
+        uint16_t source_bits;
+        std::memcpy(&source_bits, scale + (row * groups + group) * sizeof(source_bits), sizeof(source_bits));
+        return scale_desc.dtype == llama_safetensors_dtype::BF16 ?
+            load_bf16(reinterpret_cast<const uint8_t *>(&source_bits)) : ggml_fp16_to_fp32(source_bits);
+    };
+    const auto read_zero = [&](size_t row, size_t group) -> uint8_t {
+        if (symmetric) {
+            return 8;
+        }
+        uint32_t packed_zero;
+        std::memcpy(&packed_zero,
+                    zero + ((row / pack_factor) * groups + group) * sizeof(packed_zero),
+                    sizeof(packed_zero));
+        return (packed_zero >> (4 * (row % pack_factor))) & 0x0f;
+    };
+
+    if (target_type == GGML_TYPE_Q4_1) {
+        // Canonical Q4_1 blocks: value = d*q + m with m = -zero*scale. Source nibbles are
+        // consecutive; Q4_1 pairs element j with j+16 in one byte.
+        constexpr size_t qk = 32;
+        constexpr size_t block_size = 2 * sizeof(ggml_fp16_t) + qk / 2;
+        std::vector<uint8_t> result(rows * (cols / qk) * block_size);
+        for (size_t row = 0; row < rows; ++row) {
+            for (size_t block = 0; block < cols / qk; ++block) {
+                const size_t group = block * qk / group_size;
+                const float scale_f32 = read_scale(row, group);
+                const ggml_fp16_t d = ggml_fp32_to_fp16(scale_f32);
+                const ggml_fp16_t m = ggml_fp32_to_fp16(-scale_f32 * read_zero(row, group));
+                if (scale_f32 == 0.0f || !std::isfinite(scale_f32) ||
+                    !std::isfinite(ggml_fp16_to_fp32(d)) || !std::isfinite(ggml_fp16_to_fp32(m))) {
+                    throw std::runtime_error("packed INT4 scale/zero must be finite, non-zero, and representable in Q4_1");
+                }
+                uint8_t * out = result.data() + (row * (cols / qk) + block) * block_size;
+                std::memcpy(out, &d, sizeof(d));
+                std::memcpy(out + sizeof(d), &m, sizeof(m));
+                const uint8_t * src = weight + (row * packed_cols + block * qk / pack_factor) * sizeof(uint32_t);
+                for (size_t j = 0; j < qk / 2; ++j) {
+                    const uint8_t lo = (src[j / 2] >> (4 * (j % 2))) & 0x0f;
+                    const uint8_t hi = (src[(j + qk / 2) / 2] >> (4 * ((j + qk / 2) % 2))) & 0x0f;
+                    out[2 * sizeof(ggml_fp16_t) + j] = lo | (hi << 4);
+                }
+            }
+        }
+        return result;
+    }
+    if (target_type != GGML_TYPE_Q4_A32) {
+        throw std::runtime_error("unsupported packed INT4 target type");
+    }
+
     constexpr size_t block_values = 128;
     constexpr size_t block_scales = 4 * sizeof(uint16_t);
     constexpr size_t block_zeros  = 2;
@@ -2251,11 +2305,7 @@ std::vector<uint8_t> llama_safetensors_quant_adapters::repack_packed_int4(
             for (size_t local_group = 0; local_group < block_values / 32; ++local_group) {
                 const size_t col = ib * block_values + local_group * 32;
                 const size_t group = col / group_size;
-                uint16_t source_bits;
-                std::memcpy(
-                    &source_bits, scale + (row * groups + group) * sizeof(source_bits), sizeof(source_bits));
-                const float scale_f32 = scale_desc.dtype == llama_safetensors_dtype::BF16 ?
-                    load_bf16(reinterpret_cast<const uint8_t *>(&source_bits)) : ggml_fp16_to_fp32(source_bits);
+                const float scale_f32 = read_scale(row, group);
                 const ggml_bf16_t scale_bits = ggml_fp32_to_bf16(scale_f32);
                 const float restored_scale = ggml_bf16_to_fp32(scale_bits);
                 if (scale_f32 == 0.0f || !std::isfinite(scale_f32) ||
@@ -2266,15 +2316,7 @@ std::vector<uint8_t> llama_safetensors_quant_adapters::repack_packed_int4(
                 std::memcpy(
                     out + local_group * sizeof(scale_bits.bits), &scale_bits.bits, sizeof(scale_bits.bits));
 
-                uint8_t zero_code = 8;
-                if (!symmetric) {
-                    uint32_t packed_zero;
-                    std::memcpy(&packed_zero,
-                                zero + ((row / pack_factor) * groups + group) * sizeof(packed_zero),
-                                sizeof(packed_zero));
-                    zero_code = (packed_zero >> (4 * (row % pack_factor))) & 0x0f;
-                }
-                out[block_scales + local_group / 2] |= zero_code << (4 * (local_group % 2));
+                out[block_scales + local_group / 2] |= read_zero(row, group) << (4 * (local_group % 2));
             }
             // compressed-tensors packs consecutive low-to-high nibbles, which
             // is already the canonical adjacent-pair byte order.
@@ -3224,7 +3266,8 @@ std::vector<uint8_t> llama_safetensors_quant_adapters::read(
             }
             return repack_packed_int4(
                 primary, packed_weight.data(), scale_desc, scale.data(), zero_desc,
-                zero.has_value() ? zero->data() : nullptr, weight_shape, group->group_size, group->symmetric);
+                zero.has_value() ? zero->data() : nullptr, weight_shape, group->group_size, group->symmetric,
+                binding.target_type);
         }
         return repack_packed_int8(primary, packed_weight.data(), scale_desc, scale.data(), weight_shape);
     }

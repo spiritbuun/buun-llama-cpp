@@ -225,7 +225,8 @@ class llama_safetensors_quant_adapters {
         const uint8_t * zero,
         const std::array<uint64_t, 2> & weight_shape,
         uint32_t group_size,
-        bool symmetric) const;
+        bool symmetric,
+        ggml_type target_type) const;
     std::vector<uint8_t> repack_packed_int8(
         const llama_safetensors_tensor & weight_desc,
         const uint8_t * weight,
