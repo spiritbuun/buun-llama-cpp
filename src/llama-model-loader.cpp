@@ -1735,9 +1735,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
-        // avoid using a host buffer when using mmap
+        // avoid using a host buffer when using mmap. Native safetensors sources cannot mmap (the
+        // tensors are repacked on load) but follow the same rule: page-locking a 170 GB expert set
+        // costs ~120 s per start, and the MoE cache stages its fills through its own pinned ring.
         auto * buft_dev = ggml_backend_buft_get_device(buft);
-        if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
+        if ((use_mmap || tensor_source != nullptr) && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
             auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
             if (!cpu_dev) {
                 throw std::runtime_error("no CPU backend found");
