@@ -20,6 +20,7 @@
 #include <cassert>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <functional>
@@ -32,6 +33,48 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+uint64_t llama_memory_vbr_budget_bytes_resolve(const llama_memory_vbr_params & params) {
+    if (const char * env = getenv("VBR_BUDGET_MIB")) {
+        return (uint64_t) strtoull(env, nullptr, 10) * 1024 * 1024;
+    }
+    return params.budget_bytes;
+}
+
+void llama_memory_vbr_budget_partition(
+        uint64_t total,
+        const std::vector<llama_memory_vbr_budget_cost> & costs,
+        std::vector<uint64_t> & result) {
+    uint64_t entry_total = 0;
+    uint64_t floor_total = 0;
+    for (const auto & cost : costs) {
+        entry_total += cost.entry;
+        floor_total += cost.floor;
+    }
+
+    const uint64_t base_total = total < floor_total ? 0 : total < entry_total ? floor_total : entry_total;
+    const uint64_t extra_total = total - base_total;
+    const auto weight = [&](const llama_memory_vbr_budget_cost & cost) {
+        return total < floor_total ? cost.floor
+             : total < entry_total ? cost.entry > cost.floor ? cost.entry - cost.floor : 0
+             : cost.entry;
+    };
+    uint64_t weight_total = 0;
+    for (const auto & cost : costs) {
+        weight_total += weight(cost);
+    }
+
+    result.resize(costs.size());
+    uint64_t assigned = 0;
+    for (size_t i = 0; i < costs.size(); ++i) {
+        const uint64_t base = total < floor_total ? 0 : total < entry_total ? costs[i].floor : costs[i].entry;
+        result[i] = i + 1 == costs.size() ? total - assigned
+            : base + (weight_total > 0
+                ? (uint64_t) ((long double) extra_total * weight(costs[i]) / weight_total)
+                : 0);
+        assigned += result[i];
+    }
+}
 
 // Dynamic-VBR degrade tier ladder and measured price order (generated table).
 enum vbr_tier : uint8_t {
@@ -1733,10 +1776,9 @@ llama_kv_cache::llama_kv_cache(
                     t8_band_end_ != 0 && vbr_floor_typed_
                         ? " — explicit floor: peer yield consented to the floor" : "");
             vbr_floor_clamp_order();
-            vbr_budget_bytes_    = (size_t) vbr_params_.budget_bytes;
+            vbr_budget_bytes_    = (size_t) llama_memory_vbr_budget_bytes_resolve(vbr_params_);
             vbr_budget_explicit_ = vbr_params_.budget_explicit;
-            if (const char * env = getenv("VBR_BUDGET_MIB")) {
-                vbr_budget_bytes_    = (size_t) strtoull(env, nullptr, 10) * 1024 * 1024;
+            if (getenv("VBR_BUDGET_MIB") != nullptr) {
                 vbr_budget_explicit_ = true; // forced-budget instrumentation must never grow
             }
             // Deterministic freeze is test/gating only (see header). Read after the budget
@@ -3971,27 +4013,29 @@ void llama_kv_cache::vbr_attach_ledger_tree(
 void llama_kv_cache::vbr_finalize_ledger_tree() {
     GGML_ASSERT(vbr_ledger_owner_ && vbr_tree_root() == this);
 
-    // Constructor-time live budgets were derived before the peer backlink existed. Repair
-    // only that fallback path; fit-provided and explicit scalar budgets retain their split.
-    auto finalize_child = [](llama_kv_cache * child) {
-        if (child == nullptr || child->vbr_budget_from_scalar_) {
+    vbr_tree_pools_.clear();
+    auto collect_child = [&](llama_kv_cache * child) {
+        if (child == nullptr) {
             return;
         }
-        size_t derived_total = 0;
-        for (auto & p : child->vbr_pools_) {
-            if (p.vmm == nullptr) {
-                continue;
+        for (auto & pool : child->vbr_pools_) {
+            if (pool.vmm != nullptr) {
+                vbr_tree_pools_.push_back(&pool);
             }
-            p.budget = std::max(child->vbr_pool_reach(p), p.budget_base);
-            p.budget_eff_stamp = ~0ull;
-            derived_total += p.budget;
-        }
-        if (derived_total > 0) {
-            child->vbr_budget_bytes_ = std::max(derived_total, child->vbr_floor_cost_bytes_);
         }
     };
-    finalize_child(this);
-    finalize_child(vbr_ledger_sibling_);
+    collect_child(this);
+    collect_child(vbr_ledger_sibling_);
+    vbr_tree_device_pools_scratch_.reserve(vbr_tree_pools_.size());
+    vbr_tree_budget_costs_scratch_.reserve(vbr_tree_pools_.size());
+    vbr_tree_budget_shares_scratch_.reserve(vbr_tree_pools_.size());
+
+    // Constructor-time live budgets were derived before the peer backlink existed. Repair
+    // only that fallback path; fit-provided and explicit scalar budgets retain their split.
+    if (!vbr_budget_from_scalar_ ||
+            (vbr_ledger_sibling_ != nullptr && !vbr_ledger_sibling_->vbr_budget_from_scalar_)) {
+        vbr_rederive_tree_budget();
+    }
 }
 
 void llama_kv_cache::vbr_finalize_failed_child(uint32_t n_tokens, bool root_ran) {
@@ -4139,12 +4183,7 @@ size_t llama_kv_cache::vbr_budget_eff_uncached(const vbr_pool & p) const {
         const size_t headroom_eff = own_headroom + ledger_headroom * (n_live - 1);
         if (n_live > 1) {
             constexpr size_t quantum = 64ull * 1024 * 1024;
-            size_t va_total = 0;
-            for (const auto & q : vbr_pools_) {
-                va_total += q.vmm != nullptr ? q.size : 0;
-            }
-            const size_t floor_share = va_total > 0
-                ? (size_t) ((double) vbr_floor_cost_bytes_ * (double) p.size / (double) va_total) : 0;
+            const size_t floor_share = p.floor_cost;
             const size_t spare = budget_eff > mapped_now ? budget_eff - mapped_now : 0;
             budget_eff = std::max(floor_share, mapped_now + spare / n_live / quantum * quantum);
         }
@@ -4184,38 +4223,82 @@ size_t llama_kv_cache::vbr_pool_reach(const vbr_pool & p) const {
     const size_t mapped_now = p.be->vmm_pool_mapped(p.vmm);
     const size_t spare = free_b > vbr_growth_headroom_ ? free_b - vbr_growth_headroom_ : 0;
 
-    double share = vbr_params_.device_share;
-    if (vbr_ledger_root_ != nullptr) {
-        const llama_kv_cache * root = vbr_tree_root();
-        size_t denom = 0;
-        auto add_child = [&](const llama_kv_cache * child) {
-            if (child == nullptr) {
-                return;
+    // A child owns its mapped pages outright; only currently free device memory is divided.
+    const size_t reach_raw = mapped_now + (size_t) ((double) spare * vbr_params_.device_share);
+    return std::max(mapped_now, reach_raw / quantum * quantum);
+}
+
+void llama_kv_cache::vbr_rederive_tree_budget() {
+    GGML_ASSERT(vbr_ledger_owner_ && vbr_tree_root() == this);
+    constexpr size_t quantum = 64ull * 1024 * 1024;
+
+    for (size_t first = 0; first < vbr_tree_pools_.size(); ++first) {
+        vbr_pool * const seed = vbr_tree_pools_[first];
+        bool seen = false;
+        for (size_t i = 0; i < first; ++i) {
+            seen |= vbr_tree_pools_[i]->device == seed->device;
+        }
+        if (seen) {
+            continue;
+        }
+
+        vbr_tree_device_pools_scratch_.clear();
+        vbr_tree_budget_costs_scratch_.clear();
+        size_t mapped_total = 0;
+        size_t lower_total = 0;
+        for (vbr_pool * pool : vbr_tree_pools_) {
+            if (pool->device != seed->device) {
+                continue;
             }
-            for (const auto & q : child->vbr_pools_) {
-                // Child constructors eagerly assign device ordinals before tree attachment.
-                // Do not couple constructor-time normalization to marker-key resolution.
-                if (q.vmm != nullptr && q.device == p.device) {
-                    denom += q.size;
-                }
-            }
-        };
-        add_child(root);
-        add_child(root->vbr_ledger_sibling_);
-        share = denom > 0
-                ? root->vbr_tree_device_share_ * (double) p.size / (double) denom
-                : root->vbr_tree_device_share_;
+            const size_t mapped = pool->be->vmm_pool_mapped(pool->vmm);
+            const size_t lower = std::max(pool->floor_cost, mapped);
+            vbr_tree_device_pools_scratch_.push_back(pool);
+            vbr_tree_budget_costs_scratch_.push_back({ pool->entry_cost, lower });
+            mapped_total += mapped;
+            lower_total += lower;
+        }
+
+        size_t free_b = 0, total_b = 0;
+        seed->be->get_device_memory(seed->device, &free_b, &total_b);
+        const size_t spare = free_b > vbr_growth_headroom_ ? free_b - vbr_growth_headroom_ : 0;
+        const size_t extra = (size_t) ((double) spare * vbr_tree_device_share_);
+        const size_t reach = mapped_total + extra / quantum * quantum;
+        llama_memory_vbr_budget_partition(
+                std::max(reach, lower_total),
+                vbr_tree_budget_costs_scratch_,
+                vbr_tree_budget_shares_scratch_);
+        for (size_t i = 0; i < vbr_tree_device_pools_scratch_.size(); ++i) {
+            auto & pool = *vbr_tree_device_pools_scratch_[i];
+            pool.budget = (size_t) vbr_tree_budget_shares_scratch_[i];
+            pool.budget_eff_stamp = ~0ull;
+        }
     }
 
-    // A child owns its mapped pages outright; only currently free device memory is divided.
-    const size_t reach_raw = mapped_now + (size_t) ((double) spare * share);
-    return std::max(mapped_now, reach_raw / quantum * quantum);
+    auto refresh_total = [](llama_kv_cache * child) {
+        if (child == nullptr) {
+            return;
+        }
+        child->vbr_budget_bytes_ = 0;
+        for (const auto & pool : child->vbr_pools_) {
+            child->vbr_budget_bytes_ += pool.vmm != nullptr ? pool.budget : 0;
+        }
+    };
+    refresh_total(this);
+    refresh_total(vbr_ledger_sibling_);
+    vbr_tree_budget_refresh_stamp_ = vbr_boundary_count_;
 }
 
 void llama_kv_cache::vbr_rederive_budget() {
     // skip the FIRST boundary: cuBLAS workspaces and CUDA-graph pools allocate lazily during
     // the first graph_compute, so free measured before it overstates reality
     if (vbr_boundary_count_ == 0) {
+        return;
+    }
+    if (vbr_ledger_root_ != nullptr) {
+        llama_kv_cache * root = vbr_tree_root();
+        if (root->vbr_tree_budget_refresh_stamp_ != root->vbr_boundary_count_) {
+            root->vbr_rederive_tree_budget();
+        }
         return;
     }
     for (size_t pi = 0; pi < vbr_pools_.size(); ++pi) {
@@ -5142,9 +5225,6 @@ void llama_kv_cache::vbr_floor_clamp_order() {
             std::to_string(res.initial_bpv) + " bits/value)");
     }
     vbr_degrade_limit_ = res.clamp_step;
-    if (res.bits_per_token == 0.0) {
-        return; // no VMM-pooled units
-    }
     if (res.n_pinned > 0) {
         LLAMA_LOG_INFO("%s: VBR: %zu (layer,side) units are PINNED at non-vbr types — degrade steps "
                 "touching them are skipped; they stay in the aggregate at their fixed bits/value\n",
@@ -5161,8 +5241,13 @@ void llama_kv_cache::vbr_floor_clamp_order() {
     // when dynamic mode reaches us without a fit-resolved one. Summed across pools (page rounding
     // uses each tensor's OWNING pool granularity).
     vbr_floor_cost_bytes_ = 0;
-    for (const auto & p : vbr_pools_) {
-        vbr_floor_cost_bytes_ += p.mapped_base;
+    for (auto & p : vbr_pools_) {
+        p.entry_cost = vbr_vmm_projected_bytes(p, get_size());
+        p.floor_cost = p.mapped_base;
+        vbr_floor_cost_bytes_ += p.floor_cost;
+    }
+    if (res.bits_per_token == 0.0) {
+        return; // no VMM-pooled units
     }
     for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
         for (int side = 0; side < 2; ++side) {
@@ -5172,7 +5257,9 @@ void llama_kv_cache::vbr_floor_clamp_order() {
             // page rounding is per pool instance (per device shard under -sm tensor)
             for (const auto & [p, e] : vbr_units_of(ikv, side != 0)) {
                 const size_t need = ggml_row_size(res.end_types[ikv*2 + side], e->t->ne[0]) * (size_t) e->t->ne[1];
-                vbr_floor_cost_bytes_ += GGML_PAD(need, p->gran);
+                const size_t mapped = GGML_PAD(need, p->gran);
+                p->floor_cost += mapped;
+                vbr_floor_cost_bytes_ += mapped;
             }
         }
     }

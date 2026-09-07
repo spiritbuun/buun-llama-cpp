@@ -70,6 +70,99 @@ struct llama_kv_cache_vbr_epoch_test {
         return kv->vbr_vmm_active() && kv->vbr_budget_bytes_ > 0;
     }
 
+    static size_t budget(const llama_kv_cache * kv) {
+        return kv->vbr_budget_bytes_;
+    }
+
+    static size_t entry_cost(const llama_kv_cache * kv) {
+        size_t result = 0;
+        for (const auto & pool : kv->vbr_pools_) {
+            if (pool.vmm != nullptr) {
+                result += kv->vbr_vmm_projected_bytes(pool, kv->get_size());
+            }
+        }
+        return result;
+    }
+
+    static size_t floor_cost(const llama_kv_cache * kv) {
+        size_t result = 0;
+        for (const auto & pool : kv->vbr_pools_) {
+            if (pool.vmm != nullptr) {
+                result += pool.floor_cost;
+            }
+        }
+        return result;
+    }
+
+    static size_t pool_count(const llama_kv_cache * kv) {
+        return std::count_if(kv->vbr_pools_.begin(), kv->vbr_pools_.end(),
+                [](const auto & pool) { return pool.vmm != nullptr; });
+    }
+
+    static bool tree_rederive_updates_all(llama_kv_cache * base, llama_kv_cache * swa) {
+        llama_kv_cache * root = base->vbr_tree_root();
+        if (root == base || root != swa->vbr_tree_root()) {
+            return false;
+        }
+        for (llama_kv_cache * child : { base, swa }) {
+            child->vbr_budget_explicit_ = false;
+            child->vbr_boundary_count_ = 8;
+            child->vbr_budget_bytes_ = 0;
+            for (auto & pool : child->vbr_pools_) {
+                if (pool.vmm != nullptr) {
+                    pool.budget = 1;
+                    child->vbr_budget_bytes_ += 1;
+                }
+            }
+        }
+        root->vbr_tree_budget_refresh_stamp_ = ~0ull;
+        root->vbr_growth_headroom_ = std::numeric_limits<size_t>::max();
+        const auto pools_cap  = root->vbr_tree_device_pools_scratch_.capacity();
+        const auto costs_cap  = root->vbr_tree_budget_costs_scratch_.capacity();
+        const auto shares_cap = root->vbr_tree_budget_shares_scratch_.capacity();
+        base->vbr_rederive_budget();
+
+        std::vector<int> checked_devices;
+        for (llama_kv_cache * child : { base, swa }) {
+            for (const auto & pool : child->vbr_pools_) {
+                if (pool.vmm == nullptr) {
+                    continue;
+                }
+                const size_t lower = std::max(
+                        pool.floor_cost, pool.be->vmm_pool_mapped(pool.vmm));
+                if (pool.budget != lower) {
+                    return false;
+                }
+                if (std::find(checked_devices.begin(), checked_devices.end(), pool.device) ==
+                        checked_devices.end()) {
+                    checked_devices.push_back(pool.device);
+                }
+            }
+        }
+        for (int device : checked_devices) {
+            size_t actual = 0;
+            size_t expected = 0;
+            for (llama_kv_cache * child : { base, swa }) {
+                for (const auto & pool : child->vbr_pools_) {
+                    if (pool.vmm == nullptr || pool.device != device) {
+                        continue;
+                    }
+                    actual += pool.budget;
+                    expected += std::max(
+                            pool.floor_cost, pool.be->vmm_pool_mapped(pool.vmm));
+                }
+            }
+            if (actual != expected) {
+                return false;
+            }
+        }
+        root->vbr_boundary_count_++;
+        root->vbr_rederive_budget();
+        return pools_cap  == root->vbr_tree_device_pools_scratch_.capacity() &&
+               costs_cap  == root->vbr_tree_budget_costs_scratch_.capacity() &&
+               shares_cap == root->vbr_tree_budget_shares_scratch_.capacity();
+    }
+
     static bool generation_seeded(const llama_kv_cache * kv) {
         const auto * tracker = kv->vbr_generation_tracker_get();
         if (tracker == nullptr || !tracker->active() || !tracker->stable()) {
@@ -1678,6 +1771,29 @@ static vbr_extent_handle test_multi_extent_cb(void * ctx, uint8_t target_index) 
 }
 
 static bool run_identity_cpu_tests() {
+    {
+        const std::vector<llama_memory_vbr_budget_cost> costs = {
+            { 80, 20 },
+            { 220, 100 },
+        };
+        std::vector<uint64_t> shares;
+        llama_memory_vbr_budget_partition(60, costs, shares);
+        if (shares != std::vector<uint64_t>({ 10, 50 })) {
+            fprintf(stderr, "VBR floor/entry/surplus budget partition contract failed\n");
+            return false;
+        }
+        llama_memory_vbr_budget_partition(160, costs, shares);
+        if (shares != std::vector<uint64_t>({ 33, 127 })) {
+            fprintf(stderr, "VBR floor/entry/surplus budget partition contract failed\n");
+            return false;
+        }
+        llama_memory_vbr_budget_partition(600, costs, shares);
+        if (shares != std::vector<uint64_t>({ 160, 440 })) {
+            fprintf(stderr, "VBR floor/entry/surplus budget partition contract failed\n");
+            return false;
+        }
+    }
+
     // Entropy failure is terminal for that construction attempt, never replaced by the old
     // fixed-domain fallback. The deterministic provider is restored before the remaining rows.
     if (!vbr_lineage_origin_provider_set_for_tests(f40_unavailable_origin)) {
@@ -2742,45 +2858,52 @@ int main(int argc, char ** argv) {
     if (argc == 2 && std::string(argv[1]) == "--operation-cpu") {
         return run_operation_cpu_tests() ? 0 : 1;
     }
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s MODEL | --identity-cpu | --generation-cpu | --operation-cpu\n", argv[0]);
+    const bool partition_typed = argc == 3 && std::string(argv[1]) == "--iswa-budget";
+    const bool partition_env   = argc == 3 && std::string(argv[1]) == "--iswa-budget-env";
+    const bool partition_only  = partition_typed || partition_env;
+    if (argc != 2 && !partition_only) {
+        fprintf(stderr, "usage: %s MODEL | --iswa-budget MODEL | --iswa-budget-env MODEL | "
+                "--identity-cpu | --generation-cpu | --operation-cpu\n", argv[0]);
         return 1;
     }
+    const char * model_path = partition_only ? argv[2] : argv[1];
 
-    // operation registry registry foundation: RAII closes exactly once, IDs are process-global/nonzero, and a
-    // completed identity is never returned by the next operation.
-    uint64_t first_registry_id = 0;
-    {
-        vbr_operation_binding binding = {};
-        binding.kind = vbr_operation_kind::state_export;
-        vbr_operation_registry_guard guard(binding);
-        if (!guard.active()) {
-            fprintf(stderr, "operation registry registry RAII guard failed to mint an operation ID\n");
+    if (!partition_only) {
+        // operation registry registry foundation: RAII closes exactly once, IDs are process-global/nonzero, and a
+        // completed identity is never returned by the next operation.
+        uint64_t first_registry_id = 0;
+        {
+            vbr_operation_binding binding = {};
+            binding.kind = vbr_operation_kind::state_export;
+            vbr_operation_registry_guard guard(binding);
+            if (!guard.active()) {
+                fprintf(stderr, "operation registry registry RAII guard failed to mint an operation ID\n");
+                return 1;
+            }
+            first_registry_id = guard.binding().operation_id.value;
+            if (!vbr_operation_registry_is_live(guard.binding().operation_id)) {
+                fprintf(stderr, "operation registry registry did not expose its live RAII operation\n");
+                return 1;
+            }
+        }
+        if (vbr_operation_registry_is_live({ first_registry_id })) {
+            fprintf(stderr, "operation registry registry RAII guard left a completed operation live\n");
             return 1;
         }
-        first_registry_id = guard.binding().operation_id.value;
-        if (!vbr_operation_registry_is_live(guard.binding().operation_id)) {
-            fprintf(stderr, "operation registry registry did not expose its live RAII operation\n");
-            return 1;
+        {
+            vbr_operation_binding binding = {};
+            binding.kind = vbr_operation_kind::state_export;
+            vbr_operation_registry_guard guard(binding);
+            if (!guard.active() ||
+                guard.binding().operation_id.value == first_registry_id) {
+                fprintf(stderr, "operation registry registry reused an operation ID\n");
+                return 1;
+            }
         }
-    }
-    if (vbr_operation_registry_is_live({ first_registry_id })) {
-        fprintf(stderr, "operation registry registry RAII guard left a completed operation live\n");
-        return 1;
-    }
-    {
-        vbr_operation_binding binding = {};
-        binding.kind = vbr_operation_kind::state_export;
-        vbr_operation_registry_guard guard(binding);
-        if (!guard.active() ||
-            guard.binding().operation_id.value == first_registry_id) {
-            fprintf(stderr, "operation registry registry reused an operation ID\n");
-            return 1;
-        }
-    }
 
-    if (!run_generation_cpu_tests() || !run_operation_cpu_tests()) {
-        return 1;
+        if (!run_generation_cpu_tests() || !run_operation_cpu_tests()) {
+            return 1;
+        }
     }
 
     ggml_backend_load_all();
@@ -2807,6 +2930,9 @@ int main(int argc, char ** argv) {
     unset_test_env("VBR_MIN_BITS");
     unset_test_env("VBR_GROWTH_HEADROOM_MIB");
     unset_test_env("VBR_TRANSCODE_TEST");
+    if (partition_env) {
+        set_test_env("VBR_BUDGET_MIB", "160");
+    }
     set_test_env("VBR_PROMOTE", "0");
     set_test_env("VBR_STASH_ROWS", "0");
     const char * trace_prefix_env = std::getenv("VBR_EPOCH_TEST_TRACE_PREFIX");
@@ -2820,14 +2946,14 @@ int main(int argc, char ** argv) {
 
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = 99;
-    llama_model_ptr model(llama_model_load_from_file(argv[1], mparams));
+    llama_model_ptr model(llama_model_load_from_file(model_path, mparams));
     if (!model) {
-        fprintf(stderr, "failed to load model %s\n", argv[1]);
+        fprintf(stderr, "failed to load model %s\n", model_path);
         return 1;
     }
 
     llama_context_params cparams = llama_context_default_params();
-    cparams.n_ctx                  = 128;
+    cparams.n_ctx                  = partition_only ? 1024 : 128;
     cparams.n_batch                = 32;
     cparams.n_ubatch               = 32;
     cparams.n_seq_max              = 8;
@@ -2838,7 +2964,9 @@ int main(int argc, char ** argv) {
     cparams.flash_attn_type        = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     cparams.vbr_dynamic            = true;
     cparams.vbr_budget_explicit    = true;
-    cparams.vbr_vram_budget_bytes  = 64ull * 1024 * 1024;
+    cparams.vbr_vram_budget_bytes  = partition_typed ? 160ull * 1024 * 1024
+                                       : partition_env ? 96ull * 1024 * 1024
+                                       : 64ull * 1024 * 1024;
 
     llama_context_ptr ctx(llama_init_from_model(model.get(), cparams));
     if (!ctx) {
@@ -2916,6 +3044,40 @@ int main(int argc, char ** argv) {
     }
     if (!llama_kv_cache_vbr_epoch_test::active(swa)) {
         fprintf(stderr, "SKIP: loaded GPU backend does not provide VBR VMM for the SWA child\n");
+        return 0;
+    }
+    if (partition_only) {
+        const size_t budget = 160ull * 1024 * 1024;
+        const size_t base_entry = llama_kv_cache_vbr_epoch_test::entry_cost(base);
+        const size_t swa_entry  = llama_kv_cache_vbr_epoch_test::entry_cost(swa);
+        const size_t base_floor = llama_kv_cache_vbr_epoch_test::floor_cost(base);
+        const size_t swa_floor  = llama_kv_cache_vbr_epoch_test::floor_cost(swa);
+        const size_t entry_total = base_entry + swa_entry;
+        const size_t floor_total = base_floor + swa_floor;
+        if (!(floor_total <= budget && budget < entry_total)) {
+            fprintf(stderr, "PRECONDITION failed: iSWA scalar-budget fixture does not exercise constrained allocation\n");
+            return 1;
+        }
+        const size_t expected_base = base_floor + (size_t) ((long double) (budget - floor_total) *
+                (base_entry - base_floor) / (entry_total - floor_total));
+        const size_t expected_swa = budget - expected_base;
+        const size_t actual_base = llama_kv_cache_vbr_epoch_test::budget(base);
+        const size_t actual_swa  = llama_kv_cache_vbr_epoch_test::budget(swa);
+        const size_t rounding = llama_kv_cache_vbr_epoch_test::pool_count(base);
+        const size_t base_delta = actual_base > expected_base
+                ? actual_base - expected_base : expected_base - actual_base;
+        const size_t swa_delta = actual_swa > expected_swa
+                ? actual_swa - expected_swa : expected_swa - actual_swa;
+        if (actual_base + actual_swa != budget ||
+                base_delta > rounding || swa_delta > rounding) {
+            fprintf(stderr, "iSWA scalar budget was not partitioned from realized VMM entry/floor costs\n");
+            return 1;
+        }
+        if (!llama_kv_cache_vbr_epoch_test::tree_rederive_updates_all(base, swa)) {
+            fprintf(stderr, "iSWA auto budget did not refresh its tree atomically from mapped pool floors\n");
+            return 1;
+        }
+        printf("VBR iSWA realized-pool scalar partition PASS\n");
         return 0;
     }
     if (!llama_kv_cache_vbr_epoch_test::map_seed_watermark(base)) {

@@ -36,6 +36,7 @@ struct llama_context;
 class vbr_unit_build;
 class vbr_pinned_chunk_ring;
 class vbr_kv_import_session;
+class llama_kv_cache_iswa;
 struct vbr_validated_child_plan;
 struct vbr_target_unit_snapshot;
 class vbr_import_receipt_group;
@@ -744,6 +745,8 @@ private:
         size_t                used    = 0;        // high-water of placed extents (log-only)
         size_t                budget  = 0;         // current per-pool mapped-physical budget
         size_t                budget_base = 0;      // explicit arm or floor-layout share: re-derivation floor
+        size_t                entry_cost = 0;       // page-exact full-cache cost at resolved entry types
+        size_t                floor_cost = 0;       // page-exact full-cache cost at the configured floor
         // vbr_budget_eff memo: one live free-VRAM query per pool per boundary (the degrade loop
         // and promote hysteresis both consult it repeatedly within one boundary)
         mutable uint64_t      budget_eff_stamp = ~0ull;
@@ -986,6 +989,13 @@ private:
     llama_kv_cache * vbr_ledger_root_ = nullptr;    // null means standalone/self
     llama_kv_cache * vbr_ledger_sibling_ = nullptr; // symmetric peer backlink in a composite
     double vbr_tree_device_share_ = 1.0;            // parent share before child normalization
+    // Root-owned topology and reusable scratch for one device-local budget refresh. Pool addresses
+    // are stable after construction; reserving here keeps dirty decode boundaries allocation-free.
+    std::vector<vbr_pool *> vbr_tree_pools_;
+    std::vector<vbr_pool *> vbr_tree_device_pools_scratch_;
+    std::vector<llama_memory_vbr_budget_cost> vbr_tree_budget_costs_scratch_;
+    std::vector<uint64_t> vbr_tree_budget_shares_scratch_;
+    uint64_t vbr_tree_budget_refresh_stamp_ = ~0ull;
     llama_kv_cache *       vbr_tree_root();
     const llama_kv_cache * vbr_tree_root() const;
     bool   vbr_tree_forced() const;
@@ -1224,6 +1234,7 @@ private:
     // 64 MiB-quantized. Shared by the init-time auto-budget arm (fit-less modes, e.g.
     // SPLIT_MODE_TENSOR) and the periodic re-derivation.
     size_t   vbr_pool_reach(const vbr_pool & p) const;
+    void     vbr_rederive_tree_budget();
     // Fast-path stability tracking: skip per-batch VBR bookkeeping when settled (avoids ~1ms/token)
     uint32_t vbr_last_used_        = 0;   // observed cell count last prepare() pass
     uint32_t vbr_last_wm_          = 0;   // predicted padded watermark of last successful boundary
@@ -1614,6 +1625,7 @@ private:
     // turbo8->turbo4 in-place-vs-separate identity, on a scoped CUDA backend. See definition.
     void vbr_transcode_anchor_test();
 
+    friend class llama_kv_cache_iswa;
     friend struct llama_kv_cache_vbr_epoch_test;
 
     // TurboQuant rotation matrices (128x128, row-major stored)

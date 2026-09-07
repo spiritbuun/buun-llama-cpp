@@ -222,6 +222,7 @@ private:
 
     void vbr_finalize_prepare_failure(llama_kv_cache * child,
             const std::vector<llama_ubatch> & ubatches);
+    void vbr_repartition_scalar_budget(uint64_t budget_bytes);
 
     const bool swa_full;
     const bool unified;
