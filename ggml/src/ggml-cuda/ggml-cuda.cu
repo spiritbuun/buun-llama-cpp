@@ -101,6 +101,7 @@
 #include <initializer_list>
 #include <limits>
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <cstdarg>
@@ -2889,6 +2890,18 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         return;
     }
 
+    // GGML_CUDA_DEBUG_MMID=1: report once per (type, n_tokens) which executor MUL_MAT_ID takes
+    static const bool debug_mmid = getenv("GGML_CUDA_DEBUG_MMID") != nullptr;
+    const auto mmid_trace = [&](const char * path) {
+        if (!debug_mmid) return;
+        static std::set<std::tuple<int, int64_t, int64_t>> seen;
+        if (seen.insert({ (int) src0->type, ne2, ids->ne[0] }).second) {
+            fprintf(stderr, "[mmid] %s type=%s n_tokens=%lld n_expert=%lld n_used=%lld ne00=%lld ne01=%lld srcs=%d%d\n", path,
+                    ggml_type_name(src0->type), (long long) ne2, (long long) ne02, (long long) ids->ne[0],
+                    (long long) ne00, (long long) ne01, dst->src[3] != nullptr, dst->src[4] != nullptr);
+        }
+    };
+
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && !ggml_cuda_is_exl3(src0->type)) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
@@ -2896,11 +2909,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             if (ggml_cuda_should_use_mmvq(src0->type, cc, ne2)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
+                    mmid_trace("mmvq");
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                     return;
                 }
             } else {
                 if (GGML_CUDA_CC_IS_AMD(cc)) {
+                    mmid_trace("mmvf");
                     ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
                     return;
                 }
@@ -2908,15 +2923,18 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+            mmid_trace("mmq");
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }
 
         if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+            mmid_trace("mmf");
             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
             return;
         }
     }
+    mmid_trace("sorted-fallback (stream sync)");
 
     // note: this path should not be reached when recording CUDA graphs, because it requires stream synchronization
     GGML_ASSERT(ggml_cuda_mul_mat_id_needs_sync(dst, cc));
