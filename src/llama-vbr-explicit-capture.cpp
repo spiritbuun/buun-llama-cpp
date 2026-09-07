@@ -888,12 +888,15 @@ public:
         }
         for (const auto & pool : cache.vbr_pools_) {
             if (pool.vmm == nullptr || pool.buf == nullptr ||
-                pool.device < 0) {
+                pool.compute_backend == nullptr || pool.device < 0) {
                 return false;
             }
+            // The buffer can be owned by a Meta wrapper under tensor split.
+            // compute_backend is resolved from the simple child buffer type at
+            // pool construction, so it is the physical device authority used
+            // by both cache execution and the server's capture lanes.
             const auto backend_device =
-                ggml_backend_buft_get_device(
-                    ggml_backend_buffer_get_type(pool.buf));
+                ggml_backend_get_device(pool.compute_backend);
             if (backend_device == nullptr) {
                 return false;
             }
@@ -905,15 +908,14 @@ public:
                 });
             if (duplicate != output.end()) {
                 if (duplicate->backend_device != backend_device ||
-                    (duplicate->backend != nullptr &&
-                     pool.backend != nullptr &&
-                     duplicate->backend != pool.backend)) {
+                    duplicate->backend != pool.compute_backend) {
                     return false;
                 }
                 continue;
             }
             output.push_back({
-                instance, pool.device, backend_device, pool.backend,
+                instance, pool.device, backend_device,
+                pool.compute_backend,
             });
         }
         return true;

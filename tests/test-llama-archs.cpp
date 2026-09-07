@@ -470,6 +470,34 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
     return true;
 }
 
+static bool devices_support_vbr_vmm(const std::vector<ggml_backend_dev_t> & devices) {
+    if (devices.empty()) {
+        return false;
+    }
+    for (ggml_backend_dev_t device : devices) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
+        const auto get_iface = reg != nullptr
+            ? reinterpret_cast<ggml_backend_vbr_iface_fn_t>(
+                ggml_backend_reg_get_proc_address(reg, GGML_VBR_BACKEND_IFACE_PROC))
+            : nullptr;
+        const ggml_vbr_backend_iface * iface = get_iface != nullptr ? get_iface() : nullptr;
+        bool found = false;
+        if (iface != nullptr) {
+            const ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(device);
+            for (int i = 0; i < iface->get_device_count(); ++i) {
+                if (iface->buffer_type(i) == buft) {
+                    found = iface->vmm_available(i);
+                    break;
+                }
+            }
+        }
+        if (!found) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
@@ -3828,6 +3856,137 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llm_arch_supports_sm_tensor(arch)) {
                         model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, dc.devs, dc.split_mode, encode);
+                        if (dc.split_mode == LLAMA_SPLIT_MODE_TENSOR &&
+                            (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 ||
+                             arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP)) {
+                            const auto live = llama_get_live_memory_breakdown(
+                                model_and_ctx_dev.second.get());
+                            std::vector<ggml_backend_dev_t> state_devices;
+                            for (const auto & [buft, row] : live) {
+                                const size_t bytes = row.attention + row.recurrent +
+                                    row.recurrent_rollback + row.rolling_window_tape;
+                                if (bytes == 0 || ggml_backend_buft_is_host(buft)) {
+                                    continue;
+                                }
+                                GGML_ASSERT(!ggml_backend_buft_is_meta(buft));
+                                const ggml_backend_dev_t device =
+                                    ggml_backend_buft_get_device(buft);
+                                GGML_ASSERT(device != nullptr);
+                                if (std::find(state_devices.begin(), state_devices.end(), device) ==
+                                    state_devices.end()) {
+                                    state_devices.push_back(device);
+                                }
+                            }
+                            GGML_ASSERT(!state_devices.empty());
+                            // The fixture has two KV heads, so only a two-device split is
+                            // guaranteed to give every child a nonzero state shard.
+                            if (dc.devs.size() == 2) {
+                                GGML_ASSERT(state_devices.size() == dc.devs.size());
+                                for (ggml_backend_dev_t device : dc.devs) {
+                                    GGML_ASSERT(std::find(
+                                        state_devices.begin(), state_devices.end(), device) !=
+                                        state_devices.end());
+                                }
+                            }
+                            const auto total = llama_get_memory_breakdown(
+                                model_and_ctx_dev.second.get());
+                            std::vector<ggml_backend_dev_t> compute_devices;
+                            for (const auto & [buft, row] : total) {
+                                if (row.compute == 0 || ggml_backend_buft_is_host(buft)) {
+                                    continue;
+                                }
+                                GGML_ASSERT(!ggml_backend_buft_is_meta(buft));
+                                const ggml_backend_dev_t device =
+                                    ggml_backend_buft_get_device(buft);
+                                GGML_ASSERT(device != nullptr);
+                                if (std::find(compute_devices.begin(), compute_devices.end(), device) ==
+                                    compute_devices.end()) {
+                                    compute_devices.push_back(device);
+                                }
+                            }
+                            GGML_ASSERT(compute_devices.size() == dc.devs.size());
+                            for (ggml_backend_dev_t device : dc.devs) {
+                                GGML_ASSERT(std::find(
+                                    compute_devices.begin(), compute_devices.end(), device) !=
+                                    compute_devices.end());
+                            }
+
+                            // A dry fit still owns one logical Meta device, so its estimated
+                            // compute row must remain Meta instead of being expanded into child
+                            // devices that the fitter cannot associate with the model.
+                            if (arch == LLM_ARCH_QWEN35 && dc.devs.size() > 1) {
+                                llama_model_params estimate_model_params = llama_model_default_params();
+                                estimate_model_params.progress_callback = silent_model_load_progress;
+                                estimate_model_params.no_alloc = true;
+                                estimate_model_params.load_mode = LLAMA_LOAD_MODE_NONE;
+                                estimate_model_params.split_mode = LLAMA_SPLIT_MODE_TENSOR;
+                                std::vector<ggml_backend_dev_t> estimate_devices = dc.devs;
+                                estimate_devices.push_back(nullptr);
+                                estimate_model_params.devices = estimate_devices.data();
+                                size_t estimate_seed = seed;
+                                llama_model_ptr estimate_model(llama_model_init_from_user(
+                                    gguf_ctx.get(), set_tensor_data, &estimate_seed,
+                                    estimate_model_params));
+                                GGML_ASSERT(estimate_model != nullptr);
+                                llama_context_params estimate_ctx_params = llama_context_default_params();
+                                estimate_ctx_params.n_ctx = 256;
+                                estimate_ctx_params.n_batch = 64;
+                                estimate_ctx_params.n_ubatch = 64;
+                                llama_context_ptr estimate_ctx(llama_init_from_model(
+                                    estimate_model.get(), estimate_ctx_params));
+                                GGML_ASSERT(estimate_ctx != nullptr);
+                                size_t non_host_compute_rows = 0;
+                                for (const auto & [buft, row] :
+                                        llama_get_memory_breakdown(estimate_ctx.get())) {
+                                    if (row.compute == 0 || ggml_backend_buft_is_host(buft)) {
+                                        continue;
+                                    }
+                                    ++non_host_compute_rows;
+                                    GGML_ASSERT(ggml_backend_buft_is_meta(buft));
+                                }
+                                GGML_ASSERT(non_host_compute_rows == 1);
+                            }
+
+                            // Pool discovery has a separate physical-backend contract from
+                            // memory accounting. Exercise it on one representative hybrid
+                            // architecture when exactly two VMM-capable devices are present.
+                            const bool supports_vbr_vmm = devices_support_vbr_vmm(dc.devs);
+                            if (arch == LLM_ARCH_QWEN35 && dc.devs.size() == 2 &&
+                                supports_vbr_vmm) {
+                                llama_context_params vbr_params = llama_context_default_params();
+                                vbr_params.n_ctx = 256;
+                                vbr_params.n_batch = 64;
+                                vbr_params.n_ubatch = 64;
+                                vbr_params.n_threads = 4;
+                                vbr_params.n_threads_batch = 4;
+                                vbr_params.kv_unified = true;
+                                vbr_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+                                vbr_params.vbr_dynamic = true;
+                                vbr_params.vbr_budget_explicit = true;
+                                vbr_params.vbr_vram_budget_bytes = 64ull * 1024 * 1024;
+                                llama_context_ptr vbr_ctx(llama_init_from_model(
+                                    model_and_ctx_dev.first.get(), vbr_params));
+                                GGML_ASSERT(vbr_ctx != nullptr);
+
+                                std::vector<vbr_explicit_capture_runtime_pool> pools;
+                                uint32_t attention_children = 0;
+                                GGML_ASSERT(vbr_explicit_capture_runtime_pools(
+                                    *llama_get_memory(vbr_ctx.get()), pools, attention_children));
+                                GGML_ASSERT(attention_children == 1);
+                                GGML_ASSERT(pools.size() == dc.devs.size());
+                                std::vector<ggml_backend_dev_t> unmatched = dc.devs;
+                                for (const auto & pool : pools) {
+                                    GGML_ASSERT(pool.backend != nullptr);
+                                    GGML_ASSERT(pool.backend_device ==
+                                                ggml_backend_get_device(pool.backend));
+                                    const auto it = std::find(
+                                        unmatched.begin(), unmatched.end(), pool.backend_device);
+                                    GGML_ASSERT(it != unmatched.end());
+                                    unmatched.erase(it);
+                                }
+                                GGML_ASSERT(unmatched.empty());
+                            }
+                        }
                         logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode);
                         const double nmse_val = nmse(logits_cpu, logits_dev);
                         snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);

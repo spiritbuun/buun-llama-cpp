@@ -2878,25 +2878,20 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() 
             GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) == nullptr);
             ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
         } else {
-            // GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) != nullptr); // multi_buffer does not have a defined base
-            // for VMM-backed buffers the buffer size is the VA reservation — report the
-            // mapped-physical bytes instead (summed across the per-device buffers under a
-            // meta buffer; -sm tensor)
-            size_t sz      = 0;
-            bool   any_vmm = false;
-            for (ggml_backend_buffer_t pb : kv_phys_buffers(buf.get())) {
-                const vbr_pool * p = kv_vmm_pool_for(vbr_pools_, pb);
-                if (p != nullptr) {
-                    sz     += p->be->vmm_pool_mapped(p->vmm);
-                    any_vmm = true;
-                } else {
-                    sz += pb != nullptr ? ggml_backend_buffer_get_size(pb) : 0;
+            // Meta is a logical wrapper, not a residency domain. Attribute
+            // each tensor-split child to its physical buffer type so memory
+            // accounting and capture can bind it to the corresponding device.
+            // VMM buffers report mapped physical bytes rather than VA reserve.
+            for (ggml_backend_buffer_t physical : kv_phys_buffers(buf.get())) {
+                if (physical == nullptr) {
+                    continue;
                 }
+                const vbr_pool * pool = kv_vmm_pool_for(vbr_pools_, physical);
+                const size_t size = pool != nullptr
+                    ? pool->be->vmm_pool_mapped(pool->vmm)
+                    : ggml_backend_buffer_get_size(physical);
+                ret[ggml_backend_buffer_get_type(physical)] += size;
             }
-            if (!any_vmm) {
-                sz = ggml_backend_buffer_get_size(buf.get());
-            }
-            ret[buft] += sz;
         }
     }
 

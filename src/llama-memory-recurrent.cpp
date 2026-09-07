@@ -1605,6 +1605,16 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_brea
             // fit probe: the buffer is a 0-size dummy — report what the real allocation costs,
             // or the fit stops billing RS entirely and under-projects by the whole cache
             ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
+        } else if (ggml_backend_buffer_is_meta(buf.get())) {
+            const size_t n = ggml_backend_meta_buffer_n_bufs(buf.get());
+            for (size_t i = 0; i < n; ++i) {
+                ggml_backend_buffer_t physical =
+                    ggml_backend_meta_buffer_simple_buffer(buf.get(), i);
+                if (physical != nullptr) {
+                    ret[ggml_backend_buffer_get_type(physical)] +=
+                        ggml_backend_buffer_get_size(physical);
+                }
+            }
         } else {
             ret[buft] += ggml_backend_buffer_get_size(buf.get());
         }

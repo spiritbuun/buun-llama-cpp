@@ -3745,9 +3745,9 @@ private:
     // Live-state producer. During initialization it configures authority under
     // debug||lifecycle; later debug finalization refreshes the same gauges for records. It
     // measures every distinct live target/draft context's resident cache
-    // allocations from the library's canonical breakdown, then updates the manifested device
-    // cells. A multi-device meta row cannot be assigned without per-shard bytes and therefore
-    // fails closed rather than applying topology weights to a physical measurement.
+    // allocations from the library's canonical physical breakdown, then updates the manifested
+    // device cells. Tensor-split Meta allocations are expanded by the memory owner using their
+    // actual child buffers; topology weights are never substituted for measured resident bytes.
     bool cache_plan_observe_live_memory(bool certify) noexcept {
         if (!cache_authority || cache_authority->live_device_domains.empty()) {
             return true;
@@ -3915,16 +3915,15 @@ private:
                         ggml_backend_buft_is_host(raw_buft)) {
                         continue;
                     }
-                    ggml_backend_buffer_type_t buft = raw_buft;
-                    if (ggml_backend_buft_is_meta(buft)) {
-                        if (ggml_backend_meta_buft_n_bufts(buft) != 1) {
-                            complete = false;
-                            continue;
-                        }
-                        buft = ggml_backend_meta_buft_simple_buft(buft, 0);
+                    // The context owner expands Meta scheduler buffers into
+                    // physical rows. A Meta row here is incomplete accounting,
+                    // not a quantity that can safely be split by topology.
+                    if (ggml_backend_buft_is_meta(raw_buft)) {
+                        complete = false;
+                        continue;
                     }
                     const ggml_backend_dev_t device =
-                        ggml_backend_buft_get_device(buft);
+                        ggml_backend_buft_get_device(raw_buft);
                     auto it = std::find_if(
                         cache_authority->budget_devices.begin(),
                         cache_authority->budget_devices.end(),
