@@ -8,9 +8,12 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstring>
+#include <exception>
 #include <limits>
+#include <mutex>
 #include <regex>
 #include <stdexcept>
 #include <string_view>
@@ -1209,10 +1212,33 @@ std::vector<uint8_t> llama_safetensors_qwen4exp_importer::materialize(
         std::vector<uint8_t> result;
         const llama_safetensors_tensor * source_desc = nullptr;
         if (!spec.stack_exl3.empty()) {
-            // per-expert repacks (EXL3 tiles, Q4_1/Q8_0 rows, or F16 side vectors) concatenated along the expert dimension
+            // per-expert repacks (EXL3 tiles, Q4_1/Q8_0 rows, or F16 side vectors) concatenated along the
+            // expert dimension; experts repack independently, so spread them over the host cores
+            const size_t n_expert = spec.stack_exl3.size();
+            std::vector<std::vector<uint8_t>> parts(n_expert);
+            std::atomic<size_t> next{0};
+            std::exception_ptr error;
+            std::mutex error_mutex;
+            const size_t n_threads = std::max<size_t>(1, std::min<size_t>(std::thread::hardware_concurrency(), n_expert));
+            std::vector<std::thread> workers;
+            workers.reserve(n_threads);
+            for (size_t thread = 0; thread < n_threads; ++thread) {
+                workers.emplace_back([&]() {
+                    for (size_t i = next.fetch_add(1); i < n_expert; i = next.fetch_add(1)) {
+                        try {
+                            parts[i] = quant_->finalize(spec.stack_exl3[i], quant_->read(spec.stack_exl3[i]));
+                        } catch (...) {
+                            std::lock_guard<std::mutex> lock(error_mutex);
+                            if (!error) error = std::current_exception();
+                            next.store(n_expert);
+                        }
+                    }
+                });
+            }
+            for (auto & worker : workers) worker.join();
+            if (error) std::rethrow_exception(error);
             result.reserve(target_size);
-            for (const auto & binding : spec.stack_exl3) {
-                auto bytes = quant_->finalize(binding, quant_->read(binding));
+            for (const auto & bytes : parts) {
                 result.insert(result.end(), bytes.begin(), bytes.end());
             }
             if (result.size() != target_size) {

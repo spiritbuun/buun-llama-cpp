@@ -1704,6 +1704,7 @@ void llama_safetensors_registry::read_into(
         return;
     }
 
+    std::lock_guard<std::mutex> lock(*read_mutex_);
     llama_file & file = *files_.at(tensor.shard);
     file.seek(tensor.offset + offset, SEEK_SET);
     file.read_raw(destination, size);

@@ -5,6 +5,8 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <regex>
 #include <string>
@@ -172,4 +174,6 @@ class llama_safetensors_registry {
     std::unordered_map<std::string, std::string> metadata_;
     llama_files                             files_;
     llama_mmaps                             mappings_;
+    // seek+read on shared handles (READ mode); heap-held so the registry stays movable
+    std::unique_ptr<std::mutex>             read_mutex_ = std::make_unique<std::mutex>();
 };
