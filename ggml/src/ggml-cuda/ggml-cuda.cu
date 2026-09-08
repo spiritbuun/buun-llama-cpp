@@ -3,6 +3,7 @@
 #include "ggml-backend-impl.h"
 
 #include "ggml-cuda/allreduce.cuh"
+#include "ggml-cuda/allreduce-oneshot.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/moe-cache.cuh"
 #include "ggml-cuda/acc.cuh"
@@ -1503,6 +1504,8 @@ struct ggml_backend_cuda_comm_context {
     try_allreduce_fn            try_allreduce = nullptr;
 
     ggml_cuda_ar_pipeline *     ar_pipeline = nullptr;
+    // latency path for small F32 tensors (decode activations), any rank count, graph-capturable
+    ggml_cuda_ar_oneshot *      oneshot = nullptr;
 
 #ifdef GGML_USE_NCCL
     std::vector<ncclComm_t>     comms;
@@ -1515,6 +1518,7 @@ struct ggml_backend_cuda_comm_context {
         }
 #endif // GGML_USE_NCCL
         ggml_cuda_ar_pipeline_free(ar_pipeline);
+        ggml_cuda_ar_oneshot_free(oneshot);
     }
 };
 
@@ -1780,6 +1784,15 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
             ggml_backend_cuda_comm_init_none(ret);
         }
     }
+    // Small decode activations are latency-bound: reduce them through pinned host memory in one shot
+    // (GGML_CUDA_ALLREDUCE_ONESHOT=0 disables; the value sets the byte limit, default 256 KiB).
+    {
+        const char * env_os = getenv("GGML_CUDA_ALLREDUCE_ONESHOT");
+        const size_t limit = env_os == nullptr ? (size_t) 256 * 1024 : (size_t) atoll(env_os);
+        if (limit > 0 && n_backends >= 2) {
+            ret->oneshot = ggml_cuda_ar_oneshot_init(ret->dev_ids.data(), n_backends, limit);
+        }
+    }
 
     return ret;
 }
@@ -1932,6 +1945,9 @@ static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct gg
         return false;
     }
     auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    if (comm_ctx->oneshot != nullptr && ggml_cuda_ar_oneshot_eligible(comm_ctx->oneshot, tensors)) {
+        return ggml_cuda_ar_oneshot_allreduce(comm_ctx->oneshot, comm_ctx->backends.data(), tensors);
+    }
     return comm_ctx->try_allreduce(comm_ctx, tensors);
 }
 
