@@ -439,6 +439,14 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_ffn_down_weight   ("blk\\.\\d*\\.ffn_down(_exps)?.weight");
     static const std::regex pattern_ffn_down_bias         ("blk\\.\\d*\\.ffn_down.bias");
     static const std::regex pattern_ffn_down_exps_bias    ("blk\\.\\d*\\.ffn_down_exps.bias");
+    static const std::regex pattern_ffn_up_exps_any      ("blk\\.\\d*\\.ffn_up_exps\\.(weight|scale|input_scale)");
+    static const std::regex pattern_ffn_gate_exps_any    ("blk\\.\\d*\\.ffn_gate_exps\\.(weight|scale|input_scale)");
+    static const std::regex pattern_ffn_gate_up_exps_any ("blk\\.\\d*\\.ffn_gate_up_exps\\.(weight|scale|input_scale)");
+    static const std::regex pattern_ffn_down_exps_any    ("blk\\.\\d*\\.ffn_down_exps\\.(weight|scale|input_scale)");
+    static const bool expert_parallel = [] {
+        const char * env = std::getenv("LLAMA_SPLIT_EXPERTS");
+        return env == nullptr || std::string(env) != "slice";
+    }();
     static const std::regex pattern_ffn_up_shexp_weight   ("blk\\.\\d*\\.ffn_up_shexp.weight");
     static const std::regex pattern_ffn_gate_shexp_weight ("blk\\.\\d*\\.ffn_gate_shexp.weight");
     static const std::regex pattern_ffn_down_shexp_weight ("blk\\.\\d*\\.ffn_down_shexp.weight");
@@ -632,6 +640,15 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
 
         // FFN
+        // Stacked expert tensors: expert parallelism keeps whole experts per device (split on the expert
+        // axis) instead of slicing every expert across all devices; the MUL_MAT_ID nodes get a per-device
+        // expert window and the expert outputs are reduced once per layer. LLAMA_SPLIT_EXPERTS=slice restores
+        // the sliced layout.
+        if (expert_parallel && tensor->ne[2] > 1 &&
+                (std::regex_match(tensor_name, pattern_ffn_up_exps_any) || std::regex_match(tensor_name, pattern_ffn_gate_exps_any) ||
+                 std::regex_match(tensor_name, pattern_ffn_gate_up_exps_any) || std::regex_match(tensor_name, pattern_ffn_down_exps_any))) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2, "ffn_down_exps.weight");
+        }
         if (std::regex_match(tensor_name, pattern_ffn_up_weight) || std::regex_match(tensor_name, pattern_ffn_gate_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down.weight", "ffn_down_exps.weight");
         }
@@ -679,6 +696,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_split_segments = [&](int axis, uint32_t il) -> std::vector<std::pair<int64_t, uint32_t>> {
+        // expert parallelism: stacked expert tensors split on the expert axis move whole experts
+        if (axis == GGML_BACKEND_SPLIT_AXIS_2 && tensor->ne[2] > 1 &&
+                (std::regex_match(tensor_name, pattern_ffn_up_exps_any) || std::regex_match(tensor_name, pattern_ffn_gate_exps_any) ||
+                 std::regex_match(tensor_name, pattern_ffn_gate_up_exps_any) || std::regex_match(tensor_name, pattern_ffn_down_exps_any))) {
+            return {{tensor->ne[2], 1}};
+        }
         if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE ||
                 ud->model->arch == LLM_ARCH_QWEN4EXP) {
             const int64_t head_k_dim = hparams.ssm_d_state;
@@ -806,7 +829,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         return {{tensor->ne[axis], 1}};
     };
 
+    int split_axis_for_granularity = -1;
     auto get_split_granularity = [&](int64_t blck_size, uint32_t il, const std::vector<std::pair<int64_t, uint32_t>> & segments) -> std::vector<int64_t> {
+        if (split_axis_for_granularity == GGML_BACKEND_SPLIT_AXIS_2 && tensor->ne[2] > 1 &&
+                (std::regex_match(tensor_name, pattern_ffn_up_exps_any) || std::regex_match(tensor_name, pattern_ffn_gate_exps_any) ||
+                 std::regex_match(tensor_name, pattern_ffn_gate_up_exps_any) || std::regex_match(tensor_name, pattern_ffn_down_exps_any))) {
+            return std::vector<int64_t>(segments.size(), 1); // whole experts
+        }
         // for better performance it may make sense to round up blck_size to a higher power of 2 so that more efficient kernels can be used
         if (hparams.is_recr(il)) {
             // linear attention
@@ -951,6 +980,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
         }
         const std::vector<std::pair<int64_t, uint32_t>> segments = get_split_segments(split_state.axis, tc.il);
+        split_axis_for_granularity = split_state.axis;
         const std::vector<int64_t> granularity = get_split_granularity(blck_size, tc.il, segments);
         for (size_t is = 0; is < segments.size(); is++) {
             const int64_t  ne_s = segments[is].first;
