@@ -1628,6 +1628,9 @@ struct server_slot {
     int32_t n_keep  = 0;
     int32_t i_batch = -1;
 
+    // token sampled ahead of the serial slot loop (parallel sampling across slots), consumed once
+    llama_token presampled = LLAMA_TOKEN_NULL;
+
     // effective generation limit for the current task, -1 means unlimited
     int32_t n_predict_max = -1;
 
@@ -19372,6 +19375,40 @@ private:
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
         };
 
+        // Sample the plain generating slots of this sub-batch in parallel before the serial loop: each slot
+        // owns its sampler and the logits are read-only after the sync, so the per-token sampler chain
+        // (~0.6 ms over a 150k vocab) no longer serializes across slots (8 slots: ~5 ms of a ~45 ms step).
+        {
+            std::vector<server_slot *> presample;
+            for (auto & slot : slots) {
+                if (slot.state == SLOT_STATE_GENERATING && is_inside_view(slot.i_batch) &&
+                        !(slot.can_speculate() && !slot.spec_draft.empty()) &&
+                        slot.task && slot.task->params.sampling.n_probs == 0 && slot.ctx_tgt == ctx_tgt) {
+                    presample.push_back(&slot);
+                }
+            }
+            if (presample.size() > 1) {
+                scoped_timer timer(t_sampl, n_sampl);
+                llama_synchronize(ctx_tgt);
+                const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_tgt)));
+                std::vector<const float *> logits(presample.size());
+                for (size_t i = 0; i < presample.size(); i++) {
+                    logits[i] = llama_get_logits_ith(ctx_tgt, presample[i]->i_batch - off);
+                }
+                std::vector<std::thread> workers;
+                workers.reserve(presample.size() - 1);
+                for (size_t i = 1; i < presample.size(); i++) {
+                    workers.emplace_back([&, i]() {
+                        presample[i]->presampled = common_sampler_sample_from_logits(presample[i]->smpl.get(), logits[i], n_vocab);
+                    });
+                }
+                presample[0]->presampled = common_sampler_sample_from_logits(presample[0]->smpl.get(), logits[0], n_vocab);
+                for (auto & w : workers) {
+                    w.join();
+                }
+            }
+        }
+
         iterate(slots, [&](server_slot & slot) {
             // optionally send prompt processing progress
             if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
@@ -19489,7 +19526,10 @@ private:
             const int tok_idx = slot.i_batch - off;
 
             llama_token id;
-            {
+            if (slot.presampled != LLAMA_TOKEN_NULL) {
+                id = slot.presampled;
+                slot.presampled = LLAMA_TOKEN_NULL;
+            } else {
                 scoped_timer timer(t_sampl, n_sampl);
                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
             }
