@@ -524,6 +524,11 @@ llama_build_and_test(test-cuda-q8-mmv-selector.cpp)
 llama_build_and_test(test-cuda-graph-key.cpp)
 llama_build_and_test(test-cuda-rdna2-vmm-policy.cpp)
 if (TARGET ggml-cuda AND NOT GGML_BACKEND_DL)
+    llama_build(test-cuda-tcq-asym-codebooks.cpp)
+    llama_test(test-cuda-tcq-asym-codebooks LABEL "main;backend")
+    set_tests_properties(test-cuda-tcq-asym-codebooks PROPERTIES
+        ENVIRONMENT "GGML_TURBO_MMA_FUSED=1;TURBO_FUSED_PREFILL=0"
+        SKIP_RETURN_CODE 77)
     llama_build(test-cuda-hc-combine-match.cpp)
     target_link_libraries(test-cuda-hc-combine-match PRIVATE ggml-cuda)
     llama_test(test-cuda-hc-combine-match LABEL "main;backend")

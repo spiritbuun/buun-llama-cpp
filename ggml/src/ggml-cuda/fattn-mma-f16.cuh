@@ -1537,20 +1537,29 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     half2 * tile_V    =           nstages > 1 ? tile_K + nbatch_fa * stride_tile_K : tile_K;
     half  * tile_mask = (half *) (nstages > 1 ? tile_V + nbatch_fa * stride_tile_V : tile_V + nbatch_fa * stride_tile_KV_max);
 
-    constexpr bool is_tcq3_cb = (type_K == GGML_TYPE_TURBO3_TCQ || type_V == GGML_TYPE_TURBO3_TCQ);
-    constexpr bool is_tcq2_cb = (type_K == GGML_TYPE_TURBO2_TCQ || type_V == GGML_TYPE_TURBO2_TCQ);
-    constexpr bool is_tcq1_cb = (type_K == GGML_TYPE_TURBO1_TCQ || type_V == GGML_TYPE_TURBO1_TCQ);
-    constexpr int  cb_size    = is_tcq3_cb ? 512 : ((is_tcq2_cb || is_tcq1_cb) ? 256 : 1);
-    __shared__ float smem_cb[cb_size];
-    __shared__ float smem_cb_v[cb_size];   // separate V codebook: V may use a different book than K (asymmetric K/V)
-    if constexpr (is_tcq3_cb || is_tcq2_cb || is_tcq1_cb) {
-        const float * cb_src   = is_tcq3_cb ? d_turbo3_tcq_codebook_fattn   : (is_tcq2_cb ? d_turbo2_tcq_codebook_fattn   : d_turbo1_tcq_codebook);
-        // K reads the K book, V reads the separate V book (asymmetric K/V split).
-        const float * cb_src_v = is_tcq3_cb ? d_turbo3_tcq_codebook_v_fattn : (is_tcq2_cb ? d_turbo2_tcq_codebook_v_fattn : d_turbo1_tcq_codebook_v);
-        for (int i = threadIdx.y * warp_size + threadIdx.x; i < cb_size; i += nwarps * warp_size) {
-            smem_cb[i]   = cb_src[i];
+    constexpr int cb_size_k = type_K == GGML_TYPE_TURBO3_TCQ ? 512 :
+                              type_K == GGML_TYPE_TURBO2_TCQ || type_K == GGML_TYPE_TURBO1_TCQ ? 256 : 0;
+    constexpr int cb_size_v = type_V == GGML_TYPE_TURBO3_TCQ ? 512 :
+                              type_V == GGML_TYPE_TURBO2_TCQ || type_V == GGML_TYPE_TURBO1_TCQ ? 256 : 0;
+    __shared__ float smem_cb  [cb_size_k > 0 ? cb_size_k : 1];
+    __shared__ float smem_cb_v[cb_size_v > 0 ? cb_size_v : 1];
+    if constexpr (cb_size_k > 0) {
+        const float * cb_src_k = type_K == GGML_TYPE_TURBO3_TCQ ? d_turbo3_tcq_codebook_fattn :
+                                     type_K == GGML_TYPE_TURBO2_TCQ ? d_turbo2_tcq_codebook_fattn :
+                                                                      d_turbo1_tcq_codebook;
+        for (int i = threadIdx.y * warp_size + threadIdx.x; i < cb_size_k; i += nwarps * warp_size) {
+            smem_cb[i] = cb_src_k[i];
+        }
+    }
+    if constexpr (cb_size_v > 0) {
+        const float * cb_src_v = type_V == GGML_TYPE_TURBO3_TCQ ? d_turbo3_tcq_codebook_v_fattn :
+                                     type_V == GGML_TYPE_TURBO2_TCQ ? d_turbo2_tcq_codebook_v_fattn :
+                                                                      d_turbo1_tcq_codebook_v;
+        for (int i = threadIdx.y * warp_size + threadIdx.x; i < cb_size_v; i += nwarps * warp_size) {
             smem_cb_v[i] = cb_src_v[i];
         }
+    }
+    if constexpr (cb_size_k > 0 || cb_size_v > 0) {
         __syncthreads();
     }
 
