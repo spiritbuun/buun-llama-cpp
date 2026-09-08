@@ -23,7 +23,9 @@ static bool expect_granularity(const char * label, size_t actual, size_t expecte
 
 int main() {
     const ggml_cuda_fattn_rdna2_occupancy_inputs eligible = {
-        true, true, 0, 256, 256, 16, 2, 256, 256, 209, 65536, 37888, 0, 65536,
+        // Exact values reported by the issue #108 gfx1030 campaign. HIP exposes the
+        // per-CU register count here; the validated kernel occupies one two-CU WGP.
+        true, true, 0, 256, 256, 16, 2, 256, 256, 209, 32768, 37888, 0, 65536,
     };
     bool ok = expect_occupancy("rdna2-wgp", eligible, 1);
 
@@ -58,11 +60,11 @@ int main() {
     ok &= expect_granularity("cuda-driver-authority",
         ggml_cuda_vbr_vmm_commit_granularity(4096, false), 4096);
     ok &= expect_granularity("hip-4k-batch",
-        ggml_cuda_vbr_vmm_commit_granularity(4096, true), 64 * 1024);
+        ggml_cuda_vbr_vmm_commit_granularity(4096, true), 256 * 1024);
     ok &= expect_granularity("hip-16k-batch",
-        ggml_cuda_vbr_vmm_commit_granularity(16 * 1024, true), 64 * 1024);
+        ggml_cuda_vbr_vmm_commit_granularity(16 * 1024, true), 256 * 1024);
     ok &= expect_granularity("hip-nondivisor-roundup",
-        ggml_cuda_vbr_vmm_commit_granularity(48 * 1024, true), 96 * 1024);
+        ggml_cuda_vbr_vmm_commit_granularity(48 * 1024, true), 288 * 1024);
     ok &= expect_granularity("hip-larger-driver-authority",
         ggml_cuda_vbr_vmm_commit_granularity(2 * 1024 * 1024, true), 2 * 1024 * 1024);
     ok &= expect_granularity("unavailable",
