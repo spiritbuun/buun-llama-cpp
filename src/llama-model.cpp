@@ -503,6 +503,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         GGML_ASSERT(tensor_axis_0 != nullptr);
         return {axis, tensor_axis_0, il, rotation};
     };
+    // Quantization scales follow their weight's output rows: a per-channel scale is a vector (rows on
+    // axis 0) while a group-wise scale grid is [group, row] (rows on axis 1).
+    auto scale_rows_axis = [](const ggml_tensor * t) {
+        return t->ne[1] > 1 ? GGML_BACKEND_SPLIT_AXIS_1 : GGML_BACKEND_SPLIT_AXIS_0;
+    };
 
     auto get_tensor_config = [&]() -> tensor_config {
         if (is_dsv4) {
@@ -517,13 +522,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output_a.weight");
             }
             if (ggml_nelements(tensor) > 1 && std::regex_match(tensor_name, pattern_attn_q_b_scale)) {
-                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_q_b.weight");
+                return get_tensor_config_impl(scale_rows_axis(tensor), "attn_q_b.weight");
             }
             if (std::regex_match(tensor_name, pattern_attn_out_a_weight)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
             }
             if (ggml_nelements(tensor) > 1 && std::regex_match(tensor_name, pattern_attn_out_a_scale)) {
-                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output_a.weight");
+                return get_tensor_config_impl(scale_rows_axis(tensor), "attn_output_a.weight");
             }
             if (std::regex_match(tensor_name, pattern_attn_out_b_weight)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
@@ -537,7 +542,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
             if (ggml_nelements(tensor) > 1 && (std::regex_match(tensor_name, pattern_ffn_up_shexp_scale) ||
                     std::regex_match(tensor_name, pattern_ffn_gate_shexp_scale))) {
-                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down_shexp.weight");
+                return get_tensor_config_impl(scale_rows_axis(tensor), "ffn_down_shexp.weight");
             }
             if (std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down_shexp.weight");
@@ -572,10 +577,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         // device can apply the scale without first gathering the activation.
         if (tensor->ne[0] > 1 &&
                 (std::regex_match(tensor_name, pattern_q_scale) || std::regex_match(tensor_name, pattern_kv_scale))) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight", "ssm_out.weight");
+            return get_tensor_config_impl(scale_rows_axis(tensor), "attn_output.weight", "ssm_out.weight");
         }
         if (tensor->ne[0] > 1 && std::regex_match(tensor_name, pattern_qkv_scale)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight", "ssm_out.weight");
+            return get_tensor_config_impl(scale_rows_axis(tensor), "attn_output.weight", "ssm_out.weight");
         }
         if ( std::regex_match(tensor_name, pattern_qkv_bias)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight", "ssm_out.weight");
@@ -597,7 +602,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
         }
         if (tensor->ne[0] > 1 && std::regex_match(tensor_name, pattern_attn_gate_scale)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight", "ssm_out.weight");
+            return get_tensor_config_impl(scale_rows_axis(tensor), "attn_output.weight", "ssm_out.weight");
         }
         if (std::regex_match(tensor_name, pattern_ssm_dt) || std::regex_match(tensor_name, pattern_ssm_a)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ssm_out.weight");
@@ -632,7 +637,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
         if (tensor->ne[0] > 1 &&
                 (std::regex_match(tensor_name, pattern_ffn_up_scale) || std::regex_match(tensor_name, pattern_ffn_gate_scale))) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down.weight", "ffn_down_exps.weight");
+            return get_tensor_config_impl(scale_rows_axis(tensor), "ffn_down.weight", "ffn_down_exps.weight");
         }
         if (std::regex_match(tensor_name, pattern_ffn_up_bias) || std::regex_match(tensor_name, pattern_ffn_gate_bias)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down.weight", "ffn_down_exps.weight");
@@ -641,7 +646,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down.weight", "ffn_down_exps.weight");
         }
         if (tensor->ne[0] > 1 && std::regex_match(tensor_name, pattern_ffn_gate_up_scale)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down.weight", "ffn_down_exps.weight");
+            return get_tensor_config_impl(scale_rows_axis(tensor), "ffn_down.weight", "ffn_down_exps.weight");
         }
         if (std::regex_match(tensor_name, pattern_ffn_down_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down.weight", "ffn_down_exps.weight");
@@ -661,7 +666,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
         }
         if (tensor->ne[0] > 1 && std::regex_match(tensor_name, pattern_output_scale)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+            return get_tensor_config_impl(scale_rows_axis(tensor));
         }
         if (std::regex_match(tensor_name, pattern_output_bias)) {
             const ggml_tensor * output_weight = ud->model->get_tensor("output.weight");
@@ -683,13 +688,41 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             const int64_t key_dim    = head_k_dim * n_k_heads;
             const int64_t value_dim  = head_v_dim * n_v_heads;
 
+            // Full-attention layers of the hybrid stack: native checkpoints fuse q, k, v (and the q gate)
+            // into attn_qkv. Split by KV-head groups so every device keeps whole GQA groups:
+            // q (with its per-head gate interleaved, when present), k and v as separate segments so the
+            // granularity rule keeps whole GQA groups per device.
+            if (!hparams.is_recr(il) &&
+                    (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_qkv_scale))) {
+                const int64_t q_rows  = hparams.n_embd_head_k(il) * hparams.n_head(il);
+                const int64_t kv_rows = hparams.n_embd_head_k(il) * hparams.n_head_kv(il);
+                if (tensor->ne[axis] == q_rows + 2*kv_rows) {
+                    return {{q_rows, 1}, {kv_rows, 2}};
+                }
+                if (tensor->ne[axis] == 2*q_rows + 2*kv_rows) {
+                    // gated attention: q and its gate are interleaved per head inside the first block
+                    return {{2*q_rows, 1}, {kv_rows, 2}};
+                }
+                LLAMA_LOG_ERROR("%s: tensor split: %s ne=[%" PRId64 ",%" PRId64 "] axis=%d: not a q/k/v(/gate) fusion of %" PRId64 "-row groups\n",
+                        __func__, tensor_name.c_str(), tensor->ne[0], tensor->ne[1], axis, kv_rows);
+                GGML_ABORT("tensor split: unexpected fused attention qkv row count");
+            }
+
             // both Qwen 3 Next and Qwen 3.5 support n_v_heads > n_k_heads but the broadcasting pattern is different:
             //   - Qwen 3 Next: [k0_v0, k0_v1, k1_v2, k1_v3] (this is the default split pattern)
             //   - Qwen 3.5:    [k0_v0, k1_v1, k0_v2, k1_v3] (needs segmenting of V on the scale of K to get the correct pattern)
             if (ud->model->arch == LLM_ARCH_QWEN3NEXT) {
                 if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_qkv_scale) ||
                         std::regex_match(tensor_name, pattern_ssm_conv1d)) {
-                    GGML_ASSERT(tensor->ne[axis] == 2*key_dim + value_dim);
+                    // native checkpoints fuse the z gate behind qkv (qkvz): one more value_dim block
+                    if (tensor->ne[axis] == 2*key_dim + 2*value_dim) {
+                        return {{key_dim, 2}, {value_dim, 1}, {value_dim, 1}};
+                    }
+                    if (tensor->ne[axis] != 2*key_dim + value_dim) {
+                        LLAMA_LOG_ERROR("%s: tensor split: %s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] axis=%d expected %" PRId64 " on that axis\n",
+                                __func__, tensor_name.c_str(), tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3], axis, 2*key_dim + value_dim);
+                        GGML_ABORT("tensor split: unexpected fused-qkv row count");
+                    }
                     return {{key_dim, 2}, {value_dim, 1}};
                 }
                 if (std::regex_match(tensor_name, pattern_r_cache)) {
@@ -699,7 +732,15 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 const int64_t head_ratio = n_v_heads / n_k_heads;
                 if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_qkv_scale) ||
                         std::regex_match(tensor_name, pattern_ssm_conv1d)) {
-                    GGML_ASSERT(tensor->ne[axis] == 2*key_dim + value_dim);
+                    // native checkpoints fuse the z gate behind qkv (qkvz): z is laid out like v
+                    if (tensor->ne[axis] == 2*key_dim + 2*value_dim) {
+                        return {{key_dim, 2 + 2*head_ratio}};
+                    }
+                    if (tensor->ne[axis] != 2*key_dim + value_dim) {
+                        LLAMA_LOG_ERROR("%s: tensor split: %s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] axis=%d expected %" PRId64 " on that axis\n",
+                                __func__, tensor_name.c_str(), tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3], axis, 2*key_dim + value_dim);
+                        GGML_ABORT("tensor split: unexpected fused-qkv row count");
+                    }
                     return {{key_dim, 2 + head_ratio}};
                 }
                 if (std::regex_match(tensor_name, pattern_attn_gate_weight) || std::regex_match(tensor_name, pattern_attn_gate_scale) ||
@@ -723,7 +764,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                     return {{n_k_heads, head_ratio}};
                 }
                 if (std::regex_match(tensor_name, pattern_tape_qkv)) {
-                    GGML_ASSERT(tensor->ne[axis] == 2*key_dim + value_dim);
+                    if (tensor->ne[axis] != 2*key_dim + value_dim) {
+                        LLAMA_LOG_ERROR("%s: tensor split: %s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] axis=%d expected %" PRId64 " on that axis\n",
+                                __func__, tensor_name.c_str(), tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3], axis, 2*key_dim + value_dim);
+                        GGML_ABORT("tensor split: unexpected fused-qkv row count");
+                    }
                     return {{key_dim, 2 + head_ratio}};
                 }
             }
@@ -864,7 +909,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_qkv_scale) ||
                     std::regex_match(tensor_name, pattern_qkv_bias)) {
                 GGML_ASSERT(segments.size() == 2);
-                return {granularity_q, granularity_kv};
+                // a q block twice the head size carries the per-head q gate interleaved: double the granularity
+                const bool gated_q = segments[0].first == 2 * (int64_t) hparams.n_head(il) * hparams.n_embd_head_k(il);
+                return {gated_q ? std::lcm(2*n_embd_q, blck_size_perf) : granularity_q, granularity_kv};
             }
         }
 

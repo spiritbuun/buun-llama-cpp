@@ -1177,7 +1177,6 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 }
                 const ggml_backend_meta_split_state split_state =
                         ggml_backend_meta_get_split_state(tensor->src[i], true);
-                GGML_ASSERT(split_state.n_segments == 1);
                 const char * axis_name = ggml_backend_meta_split_axis_name(split_state.axis);
                 std::string ne_info;
                 for (size_t j = 0; j < n_bufs; j++) {
