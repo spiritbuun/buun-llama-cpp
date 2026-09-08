@@ -2979,15 +2979,20 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
     }
-    // MMQ serves batches up to GGML_CUDA_MMQ_MAX_BATCH rows (default 128, -1 =
-    // always); larger batches dequantize and run cuBLAS. On tensor-core
+    // MMQ serves batches up to GGML_CUDA_MMQ_MAX_BATCH rows (-1 = always);
+    // larger batches dequantize and run cuBLAS. On datacenter tensor-core
     // hardware the MMQ kernels reach well under half the dense GEMM rate, so
     // the dequant pass pays for itself once the batch is large enough (A100,
-    // 27B: crossover near 192 rows, 1.5-2x faster at 512-2048).
-    static const int64_t mmq_max_batch = [] {
+    // 27B: crossover near 192 rows, 1.5-2x faster at 512-2048) -> default 128
+    // there. Consumer parts have a far lower BF16 GEMM rate relative to their
+    // int8 MMQ rate: RTX 3090 pp2048 is 1.27-1.55x faster on MMQ -> default -1.
+    static const int64_t mmq_max_batch_env = [] {
         const char * env = std::getenv("GGML_CUDA_MMQ_MAX_BATCH");
-        return env != nullptr ? std::atoll(env) : int64_t(128);
+        return env != nullptr ? std::atoll(env) : int64_t(INT64_MIN);
     }();
+    const bool datacenter_bf16 = GGML_CUDA_CC_IS_NVIDIA(cc) &&
+        (cc == GGML_CUDA_CC_AMPERE || cc == GGML_CUDA_CC_HOPPER || (cc >= 1000 && cc < GGML_CUDA_CC_BLACKWELL));
+    const int64_t mmq_max_batch = mmq_max_batch_env != INT64_MIN ? mmq_max_batch_env : (datacenter_bf16 ? 128 : -1);
     if ((mmq_max_batch < 0 || ne11 <= mmq_max_batch) &&
             ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);

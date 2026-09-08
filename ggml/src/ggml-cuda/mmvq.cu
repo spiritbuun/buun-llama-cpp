@@ -1188,6 +1188,32 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     if (!ggml_is_quantized(type) && type != GGML_TYPE_F8_E4M3) {
         return false;
     }
+    // tuning knob: cap the batch size handed to MMVQ (larger batches go to MMQ)
+    static const int64_t max_n_env = [] {
+        const char * s = getenv("GGML_CUDA_MMVQ_MAX_N");
+        return s != nullptr ? (int64_t) atoi(s) : (int64_t) -1;
+    }();
+    if (max_n_env >= 0) {
+        return ne11 <= max_n_env;
+    }
+    // Consumer Ampere (GA10x): MMQ's int8 tensor-core path is flat from n=2 to n=8 while MMVQ re-reads and
+    // re-decodes the weights per column. K-quants and IQ4_NL decode dearly, so MMQ wins from n=3 (n=2 for
+    // Q5_K); the cheap-to-decode types keep MMVQ to n=4 (its per-column cost there is within MMQ's fixed
+    // quantize/fixup overhead, which tensor-split shards feel most). Tuned on RTX 3090, m=4096 k=14336.
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc > GGML_CUDA_CC_AMPERE && cc < GGML_CUDA_CC_ADA_LOVELACE) {
+        switch (type) {
+            case GGML_TYPE_Q5_K:
+                return ne11 <= 1;
+            case GGML_TYPE_Q2_K:
+            case GGML_TYPE_Q3_K:
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q6_K:
+            case GGML_TYPE_IQ4_NL:
+                return ne11 <= 2;
+            default:
+                return ne11 <= 4;
+        }
+    }
     // k-quants cost more to decode and mvq redoes that per column, so MMQ wins sooner.
     // Only list quant-types MMQ supports, others would fall back to cuBLAS.
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_ADA_LOVELACE) {
