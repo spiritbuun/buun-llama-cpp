@@ -727,8 +727,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_cpy = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        // a same-shape copy (materialising a permuted view, e.g. the selected keys of an attention layer)
+        // is element-wise: every device copies its own shard, the split state carries over unchanged
+        if (ggml_are_same_shape(tensor, tensor->src[0]) && tensor->src[1] == nullptr) {
+            return src_ss[0];
+        }
         if (src_ss[0].axis >= 0 && src_ss[0].axis < GGML_MAX_DIMS) {
-            return handle_reshape(src_ss);
+            return handle_reshape(src_ss, /*allow_permuted_src =*/ !ggml_is_permuted(tensor));
         }
         return handle_generic(src_ss, /*scalar_only =*/ false);
     };
@@ -2822,6 +2827,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     }
                     if (launched) {
                         return GGML_STATUS_SUCCESS;
+                    }
+                    if (getenv("GGML_META_DEBUG") != nullptr) {
+                        fprintf(stderr, "ggml_backend_meta: step graph launch FAILED for uid %" PRIu64 " (running uncaptured from now on)\n", cgraph->uid);
                     }
                     backend_ctx->step_records.back().uid = 0;
                     // fall through: execute uncaptured
