@@ -4,6 +4,26 @@
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
 #include <cublasLt.h>
+#if defined(__linux__)
+#include <dlfcn.h>
+
+using fp8_cutlass_fn = int (*)(const void *, const void *, const float *, const float *, float *,
+    int, int, int, int, int, int, void *, size_t, size_t *, cudaStream_t);
+
+static fp8_cutlass_fn fp8_cutlass_provider() {
+    static const auto fn = []() -> fp8_cutlass_fn {
+        const char * path = getenv("GGML_CUDA_FP8_CUTLASS_LIBRARY");
+        if (!path) return nullptr;
+        void * library = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+        if (!library) GGML_ABORT("FP8 CUTLASS experiment: %s", dlerror());
+        auto result = reinterpret_cast<fp8_cutlass_fn>(dlsym(library, "buun_fp8_cutlass"));
+        if (!result) GGML_ABORT("FP8 CUTLASS experiment: missing entry point");
+        // Keep code loaded while CUDA graphs can refer to its kernels.
+        return result;
+    }();
+    return fn;
+}
+#endif
 
 // Use the same row scale and E4M3 rounding as fp8_dynamic_fake_quant_kernel,
 // but keep quantized activations packed until the GEMM epilogue.
@@ -223,6 +243,35 @@ bool ggml_cuda_mul_mat_fp8_channel_lt(ggml_backend_cuda_context & ctx, ggml_tens
         !bf16_reference && !round_correction && !wide_scale && m <= 65535 &&
         !getenv("GGML_CUDA_FP8_LT_CHECK_ALL");
     if (k % (16*split_k)) return false;
+#if defined(__linux__)
+    // Use the fused F32 epilogue for large prefill batches; smaller batches keep Lt.
+    if (padded_m >= 1024 && !bf16_reference && !round_correction && !wide_scale && split_k <= 2 &&
+            scale->type == GGML_TYPE_F32 && !getenv("GGML_CUDA_FP8_LT_CHECK_ALL") &&
+            !getenv("GGML_CUDA_FP8_LT_CHECK") && !getenv("GGML_CUDA_FP8_LT_DUMP")) {
+        if (auto provider = fp8_cutlass_provider()) {
+            ggml_cuda_pool_alloc<__nv_fp8_e4m3> input(ctx.pool(), k*padded_m);
+            ggml_cuda_pool_alloc<float> scales(ctx.pool(), padded_m);
+            size_t required = 0;
+            const auto invoke = [&](void * workspace, size_t capacity) {
+                return provider(w->data, input.get(), static_cast<const float *>(scale->data),
+                    scales.get(), static_cast<float *>(dst->data), int(m), int(n), int(k), split_k,
+                    ctx.device, ggml_cuda_info().devices[ctx.device].nsm,
+                    workspace, capacity, &required, ctx.stream());
+            };
+            if (invoke(nullptr, 0) == 0) {
+                ggml_cuda_pool_alloc<char> workspace(ctx.pool(), std::max(size_t(1), required));
+                fp8_channel_pack<<<padded_m, 256, 0, ctx.stream()>>>(
+                    static_cast<const float *>(x->data), input.get(), scales.get(),
+                    static_cast<const int32_t *>(marker->data), k, m);
+                CUDA_CHECK(cudaGetLastError());
+                const int status = invoke(workspace.get(), std::max(size_t(1), required));
+                if (status != 0) GGML_ABORT("FP8 CUTLASS experiment: launch status %d", status);
+                CUDA_CHECK(cudaGetLastError());
+                return true;
+            }
+        }
+    }
+#endif
     const int64_t part_k = k/split_k;
     const cudaDataType_t gemm_type = bf16_reference ? CUDA_R_16BF : CUDA_R_8F_E4M3;
     fp8_channel_lt_descriptors plan;
