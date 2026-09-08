@@ -5,7 +5,10 @@
 #include "fattn-rdna2-policy.h"
 #include "vecdotq.cuh"
 
+#include <atomic>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 
 static __constant__ float d_turbo_centroids_2bit_fattn[4] = {
     -0.133462f, -0.039994f, 0.039994f, 0.133462f
@@ -2061,6 +2064,7 @@ void launch_fattn(
             &attr, reinterpret_cast<const void *>(fattn_kernel));
         const cudaError_t prop_status = hipGetDeviceProperties(
             &prop, ggml_cuda_info().devices[id].physical_device);
+        const int runtime_occupancy = max_blocks_per_sm;
         if (attr_status == cudaSuccess && prop_status == cudaSuccess) {
             max_blocks_per_sm = ggml_cuda_fattn_correct_rdna2_wgp_occupancy({
                 true,
@@ -2078,6 +2082,46 @@ void launch_fattn(
                 nbytes_shared,
                 ggml_cuda_info().devices[id].smpb,
             });
+        }
+        static const bool diagnostics = [] {
+            const char * value = std::getenv("GGML_FATTN_RDNA2_DIAGNOSTICS");
+            return value != nullptr && std::atoi(value) != 0;
+        }();
+        static std::atomic_flag reported[GGML_CUDA_MAX_DEVICES] = {};
+        if (diagnostics && !reported[id].test_and_set(std::memory_order_relaxed)) {
+            const uint64_t registers_required = attr.numRegs > 0
+                ? uint64_t(attr.numRegs) * uint64_t(block_dim.x * block_dim.y * block_dim.z)
+                : 0;
+            const uint64_t registers_per_wgp = prop.regsPerBlock > 0
+                ? uint64_t(prop.regsPerBlock) * 2
+                : 0;
+            std::fprintf(stderr,
+                "GGML_FATTN_RDNA2_WGP version=1 device=%d physical_device=%d "
+                "runtime_occupancy=%d corrected_occupancy=%d attr_status=%d prop_status=%d "
+                "DKQ=%lld DV=%d ncols1=%d ncols2=%d threads=%u "
+                "registers_per_thread=%d registers_per_cu=%d registers_required=%llu "
+                "registers_per_wgp=%llu static_shared=%zu dynamic_shared=%zu "
+                "shared_per_wgp=%zu action=%s\n",
+                id,
+                ggml_cuda_info().devices[id].physical_device,
+                runtime_occupancy,
+                max_blocks_per_sm,
+                (int) attr_status,
+                (int) prop_status,
+                (long long) Q->ne[0],
+                DV,
+                ncols1,
+                ncols2,
+                block_dim.x * block_dim.y * block_dim.z,
+                attr.numRegs,
+                prop.regsPerBlock,
+                (unsigned long long) registers_required,
+                (unsigned long long) registers_per_wgp,
+                attr.sharedSizeBytes,
+                nbytes_shared,
+                ggml_cuda_info().devices[id].smpb,
+                max_blocks_per_sm > 0 ? "accept" : "reject");
+            std::fflush(stderr);
         }
     }
 #endif // defined(GGML_USE_HIP)
