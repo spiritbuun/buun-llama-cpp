@@ -106,7 +106,7 @@ static __global__ void fp8_channel_sum_partials(float * src, int64_t stride, int
 }
 
 // Research variant: combine the split reduction and channel scaling without
-// materializing the reduced matrix. Keep the FP64 sum -> F32 -> scales order.
+// materializing the reduced matrix. Round the partial sum to F32 before scaling.
 template<typename S>
 static __global__ void fp8_channel_reduce_finish(
         const float * src, float * dst, const S * weight_scale,
@@ -116,7 +116,11 @@ static __global__ void fp8_channel_reduce_finish(
     if (col >= n) return;
     const int64_t i = row*n + col;
     float value = src[i];
-    if (parts > 1) {
+    if (parts == 2) {
+        // Two F32 partials need only one rounded F32 addition. Preserve the
+        // initial +0 and explicit rounding (including fast-math FTZ behavior).
+        value = __fadd_rn(__fadd_rn(0.0f, src[i]), src[stride+i]);
+    } else if (parts > 1) {
         double sum = 0.0;
         for (int p = 0; p < parts; ++p) sum += double(src[p*stride+i]);
         value = float(sum);
