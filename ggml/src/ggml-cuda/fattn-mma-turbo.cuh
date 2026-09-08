@@ -192,18 +192,18 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
     template void ggml_cuda_flash_attn_ext_mma_turbo_case                                            \
     <DKQ, DV, ncols1, ncols2, tK, tV>(ggml_backend_cuda_context & ctx, ggml_tensor * dst)            \
 
-// Matched K/V at D=128 and D=256. ncols2 ≤ 8.
-#define DECL_FATTN_MMA_TURBO_CASES_ALL_NCOLS2(DKQ, DV, ncols, tK, tV)           \
-    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV, (ncols)/1, 1, tK, tV); \
-    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV, (ncols)/2, 2, tK, tV); \
-    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV, (ncols)/4, 4, tK, tV); \
-    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV, (ncols)/8, 8, tK, tV); \
-
+// Fused Turbo attention handles at most four query tokens. These are the nine
+// tile shapes selected by the NVIDIA and RDNA decode paths.
 #define DECL_FATTN_MMA_TURBO_ALL(DKQ, DV, tK, tV) \
-    DECL_FATTN_MMA_TURBO_CASES_ALL_NCOLS2(DKQ, DV,  8, tK, tV) \
-    DECL_FATTN_MMA_TURBO_CASES_ALL_NCOLS2(DKQ, DV, 16, tK, tV) \
-    DECL_FATTN_MMA_TURBO_CASES_ALL_NCOLS2(DKQ, DV, 32, tK, tV) \
-    DECL_FATTN_MMA_TURBO_CASES_ALL_NCOLS2(DKQ, DV, 64, tK, tV) \
+    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV,  8, 1, tK, tV); \
+    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV,  4, 2, tK, tV); \
+    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV,  2, 4, tK, tV); \
+    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV,  1, 8, tK, tV); \
+    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV, 16, 1, tK, tV); \
+    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV,  8, 2, tK, tV); \
+    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV,  4, 4, tK, tV); \
+    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV,  2, 8, tK, tV); \
+    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DV,  4, 8, tK, tV); \
 
 DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_TURBO4_0,   GGML_TYPE_TURBO4_0)
 DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO4_0,   GGML_TYPE_TURBO4_0)
