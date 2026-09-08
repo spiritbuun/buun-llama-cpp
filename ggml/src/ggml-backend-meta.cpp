@@ -2008,6 +2008,7 @@ struct ggml_backend_meta_context {
     int                      step_same_sig    = 0;   // consecutive computes with the same signature (warmup)
     uint64_t                 step_sig_uid     = 0;   // graph uid the cached signature belongs to
     uint64_t                 step_sig_cached  = 0;
+    size_t                   cur_min_reduce   = 0;   // smallest all-reduce of the last rebuilt graph (bytes)
     bool                     step_graphs      = false;
 
     void step_records_free() {
@@ -2419,6 +2420,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         rotate_shard_containers();
         size_t n_subgraphs  = 0;
         size_t max_tmp_size = 0;
+        size_t min_reduce   = SIZE_MAX;
 
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
@@ -2603,6 +2605,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(node, /*assume_sync =*/ false);
                 if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
                     max_tmp_size = std::max(max_tmp_size, ggml_nbytes(node));
+                    min_reduce   = std::min(min_reduce, ggml_nbytes(node));
                 }
                 const bool new_subgraph = i + 1 == cgraph->n_nodes || split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
                 if (!new_subgraph) {
@@ -2652,6 +2655,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     cgraph->n_nodes, n_subgraphs, n_subgraphs > 0 ? n_subgraphs - 1 : 0, n_backends);
         }
 
+        backend_ctx->cur_min_reduce = min_reduce == SIZE_MAX ? 0 : min_reduce;
         if (max_tmp_size > backend_ctx->max_tmp_size) {
             for (size_t j = 0; j < n_backends; j++) {
                 auto & bcj = backend_ctx->backend_configs[j];
@@ -2863,12 +2867,36 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // One pass over the subgraphs: launch every device, then all-reduce the boundary node. Under a
     // step capture, a fallback all-reduce (not a plain backend collective) invalidates the capture.
     auto run_subgraphs = [&](bool capturing, bool & capture_ok) -> ggml_status {
+        // Uncaptured, one host thread issues every device's launches (7250 nodes x 8 devices per prompt chunk
+        // ≈ 58k launches, several hundred ms): give each device its own thread. A capture stays on one thread.
+        static const bool threaded_launch = getenv("GGML_META_NO_THREADED_COMPUTE") == nullptr;
+        std::vector<ggml_status> status_j(n_backends, GGML_STATUS_SUCCESS);
         for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
-            for (size_t j = 0; j < n_backends; j++) {
-                auto & bcj = backend_ctx->backend_configs[j];
-                const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
-                if (status != GGML_STATUS_SUCCESS) {
-                    return status;
+            if (!capturing && threaded_launch && n_backends > 2) {
+                std::vector<std::thread> workers;
+                workers.reserve(n_backends - 1);
+                for (size_t j = 1; j < n_backends; j++) {
+                    workers.emplace_back([&, i, j]() {
+                        auto & bcj = backend_ctx->backend_configs[j];
+                        status_j[j] = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
+                    });
+                }
+                status_j[0] = ggml_backend_graph_compute_async(backend_ctx->backend_configs[0].backend, backend_ctx->backend_configs[0].cgraphs[i].cgraph_main);
+                for (auto & w : workers) {
+                    w.join();
+                }
+                for (size_t j = 0; j < n_backends; j++) {
+                    if (status_j[j] != GGML_STATUS_SUCCESS) {
+                        return status_j[j];
+                    }
+                }
+            } else {
+                for (size_t j = 0; j < n_backends; j++) {
+                    auto & bcj = backend_ctx->backend_configs[j];
+                    const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
+                    if (status != GGML_STATUS_SUCCESS) {
+                        return status;
+                    }
                 }
             }
 
@@ -2908,8 +2936,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             known_bad = known_bad || (rec.sig == step_sig && !rec.valid);
         }
 
+        // Capture pays off for launch-bound decode steps; a prompt chunk is compute/comm-bound and its shape
+        // rarely recurs, so recording it (≈0.5 s for 8 devices) is pure loss. Classify by the SMALLEST
+        // all-reduce: a prompt chunk reduces megabytes at every layer, a decode step reduces a few tokens'
+        // hidden states (the one large logits reduce at the end does not make it a prompt).
+        static const size_t step_max_reduce = getenv("GGML_META_STEP_MAX_REDUCE") != nullptr ?
+            (size_t) atoll(getenv("GGML_META_STEP_MAX_REDUCE")) : (size_t) 256 * 1024;
+        const bool decode_class = backend_ctx->cur_min_reduce <= step_max_reduce;
+
         // second consecutive compute of the same shape (the first is the simple backends' warmup)
-        if (backend_ctx->step_same_sig >= 1 && !known_bad) {
+        if (backend_ctx->step_same_sig >= 1 && !known_bad && decode_class) {
             bool capturable = true;
             for (size_t j = 0; j < n_backends && capturable; j++) {
                 auto & bcj = backend_ctx->backend_configs[j];
