@@ -5939,7 +5939,7 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
 }
 
 // GGML_OP_MUL_MAT_ID with an expert-parallel window: `as` holds n_local experts of an n_mats routing space
-// followed by one zero pad expert; routed ids outside [lo, lo + n_local) must produce zero rows.
+// routed ids outside [lo, lo + n_local) must produce zero rows.
 struct test_mul_mat_id_window : public test_case {
     const ggml_type type_a;
     const int n_mats;
@@ -5965,7 +5965,7 @@ struct test_mul_mat_id_window : public test_case {
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_local + 1);
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_local);
         ggml_set_name(as, "as");
         ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
         ggml_set_name(ids, "ids");
@@ -5983,14 +5983,6 @@ struct test_mul_mat_id_window : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         init_mul_mat_id_tensors(ctx, n_mats);
-        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            if (strcmp(t->name, "as") == 0) {
-                // zero the pad expert (last)
-                const size_t expert_bytes = ggml_nbytes(t) / (n_local + 1);
-                std::vector<uint8_t> zeros(expert_bytes, 0);
-                ggml_backend_tensor_set(t, zeros.data(), n_local * expert_bytes, expert_bytes);
-            }
-        }
     }
 };
 
@@ -10617,6 +10609,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 1700000,  1, 2592, {1, 1}, {1, 1}));
 
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 2, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 1, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
+#endif
+    // expert-parallel windows (live: these must run)
     for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
         for (int64_t n : {1, 8, 64}) {
             test_cases.emplace_back(new test_mul_mat_id_window(type_a, 16, 4, 4, 4, 64, n, 256)); // window in the middle
@@ -10624,10 +10621,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id_window(type_a, 16, 4, 12, 4, 64, n, 256)); // window at the end
         }
     }
-    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 1, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
-    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
-#endif
+    // Flash-Next expert shapes on one of 8 devices: 512 experts, 64 local, 10 used, 640 x 2560 experts
+    for (int64_t n : {8, 16, 64, 512}) {
+        test_cases.emplace_back(new test_mul_mat_id_window(GGML_TYPE_Q4_K, 512, 64, 0,   10, 640, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id_window(GGML_TYPE_Q4_0, 512, 64, 448, 10, 2560, n, 640)); // k=640 is not a Q4_K multiple
+    }
 
     // Channel-scaled F8 uses raw E4M3 storage with BF16 activations in MMVQ,
     // then BF16/F32 expansion for wider batches.

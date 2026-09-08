@@ -1530,6 +1530,9 @@ static __global__ void mul_mat_vec_q(
     channel_x  = ncols_dst == 1 && ids ? ids[channel_dst]                     : fastdiv(channel_dst, channel_ratio);
     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
     sample_dst = blockIdx.z;
+    if (ncols_dst == 1 && ids && (int32_t) channel_x < 0) {
+        return; // expert on another device (expert-parallel window): the row is zeroed by the caller
+    }
 
     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
     const uint32_t sample_y    = sample_dst;
@@ -1797,6 +1800,9 @@ static __global__ void mul_mat_vec_q_moe(
 
     ggml_cuda_pdl_sync();
     const uint32_t channel_x = ids[route_idx];
+    if ((int32_t) channel_x < 0) {
+        return; // expert on another device (expert-parallel window): the row is zeroed by the caller
+    }
     const uint32_t channel_gate = has_fusion
         ? gate_ids[route_idx] : 0;
     const uint32_t channel_y = act_ids

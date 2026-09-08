@@ -3122,7 +3122,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     std::vector<int32_t> ids_to_sorted_host;
     ids_to_sorted_host.reserve(2*ne_get_rows);
-    std::vector<int32_t> ids_from_sorted_host(ne_get_rows);
+    std::vector<int32_t> ids_from_sorted_host(ne_get_rows, 0); // 0: rows of a foreign expert gather any row and are zeroed afterwards
 
     ggml_cuda_pool_alloc<int32_t> ids_buf_dev(ctx.pool(), 2*ne_get_rows);
 
@@ -3139,7 +3139,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
             for (int64_t iex = 0; iex < n_expert_used; ++iex) {
                 const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
-                assert(expert_to_use >= 0 && expert_to_use < ne02);
+                if (expert_to_use < 0) {
+                    continue; // expert-parallel window: routed to another device
+                }
+                assert(expert_to_use < ne02);
                 if (expert_to_use == i02) {
                     ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
                     ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
@@ -3149,7 +3152,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
         }
     }
-    GGML_ASSERT(ids_to_sorted_host.size() == size_t(ne_get_rows));
+    GGML_ASSERT(ids_to_sorted_host.size() <= size_t(ne_get_rows));
+    ids_to_sorted_host.resize(ne_get_rows, 0); // pad (foreign rows) so the buffer layout below stays fixed
 
     ids_to_sorted_host.insert(ids_to_sorted_host.end(), ids_from_sorted_host.begin(), ids_from_sorted_host.end());
 
@@ -3249,7 +3253,28 @@ static __global__ void k_mmid_remap_ids(const int32_t * __restrict__ ids, int32_
     const int64_t i0 = i - i1 * ne0;
     const int32_t id    = *(const int32_t *) ((const char *) ids + i1 * nb1 + i0 * sizeof(int32_t));
     const int32_t local = id - lo; // same mapping as ggml_mmid_expert_index (host-only inline)
-    out[i] = (local < 0 || local >= n_local) ? n_local : local;
+    out[i] = (local < 0 || local >= n_local) ? -1 : local;
+}
+
+// Rows routed to experts on other devices are skipped by every executor and zeroed here afterwards.
+static __global__ void k_mmid_zero_foreign_rows(const int32_t * __restrict__ ids, float * __restrict__ dst,
+        const int64_t ne0, const int64_t n_used, const int64_t n_tokens, const size_t ids_nb1,
+        const size_t dst_nb1, const size_t dst_nb2, const int32_t lo, const int32_t n_local) {
+    const int64_t row = blockIdx.x; // (token, slot)
+    const int64_t t = row / n_used;
+    const int64_t u = row - t * n_used;
+    if (t >= n_tokens) {
+        return;
+    }
+    const int32_t id = *(const int32_t *) ((const char *) ids + t * ids_nb1 + u * sizeof(int32_t));
+    const int32_t local = id - lo;
+    if (local >= 0 && local < n_local) {
+        return;
+    }
+    float * d = (float *) ((char *) dst + t * dst_nb2 + u * dst_nb1);
+    for (int64_t i = threadIdx.x; i < ne0; i += blockDim.x) {
+        d[i] = 0.0f;
+    }
 }
 
 static void ggml_cuda_mul_mat_id_windowed(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -3267,10 +3292,23 @@ static void ggml_cuda_mul_mat_id_windowed(ggml_backend_cuda_context & ctx, ggml_
     ids_local.nb[2] = ids_local.nb[1] * ids->ne[1];
     ids_local.nb[3] = ids_local.nb[2];
     ids_local.view_src = nullptr;
+    GGML_ASSERT(!ggml_cuda_is_exl3(dst->src[0]->type) && "expert-parallel window: exl3 mul_mat_id not supported yet");
     ggml_tensor shadow = *dst;
     shadow.src[2] = &ids_local;
     ggml_mul_mat_id_set_expert_window(&shadow, 0, 0);
+    static const bool debug_mmid = getenv("GGML_CUDA_DEBUG_MMID") != nullptr;
+    if (debug_mmid) {
+        fprintf(stderr, "[mmid] window lo=%d n_local=%d ne02=%lld ids=[%lld x %lld] nb1=%zu -> compact nb1=%zu\n",
+                ggml_mmid_window_lo(dst), ggml_mmid_window_n_local(dst), (long long) dst->src[0]->ne[2],
+                (long long) ids->ne[0], (long long) ids->ne[1], ids->nb[1], ids_local.nb[1]);
+    }
     ggml_cuda_mul_mat_id(ctx, &shadow);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    const int64_t n_rows = ids->ne[0] * ids->ne[1];
+    k_mmid_zero_foreign_rows<<<n_rows, 256, 0, ctx.stream()>>>(
+        (const int32_t *) ids->data, (float *) dst->data, dst->ne[0], ids->ne[0], ids->ne[1], ids->nb[1],
+        dst->nb[1], dst->nb[2], ggml_mmid_window_lo(dst), ggml_mmid_window_n_local(dst));
+    CUDA_CHECK(cudaGetLastError());
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {

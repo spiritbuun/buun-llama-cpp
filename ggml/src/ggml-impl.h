@@ -173,13 +173,13 @@ static inline int32_t ggml_mmid_window_n_local(const struct ggml_tensor * mmid) 
 static inline int32_t ggml_mmid_window_lo(const struct ggml_tensor * mmid) {
     return ggml_get_op_params_i32(mmid, 2);
 }
-// maps a routed expert id into the local expert tensor: index n_local is the zero pad expert
+// maps a routed expert id into the local expert tensor; -1 = not on this device (the row is skipped and zeroed)
 static inline int32_t ggml_mmid_expert_index(int32_t id, int32_t lo, int32_t n_local) {
     if (n_local == 0) {
         return id;
     }
     const int32_t local = id - lo;
-    return (local < 0 || local >= n_local) ? n_local : local;
+    return (local < 0 || local >= n_local) ? -1 : local;
 }
 
 static void ggml_set_op_params_f32(struct ggml_tensor * tensor, uint32_t i, float value) {

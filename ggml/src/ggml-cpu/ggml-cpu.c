@@ -2437,7 +2437,7 @@ static void ggml_compute_forward_mul_mat_id_impl(
         if (allow_moe_cache &&
             ggml_moe_cache.begin && ggml_moe_cache.plan &&
             ggml_moe_cache.dispatch && ggml_moe_cache.collect && ggml_moe_cache.end &&
-            src0->op == GGML_OP_NONE && src0_buffer &&
+            src0->op == GGML_OP_NONE && src0_buffer && mmid_n_local == 0 &&
             ggml_backend_buffer_is_host(src0_buffer) &&
             ggml_backend_buffer_get_usage(src0_buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
             src1->type == GGML_TYPE_F32) {
@@ -2472,6 +2472,11 @@ static void ggml_compute_forward_mul_mat_id_impl(
                     }
                 }
                 const int32_t i02 = ggml_mmid_expert_index(*(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]), mmid_lo, mmid_n_local);
+                if (i02 < 0) {
+                    // expert-parallel window: the expert lives on another device, the row is zero here
+                    memset((char *) dst->data + iid1*nb2 + id*nb1, 0, ne0*sizeof(float));
+                    continue;
+                }
 
                 assert(i02 >= 0 && i02 < n_as);
 
