@@ -1625,6 +1625,11 @@ extern "C" {
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
 
+    // expert-parallel window: `as` holds only experts [lo, lo + n_local) of the routed expert space at local
+    // indices 0..n_local-1, followed by one all-zero pad expert (n_local + 1 in total). Routed ids outside the
+    // window resolve to the pad expert (zero output); n_local == 0 disables the window.
+    GGML_API void ggml_mul_mat_id_set_expert_window(struct ggml_tensor * mmid, int32_t lo, int32_t n_local);
+
     // A: m columns, n rows,
     // B: p columns, n rows,
     // result is m columns, p rows

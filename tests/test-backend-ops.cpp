@@ -5938,6 +5938,62 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
     }
 }
 
+// GGML_OP_MUL_MAT_ID with an expert-parallel window: `as` holds n_local experts of an n_mats routing space
+// followed by one zero pad expert; routed ids outside [lo, lo + n_local) must produce zero rows.
+struct test_mul_mat_id_window : public test_case {
+    const ggml_type type_a;
+    const int n_mats;
+    const int n_local;
+    const int lo;
+    const int n_used;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    std::string vars() override {
+        return VARS_TO_STR8(type_a, n_mats, n_local, lo, n_used, m, n, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_id_window(ggml_type type_a = GGML_TYPE_F32, int n_mats = 16, int n_local = 4, int lo = 4,
+            int n_used = 4, int64_t m = 64, int64_t n = 8, int64_t k = 256)
+        : type_a(type_a), n_mats(n_mats), n_local(n_local), lo(lo), n_used(n_used), m(m), n(n), k(k) {
+        GGML_ASSERT(n_used <= n_mats && lo + n_local <= n_mats);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_local + 1);
+        ggml_set_name(as, "as");
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+        }
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_used, n);
+        ggml_set_name(b, "b");
+        ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
+        ggml_mul_mat_id_set_expert_window(out, lo, n_local);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "as") == 0) {
+                // zero the pad expert (last)
+                const size_t expert_bytes = ggml_nbytes(t) / (n_local + 1);
+                std::vector<uint8_t> zeros(expert_bytes, 0);
+                ggml_backend_tensor_set(t, zeros.data(), n_local * expert_bytes, expert_bytes);
+            }
+        }
+    }
+};
+
 // GGML_OP_MUL_MAT_ID
 struct test_mul_mat_id : public test_case {
     const ggml_type type_a;
@@ -10561,6 +10617,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 1700000,  1, 2592, {1, 1}, {1, 1}));
 
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 2, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
+        for (int64_t n : {1, 8, 64}) {
+            test_cases.emplace_back(new test_mul_mat_id_window(type_a, 16, 4, 4, 4, 64, n, 256)); // window in the middle
+            test_cases.emplace_back(new test_mul_mat_id_window(type_a, 16, 4, 0, 4, 64, n, 256)); // window at the start
+            test_cases.emplace_back(new test_mul_mat_id_window(type_a, 16, 4, 12, 4, 64, n, 256)); // window at the end
+        }
+    }
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 1, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));

@@ -165,6 +165,23 @@ static void ggml_set_op_params_i32(struct ggml_tensor * tensor, uint32_t i, int3
     ((int32_t *)(tensor->op_params))[i] = value;
 }
 
+// GGML_OP_MUL_MAT_ID expert window (see ggml_mul_mat_id_set_expert_window): op_params[2] = lo, [3] = n_local
+// (op_params[1] carries the GGML_HINT_* value)
+static inline int32_t ggml_mmid_window_n_local(const struct ggml_tensor * mmid) {
+    return ggml_get_op_params_i32(mmid, 3);
+}
+static inline int32_t ggml_mmid_window_lo(const struct ggml_tensor * mmid) {
+    return ggml_get_op_params_i32(mmid, 2);
+}
+// maps a routed expert id into the local expert tensor: index n_local is the zero pad expert
+static inline int32_t ggml_mmid_expert_index(int32_t id, int32_t lo, int32_t n_local) {
+    if (n_local == 0) {
+        return id;
+    }
+    const int32_t local = id - lo;
+    return (local < 0 || local >= n_local) ? n_local : local;
+}
+
 static void ggml_set_op_params_f32(struct ggml_tensor * tensor, uint32_t i, float value) {
     assert(i < GGML_MAX_OP_PARAMS / sizeof(float));
     ((float *)(tensor->op_params))[i] = value;

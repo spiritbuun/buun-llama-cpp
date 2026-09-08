@@ -2474,6 +2474,9 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
 
     const bool is_mul_mat     = ffn_up->op == GGML_OP_MUL_MAT     && ffn_gate->op == GGML_OP_MUL_MAT     && glu->op == GGML_OP_GLU;
     const bool is_mul_mat_id  = ffn_up->op == GGML_OP_MUL_MAT_ID  && ffn_gate->op == GGML_OP_MUL_MAT_ID  && glu->op == GGML_OP_GLU;
+    if (is_mul_mat_id && (ggml_mmid_window_n_local(ffn_up) != 0 || ggml_mmid_window_n_local(ffn_gate) != 0)) {
+        return false; // expert-parallel windows are applied by the per-node executor only
+    }
 
     GGML_ASSERT(ffn_up && ffn_gate && glu);
 
@@ -2565,6 +2568,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     const ggml_tensor * dst  = tensor;
 
     const bool is_mul_mat_id = tensor->op == GGML_OP_MUL_MAT_ID;
+    if (is_mul_mat_id && ggml_mmid_window_n_local(tensor) != 0) {
+        return false; // expert-parallel windows are applied by the per-node executor only
+    }
 
     if (!is_mul_mat_id && tensor->src[3] != nullptr) {
         return false;
@@ -3231,6 +3237,42 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         nb1, nb2, nb3, stream);
 }
 
+// expert-parallel window: rewrite the routed ids into the local expert space once, then run the
+// ordinary executors on a shadow node whose ids point at the remapped copy
+static __global__ void k_mmid_remap_ids(const int32_t * __restrict__ ids, int32_t * __restrict__ out,
+        const int64_t ne0, const int64_t ne1, const size_t nb1, const int32_t lo, const int32_t n_local) {
+    const int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x;
+    if (i >= ne0 * ne1) {
+        return;
+    }
+    const int64_t i1 = i / ne0;
+    const int64_t i0 = i - i1 * ne0;
+    const int32_t id    = *(const int32_t *) ((const char *) ids + i1 * nb1 + i0 * sizeof(int32_t));
+    const int32_t local = id - lo; // same mapping as ggml_mmid_expert_index (host-only inline)
+    out[i] = (local < 0 || local >= n_local) ? n_local : local;
+}
+
+static void ggml_cuda_mul_mat_id_windowed(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * ids = dst->src[2];
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->nb[0] == sizeof(int32_t));
+    const int64_t n = ids->ne[0] * ids->ne[1];
+    ggml_cuda_pool_alloc<int32_t> remapped(ctx.pool(), n);
+    k_mmid_remap_ids<<<(n + 255) / 256, 256, 0, ctx.stream()>>>(
+        (const int32_t *) ids->data, remapped.get(), ids->ne[0], ids->ne[1], ids->nb[1],
+        ggml_mmid_window_lo(dst), ggml_mmid_window_n_local(dst));
+    CUDA_CHECK(cudaGetLastError());
+    ggml_tensor ids_local = *ids;
+    ids_local.data  = remapped.get();
+    ids_local.nb[1] = ids->ne[0] * sizeof(int32_t);
+    ids_local.nb[2] = ids_local.nb[1] * ids->ne[1];
+    ids_local.nb[3] = ids_local.nb[2];
+    ids_local.view_src = nullptr;
+    ggml_tensor shadow = *dst;
+    shadow.src[2] = &ids_local;
+    ggml_mul_mat_id_set_expert_window(&shadow, 0, 0);
+    ggml_cuda_mul_mat_id(ctx, &shadow);
+}
+
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     switch (dst->op) {
         case GGML_OP_ARGMAX:
@@ -3424,7 +3466,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_mul_mat(ctx, dst->src[0], dst->src[1], dst);
             break;
         case GGML_OP_MUL_MAT_ID:
-            ggml_cuda_mul_mat_id(ctx, dst);
+            if (ggml_mmid_window_n_local(dst) != 0) {
+                ggml_cuda_mul_mat_id_windowed(ctx, dst);
+            } else {
+                ggml_cuda_mul_mat_id(ctx, dst);
+            }
             break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
