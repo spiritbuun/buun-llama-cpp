@@ -1577,6 +1577,10 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+    // set while the meta backend records a whole tensor-parallel step on this context's stream:
+    // graph_compute then launches plainly into that capture (no per-graph CUDA graph, no upload wait)
+    bool external_capture = false;
+
     // Persistent flash-attention scratch belongs to this backend context, not to the process or
     // physical device. Independent llama contexts therefore never alias Q/K/V work buffers.
     ggml_cuda_fattn_scratch fattn_scratch;

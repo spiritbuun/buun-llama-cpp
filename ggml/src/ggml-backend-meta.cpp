@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cinttypes>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -633,6 +634,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_BACKEND_SPLIT_AXIS_1:
             case GGML_BACKEND_SPLIT_AXIS_2:
             case GGML_BACKEND_SPLIT_AXIS_3: {
+                if (ggml_is_permuted(tensor) || (!allow_permuted_src && ggml_is_permuted(tensor->src[0]))) {
+                    const ggml_tensor * s = tensor->src[0];
+                    fprintf(stderr, "ggml_backend_meta: %s '%s' [%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] of %s '%s' [%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] (src split axis %d): permuted reshape not supported\n",
+                            ggml_op_name(tensor->op), tensor->name,
+                            (long long) tensor->ne[0], (long long) tensor->ne[1], (long long) tensor->ne[2], (long long) tensor->ne[3],
+                            tensor->nb[0], tensor->nb[1], tensor->nb[2], tensor->nb[3],
+                            ggml_op_name(s->op), s->name, (long long) s->ne[0], (long long) s->ne[1], (long long) s->ne[2], (long long) s->ne[3],
+                            s->nb[0], s->nb[1], s->nb[2], s->nb[3], (int) src_ss[0].axis);
+                }
                 GGML_ASSERT(!ggml_is_permuted(tensor));
                 if (!allow_permuted_src) {
                     GGML_ASSERT(!ggml_is_permuted(tensor->src[0]));
@@ -1870,6 +1880,39 @@ struct ggml_backend_meta_context {
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
 
+    // whole-step capture (see ggml_backend_step_*_t): one recorded device graph per backend per
+    // ggml graph uid, replayed with a single launch per device instead of a host-driven fan-out
+    // of every subgraph and all-reduce
+    ggml_backend_step_capturable_t    step_capturable    = nullptr;
+    ggml_backend_step_epoch_t         step_epoch         = nullptr;
+    ggml_backend_step_wait_uploads_t  step_wait_uploads  = nullptr;
+    ggml_backend_step_capture_begin_t step_capture_begin = nullptr;
+    ggml_backend_step_capture_end_t   step_capture_end   = nullptr;
+    ggml_backend_step_launch_t        step_launch        = nullptr;
+    ggml_backend_step_free_t          step_free          = nullptr;
+    struct step_record {
+        uint64_t              uid = 0;
+        bool                  valid = false;      // false = this uid is known not to capture; don't retry
+        std::vector<void *>   steps;              // one per backend
+        std::vector<uint64_t> epochs;             // per backend, at capture
+        int64_t               last_used = 0;
+    };
+    std::vector<step_record> step_records;
+    uint64_t                 step_last_uid    = 0;
+    int                      step_same_uid    = 0;   // consecutive computes with the same uid (warmup)
+    bool                     step_graphs      = false;
+
+    void step_records_free() {
+        for (auto & rec : step_records) {
+            for (size_t j = 0; j < rec.steps.size(); j++) {
+                if (rec.steps[j] != nullptr) {
+                    step_free(backend_configs[j].backend, rec.steps[j]);
+                }
+            }
+        }
+        step_records.clear();
+    }
+
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
         n_reduce_steps = std::ceil(std::log2(n_devs));
@@ -1900,10 +1943,24 @@ struct ggml_backend_meta_context {
                 ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
                     ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor");
             GGML_ASSERT(comm_allreduce != nullptr);
+
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0]));
+            step_capturable    = (ggml_backend_step_capturable_t)    ggml_backend_reg_get_proc_address(reg, "ggml_backend_step_capturable");
+            step_epoch         = (ggml_backend_step_epoch_t)         ggml_backend_reg_get_proc_address(reg, "ggml_backend_step_epoch");
+            step_wait_uploads  = (ggml_backend_step_wait_uploads_t)  ggml_backend_reg_get_proc_address(reg, "ggml_backend_step_wait_uploads");
+            step_capture_begin = (ggml_backend_step_capture_begin_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_step_capture_begin");
+            step_capture_end   = (ggml_backend_step_capture_end_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_step_capture_end");
+            step_launch        = (ggml_backend_step_launch_t)        ggml_backend_reg_get_proc_address(reg, "ggml_backend_step_launch");
+            step_free          = (ggml_backend_step_free_t)          ggml_backend_reg_get_proc_address(reg, "ggml_backend_step_free");
+            step_graphs = step_capturable && step_epoch && step_wait_uploads && step_capture_begin &&
+                          step_capture_end && step_launch && step_free && getenv("GGML_META_NO_STEP_GRAPHS") == nullptr;
         }
     }
 
     ~ggml_backend_meta_context() {
+        if (step_graphs) {
+            step_records_free();
+        }
         if (comm_ctx != nullptr) {
             ggml_backend_comm_free_t comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
                 ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_configs[0].backend)), "ggml_backend_comm_free");
@@ -2290,6 +2347,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
         backend_ctx->uid         = cgraph->uid;
         backend_ctx->n_subgraphs = n_subgraphs;
+        if (getenv("GGML_META_DEBUG") != nullptr) {
+            // one all-reduce (and one launch fan-out over every device) per subgraph — the number that
+            // decides tensor-split decode latency
+            fprintf(stderr, "ggml_backend_meta: graph of %d nodes split into %zu subgraphs (%zu all-reduces) across %zu devices\n",
+                    cgraph->n_nodes, n_subgraphs, n_subgraphs > 0 ? n_subgraphs - 1 : 0, n_backends);
+        }
 
         if (max_tmp_size > backend_ctx->max_tmp_size) {
             for (size_t j = 0; j < n_backends; j++) {
@@ -2496,37 +2559,191 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
 
-    for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
-        for (size_t j = 0; j < n_backends; j++) {
-            auto & bcj = backend_ctx->backend_configs[j];
-            const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
-            if (status != GGML_STATUS_SUCCESS) {
-                return status;
-            }
-        }
-
-        if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
-            bool backend_allreduce_success = false;
-            if (backend_ctx->comm_ctx) {
-                std::vector<ggml_tensor *> nodes;
-                nodes.reserve(n_backends);
-                for (size_t j = 0; j < n_backends; j++) {
-                    auto & bcj = backend_ctx->backend_configs[j];
-                    ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
-                    nodes.push_back(cgraph_ij->nodes[cgraph_ij->n_nodes-1]);
-                }
-                backend_allreduce_success = backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
-            }
-
-            if (!backend_allreduce_success) {
-                const ggml_status status = allreduce_fallback(i);
+    // One pass over the subgraphs: launch every device, then all-reduce the boundary node. Under a
+    // step capture, a fallback all-reduce (not a plain backend collective) invalidates the capture.
+    auto run_subgraphs = [&](bool capturing, bool & capture_ok) -> ggml_status {
+        for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+            for (size_t j = 0; j < n_backends; j++) {
+                auto & bcj = backend_ctx->backend_configs[j];
+                const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;
                 }
             }
+
+            if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
+                bool backend_allreduce_success = false;
+                if (backend_ctx->comm_ctx) {
+                    std::vector<ggml_tensor *> nodes;
+                    nodes.reserve(n_backends);
+                    for (size_t j = 0; j < n_backends; j++) {
+                        auto & bcj = backend_ctx->backend_configs[j];
+                        ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
+                        nodes.push_back(cgraph_ij->nodes[cgraph_ij->n_nodes-1]);
+                    }
+                    backend_allreduce_success = backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
+                }
+
+                if (!backend_allreduce_success) {
+                    if (capturing) {
+                        // the comm backend cannot record its all-reduce: no step graph will ever complete
+                        backend_ctx->step_graphs = false;
+                        capture_ok = false;
+                        return GGML_STATUS_SUCCESS; // abort the capture; the caller re-runs uncaptured
+                    }
+                    const ggml_status status = allreduce_fallback(i);
+                    if (status != GGML_STATUS_SUCCESS) {
+                        return status;
+                    }
+                }
+            }
+        }
+        return GGML_STATUS_SUCCESS;
+    };
+
+    const bool step_graphs = backend_ctx->step_graphs && n_backends > 1 && backend_ctx->comm_ctx != nullptr && cgraph->uid != 0;
+    if (step_graphs) {
+        // replay a recorded step for this graph if its device state has not moved
+        for (auto & rec : backend_ctx->step_records) {
+            if (rec.uid != cgraph->uid) {
+                continue;
+            }
+            if (!rec.valid) {
+                break; // known not to capture: fall through to the normal path
+            }
+            bool stale = false;
+            for (size_t j = 0; j < n_backends && !stale; j++) {
+                stale = backend_ctx->step_epoch(backend_ctx->backend_configs[j].backend) != rec.epochs[j];
+            }
+            if (stale) {
+                for (size_t j = 0; j < n_backends; j++) {
+                    backend_ctx->step_free(backend_ctx->backend_configs[j].backend, rec.steps[j]);
+                    rec.steps[j] = nullptr;
+                }
+                rec.uid = 0;
+                break;
+            }
+            bool launched = true;
+            for (size_t j = 0; j < n_backends && launched; j++) {
+                backend_ctx->step_wait_uploads(backend_ctx->backend_configs[j].backend);
+                launched = backend_ctx->step_launch(backend_ctx->backend_configs[j].backend, rec.steps[j]);
+            }
+            if (launched) {
+                rec.last_used = ggml_time_us();
+                return GGML_STATUS_SUCCESS;
+            }
+            GGML_LOG_WARN("%s: step graph replay failed for uid %" PRIu64 ", recording again\n", __func__, cgraph->uid);
+            rec.uid = 0;
+            break;
+        }
+
+        if (cgraph->uid == backend_ctx->step_last_uid) {
+            backend_ctx->step_same_uid++;
+        } else {
+            backend_ctx->step_last_uid = cgraph->uid;
+            backend_ctx->step_same_uid = 0;
+        }
+
+        bool known_bad = false;
+        for (const auto & rec : backend_ctx->step_records) {
+            known_bad = known_bad || (rec.uid == cgraph->uid && !rec.valid);
+        }
+
+        // second consecutive compute of the same graph (the first is the simple backends' warmup)
+        if (backend_ctx->step_same_uid >= 1 && !known_bad) {
+            bool capturable = true;
+            for (size_t j = 0; j < n_backends && capturable; j++) {
+                auto & bcj = backend_ctx->backend_configs[j];
+                for (size_t i = 0; i < backend_ctx->n_subgraphs && capturable; i++) {
+                    capturable = backend_ctx->step_capturable(bcj.backend, bcj.cgraphs[i].cgraph_main);
+                }
+            }
+            if (capturable) {
+                size_t n_began = 0;
+                for (size_t j = 0; j < n_backends; j++) {
+                    backend_ctx->step_wait_uploads(backend_ctx->backend_configs[j].backend);
+                    if (!backend_ctx->step_capture_begin(backend_ctx->backend_configs[j].backend)) {
+                        break;
+                    }
+                    n_began++;
+                }
+                bool capture_ok = n_began == n_backends;
+                ggml_status status = GGML_STATUS_SUCCESS;
+                if (capture_ok) {
+                    status = run_subgraphs(/*capturing =*/ true, capture_ok);
+                }
+                std::vector<void *> steps(n_backends, nullptr);
+                for (size_t j = 0; j < n_began; j++) {
+                    steps[j] = backend_ctx->step_capture_end(backend_ctx->backend_configs[j].backend);
+                    capture_ok = capture_ok && steps[j] != nullptr;
+                }
+                if (status != GGML_STATUS_SUCCESS) {
+                    return status;
+                }
+                if (capture_ok) {
+                    // keep a few graphs (decode/prefill shapes alternate); evict the oldest
+                    if (backend_ctx->step_records.size() >= 4) {
+                        size_t oldest = 0;
+                        for (size_t r = 1; r < backend_ctx->step_records.size(); r++) {
+                            if (backend_ctx->step_records[r].last_used < backend_ctx->step_records[oldest].last_used) {
+                                oldest = r;
+                            }
+                        }
+                        auto & rec = backend_ctx->step_records[oldest];
+                        for (size_t j = 0; j < rec.steps.size(); j++) {
+                            if (rec.steps[j] != nullptr) {
+                                backend_ctx->step_free(backend_ctx->backend_configs[j].backend, rec.steps[j]);
+                            }
+                        }
+                        backend_ctx->step_records.erase(backend_ctx->step_records.begin() + oldest);
+                    }
+                    ggml_backend_meta_context::step_record rec;
+                    rec.uid   = cgraph->uid;
+                    rec.valid = true;
+                    rec.steps = steps;
+                    rec.epochs.resize(n_backends);
+                    for (size_t j = 0; j < n_backends; j++) {
+                        rec.epochs[j] = backend_ctx->step_epoch(backend_ctx->backend_configs[j].backend);
+                    }
+                    rec.last_used = ggml_time_us();
+                    backend_ctx->step_records.push_back(std::move(rec));
+                    if (getenv("GGML_META_DEBUG") != nullptr) {
+                        fprintf(stderr, "ggml_backend_meta: recorded step graph for uid %" PRIu64 " (%zu subgraphs x %zu devices)\n",
+                                cgraph->uid, backend_ctx->n_subgraphs, n_backends);
+                    }
+                    // capture recorded the work without executing it: run this compute via replay
+                    bool launched = true;
+                    for (size_t j = 0; j < n_backends && launched; j++) {
+                        launched = backend_ctx->step_launch(backend_ctx->backend_configs[j].backend, steps[j]);
+                    }
+                    if (launched) {
+                        return GGML_STATUS_SUCCESS;
+                    }
+                    backend_ctx->step_records.back().uid = 0;
+                    // fall through: execute uncaptured
+                } else {
+                    for (size_t j = 0; j < n_backends; j++) {
+                        if (steps[j] != nullptr) {
+                            backend_ctx->step_free(backend_ctx->backend_configs[j].backend, steps[j]);
+                        }
+                    }
+                    ggml_backend_meta_context::step_record bad;
+                    bad.uid   = cgraph->uid;
+                    bad.valid = false;
+                    bad.steps.assign(n_backends, nullptr);
+                    bad.epochs.assign(n_backends, 0);
+                    backend_ctx->step_records.push_back(std::move(bad));
+                    if (getenv("GGML_META_DEBUG") != nullptr) {
+                        fprintf(stderr, "ggml_backend_meta: step capture unavailable for uid %" PRIu64 " (fallback all-reduce or capture error)\n", cgraph->uid);
+                    }
+                    // the captured attempt executed nothing: run for real below
+                }
+            }
         }
     }
-    return GGML_STATUS_SUCCESS;
+
+    bool unused = true;
+    return run_subgraphs(/*capturing =*/ false, unused);
 }
 
 static const ggml_backend_i ggml_backend_meta_i = {
