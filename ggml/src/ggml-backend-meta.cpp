@@ -1472,6 +1472,55 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         GGML_ASSERT(split_state.nr[0] != 0);
         GGML_ASSERT(tensor->ne[3] == 1);
 
+        // A whole-tensor upload is staged per device and handed to the simple buffer as ONE full set_tensor:
+        // backends that repack weights at upload time (e.g. the CUDA Marlin paths) only do so for complete
+        // tensors, and the strided per-segment copies below would leave every multi-segment or column-split
+        // shard unrepacked.
+        if (offset == 0 && size == ggml_nbytes(tensor) && tensor->ne[2] == 1 &&
+                (split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 || split_state.axis == GGML_BACKEND_SPLIT_AXIS_1)) {
+            const int64_t blck_size = ggml_blck_size(tensor->type);
+            for (size_t j = 0; j < n_bufs; j++) {
+                ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                std::vector<uint8_t> staging(ggml_nbytes(simple_tensor));
+                if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_0) {
+                    // each row of the shard = this device's column pieces of every segment/repeat, in order
+                    for (int64_t row = 0; row < tensor->ne[1]; row++) {
+                        size_t src_off = row * tensor->nb[1];
+                        size_t dst_off = row * simple_tensor->nb[1];
+                        for (size_t s = 0; s < split_state.n_segments; s++) {
+                            for (size_t r = 0; r < split_state.nr[s]; r++) {
+                                for (size_t jj = 0; jj < n_bufs; jj++) {
+                                    const size_t nbytes = split_state.ne[s*n_bufs + jj]/blck_size * tensor->nb[0];
+                                    if (jj == j) {
+                                        memcpy(staging.data() + dst_off, (const char *) data + src_off, nbytes);
+                                        dst_off += nbytes;
+                                    }
+                                    src_off += nbytes;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // row blocks: this device's rows of every segment/repeat, in order
+                    size_t src_off = 0;
+                    size_t dst_off = 0;
+                    for (size_t s = 0; s < split_state.n_segments; s++) {
+                        for (size_t r = 0; r < split_state.nr[s]; r++) {
+                            for (size_t jj = 0; jj < n_bufs; jj++) {
+                                const size_t nbytes = split_state.ne[s*n_bufs + jj] * tensor->nb[1];
+                                if (jj == j) {
+                                    memcpy(staging.data() + dst_off, (const char *) data + src_off, nbytes);
+                                    dst_off += nbytes;
+                                }
+                                src_off += nbytes;
+                            }
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(simple_tensor, staging.data(), 0, staging.size());
+            }
+            return;
+        }
         size_t offset_data = 0;
         std::vector<size_t> simple_offsets(n_bufs, 0);
         if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_0) {
