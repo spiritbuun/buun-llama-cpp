@@ -4044,7 +4044,9 @@ ggml_tensor * llm_graph_context::build_rs_in(
     // of the small gather (~38% prompt-eval regression measured on a multi-GPU rig; invisible on
     // single-GPU). Prefill keeps the standard get_rows path — the view only ever bought a small
     // gather skip there — while decode keeps the fast-path where CUDA graphs benefit.
-    if (ubatch.n_tokens == 1 && kv_state->states_are_contiguous_identity((uint32_t) n_seqs)) {
+    // Batched decode (one token per sequence) is the same class: the gather is an identity over
+    // the n_seqs active rows, and the get_rows copy costs ~3 MB per sequence per layer per step.
+    if (ubatch.n_tokens == ubatch.n_seqs && kv_state->states_are_contiguous_identity((uint32_t) n_seqs)) {
         // The get_rows would be a contiguous identity gather of rows [head, head + n_seqs):
         // return a view of those rows directly and skip the copy + kernel launch.
         inp->view_path = true;
