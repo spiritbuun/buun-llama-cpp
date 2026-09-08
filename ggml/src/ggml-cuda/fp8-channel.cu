@@ -105,6 +105,25 @@ static __global__ void fp8_channel_sum_partials(float * src, int64_t stride, int
     }
 }
 
+// Research variant: combine the split reduction and channel scaling without
+// materializing the reduced matrix. Keep the FP64 sum -> F32 -> scales order.
+template<typename S>
+static __global__ void fp8_channel_reduce_finish(
+        const float * src, float * dst, const S * weight_scale,
+        const float * input_scale, int64_t n, int64_t stride, int parts) {
+    const int64_t col = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    const int64_t row = blockIdx.y;
+    if (col >= n) return;
+    const int64_t i = row*n + col;
+    float value = src[i];
+    if (parts > 1) {
+        double sum = 0.0;
+        for (int p = 0; p < parts; ++p) sum += double(src[p*stride+i]);
+        value = float(sum);
+    }
+    dst[i] = (value * input_scale[row]) * float(weight_scale[col]);
+}
+
 static __global__ void fp8_channel_check_reference(
         const __nv_fp8_e4m3 * w, const __nv_fp8_e4m3 * x, const float * input_scales,
         const void * weight_scales, bool scale_f32, bool rounded, const float * actual,
@@ -196,6 +215,9 @@ bool ggml_cuda_mul_mat_fp8_channel_lt(ggml_backend_cuda_context & ctx, ggml_tens
     const char * split_env = getenv("GGML_CUDA_FP8_LT_SPLIT_K");
     const int split_k = !bf16_reference && split_env ? atoi(split_env) : 1;
     GGML_ASSERT(split_k == 1 || split_k == 2 || split_k == 4);
+    const bool fused_finish = getenv("GGML_CUDA_FP8_LT_FUSED_FINISH") &&
+        !bf16_reference && !round_correction && !wide_scale && m <= 65535 &&
+        !getenv("GGML_CUDA_FP8_LT_CHECK_ALL");
     if (k % (16*split_k)) return false;
     const int64_t part_k = k/split_k;
     const cudaDataType_t gemm_type = bf16_reference ? CUDA_R_16BF : CUDA_R_8F_E4M3;
@@ -277,7 +299,7 @@ bool ggml_cuda_mul_mat_fp8_channel_lt(ggml_backend_cuda_context & ctx, ggml_tens
                 &beta, partial, plan.c, partial, plan.c, &heuristic.algo,
                 workspace.get(), heuristic.workspaceSize, ctx.stream()));
         }
-        if (split_k > 1) {
+        if (split_k > 1 && !fused_finish) {
             fp8_channel_sum_partials<<<(n*m+255)/256, 256, 0, ctx.stream()>>>(
                 output, n*padded_m, n*m, split_k);
             CUDA_CHECK(cudaGetLastError());
@@ -288,7 +310,18 @@ bool ggml_cuda_mul_mat_fp8_channel_lt(ggml_backend_cuda_context & ctx, ggml_tens
         multiply(residual_x.get(), residual_y.get());
     }
     const int64_t elements = n*m;
-    if (scale->type == GGML_TYPE_F32) {
+    if (fused_finish) {
+        const dim3 grid((n + 255)/256, m);
+        if (scale->type == GGML_TYPE_F32) {
+            fp8_channel_reduce_finish<<<grid, 256, 0, ctx.stream()>>>(
+                unscaled.get(), static_cast<float *>(dst->data), static_cast<const float *>(scale->data),
+                input_scales.get(), n, n*padded_m, split_k);
+        } else {
+            fp8_channel_reduce_finish<<<grid, 256, 0, ctx.stream()>>>(
+                unscaled.get(), static_cast<float *>(dst->data), static_cast<const nv_bfloat16 *>(scale->data),
+                input_scales.get(), n, n*padded_m, split_k);
+        }
+    } else if (scale->type == GGML_TYPE_F32) {
         fp8_channel_finish<<<(elements + 255)/256, 256, 0, ctx.stream()>>>(
             unscaled.get(), static_cast<float *>(dst->data), static_cast<const float *>(scale->data),
             input_scales.get(), n, elements, rounded_reference, wide_scale, residual_y.get());
