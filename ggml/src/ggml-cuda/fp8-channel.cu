@@ -4,6 +4,7 @@
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
 #include <cublasLt.h>
+#include "unary.cuh"
 #if defined(__linux__)
 #include <dlfcn.h>
 
@@ -27,25 +28,34 @@ static fp8_cutlass_fn fp8_cutlass_provider() {
 
 // Use the same row scale and E4M3 rounding as fp8_dynamic_fake_quant_kernel,
 // but keep quantized activations packed until the GEMM epilogue.
-template<typename T, int Capacity = 0>
+template<typename T, int Capacity = 0, bool FuseSwiGLU = false>
 static __global__ void fp8_channel_pack(
         const float * src, T * dst, float * scales,
         const int32_t * marker, int64_t k, int64_t m,
-        __nv_fp8_e4m3 * round_residual = nullptr) {
+        __nv_fp8_e4m3 * round_residual = nullptr, const float * up = nullptr) {
     const int64_t row = blockIdx.x;
     float maximum = 0.0f;
+    const auto load = [&](int64_t col) {
+        if (row >= m) return 0.0f;
+        const int64_t index = row*k + col;
+        if constexpr (FuseSwiGLU) {
+            return ggml_cuda_op_silu_single(src[index]) * up[index];
+        } else {
+            return src[index];
+        }
+    };
     // Nonzero Capacity is dispatched only for k == 256*Capacity.
     float retained[Capacity > 0 ? Capacity : 1];
     if constexpr (Capacity > 0) {
 #pragma unroll
         for (int i = 0; i < Capacity; ++i) {
             const int64_t col = threadIdx.x + i*256;
-            retained[i] = row < m ? src[row*k + col] : 0.0f;
+            retained[i] = load(col);
             maximum = fmaxf(maximum, fabsf(retained[i]));
         }
     } else if (row < m) {
         for (int64_t col = threadIdx.x; col < k; col += blockDim.x) {
-            maximum = fmaxf(maximum, fabsf(src[row*k + col]));
+            maximum = fmaxf(maximum, fabsf(load(col)));
         }
     }
     __shared__ float maxima[256 / WARP_SIZE];
@@ -81,7 +91,7 @@ static __global__ void fp8_channel_pack(
         }
     } else {
         for (int64_t col = threadIdx.x; col < k; col += blockDim.x) {
-            emit(col, row < m ? src[row*k + col] : 0.0f);
+            emit(col, load(col));
         }
     }
 }
@@ -89,7 +99,18 @@ static __global__ void fp8_channel_pack(
 template<typename T>
 static void fp8_channel_pack_launch(const float * src, T * dst, float * scales,
         const int32_t * marker, int64_t k, int64_t m, int64_t padded_m,
-        cudaStream_t stream, __nv_fp8_e4m3 * round_residual = nullptr) {
+        cudaStream_t stream, __nv_fp8_e4m3 * round_residual = nullptr, const float * up = nullptr) {
+    if constexpr (std::is_same<T, __nv_fp8_e4m3>::value) {
+        if (up) {
+            if (k == 5120) {
+                fp8_channel_pack<T, 20, true><<<padded_m, 256, 0, stream>>>(src, dst, scales, marker, k, m, nullptr, up);
+            } else {
+                GGML_ASSERT(k == 17408);
+                fp8_channel_pack<T, 68, true><<<padded_m, 256, 0, stream>>>(src, dst, scales, marker, k, m, nullptr, up);
+            }
+            return;
+        }
+    }
     // Retain a row across the reduction for these measured widths, avoiding
     // its second global read. Other widths keep the generic streaming loop.
     if (k == 5120) {
@@ -227,7 +248,7 @@ static __global__ void fp8_channel_compare_all(
 }
 #endif
 
-bool ggml_cuda_mul_mat_fp8_channel_lt(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+bool ggml_cuda_mul_mat_fp8_channel_lt(ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool fuse_swiglu) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
     // Experimental gate while the native FP8 numerical path is qualified.
     static const bool enabled = getenv("GGML_CUDA_FP8_LT") != nullptr;
@@ -252,6 +273,16 @@ bool ggml_cuda_mul_mat_fp8_channel_lt(ggml_backend_cuda_context & ctx, ggml_tens
         return false;
     }
     const int64_t k = w->ne[0], n = w->ne[1], m = x->ne[1];
+    if (fuse_swiglu) {
+        if (m < 384 || (k != 5120 && k != 17408) || x->op != GGML_OP_GLU ||
+                ggml_get_glu_op(x) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(x, 1) ||
+                !x->src[0] || !x->src[1]) return false;
+        for (const auto * input : { x->src[0], x->src[1] }) {
+            if (input->type != GGML_TYPE_F32 || !ggml_is_contiguous(input) ||
+                    !ggml_are_same_shape(input, x) || ctx.humming_bf16_activations.count(input) ||
+                    ctx.humming_bf16_activation_uses.count(input)) return false;
+        }
+    }
     if (getenv("GGML_CUDA_FP8_LT_KEEP_SKINNY") && n <= 128) {
         return false;
     }
@@ -262,6 +293,11 @@ bool ggml_cuda_mul_mat_fp8_channel_lt(ggml_backend_cuda_context & ctx, ggml_tens
     const bool rounded_reference = fused_bf16 || (reference && std::string(reference) == "rounded-bf16");
     const bool round_correction = !bf16_reference && getenv("GGML_CUDA_FP8_LT_ROUND_CORRECTION");
     const bool wide_scale = getenv("GGML_CUDA_FP8_LT_WIDE_SCALE") != nullptr;
+    if (fuse_swiglu && (bf16_reference || round_correction || wide_scale ||
+            getenv("GGML_CUDA_FP8_LT_CHECK_ALL") || getenv("GGML_CUDA_FP8_LT_CHECK") ||
+            getenv("GGML_CUDA_FP8_LT_DUMP"))) return false;
+    const auto * pack_src = static_cast<const float *>(fuse_swiglu ? x->src[0]->data : x->data);
+    const auto * pack_up = fuse_swiglu ? static_cast<const float *>(x->src[1]->data) : nullptr;
     const char * split_env = getenv("GGML_CUDA_FP8_LT_SPLIT_K");
     const int split_k = !bf16_reference && split_env ? atoi(split_env) : 1;
     GGML_ASSERT(split_k == 1 || split_k == 2 || split_k == 4);
@@ -287,8 +323,8 @@ bool ggml_cuda_mul_mat_fp8_channel_lt(ggml_backend_cuda_context & ctx, ggml_tens
             if (invoke(nullptr, 0) == 0) {
                 ggml_cuda_pool_alloc<char> workspace(ctx.pool(), std::max(size_t(1), required));
                 fp8_channel_pack_launch(
-                    static_cast<const float *>(x->data), input.get(), scales.get(),
-                    static_cast<const int32_t *>(marker->data), k, m, padded_m, ctx.stream());
+                    pack_src, input.get(), scales.get(),
+                    static_cast<const int32_t *>(marker->data), k, m, padded_m, ctx.stream(), nullptr, pack_up);
                 CUDA_CHECK(cudaGetLastError());
                 const int status = invoke(workspace.get(), std::max(size_t(1), required));
                 if (status != 0) GGML_ABORT("FP8 CUTLASS experiment: launch status %d", status);
@@ -350,8 +386,8 @@ bool ggml_cuda_mul_mat_fp8_channel_lt(ggml_backend_cuda_context & ctx, ggml_tens
             static_cast<const int32_t *>(marker->data), k, m, padded_m, ctx.stream());
     } else {
         fp8_channel_pack_launch(
-            static_cast<const float *>(x->data), packed.get(), input_scales.get(),
-            static_cast<const int32_t *>(marker->data), k, m, padded_m, ctx.stream(), residual_x.get());
+            pack_src, packed.get(), input_scales.get(),
+            static_cast<const int32_t *>(marker->data), k, m, padded_m, ctx.stream(), residual_x.get(), pack_up);
     }
     CUDA_CHECK(cudaGetLastError());
     const void * gemm_w = w->data;
@@ -478,6 +514,7 @@ bool ggml_cuda_mul_mat_fp8_channel_lt(ggml_backend_cuda_context & ctx, ggml_tens
 #else
     GGML_UNUSED(ctx);
     GGML_UNUSED(dst);
+    GGML_UNUSED(fuse_swiglu);
     return false;
 #endif
 }

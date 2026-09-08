@@ -5511,6 +5511,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 0;
     }
 
+    // Consume SwiGLU directly while packing dynamic FP8 activations. Unlike
+    // legacy projection fusions, this executor honors both scale sources.
+    if (node->op == GGML_OP_GLU && node->type == GGML_TYPE_F32 && node->ne[1] >= 384 &&
+            i + 1 < cgraph->n_nodes) {
+        ggml_tensor * mm = cgraph->nodes[i + 1];
+        const ggml_op ops[] = { GGML_OP_GLU, GGML_OP_MUL_MAT };
+        const int output = i + 1;
+        if (mm->op == GGML_OP_MUL_MAT && mm->src[1] == node && mm->src[3] &&
+                ggml_can_fuse_subgraph(cgraph, i, 2, ops, &output, 1) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, &output, 1) &&
+                ggml_cuda_mul_mat_fp8_channel_lt(*cuda_ctx, mm, true)) {
+            return 1;
+        }
+    }
+
     // A Marlin-repacked weight (Q4-A32 or Q8-G128) is served only by its
     // executor: unfused through ggml_cuda_mul_mat, or by the gate/up/GLU and
     // residual + RMS-norm matchers below. Q4-A32 weights that are not repacked
