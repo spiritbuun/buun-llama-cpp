@@ -27,28 +27,29 @@ static fp8_cutlass_fn fp8_cutlass_provider() {
 
 // Use the same row scale and E4M3 rounding as fp8_dynamic_fake_quant_kernel,
 // but keep quantized activations packed until the GEMM epilogue.
-template<typename T>
+template<typename T, int Capacity = 0>
 static __global__ void fp8_channel_pack(
         const float * src, T * dst, float * scales,
         const int32_t * marker, int64_t k, int64_t m,
         __nv_fp8_e4m3 * round_residual = nullptr) {
     const int64_t row = blockIdx.x;
     float maximum = 0.0f;
-    if (row < m) {
+    // Nonzero Capacity is dispatched only for k == 256*Capacity.
+    float retained[Capacity > 0 ? Capacity : 1];
+    if constexpr (Capacity > 0) {
+#pragma unroll
+        for (int i = 0; i < Capacity; ++i) {
+            const int64_t col = threadIdx.x + i*256;
+            retained[i] = row < m ? src[row*k + col] : 0.0f;
+            maximum = fmaxf(maximum, fabsf(retained[i]));
+        }
+    } else if (row < m) {
         for (int64_t col = threadIdx.x; col < k; col += blockDim.x) {
             maximum = fmaxf(maximum, fabsf(src[row*k + col]));
         }
     }
-    __shared__ float maxima[256];
-    maxima[threadIdx.x] = maximum;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
-        if (threadIdx.x < stride) {
-            maxima[threadIdx.x] = fmaxf(maxima[threadIdx.x], maxima[threadIdx.x + stride]);
-        }
-        __syncthreads();
-    }
-    maximum = maxima[0];
+    __shared__ float maxima[256 / WARP_SIZE];
+    maximum = block_reduce<block_reduce_method::MAX, 256>(maximum, maxima);
     const float upper_bound = __int_as_float(marker[0]);
     if (upper_bound > 0.0f) {
         maximum = fminf(maximum, upper_bound);
@@ -58,8 +59,8 @@ static __global__ void fp8_channel_pack(
     if (threadIdx.x == 0) {
         scales[row] = scale;
     }
-    for (int64_t col = threadIdx.x; col < k; col += blockDim.x) {
-        const __nv_fp8_e4m3 q(row < m ? src[row*k + col] * inverse : 0.0f);
+    const auto emit = [&](int64_t col, float value_in) {
+        const __nv_fp8_e4m3 q(value_in * inverse);
         if constexpr (std::is_same<T, nv_bfloat16>::value) {
             dst[row*k + col] = __float2bfloat16_rn(float(q) * scale);
         } else {
@@ -72,6 +73,31 @@ static __global__ void fp8_channel_pack(
             const float rounded = __bfloat162float(__float2bfloat16_rn(value));
             round_residual[row*k + col] = __nv_fp8_e4m3((rounded-value) * inverse * 128.0f);
         }
+    };
+    if constexpr (Capacity > 0) {
+#pragma unroll
+        for (int i = 0; i < Capacity; ++i) {
+            emit(threadIdx.x + i*256, retained[i]);
+        }
+    } else {
+        for (int64_t col = threadIdx.x; col < k; col += blockDim.x) {
+            emit(col, row < m ? src[row*k + col] : 0.0f);
+        }
+    }
+}
+
+template<typename T>
+static void fp8_channel_pack_launch(const float * src, T * dst, float * scales,
+        const int32_t * marker, int64_t k, int64_t m, int64_t padded_m,
+        cudaStream_t stream, __nv_fp8_e4m3 * round_residual = nullptr) {
+    // Retain a row across the reduction for these measured widths, avoiding
+    // its second global read. Other widths keep the generic streaming loop.
+    if (k == 5120) {
+        fp8_channel_pack<T, 20><<<padded_m, 256, 0, stream>>>(src, dst, scales, marker, k, m, round_residual);
+    } else if (k == 17408) {
+        fp8_channel_pack<T, 68><<<padded_m, 256, 0, stream>>>(src, dst, scales, marker, k, m, round_residual);
+    } else {
+        fp8_channel_pack<T><<<padded_m, 256, 0, stream>>>(src, dst, scales, marker, k, m, round_residual);
     }
 }
 
@@ -260,9 +286,9 @@ bool ggml_cuda_mul_mat_fp8_channel_lt(ggml_backend_cuda_context & ctx, ggml_tens
             };
             if (invoke(nullptr, 0) == 0) {
                 ggml_cuda_pool_alloc<char> workspace(ctx.pool(), std::max(size_t(1), required));
-                fp8_channel_pack<<<padded_m, 256, 0, ctx.stream()>>>(
+                fp8_channel_pack_launch(
                     static_cast<const float *>(x->data), input.get(), scales.get(),
-                    static_cast<const int32_t *>(marker->data), k, m);
+                    static_cast<const int32_t *>(marker->data), k, m, padded_m, ctx.stream());
                 CUDA_CHECK(cudaGetLastError());
                 const int status = invoke(workspace.get(), std::max(size_t(1), required));
                 if (status != 0) GGML_ABORT("FP8 CUTLASS experiment: launch status %d", status);
@@ -319,13 +345,13 @@ bool ggml_cuda_mul_mat_fp8_channel_lt(ggml_backend_cuda_context & ctx, ggml_tens
         reference_x.alloc(padded_m*k);
     }
     if (fused_bf16) {
-        fp8_channel_pack<<<padded_m, 256, 0, ctx.stream()>>>(
+        fp8_channel_pack_launch(
             static_cast<const float *>(x->data), reference_x.get(), input_scales.get(),
-            static_cast<const int32_t *>(marker->data), k, m);
+            static_cast<const int32_t *>(marker->data), k, m, padded_m, ctx.stream());
     } else {
-        fp8_channel_pack<<<padded_m, 256, 0, ctx.stream()>>>(
+        fp8_channel_pack_launch(
             static_cast<const float *>(x->data), packed.get(), input_scales.get(),
-            static_cast<const int32_t *>(marker->data), k, m, residual_x.get());
+            static_cast<const int32_t *>(marker->data), k, m, padded_m, ctx.stream(), residual_x.get());
     }
     CUDA_CHECK(cudaGetLastError());
     const void * gemm_w = w->data;
