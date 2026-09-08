@@ -1525,7 +1525,7 @@ static void ggml_compute_forward_mul_mat_f8_channel(
     const struct ggml_tensor * input  = dst->src[1];
     const struct ggml_tensor * scale  = dst->src[2];
     GGML_ASSERT(weight->type == GGML_TYPE_F8_E4M3 && input->type == GGML_TYPE_F32 &&
-        scale != NULL && scale->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_F32 &&
+        scale != NULL && (scale->type == GGML_TYPE_BF16 || scale->type == GGML_TYPE_F32) && dst->type == GGML_TYPE_F32 &&
         scale->ne[0] == weight->ne[1] && scale->ne[1] == 1 &&
         scale->ne[2] == 1 && scale->ne[3] == 1);
 
@@ -2019,7 +2019,7 @@ void ggml_compute_forward_mul_mat(
         return;
     }
     if (src0->type == GGML_TYPE_F8_E4M3 && dst->src[2] != NULL &&
-            dst->src[2]->type == GGML_TYPE_BF16) {
+            (dst->src[2]->type == GGML_TYPE_BF16 || dst->src[2]->type == GGML_TYPE_F32)) {
         ggml_compute_forward_mul_mat_f8_channel(params, dst);
         return;
     }

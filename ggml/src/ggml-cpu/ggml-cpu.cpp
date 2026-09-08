@@ -530,7 +530,8 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                      src0->type == GGML_TYPE_MXFP4)) {
                 const bool valid_fp8_weight_scale = src0->type != GGML_TYPE_F8_E4M3 ||
                     op->src[2] == nullptr ||
-                    (op->src[2]->type == GGML_TYPE_BF16 && ggml_is_contiguous(op->src[2]) &&
+                    ((op->src[2]->type == GGML_TYPE_BF16 || op->src[2]->type == GGML_TYPE_F32) &&
+                     ggml_is_contiguous(op->src[2]) &&
                      op->src[2]->ne[0] == src0->ne[1] && op->src[2]->ne[1] == 1 &&
                      op->src[2]->ne[2] == 1 && op->src[2]->ne[3] == 1);
                 const bool valid_input_scale = src0->type == GGML_TYPE_MXFP4 ?
@@ -547,7 +548,8 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 const ggml_tensor * scale = op->src[2];
                 const ggml_tensor * input_scale = op->src[3];
                 const bool channel_weight = src0->type == GGML_TYPE_I8 ||
-                    (src0->type == GGML_TYPE_F8_E4M3 && scale->type == GGML_TYPE_BF16);
+                    (src0->type == GGML_TYPE_F8_E4M3 &&
+                     (scale->type == GGML_TYPE_BF16 || scale->type == GGML_TYPE_F32));
                 return channel_weight && src1->type == GGML_TYPE_F32 &&
                     op->type == GGML_TYPE_F32 && ggml_is_contiguous(src0) &&
                     ggml_is_contiguous(src1) && ggml_is_contiguous(scale) &&

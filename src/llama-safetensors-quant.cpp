@@ -918,7 +918,8 @@ std::optional<llama_safetensors_quant_binding> llama_safetensors_quant_adapters:
         result.target_shape = { static_cast<int64_t>(weight.shape[0]) };
         result.materialization = llama_safetensors_quant_materialization::BROADCAST_BF16_SCALAR;
     } else if (group->format == llama_safetensors_quant_format::FP8_CHANNEL) {
-        result.target_type  = GGML_TYPE_BF16;
+        result.target_type  = !group->modelopt && scale.dtype == llama_safetensors_dtype::F32 ?
+            GGML_TYPE_F32 : GGML_TYPE_BF16;
         result.target_shape = { static_cast<int64_t>(scale.shape[0]) };
         if (group->modelopt) {
             result.materialization = llama_safetensors_quant_materialization::POSITIVE_F32_TO_BF16;
@@ -1687,9 +1688,9 @@ void llama_safetensors_quant_adapters::validate() {
             const std::string scale_name = module + ".weight_scale";
             const auto & scale = require_tensor(registry_, scale_name);
             dependencies_[tensor.name] = { scale_name };
-            const llama_safetensors_dtype expected_scale_dtype = group->modelopt ?
-                llama_safetensors_dtype::F32 : llama_safetensors_dtype::BF16;
-            if (tensor.shape.size() != 2 || scale.dtype != expected_scale_dtype || scale.shape.empty() ||
+            const bool valid_scale_dtype = scale.dtype == llama_safetensors_dtype::F32 ||
+                (!group->modelopt && scale.dtype == llama_safetensors_dtype::BF16);
+            if (tensor.shape.size() != 2 || !valid_scale_dtype || scale.shape.empty() ||
                 scale.shape.size() > 2 || scale.shape[0] != tensor.shape[0] ||
                 (scale.shape.size() == 2 && scale.shape[1] != 1)) {
                 throw std::runtime_error("invalid channel-scale contract for source tensor '" + tensor.name + "'");

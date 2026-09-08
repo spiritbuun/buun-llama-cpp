@@ -27,6 +27,7 @@
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
+#include "ggml-cuda/fp8-channel.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
@@ -2705,6 +2706,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 #if defined(GGML_USE_HIP)
         GGML_ABORT("static quantized activation scaling is not implemented for HIP");
 #else
+        if (ggml_cuda_mul_mat_fp8_channel_lt(ctx, dst)) {
+            return;
+        }
         if (ggml_cuda_mul_mat_mxfp8(ctx, src0, src1, dst)) {
             return;
         }
@@ -2735,7 +2739,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         } else {
             const ggml_tensor * weight_scale = dst->src[2];
             const bool fp8_channel_scale = weight_scale != nullptr &&
-                weight_scale->type == GGML_TYPE_BF16 &&
+                (weight_scale->type == GGML_TYPE_BF16 || weight_scale->type == GGML_TYPE_F32) &&
                 weight_scale->ne[0] == src0->ne[1] &&
                 weight_scale->ne[1] == 1 && weight_scale->ne[2] == 1 && weight_scale->ne[3] == 1 &&
                 ggml_is_contiguous(weight_scale);
@@ -2847,7 +2851,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         const ggml_tensor * scale = dst->src[2];
         const bool generic_fp8_channel = src0->type == GGML_TYPE_F8_E4M3 &&
             !ggml_cuda_humming_fp8_is_repacked(src0) && src1->type == GGML_TYPE_F32 &&
-            dst->type == GGML_TYPE_F32 && scale->type == GGML_TYPE_BF16 &&
+            dst->type == GGML_TYPE_F32 && (scale->type == GGML_TYPE_BF16 || scale->type == GGML_TYPE_F32) &&
             scale->ne[0] == src0->ne[1] && scale->ne[1] == 1 &&
             scale->ne[2] == 1 && scale->ne[3] == 1 &&
             src1->ne[0] == src0->ne[0] && dst->ne[0] == src0->ne[1] &&
@@ -8121,7 +8125,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                         op->src[2]->ne[1] == a->ne[1];
                     const bool static_fp8 = op->src[2] == nullptr && a->type == GGML_TYPE_F8_E4M3;
                     const bool channel_fp8 = a->type == GGML_TYPE_F8_E4M3 && op->src[2] != nullptr &&
-                        op->src[2]->type == GGML_TYPE_BF16 && ggml_is_contiguous(op->src[2]) &&
+                        (op->src[2]->type == GGML_TYPE_BF16 || op->src[2]->type == GGML_TYPE_F32) &&
+                        ggml_is_contiguous(op->src[2]) &&
                         op->src[2]->ne[0] == a->ne[1] && op->src[2]->ne[1] == 1 &&
                         op->src[2]->ne[2] == 1 && op->src[2]->ne[3] == 1;
                     const bool static_i8 = op->src[2] != nullptr && a->type == GGML_TYPE_I8;
@@ -8201,7 +8206,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                         b->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                         cc >= GGML_CUDA_CC_AMPERE && ggml_is_contiguous(a) &&
                         ggml_is_contiguous(b) && ggml_is_contiguous(scale) &&
-                        ggml_is_contiguous(op) && scale->type == GGML_TYPE_BF16 &&
+                        ggml_is_contiguous(op) && (scale->type == GGML_TYPE_BF16 || scale->type == GGML_TYPE_F32) &&
                         scale->ne[0] == a->ne[1] && scale->ne[1] == 1 &&
                         scale->ne[2] == 1 && scale->ne[3] == 1 &&
                         b->ne[0] == a->ne[0] && op->ne[0] == a->ne[1] &&

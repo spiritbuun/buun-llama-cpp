@@ -137,9 +137,15 @@ source_spec quantized_or_plain(
     return { plain_name, std::move(transforms), std::nullopt };
 }
 
-bool quant_is_exl3(const llama_safetensors_quant_adapters & quant, const std::string & module) {
+bool quant_can_fuse_rows(const llama_safetensors_quant_adapters & quant, const std::string & module) {
     const auto binding = quant.bind(module, llama_safetensors_quant_role::WEIGHT);
-    return binding && binding->materialization == llama_safetensors_quant_materialization::EXL3_REPACK;
+    // Match describe()'s row-concatenation contract before selecting a fused
+    // source. Recurrent QKV is required, so an unsupported fusion must leave
+    // its ordinary source available rather than report a missing tensor.
+    return !binding || (binding->materialization != llama_safetensors_quant_materialization::EXL3_REPACK &&
+                       binding->target_type != GGML_TYPE_F8_E4M3 &&
+                       binding->target_type != GGML_TYPE_I8 &&
+                       binding->target_type != GGML_TYPE_GPTQ_AO);
 }
 
 bool fuse_qkv_enabled() {
@@ -397,7 +403,7 @@ source_spec map_target_unchecked(
         source_spec fused = quantized_or_plain(
             quant, module, llama_safetensors_quant_role::WEIGHT, {}, module + ".weight");
         // EXL3 modules each carry their own input sign vector, so they cannot share one projection.
-        if (fuse_qkv_enabled() && !quant_is_exl3(quant, prefix + "self_attn.q_proj")) {
+        if (fuse_qkv_enabled() && quant_can_fuse_rows(quant, prefix + "self_attn.q_proj")) {
             for (const char * part : { "attn_q.weight", "attn_k.weight", "attn_v.weight" }) {
                 fused.part_targets.push_back("blk." + std::to_string(layer) + "." + part);
             }
@@ -406,7 +412,7 @@ source_spec map_target_unchecked(
     }
 
     if (is_recurrent_layer(layer, geometry) && suffix == "attn_qkv.weight" && fuse_qkvz_enabled() &&
-            !quant_is_exl3(quant, prefix + "linear_attn.in_proj_qkv")) {
+            quant_can_fuse_rows(quant, prefix + "linear_attn.in_proj_qkv")) {
         // Recurrent layers: serve qkv|z as one projection; the graph splits it
         // by views.  The parts carry their own row transforms.
         llama_safetensors_source_name source {

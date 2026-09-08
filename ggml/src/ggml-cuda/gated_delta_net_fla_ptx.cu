@@ -49,10 +49,10 @@ struct fla_modules {
 
 static fla_modules & get_modules(int device, int cc) {
     GGML_ASSERT(device >= 0 && device < GGML_CUDA_MAX_DEVICES);
-    GGML_ASSERT(cc == 800 || cc == 860);
-    const int arch = cc == 800 ? 0 : 1;
-    static std::array<std::array<fla_modules, 2>, GGML_CUDA_MAX_DEVICES> results;
-    static std::array<std::array<std::once_flag, 2>, GGML_CUDA_MAX_DEVICES> once;
+    GGML_ASSERT(cc == 800 || cc == 860 || cc == 1200);
+    const int arch = cc == 800 ? 0 : cc == 860 ? 1 : 2;
+    static std::array<std::array<fla_modules, 3>, GGML_CUDA_MAX_DEVICES> results;
+    static std::array<std::array<std::once_flag, 3>, GGML_CUDA_MAX_DEVICES> once;
     std::call_once(once[device][arch], [&, device, arch] {
         fla_modules & result = results[device][arch];
         const char * base = std::getenv("GGML_CUDA_GDN_FLA_PTX_DIR");
@@ -74,7 +74,8 @@ static fla_modules & get_modules(int device, int cc) {
         };
         const int shared_sm80[K_COUNT] = { 8, 8192, 10240, 36864, 90632, 32768 };
         const int shared_sm86[K_COUNT] = { 8, 16384, 10240, 32768, 49412, 20480 };
-        const int * shared = cc == 800 ? shared_sm80 : shared_sm86;
+        const int shared_sm120[K_COUNT] = { 8, 16384, 10240, 20480, 90632, 24576 };
+        const int * shared = cc == 800 ? shared_sm80 : cc == 860 ? shared_sm86 : shared_sm120;
 #if defined(GGML_CUDA_GDN_FLA_EMBEDDED)
         const void * embedded_sm80[K_COUNT] = {
             _binary_sm80_chunk_local_cumsum_scalar_kernel_cubin_start,
@@ -96,9 +97,11 @@ static fla_modules & get_modules(int device, int cc) {
 #endif
         for (int i = 0; i < K_COUNT; ++i) {
             if (base != nullptr) {
-                const std::string path = std::string(base) + "/" + files[i];
+                const std::string path = std::string(base) + "/" +
+                    (cc == 1200 ? std::string(names[i]) + ".cubin" : files[i]);
                 CU_CHECK(cuModuleLoad(&result.modules[i], path.c_str()));
             } else {
+                GGML_ASSERT(cc != 1200); // SM120 experiment uses externally generated modules.
 #if defined(GGML_CUDA_GDN_FLA_EMBEDDED)
                 CU_CHECK(cuModuleLoadData(&result.modules[i], embedded[i]));
 #else
@@ -501,9 +504,13 @@ bool ggml_cuda_gdn_fla_ptx_supported(
 #endif
     static const bool external_available = std::getenv("GGML_CUDA_GDN_FLA_PTX_DIR") != nullptr;
     const bool available = embedded_available || external_available;
-    return available && (cc == 800 || cc == 860) &&
+    const bool supported_device = (available && (cc == 800 || cc == 860)) ||
+                                  (external_available && cc == 1200);
+    const bool supported_length = cc == 1200 ? n_tokens >= 508 :
+                                  n_tokens >= 512 && n_tokens % GDN_BT == 0;
+    return supported_device &&
            !kda && !keep_rs && S_v == GDN_D && H == GDN_H && H_k == GDN_HK &&
-           n_tokens >= 512 && n_tokens % GDN_BT == 0 && n_seqs == 1;
+           supported_length && n_seqs == 1;
 }
 
 void ggml_cuda_gdn_fla_ptx(
@@ -522,8 +529,8 @@ void ggml_cuda_gdn_fla_ptx(
     cudaStream_t stream = ctx.stream();
     fla_modules & m = get_modules(ctx.device, cc);
 
-    GGML_ASSERT(n_tokens > 0 && n_tokens % GDN_BT == 0 && n_tokens <= INT_MAX);
-    const int n_chunks         = int(n_tokens / GDN_BT);
+    GGML_ASSERT(n_tokens > 0 && n_tokens <= INT_MAX);
+    const int n_chunks         = int((n_tokens + GDN_BT - 1) / GDN_BT);
     const int64_t n_qk         = n_tokens * GDN_HK * GDN_D;
     const int64_t n_v          = n_tokens * GDN_H  * GDN_D;
     const int64_t n_g          = n_tokens * GDN_H;
@@ -555,7 +562,7 @@ void ggml_cuda_gdn_fla_ptx(
         GGML_ASSERT(l2_eps >= 0.0f);
         constexpr int rows_per_block = 8;
         const int norm_blocks = 2 * int(n_tokens) * GDN_HK / rows_per_block;
-        const int v_blocks = (n_v / 4 + threads - 1) / threads;
+        const int v_blocks = (std::max(n_v / 4, n_state) + threads - 1) / threads;
         pack_gdn_compact_conv_l2_bf16<<<norm_blocks + v_blocks, threads, 0, stream>>>(
             static_cast<const nv_bfloat16 *>(compact_conv_bf16), g, beta, state_in,
             q_p.get(), k_p.get(), v_p.get(), g_p.get(), beta_p.get(), state_in_p.get(),
@@ -563,7 +570,7 @@ void ggml_cuda_gdn_fla_ptx(
     } else if (l2_eps >= 0.0f) {
         constexpr int rows_per_block = 8;
         const int norm_blocks = 2 * int(n_tokens) * GDN_HK / rows_per_block;
-        const int v_blocks = (n_v / 4 + threads - 1) / threads;
+        const int v_blocks = (std::max(n_v / 4, n_state) + threads - 1) / threads;
         pack_gdn_inputs_l2_bf16<<<norm_blocks + v_blocks, threads, 0, stream>>>(
             q, k, v, g, beta, state_in,
             q_p.get(), k_p.get(), v_p.get(), g_p.get(), beta_p.get(), state_in_p.get(),
@@ -573,7 +580,7 @@ void ggml_cuda_gdn_fla_ptx(
         pack_gdn_inputs_bf16<<<(n_v + threads - 1) / threads, threads, 0, stream>>>(
             q, k, v, q_p.get(), k_p.get(), v_p.get(), int(n_tokens),
             sq1, sq2, sq3, sv1, sv2, sv3);
-        pack_gdn_heads_f32<<<(n_state + threads - 1) / threads, threads, 0, stream>>>(
+        pack_gdn_heads_f32<<<(std::max(n_state, n_g) + threads - 1) / threads, threads, 0, stream>>>(
             g, beta, state_in, g_p.get(), beta_p.get(), state_in_p.get(), int(n_tokens));
     }
     CUDA_CHECK(cudaGetLastError());
@@ -587,21 +594,22 @@ void ggml_cuda_gdn_fla_ptx(
 
     void * cumsum_args[] = { &g_p.ptr, &g_cum.ptr, &cu_seqlens.ptr, &chunk_indices.ptr, &T, &null_ptr, &null_ptr };
     const bool sm80 = cc == 800;
-    launch(m.funcs[K_CUMSUM], {(unsigned) n_chunks, GDN_H, 1}, {sm80 ? 128u : 256u, 1, 1}, 8, cu_stream, cumsum_args);
+    const bool sm120 = cc == 1200;
+    launch(m.funcs[K_CUMSUM], {(unsigned) n_chunks, GDN_H, 1}, {sm120 ? 64u : sm80 ? 128u : 256u, 1, 1}, 8, cu_stream, cumsum_args);
     void * kkt_args[] = { &k_p.ptr, &beta_p.ptr, &g_cum.ptr, &A.ptr, &cu_seqlens.ptr, &chunk_indices.ptr, &T, &null_ptr, &null_ptr };
-    launch(m.funcs[K_KKT], {(unsigned) n_chunks, GDN_H, 1}, {sm80 ? 128u : 256u, 1, 1}, sm80 ? 8192 : 16384, cu_stream, kkt_args);
+    launch(m.funcs[K_KKT], {(unsigned) n_chunks, GDN_H, 1}, {sm80 || sm120 ? 128u : 256u, 1, 1}, sm80 ? 8192 : 16384, cu_stream, kkt_args);
     CUDA_CHECK(cudaMemsetAsync(Ai.get(), 0, n_A * sizeof(nv_bfloat16), stream));
     void * solve_args[] = { &A.ptr, &Ai.ptr, &cu_seqlens.ptr, &chunk_indices.ptr, &T, &null_ptr, &null_ptr };
-    launch(m.funcs[K_SOLVE], {(unsigned) n_chunks, GDN_H, 1}, {sm80 ? 64u : 128u, 1, 1}, 10240, cu_stream, solve_args);
+    launch(m.funcs[K_SOLVE], {(unsigned) n_chunks, GDN_H, 1}, {sm80 || sm120 ? 64u : 128u, 1, 1}, 10240, cu_stream, solve_args);
     void * recompute_args[] = { &k_p.ptr, &v_p.ptr, &beta_p.ptr, &w.ptr, &u.ptr, &Ai.ptr, &g_cum.ptr,
                                 &cu_seqlens.ptr, &chunk_indices.ptr, &T, &null_ptr, &null_ptr };
-    launch(m.funcs[K_RECOMPUTE], {(unsigned) n_chunks, GDN_H, 1}, {sm80 ? 64u : 128u, 1, 1}, sm80 ? 36864 : 32768, cu_stream, recompute_args);
+    launch(m.funcs[K_RECOMPUTE], {(unsigned) n_chunks, GDN_H, 1}, {sm80 ? 64u : 128u, 1, 1}, sm120 ? 20480 : sm80 ? 36864 : 32768, cu_stream, recompute_args);
     void * state_args[] = { &k_p.ptr, &u.ptr, &w.ptr, &v_new.ptr, &g_cum.ptr, &h.ptr,
                             &state_in_p.ptr, &state_out_p.ptr, &cu_seqlens.ptr, &chunk_offsets.ptr, &T, &null_ptr, &null_ptr };
-    launch(m.funcs[K_STATE], {2, GDN_H, 1}, {128, 1, 1}, sm80 ? 90632 : 49412, cu_stream, state_args);
+    launch(m.funcs[K_STATE], {2, GDN_H, 1}, {128, 1, 1}, sm80 || sm120 ? 90632 : 49412, cu_stream, state_args);
     void * output_args[] = { &q_p.ptr, &k_p.ptr, &v_new.ptr, &h.ptr, &g_cum.ptr, &out.ptr,
                              &cu_seqlens.ptr, &chunk_indices.ptr, &scale, &T, &null_ptr, &null_ptr };
-    launch(m.funcs[K_OUTPUT], {sm80 ? 1u : 4u, (unsigned) n_chunks, GDN_H}, {sm80 ? 128u : 64u, 1, 1}, sm80 ? 32768 : 20480, cu_stream, output_args);
+    launch(m.funcs[K_OUTPUT], {sm120 ? 2u : sm80 ? 1u : 4u, (unsigned) n_chunks, GDN_H}, {sm80 || sm120 ? 128u : 64u, 1, 1}, sm120 ? 24576 : sm80 ? 32768 : 20480, cu_stream, output_args);
     if (rms_output != nullptr) {
         GGML_ASSERT(rms_weight != nullptr);
         if (rms_output_int8) {

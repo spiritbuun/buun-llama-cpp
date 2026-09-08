@@ -4808,7 +4808,7 @@ struct test_gated_delta_net : public test_case {
     double max_nmse_err() override {
         // The production Qwen3.5 FLA kernel changes the reduction order across
         // a full 512-token tile. Its observed CPU-reference NMSE is ~9.7e-6.
-        if (head_count == 16 && head_size == 128 && n_seq_tokens == 512 && n_seqs == 1 && v_repeat == 3) {
+        if (head_count == 16 && head_size == 128 && n_seq_tokens >= 508 && n_seqs == 1 && v_repeat == 3) {
             return 2e-5;
         }
         return test_case::max_nmse_err();
@@ -5435,17 +5435,16 @@ struct test_mul_mat_quant_glu_chain : public test_case {
 };
 
 struct test_mul_mat_dynamic_fp8 : public test_case {
-    static constexpr int64_t k = 32;
-    static constexpr int64_t n = 4;
-    static constexpr int64_t m = 3;
-
-    test_mul_mat_dynamic_fp8(bool channel_scale = false, float upper_bound = 0.0f, bool dynamic_input = true) :
-        channel_scale(channel_scale), upper_bound(upper_bound), dynamic_input(dynamic_input) {}
+    test_mul_mat_dynamic_fp8(bool channel_scale = false, float upper_bound = 0.0f, bool dynamic_input = true,
+            ggml_type scale_type = GGML_TYPE_BF16, int64_t k = 32, int64_t n = 4, int64_t m = 3) :
+        channel_scale(channel_scale), upper_bound(upper_bound), dynamic_input(dynamic_input),
+        scale_type(scale_type), k(k), n(n), m(m) {}
 
     std::string vars() override {
-        char buffer[96];
-        snprintf(buffer, sizeof(buffer), "k=32,n=4,m=3,channel_scale=%s,upper_bound=%.1f,dynamic_input=%s",
-            channel_scale ? "true" : "false", upper_bound, dynamic_input ? "true" : "false");
+        char buffer[192];
+        snprintf(buffer, sizeof(buffer), "k=%lld,n=%lld,m=%lld,channel_scale=%s,upper_bound=%.1f,dynamic_input=%s,scale_type=%s",
+            (long long) k, (long long) n, (long long) m, channel_scale ? "true" : "false", upper_bound,
+            dynamic_input ? "true" : "false", ggml_type_name(scale_type));
         return buffer;
     }
     std::string op_desc(ggml_tensor *) override {
@@ -5461,7 +5460,7 @@ struct test_mul_mat_dynamic_fp8 : public test_case {
         ggml_set_name(marker, "dynamic_fp8_marker");
         ggml_tensor * out = ggml_mul_mat(ctx, weight, input);
         if (channel_scale) {
-            ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_BF16, n);
+            ggml_tensor * scale = ggml_new_tensor_1d(ctx, scale_type, n);
             ggml_set_name(scale, "dynamic_fp8_weight_scale");
             out->src[2] = scale;
         }
@@ -5473,6 +5472,7 @@ struct test_mul_mat_dynamic_fp8 : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
         const ggml_type_traits * f8 = ggml_get_type_traits(GGML_TYPE_F8_E4M3);
         for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor != nullptr;
              tensor = ggml_get_next_tensor(ctx, tensor)) {
@@ -5500,6 +5500,14 @@ struct test_mul_mat_dynamic_fp8 : public test_case {
                 memcpy(&marker, &upper_bound, sizeof(marker));
                 ggml_backend_tensor_set(tensor, &marker, 0, sizeof(marker));
             } else if (strcmp(tensor->name, "dynamic_fp8_weight_scale") == 0) {
+                if (scale_type == GGML_TYPE_F32) {
+                    std::vector<float> scales(n);
+                    for (int64_t row = 0; row < n; ++row) {
+                        scales[row] = 0.50019f + 0.00131f * row;
+                    }
+                    ggml_backend_tensor_set(tensor, scales.data(), 0, scales.size() * sizeof(float));
+                    continue;
+                }
                 std::vector<ggml_bf16_t> scales(n);
                 for (int64_t row = 0; row < n; ++row) {
                     scales[row] = ggml_fp32_to_bf16(0.5f + 0.25f * row);
@@ -5515,6 +5523,8 @@ struct test_mul_mat_dynamic_fp8 : public test_case {
     bool  channel_scale;
     float upper_bound;
     bool  dynamic_input;
+    ggml_type scale_type;
+    int64_t k, n, m;
 };
 
 struct test_mul_mat_dynamic_mxfp4 : public test_case {
@@ -10595,6 +10605,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_dynamic_fp8());
     test_cases.emplace_back(new test_mul_mat_dynamic_fp8(true, 2.0f));
     test_cases.emplace_back(new test_mul_mat_dynamic_fp8(true, 0.0f, false));
+    for (ggml_type scale_type : { GGML_TYPE_BF16, GGML_TYPE_F32 }) {
+        for (bool dynamic_input : { false, true }) {
+            for (int64_t m : { 1, 8, 129 }) {
+                test_cases.emplace_back(new test_mul_mat_dynamic_fp8(true, 0.0f, dynamic_input, scale_type, 128, 256, m));
+            }
+        }
+    }
     test_cases.emplace_back(new test_mul_mat_dynamic_mxfp4());
     test_cases.emplace_back(new test_mul_mat_dynamic_mxfp8());
     test_cases.emplace_back(new test_mul_mat_dynamic_grouped_fp8());
@@ -11620,6 +11637,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 1, 3)); // Qwen3.5-27B FLA shape
+    for (int64_t n : {508, 513, 2044, 2048}) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n, 1, 3));
+    }
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1, 1, true));
     // KDA (vector gate)

@@ -1739,7 +1739,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             const bool weight_only_8bit = has_scale && scale_type == GGML_TYPE_I8 &&
                 scale_ne[0] == static_cast<int64_t>(sizeof(ggml_w8a16_scale_header) +
                     weight->ne[1] * sizeof(uint16_t));
-            const bool f8_block = f8_scaled && has_scale && scale_type == GGML_TYPE_F32;
+            const bool f8_channel = f8_scaled && has_scale &&
+                scale_ne[0] == weight->ne[1] && scale_ne[1] == 1 && scale_ne[2] == 1 && scale_ne[3] == 1;
+            const bool f8_block = f8_scaled && has_scale && scale_type == GGML_TYPE_F32 && !f8_channel;
             const bool f8_mxfp8 = f8_scaled && has_scale && scale_type == GGML_TYPE_I8 && !weight_only_8bit;
             const bool f8_group = f8_scaled && has_scale && scale_type == GGML_TYPE_BF16 && scale_ne[1] > 1;
             ggml_tensor * scale = create_tensor(
@@ -1748,9 +1750,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     std::initializer_list<int64_t>{ scale_ne[0], scale_ne[1] } :
                     std::initializer_list<int64_t>{ has_scale ? scale_ne[0] : 1 },
                 quant_scaled ? 0 : TENSOR_NOT_REQUIRED);
-            if (f8_scaled && !f8_block && !f8_mxfp8 && !weight_only_8bit && scale->type != GGML_TYPE_BF16) {
+            if (f8_scaled && !f8_block && !f8_mxfp8 && !weight_only_8bit &&
+                    scale->type != GGML_TYPE_BF16 && scale->type != GGML_TYPE_F32) {
                 throw std::runtime_error(format(
-                    "channel scale '%s' for F8 weight '%s' must be BF16", scale->name, weight->name));
+                    "channel scale '%s' for F8 weight '%s' must be BF16 or F32", scale->name, weight->name));
             }
             if (f8_block && (scale->type != GGML_TYPE_F32 || weight->ne[0] % 128 != 0 ||
                              weight->ne[1] % 128 != 0 || scale->ne[0] != weight->ne[1] / 128 ||
@@ -1811,7 +1814,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 return;
             }
             const bool channel_type = weight->type == GGML_TYPE_F8_E4M3 ?
-                scale != nullptr && scale->type == GGML_TYPE_BF16 :
+                scale != nullptr && (scale->type == GGML_TYPE_BF16 || scale->type == GGML_TYPE_F32) :
                 scale != nullptr && (scale->type == GGML_TYPE_F32 ||
                                      scale->type == GGML_TYPE_F16 || scale->type == GGML_TYPE_BF16);
             const bool w8a16 = (weight->type == GGML_TYPE_I8 || weight->type == GGML_TYPE_F8_E4M3) &&

@@ -1251,6 +1251,56 @@ int main(int argc, char ** argv) {
                     std::vector<uint8_t>({ 1, 2, 3, 4 }),
                 "Qwen output channel scale incorrectly followed the weight's column permutation");
 
+        // Preserve channel scales that are not exactly representable in BF16.
+        const auto channel_f32_dir = dir.path / "channel-f32-scales";
+        const std::vector<float> channel_f32_scales = { 0.50019f, 0.75031f };
+        std::vector<uint8_t> channel_f32_bytes(channel_f32_scales.size() * sizeof(float));
+        memcpy(channel_f32_bytes.data(), channel_f32_scales.data(), channel_f32_bytes.size());
+        for (const auto & shape : { std::vector<uint64_t>{2}, std::vector<uint64_t>{2, 1} }) {
+            write_single_shard_model(channel_f32_dir, {
+                { channel_module + ".weight", "F8_E4M3", {2, 2}, {0, 0, 0, 0} },
+                { channel_module + ".weight_scale", "F32", shape, channel_f32_bytes },
+            });
+            write_text(channel_f32_dir / "generation_config.json", "{}");
+            write_text(channel_f32_dir / "tokenizer.json", "{}");
+            llama_safetensors_qwen35_importer channel_f32_importer(channel_f32_dir, config);
+            ggml_type scale_type;
+            std::array<int64_t, GGML_MAX_DIMS> scale_ne;
+            require(channel_f32_importer.describe("blk.0.ssm_out.scale", scale_type, scale_ne) &&
+                        scale_type == GGML_TYPE_F32 && scale_ne == std::array<int64_t, GGML_MAX_DIMS>{2, 1, 1, 1},
+                    "FP32 channel scales were not preserved as FP32");
+            require(channel_f32_importer.materialize("blk.0.ssm_out.scale", scale_type, 8) == channel_f32_bytes,
+                    "FP32 channel scales changed during import");
+        }
+
+        // QKV|Z cannot concatenate channel-scaled FP8 rows. The required QKV
+        // tensor must still resolve to its original source with fusion enabled.
+        const auto qkv_fp8_dir = dir.path / "qkv-fp8-fallback";
+        const std::string qkv_module = "model.language_model.layers.0.linear_attn.in_proj_qkv";
+        const std::string z_module = "model.language_model.layers.0.linear_attn.in_proj_z";
+        write_single_shard_model(qkv_fp8_dir, {
+            { qkv_module + ".weight", "F8_E4M3", { 4, 2 }, std::vector<uint8_t>(8, 0x38) },
+            { qkv_module + ".weight_scale", "BF16", { 4 }, { 0x80, 0x3f, 0x80, 0x3f, 0x80, 0x3f, 0x80, 0x3f } },
+            { z_module + ".weight", "F8_E4M3", { 2, 2 }, std::vector<uint8_t>(4, 0x38) },
+            { z_module + ".weight_scale", "BF16", { 2 }, { 0x80, 0x3f, 0x80, 0x3f } },
+        });
+        write_text(qkv_fp8_dir / "generation_config.json", "{}");
+        write_text(qkv_fp8_dir / "tokenizer.json", "{}");
+        auto qkv_config = config;
+        qkv_config["quantization_config"]["config_groups"]["fp8"]["targets"] =
+            json::array({qkv_module, z_module});
+        llama_safetensors_qwen35_importer qkv_importer(qkv_fp8_dir, qkv_config);
+        ggml_type qkv_type;
+        std::array<int64_t, GGML_MAX_DIMS> qkv_ne;
+        require(qkv_importer.describe("blk.0.attn_qkv.weight", qkv_type, qkv_ne) &&
+                    qkv_type == GGML_TYPE_F8_E4M3 && qkv_ne == std::array<int64_t, GGML_MAX_DIMS>{2, 4, 1, 1},
+                "FP8 QKV fusion did not fall back to the ordinary projection");
+        require(qkv_importer.materialize("blk.0.attn_qkv.weight", qkv_type, 8) == std::vector<uint8_t>(8, 0x38),
+                "FP8 QKV fallback changed source weights");
+        require(qkv_importer.describe("blk.0.attn_qkv.scale", qkv_type, qkv_ne) &&
+                    qkv_type == GGML_TYPE_BF16 && qkv_ne[0] == 4,
+                "FP8 QKV fallback lost its channel scales");
+
         const std::filesystem::path plain_layout_dir = dir.path / "plain-layout-direct-upload";
         const std::string plain_layout_module = "model.language_model.layers.0.linear_attn.in_proj_z.weight";
         std::vector<uint8_t> plain_layout_source;
