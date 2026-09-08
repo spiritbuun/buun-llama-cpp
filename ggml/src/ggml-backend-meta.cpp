@@ -1997,15 +1997,17 @@ struct ggml_backend_meta_context {
     ggml_backend_step_launch_t        step_launch        = nullptr;
     ggml_backend_step_free_t          step_free          = nullptr;
     struct step_record {
-        uint64_t              uid = 0;
-        bool                  valid = false;      // false = this uid is known not to capture; don't retry
+        uint64_t              sig = 0;            // structural signature of the graph (0 = free slot)
+        bool                  valid = false;      // false = this shape is known not to capture; don't retry
         std::vector<void *>   steps;              // one per backend
         std::vector<uint64_t> epochs;             // per backend, at capture
         int64_t               last_used = 0;
     };
     std::vector<step_record> step_records;
-    uint64_t                 step_last_uid    = 0;
-    int                      step_same_uid    = 0;   // consecutive computes with the same uid (warmup)
+    uint64_t                 step_last_sig    = 0;
+    int                      step_same_sig    = 0;   // consecutive computes with the same signature (warmup)
+    uint64_t                 step_sig_uid     = 0;   // graph uid the cached signature belongs to
+    uint64_t                 step_sig_cached  = 0;
     bool                     step_graphs      = false;
 
     void step_records_free() {
@@ -2189,27 +2191,135 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
     }
 }
 
+// Structural signature of a graph: everything a recorded step graph depends on (ops, types, shapes, strides,
+// data addresses, op params, flags, view and source addresses). Every graph build gets a fresh uid even when
+// nothing changed (a server re-batching its slots, a prompt chunk between decode steps), so recordings are
+// keyed by this instead and a recurring shape replays without a re-split or a new capture.
+static uint64_t ggml_backend_meta_graph_signature(const ggml_cgraph * cgraph) {
+    uint64_t h = 1469598103934665603ULL;
+    auto mix = [&h](const void * p, size_t n) {
+        // 8 bytes per round (7250 nodes carry ~1.5 MB of fields; a byte-wise hash cost ~5 ms per graph)
+        const uint8_t * b = (const uint8_t *) p;
+        size_t i = 0;
+        for (; i + 8 <= n; i += 8) {
+            uint64_t w;
+            memcpy(&w, b + i, 8);
+            h = (h ^ w) * 0x9E3779B97F4A7C15ULL;
+            h ^= h >> 29;
+        }
+        for (; i < n; i++) {
+            h = (h ^ b[i]) * 1099511628211ULL;
+        }
+    };
+    // A meta tensor's data is an offset from a fake base: the real addresses live in the per-device buffers,
+    // which the scheduler replaces when a larger graph needs more room. Fold the device base addresses in, so a
+    // recording made against the old buffers is not replayed after a reallocation.
+    std::map<ggml_backend_buffer_t, uint64_t> buffer_ids;
+    auto mix_buffer = [&](ggml_backend_buffer_t buf) {
+        uint64_t id = 0;
+        if (buf != nullptr) {
+            auto it = buffer_ids.find(buf);
+            if (it == buffer_ids.end()) {
+                if (ggml_backend_buffer_is_meta(buf)) {
+                    const ggml_backend_meta_buffer_context * buf_ctx = (const ggml_backend_meta_buffer_context *) buf->context;
+                    for (const ggml_backend_buffer_ptr & simple : buf_ctx->bufs) {
+                        const uintptr_t base = simple ? (uintptr_t) ggml_backend_buffer_get_base(simple.get()) : 0;
+                        id = (id ^ (uint64_t) base) * 1099511628211ULL;
+                    }
+                } else {
+                    id = (uintptr_t) ggml_backend_buffer_get_base(buf);
+                }
+                it = buffer_ids.emplace(buf, id).first;
+            }
+            id = it->second;
+        }
+        mix(&id, sizeof(id));
+    };
+    auto mix_tensor = [&](const ggml_tensor * t) {
+        const void *  data = t->data;
+        const int32_t type = t->type;
+        const int32_t op   = t->op;
+        mix_buffer(t->buffer);
+        mix(&data, sizeof(data));
+        mix(&type, sizeof(type));
+        mix(&op, sizeof(op));
+        mix(t->ne, sizeof(t->ne));
+        mix(t->nb, sizeof(t->nb));
+        mix(t->op_params, sizeof(t->op_params));
+        mix(&t->flags, sizeof(t->flags));
+        const void * vdata = t->view_src != nullptr ? t->view_src->data : nullptr;
+        mix(&vdata, sizeof(vdata));
+        mix(&t->view_offs, sizeof(t->view_offs));
+        for (int k = 0; k < GGML_MAX_SRC; k++) {
+            const void * sdata = t->src[k] != nullptr ? t->src[k]->data : nullptr;
+            mix(&sdata, sizeof(sdata));
+            mix_buffer(t->src[k] != nullptr ? t->src[k]->buffer : nullptr);
+        }
+    };
+    mix(&cgraph->n_nodes, sizeof(cgraph->n_nodes));
+    mix(&cgraph->n_leafs, sizeof(cgraph->n_leafs));
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        mix_tensor(cgraph->nodes[i]);
+    }
+    for (int i = 0; i < cgraph->n_leafs; i++) {
+        mix_tensor(cgraph->leafs[i]);
+    }
+    return h == 0 ? 1 : h;
+}
+
 static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     GGML_ASSERT(cgraph->grads == nullptr);
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
 
-    // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
-    const bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
-
-    bool max_nnodes_raised = false;
-    if (cgraph->n_nodes > backend_ctx->max_nnodes) {
+    // Launching a large executable graph costs on the order of a millisecond, and every device waits at its
+    // first all-reduce for the last device launched, so fan the launches out over one thread per device (the
+    // CUDA driver is thread-safe per device/stream). Used for the recording step's own launch as well: a
+    // sequential first launch was observed to start device j only after device j-1's stream had drained.
+    auto launch_steps = [&](const std::vector<void *> & steps) -> bool {
+        static const bool launch_trace = getenv("GGML_META_DEBUG") != nullptr && atoi(getenv("GGML_META_DEBUG")) >= 2;
+        auto host_ms = []() {
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+        };
+        std::vector<char> launched_j(n_backends, 1);
         for (size_t j = 0; j < n_backends; j++) {
-            auto & bcj = backend_ctx->backend_configs[j];
-            bcj.nodes.resize(cgraph->n_nodes);
-            bcj.cgraphs.resize(cgraph->n_nodes);
+            backend_ctx->step_wait_uploads(backend_ctx->backend_configs[j].backend);
         }
-        backend_ctx->max_nnodes = cgraph->n_nodes;
-        max_nnodes_raised = true;
-        assert(needs_rebuild);
-    }
+        auto launch_one = [&](size_t j) {
+            const double t_a = launch_trace ? host_ms() : 0;
+            launched_j[j] = backend_ctx->step_launch(backend_ctx->backend_configs[j].backend, steps[j]);
+            if (launch_trace) {
+                fprintf(stderr, "ggml_backend_meta: step launch j=%zu issued %.3f returned %.3f host ms\n", j, t_a, host_ms());
+            }
+        };
+        if (n_backends > 2) {
+            std::vector<std::thread> workers;
+            workers.reserve(n_backends - 1);
+            for (size_t j = 1; j < n_backends; j++) {
+                workers.emplace_back([&, j]() { launch_one(j); });
+            }
+            launch_one(0);
+            for (auto & w : workers) {
+                w.join();
+            }
+        } else {
+            for (size_t j = 0; j < n_backends; j++) {
+                launch_one(j);
+            }
+        }
+        bool launched = true;
+        for (size_t j = 0; j < n_backends; j++) {
+            launched = launched && launched_j[j];
+        }
+        return launched;
+    };
 
-    if (needs_rebuild) {
+    // The meta buffers double-buffer the per-graph shard tensors: the scheduler's allocation of the next graph
+    // fills the spare container, so every compute of a newly allocated graph must free the other one — the
+    // rebuild below does it, and a replayed graph (no rebuild) must do the same or the containers fill up.
+    auto rotate_shard_containers = [&]() {
         std::set<ggml_backend_buffer_t> used_buffers;
         for (int i = 0; i < cgraph->n_leafs; i++) {
             if (ggml_backend_buffer_is_meta(cgraph->leafs[i]->buffer)) {
@@ -2230,6 +2340,83 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
             stc.simple_tensors.clear();
         }
+    };
+
+    const bool step_graphs = backend_ctx->step_graphs && n_backends > 1 && backend_ctx->comm_ctx != nullptr && cgraph->uid != 0;
+    uint64_t step_sig = 0;
+    if (step_graphs) {
+        // a graph the caller reuses unchanged keeps its uid, so its signature is only computed once
+        if (cgraph->uid != backend_ctx->step_sig_uid) {
+            backend_ctx->step_sig_cached = ggml_backend_meta_graph_signature(cgraph);
+            backend_ctx->step_sig_uid    = cgraph->uid;
+        }
+        step_sig = backend_ctx->step_sig_cached;
+    }
+    if (step_graphs) {
+        // replay a recorded step for this shape if its device state has not moved — before any re-split,
+        // which a recurring shape does not need
+        for (auto & rec : backend_ctx->step_records) {
+            if (rec.sig != step_sig) {
+                continue;
+            }
+            if (!rec.valid) {
+                break; // known not to capture: fall through to the normal path
+            }
+            bool stale = false;
+            for (size_t j = 0; j < n_backends && !stale; j++) {
+                stale = backend_ctx->step_epoch(backend_ctx->backend_configs[j].backend) != rec.epochs[j];
+            }
+            if (stale) {
+                for (size_t j = 0; j < n_backends; j++) {
+                    backend_ctx->step_free(backend_ctx->backend_configs[j].backend, rec.steps[j]);
+                    rec.steps[j] = nullptr;
+                }
+                rec.sig = 0;
+                break;
+            }
+            if (launch_steps(rec.steps)) {
+                rec.last_used = ggml_time_us();
+                // the replayed graph's shards were never used; free the spare container like a rebuild would, and
+                // since that container held the last rebuilt graph's shards, make the next uncaptured graph rebuild
+                rotate_shard_containers();
+                backend_ctx->uid = 0;
+                static const bool trace_replay = getenv("GGML_META_TRACE_REPLAY") != nullptr;
+                if (trace_replay) {
+                    fprintf(stderr, "ggml_backend_meta: replay signature %016" PRIx64 " (%d nodes, uid %" PRIu64 ")\n",
+                            step_sig, cgraph->n_nodes, cgraph->uid);
+                }
+                return GGML_STATUS_SUCCESS;
+            }
+            GGML_LOG_WARN("%s: step graph replay failed for signature %016" PRIx64 ", recording again\n", __func__, step_sig);
+            rec.sig = 0;
+            break;
+        }
+
+        if (step_sig == backend_ctx->step_last_sig) {
+            backend_ctx->step_same_sig++;
+        } else {
+            backend_ctx->step_last_sig = step_sig;
+            backend_ctx->step_same_sig = 0;
+        }
+    }
+
+    // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
+    const bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
+
+    bool max_nnodes_raised = false;
+    if (cgraph->n_nodes > backend_ctx->max_nnodes) {
+        for (size_t j = 0; j < n_backends; j++) {
+            auto & bcj = backend_ctx->backend_configs[j];
+            bcj.nodes.resize(cgraph->n_nodes);
+            bcj.cgraphs.resize(cgraph->n_nodes);
+        }
+        backend_ctx->max_nnodes = cgraph->n_nodes;
+        max_nnodes_raised = true;
+        assert(needs_rebuild);
+    }
+
+    if (needs_rebuild) {
+        rotate_shard_containers();
         size_t n_subgraphs  = 0;
         size_t max_tmp_size = 0;
 
@@ -2715,95 +2902,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         return GGML_STATUS_SUCCESS;
     };
 
-    // Launching a large executable graph costs on the order of a millisecond, and every device waits at its
-    // first all-reduce for the last device launched, so fan the launches out over one thread per device (the
-    // CUDA driver is thread-safe per device/stream). Used for the recording step's own launch as well: a
-    // sequential first launch was observed to start device j only after device j-1's stream had drained.
-    auto launch_steps = [&](const std::vector<void *> & steps) -> bool {
-        static const bool launch_trace = getenv("GGML_META_DEBUG") != nullptr && atoi(getenv("GGML_META_DEBUG")) >= 2;
-        auto host_ms = []() {
-            struct timespec ts;
-            clock_gettime(CLOCK_MONOTONIC, &ts);
-            return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
-        };
-        std::vector<char> launched_j(n_backends, 1);
-        for (size_t j = 0; j < n_backends; j++) {
-            backend_ctx->step_wait_uploads(backend_ctx->backend_configs[j].backend);
-        }
-        auto launch_one = [&](size_t j) {
-            const double t_a = launch_trace ? host_ms() : 0;
-            launched_j[j] = backend_ctx->step_launch(backend_ctx->backend_configs[j].backend, steps[j]);
-            if (launch_trace) {
-                fprintf(stderr, "ggml_backend_meta: step launch j=%zu issued %.3f returned %.3f host ms\n", j, t_a, host_ms());
-            }
-        };
-        if (n_backends > 2) {
-            std::vector<std::thread> workers;
-            workers.reserve(n_backends - 1);
-            for (size_t j = 1; j < n_backends; j++) {
-                workers.emplace_back([&, j]() { launch_one(j); });
-            }
-            launch_one(0);
-            for (auto & w : workers) {
-                w.join();
-            }
-        } else {
-            for (size_t j = 0; j < n_backends; j++) {
-                launch_one(j);
-            }
-        }
-        bool launched = true;
-        for (size_t j = 0; j < n_backends; j++) {
-            launched = launched && launched_j[j];
-        }
-        return launched;
-    };
-
-    const bool step_graphs = backend_ctx->step_graphs && n_backends > 1 && backend_ctx->comm_ctx != nullptr && cgraph->uid != 0;
     if (step_graphs) {
-        // replay a recorded step for this graph if its device state has not moved
-        for (auto & rec : backend_ctx->step_records) {
-            if (rec.uid != cgraph->uid) {
-                continue;
-            }
-            if (!rec.valid) {
-                break; // known not to capture: fall through to the normal path
-            }
-            bool stale = false;
-            for (size_t j = 0; j < n_backends && !stale; j++) {
-                stale = backend_ctx->step_epoch(backend_ctx->backend_configs[j].backend) != rec.epochs[j];
-            }
-            if (stale) {
-                for (size_t j = 0; j < n_backends; j++) {
-                    backend_ctx->step_free(backend_ctx->backend_configs[j].backend, rec.steps[j]);
-                    rec.steps[j] = nullptr;
-                }
-                rec.uid = 0;
-                break;
-            }
-            if (launch_steps(rec.steps)) {
-                rec.last_used = ggml_time_us();
-                return GGML_STATUS_SUCCESS;
-            }
-            GGML_LOG_WARN("%s: step graph replay failed for uid %" PRIu64 ", recording again\n", __func__, cgraph->uid);
-            rec.uid = 0;
-            break;
-        }
-
-        if (cgraph->uid == backend_ctx->step_last_uid) {
-            backend_ctx->step_same_uid++;
-        } else {
-            backend_ctx->step_last_uid = cgraph->uid;
-            backend_ctx->step_same_uid = 0;
-        }
-
         bool known_bad = false;
         for (const auto & rec : backend_ctx->step_records) {
-            known_bad = known_bad || (rec.uid == cgraph->uid && !rec.valid);
+            known_bad = known_bad || (rec.sig == step_sig && !rec.valid);
         }
 
-        // second consecutive compute of the same graph (the first is the simple backends' warmup)
-        if (backend_ctx->step_same_uid >= 1 && !known_bad) {
+        // second consecutive compute of the same shape (the first is the simple backends' warmup)
+        if (backend_ctx->step_same_sig >= 1 && !known_bad) {
             bool capturable = true;
             for (size_t j = 0; j < n_backends && capturable; j++) {
                 auto & bcj = backend_ctx->backend_configs[j];
@@ -2825,9 +2931,28 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 if (capture_ok) {
                     status = run_subgraphs(/*capturing =*/ true, capture_ok);
                 }
+                // ending a capture instantiates and uploads a graph of thousands of nodes: do the devices in parallel
                 std::vector<void *> steps(n_backends, nullptr);
+                static const bool seq_capture_end = getenv("GGML_META_SEQ_CAPTURE_END") != nullptr;
+                if (seq_capture_end) {
+                    for (size_t j = 0; j < n_began; j++) {
+                        steps[j] = backend_ctx->step_capture_end(backend_ctx->backend_configs[j].backend);
+                    }
+                } else {
+                    std::vector<std::thread> workers;
+                    for (size_t j = 1; j < n_began; j++) {
+                        workers.emplace_back([&, j]() {
+                            steps[j] = backend_ctx->step_capture_end(backend_ctx->backend_configs[j].backend);
+                        });
+                    }
+                    if (n_began > 0) {
+                        steps[0] = backend_ctx->step_capture_end(backend_ctx->backend_configs[0].backend);
+                    }
+                    for (auto & w : workers) {
+                        w.join();
+                    }
+                }
                 for (size_t j = 0; j < n_began; j++) {
-                    steps[j] = backend_ctx->step_capture_end(backend_ctx->backend_configs[j].backend);
                     capture_ok = capture_ok && steps[j] != nullptr;
                 }
                 if (getenv("GGML_META_DEBUG") != nullptr && atoi(getenv("GGML_META_DEBUG")) >= 2) {
@@ -2837,8 +2962,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     return status;
                 }
                 if (capture_ok) {
-                    // keep a few graphs (decode/prefill shapes alternate); evict the oldest
-                    if (backend_ctx->step_records.size() >= 4) {
+                    // keep the recent shapes (decode at each KV size, prefill chunks, batches with a slot
+                    // missing all alternate in a server); evict the least recently used
+                    if (backend_ctx->step_records.size() >= 16) {
                         size_t oldest = 0;
                         for (size_t r = 1; r < backend_ctx->step_records.size(); r++) {
                             if (backend_ctx->step_records[r].last_used < backend_ctx->step_records[oldest].last_used) {
@@ -2854,7 +2980,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         backend_ctx->step_records.erase(backend_ctx->step_records.begin() + oldest);
                     }
                     ggml_backend_meta_context::step_record rec;
-                    rec.uid   = cgraph->uid;
+                    rec.sig   = step_sig;
                     rec.valid = true;
                     rec.steps = steps;
                     rec.epochs.resize(n_backends);
@@ -2864,17 +2990,17 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     rec.last_used = ggml_time_us();
                     backend_ctx->step_records.push_back(std::move(rec));
                     if (getenv("GGML_META_DEBUG") != nullptr) {
-                        fprintf(stderr, "ggml_backend_meta: recorded step graph for uid %" PRIu64 " (%zu subgraphs x %zu devices)\n",
-                                cgraph->uid, backend_ctx->n_subgraphs, n_backends);
+                        fprintf(stderr, "ggml_backend_meta: recorded step graph for signature %016" PRIx64 " (%zu subgraphs x %zu devices, %zu records)\n",
+                                step_sig, backend_ctx->n_subgraphs, n_backends, backend_ctx->step_records.size());
                     }
                     // capture recorded the work without executing it: run this compute via replay
                     if (launch_steps(steps)) {
                         return GGML_STATUS_SUCCESS;
                     }
                     if (getenv("GGML_META_DEBUG") != nullptr) {
-                        fprintf(stderr, "ggml_backend_meta: step graph launch FAILED for uid %" PRIu64 " (running uncaptured from now on)\n", cgraph->uid);
+                        fprintf(stderr, "ggml_backend_meta: step graph launch FAILED for signature %016" PRIx64 " (running uncaptured from now on)\n", step_sig);
                     }
-                    backend_ctx->step_records.back().uid = 0;
+                    backend_ctx->step_records.back().sig = 0;
                     // fall through: execute uncaptured
                 } else {
                     for (size_t j = 0; j < n_backends; j++) {
@@ -2883,13 +3009,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         }
                     }
                     ggml_backend_meta_context::step_record bad;
-                    bad.uid   = cgraph->uid;
+                    bad.sig   = step_sig;
                     bad.valid = false;
                     bad.steps.assign(n_backends, nullptr);
                     bad.epochs.assign(n_backends, 0);
                     backend_ctx->step_records.push_back(std::move(bad));
                     if (getenv("GGML_META_DEBUG") != nullptr) {
-                        fprintf(stderr, "ggml_backend_meta: step capture unavailable for uid %" PRIu64 " (fallback all-reduce or capture error)\n", cgraph->uid);
+                        fprintf(stderr, "ggml_backend_meta: step capture unavailable for signature %016" PRIx64 " (fallback all-reduce or capture error)\n", step_sig);
                     }
                     // the captured attempt executed nothing: run for real below
                 }
