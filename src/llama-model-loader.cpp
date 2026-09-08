@@ -1380,7 +1380,9 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
     GGML_ASSERT(w != nullptr);
 
     if (op == GGML_OP_NONE) {
-        return true;
+        // Storage-only side tensors cannot use a matrix-repacking buffer.
+        return buft == ggml_backend_dev_buffer_type(dev) ||
+               buft == ggml_backend_dev_host_buffer_type(dev);
     }
 
     ggml_init_params params = {
@@ -1665,6 +1667,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         ggml_op op;
         if (tn.suffix != nullptr && strcmp(tn.suffix, "bias") == 0) {
             op = info.op == GGML_OP_MUL_MAT_ID ? GGML_OP_ADD_ID : GGML_OP_ADD;
+        } else if (tn.suffix != nullptr && strcmp(tn.suffix, "input_scale") == 0 &&
+                t_meta->type == GGML_TYPE_I32 && ggml_nelements(t_meta) == 1) {
+            // Dynamic activation-quantization markers are metadata, not matrix
+            // weights. Probing an I32 MUL_MAT would place them on the CPU and
+            // make the scheduler copy four bytes before every GPU projection.
+            op = GGML_OP_NONE;
         } else if (hparams.router_layer >= 0 && tn.suffix != nullptr &&
                 (strcmp(tn.suffix, "lora_a") == 0 || strcmp(tn.suffix, "lora_b") == 0)) {
             op = GGML_OP_MUL_MAT_ID;
