@@ -14,4 +14,5 @@ struct ggml_cuda_ar_oneshot;
 ggml_cuda_ar_oneshot * ggml_cuda_ar_oneshot_init(const int * devices, size_t n_devices, size_t max_bytes);
 void                   ggml_cuda_ar_oneshot_free(ggml_cuda_ar_oneshot * st);
 bool                   ggml_cuda_ar_oneshot_eligible(const ggml_cuda_ar_oneshot * st, ggml_tensor ** tensors);
+void                   ggml_cuda_ar_oneshot_report_all();
 bool                   ggml_cuda_ar_oneshot_allreduce(ggml_cuda_ar_oneshot * st, ggml_backend_t * backends, ggml_tensor ** tensors);

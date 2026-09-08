@@ -19,6 +19,8 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+#include <thread>
+#include <time.h>
 
 struct ggml_backend_meta_device;
 struct ggml_backend_meta_buffer_type;
@@ -2710,6 +2712,50 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         return GGML_STATUS_SUCCESS;
     };
 
+    // Launching a large executable graph costs on the order of a millisecond, and every device waits at its
+    // first all-reduce for the last device launched, so fan the launches out over one thread per device (the
+    // CUDA driver is thread-safe per device/stream). Used for the recording step's own launch as well: a
+    // sequential first launch was observed to start device j only after device j-1's stream had drained.
+    auto launch_steps = [&](const std::vector<void *> & steps) -> bool {
+        static const bool launch_trace = getenv("GGML_META_DEBUG") != nullptr && atoi(getenv("GGML_META_DEBUG")) >= 2;
+        auto host_ms = []() {
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+        };
+        std::vector<char> launched_j(n_backends, 1);
+        for (size_t j = 0; j < n_backends; j++) {
+            backend_ctx->step_wait_uploads(backend_ctx->backend_configs[j].backend);
+        }
+        auto launch_one = [&](size_t j) {
+            const double t_a = launch_trace ? host_ms() : 0;
+            launched_j[j] = backend_ctx->step_launch(backend_ctx->backend_configs[j].backend, steps[j]);
+            if (launch_trace) {
+                fprintf(stderr, "ggml_backend_meta: step launch j=%zu issued %.3f returned %.3f host ms\n", j, t_a, host_ms());
+            }
+        };
+        if (n_backends > 2) {
+            std::vector<std::thread> workers;
+            workers.reserve(n_backends - 1);
+            for (size_t j = 1; j < n_backends; j++) {
+                workers.emplace_back([&, j]() { launch_one(j); });
+            }
+            launch_one(0);
+            for (auto & w : workers) {
+                w.join();
+            }
+        } else {
+            for (size_t j = 0; j < n_backends; j++) {
+                launch_one(j);
+            }
+        }
+        bool launched = true;
+        for (size_t j = 0; j < n_backends; j++) {
+            launched = launched && launched_j[j];
+        }
+        return launched;
+    };
+
     const bool step_graphs = backend_ctx->step_graphs && n_backends > 1 && backend_ctx->comm_ctx != nullptr && cgraph->uid != 0;
     if (step_graphs) {
         // replay a recorded step for this graph if its device state has not moved
@@ -2732,12 +2778,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 rec.uid = 0;
                 break;
             }
-            bool launched = true;
-            for (size_t j = 0; j < n_backends && launched; j++) {
-                backend_ctx->step_wait_uploads(backend_ctx->backend_configs[j].backend);
-                launched = backend_ctx->step_launch(backend_ctx->backend_configs[j].backend, rec.steps[j]);
-            }
-            if (launched) {
+            if (launch_steps(rec.steps)) {
                 rec.last_used = ggml_time_us();
                 return GGML_STATUS_SUCCESS;
             }
@@ -2786,6 +2827,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     steps[j] = backend_ctx->step_capture_end(backend_ctx->backend_configs[j].backend);
                     capture_ok = capture_ok && steps[j] != nullptr;
                 }
+                if (getenv("GGML_META_DEBUG") != nullptr && atoi(getenv("GGML_META_DEBUG")) >= 2) {
+                    fprintf(stderr, "ggml_backend_meta: capture ended on %zu devices (ok=%d), launching\n", n_began, (int) capture_ok);
+                }
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;
                 }
@@ -2821,11 +2865,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                                 cgraph->uid, backend_ctx->n_subgraphs, n_backends);
                     }
                     // capture recorded the work without executing it: run this compute via replay
-                    bool launched = true;
-                    for (size_t j = 0; j < n_backends && launched; j++) {
-                        launched = backend_ctx->step_launch(backend_ctx->backend_configs[j].backend, steps[j]);
-                    }
-                    if (launched) {
+                    if (launch_steps(steps)) {
                         return GGML_STATUS_SUCCESS;
                     }
                     if (getenv("GGML_META_DEBUG") != nullptr) {

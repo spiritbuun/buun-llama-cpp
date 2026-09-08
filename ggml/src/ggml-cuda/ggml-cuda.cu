@@ -1892,6 +1892,12 @@ static void * ggml_backend_cuda_step_capture_end(ggml_backend_t backend) {
         (void) cudaGraphDestroy(graph);
         return nullptr;
     }
+    // upload now so the first launch is as cheap as a replay: a lazy first-launch upload was observed to
+    // block the host until the previously launched device's stream drained, which serializes the devices
+    // and deadlocks in-graph collectives that need every rank in flight
+    if (cudaGraphUpload(instance, cuda_ctx->stream()) != cudaSuccess) {
+        (void) cudaGetLastError();
+    }
     ggml_cuda_step_graph * step = new ggml_cuda_step_graph;
     step->graph    = graph;
     step->instance = instance;
@@ -3912,6 +3918,10 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 }
 
 static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
+    static const bool ar1_debug = getenv("GGML_CUDA_AR1_DEBUG") != nullptr;
+    if (ar1_debug) {
+        ggml_cuda_ar_oneshot_report_all();
+    }
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
