@@ -39,6 +39,8 @@ const char * ggml_backend_meta_split_axis_name(enum ggml_backend_meta_split_axis
             return "MIRRORED";
         case GGML_BACKEND_SPLIT_AXIS_PARTIAL:
             return "PARTIAL";
+        case GGML_BACKEND_SPLIT_AXIS_DISJOINT:
+            return "DISJOINT";
         case GGML_BACKEND_SPLIT_AXIS_NONE:
             return "NONE";
         case GGML_BACKEND_SPLIT_AXIS_UNKNOWN:
@@ -562,10 +564,19 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 tensor->src[1]->ne[src_ss[0].axis] == 1 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return src_ss[0];
         }
-        // scaling a partial sum by a replicated factor (the router weights of expert parallelism) keeps it partial
+        // Expert parallelism. A disjoint expert output scaled by the replicated router weights starts the
+        // partial branch that the expert-slot sum and the delayed all-reduce complete (the planner sees a
+        // reduced value when asked to assume the sync). Two disjoint outputs of the same routing (gate and
+        // up) combine element-wise into a disjoint one; their sum is a partial sum.
         if ((tensor->op == GGML_OP_MUL || tensor->op == GGML_OP_DIV) &&
-                src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
-            return src_ss[0];
+                src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_DISJOINT && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
+        }
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_DISJOINT && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_DISJOINT) {
+            if (tensor->op == GGML_OP_MUL) {
+                return src_ss[0];
+            }
+            return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
         }
         if (src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && (src_ss[0].axis == src_ss[1].axis ||
            (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL)))) {
@@ -627,9 +638,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         // all tokens with its own expert window (foreign experts give zero rows), so the output is a partial
         // sum. The down projection consumes the (disjoint) partial up/gate activation of the same layer.
         if (tensor->op == GGML_OP_MUL_MAT_ID && src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2 &&
-                (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) &&
                 src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
-            return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
+            if (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                // up/gate: every (token, slot) row is produced on exactly one device, the others hold zeros
+                return {GGML_BACKEND_SPLIT_AXIS_DISJOINT, {0}, {1}, 1};
+            }
+            if (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_DISJOINT || src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+                // down: the rows are still device-disjoint; the expert-slot sum that follows makes it a partial sum
+                return {GGML_BACKEND_SPLIT_AXIS_DISJOINT, {0}, {1}, 1};
+            }
         }
         // batched matmul with the batches split across devices and a replicated activation
         if (src_ss[0].axis >= GGML_BACKEND_SPLIT_AXIS_2 && src_ss[0].axis < GGML_MAX_DIMS &&
@@ -698,7 +715,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 GGML_ABORT("shape mismatch for %s", ggml_op_name(tensor->op));
             }
             case GGML_BACKEND_SPLIT_AXIS_MIRRORED:
-            case GGML_BACKEND_SPLIT_AXIS_PARTIAL: {
+            case GGML_BACKEND_SPLIT_AXIS_PARTIAL:
+            case GGML_BACKEND_SPLIT_AXIS_DISJOINT: {
                 return src_ss[0];
             }
             default: {
@@ -750,7 +768,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 }
             }
         }
-        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL ||
+                src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_DISJOINT) {
             return src_ss[0];
         }
         GGML_ABORT("view of permuted tensor not implemented");
@@ -767,7 +786,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 return {ggml_backend_meta_split_axis(tensor->op_params[src_ss[0].axis]), {0}, {src_ss[0].nr[0]}, 1};
             }
             case GGML_BACKEND_SPLIT_AXIS_MIRRORED:
-            case GGML_BACKEND_SPLIT_AXIS_PARTIAL: {
+            case GGML_BACKEND_SPLIT_AXIS_PARTIAL:
+            case GGML_BACKEND_SPLIT_AXIS_DISJOINT: {
                 return src_ss[0];
             }
             default: {
@@ -787,7 +807,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_BACKEND_SPLIT_AXIS_2:
             case GGML_BACKEND_SPLIT_AXIS_3:
             case GGML_BACKEND_SPLIT_AXIS_MIRRORED:
-            case GGML_BACKEND_SPLIT_AXIS_PARTIAL: {
+            case GGML_BACKEND_SPLIT_AXIS_PARTIAL:
+            case GGML_BACKEND_SPLIT_AXIS_DISJOINT: {
                 return src_ss[0];
             }
             default: {
@@ -1473,7 +1494,8 @@ static void ggml_backend_meta_buffer_memset_tensor(
                 }
             }
         } break;
-        case GGML_BACKEND_SPLIT_AXIS_PARTIAL: {
+        case GGML_BACKEND_SPLIT_AXIS_PARTIAL:
+        case GGML_BACKEND_SPLIT_AXIS_DISJOINT: {
             GGML_ASSERT(value == 0);
             [[fallthrough]];
         }

@@ -443,10 +443,17 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_ffn_gate_exps_any    ("blk\\.\\d*\\.ffn_gate_exps\\.(weight|scale|input_scale)");
     static const std::regex pattern_ffn_gate_up_exps_any ("blk\\.\\d*\\.ffn_gate_up_exps\\.(weight|scale|input_scale)");
     static const std::regex pattern_ffn_down_exps_any    ("blk\\.\\d*\\.ffn_down_exps\\.(weight|scale|input_scale)");
-    static const bool expert_parallel = [] {
+    // Expert parallelism needs every routed row to stay on one device between the up/gate projection and
+    // the down projection; per-expert biases (added on all devices as partial sums) would break that, so
+    // models with expert biases keep the sliced layout until the bias add learns the expert window.
+    static const bool expert_parallel_env = [] {
         const char * env = std::getenv("LLAMA_SPLIT_EXPERTS");
         return env == nullptr || std::string(env) != "slice";
     }();
+    const bool expert_parallel = expert_parallel_env &&
+        ud->model->get_tensor("blk.0.ffn_down_exps.bias") == nullptr &&
+        ud->model->get_tensor("blk.0.ffn_up_exps.bias") == nullptr &&
+        ud->model->get_tensor("blk.0.ffn_gate_exps.bias") == nullptr;
     static const std::regex pattern_ffn_up_shexp_weight   ("blk\\.\\d*\\.ffn_up_shexp.weight");
     static const std::regex pattern_ffn_gate_shexp_weight ("blk\\.\\d*\\.ffn_gate_shexp.weight");
     static const std::regex pattern_ffn_down_shexp_weight ("blk\\.\\d*\\.ffn_down_shexp.weight");
