@@ -356,23 +356,14 @@ static constexpr __device__ int ggml_cuda_mmq_get_fallback(ggml_type type, int J
 
 // ---------------------------------------------------------------------------------------------
 
+static constexpr int GGML_CUDA_MMQ_MAX_J = 128;
+
 static __host__ int ggml_cuda_mmq_get_sram_stride(const ggml_type type, const int J, const bool fallback, const int cc) {
     return ggml_cuda_mmq_get_sram_stride(ggml_cuda_mmq_get_sram_layout(type, J, fallback, cc));
 }
 
 static constexpr __device__ int ggml_cuda_mmq_get_sram_stride(ggml_type type, int J, bool fallback) {
     return ggml_cuda_mmq_get_sram_stride(ggml_cuda_mmq_get_sram_layout(type, J, fallback));
-}
-
-static __host__ int ggml_cuda_mmq_get_J_max(const ggml_type type, const bool fallback, const int cc, const int64_t ne11) {
-    int ret = std::min(ne11, int64_t(512));
-    ret -= ret % 8;
-    for (;ret > 0; ret -= 8) {
-        if (ggml_cuda_mmq_get_config(type, ret, fallback, cc).type != GGML_TYPE_COUNT) {
-            return ret;
-        }
-    }
-    return ret;
 }
 
 static constexpr __device__ int ggml_cuda_mmq_get_rows_per_warp(ggml_type type, int J, bool fallback) {
@@ -1256,7 +1247,8 @@ static __global__ void mul_mat_q(
                     break;
                 }
 
-                ids_dst_shared[j] = ids_dst[col_low + jt*J + j];
+                const int col = col_low + jt*J + j;
+                ids_dst_shared[j] = col < col_high ? ids_dst[col] : 0;
             }
             __syncthreads();
         }
@@ -1478,7 +1470,8 @@ static __global__ void mul_mat_q_stream_k_fixup(
     const int col_diff = col_high - col_low;
 
     for (int j = threadIdx.y*warp_size + threadIdx.x; j < J; j += nwarps*warp_size) {
-        ids_dst_shared[j] = ids_dst[col_low + jt*J + j];
+        const int col = col_low + jt*J + j;
+        ids_dst_shared[j] = col < col_high ? ids_dst[col] : 0;
     }
     __syncthreads();
 
@@ -1668,7 +1661,7 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
     // MMQ tile width (J) at 64 for the small IQ/Q3_K quants where the wider 128 tile regressed.
     // Perf-only, NVIDIA-Ada-only, so it never touches Ampere/Volta/Blackwell/AMD, which keep the
     // upstream-tuned J=128 rows.
-    int J_cap = 128;
+    int J_cap = GGML_CUDA_MMQ_MAX_J;
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_ADA_LOVELACE) {
         switch (type) {
             case GGML_TYPE_IQ2_XXS:
@@ -1747,8 +1740,8 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
         case 120:
             launch_mul_mat_q<type, 120, fallback>(ctx, args, stream);
             break;
-        case 128:
-            launch_mul_mat_q<type, 128, fallback>(ctx, args, stream);
+        case GGML_CUDA_MMQ_MAX_J:
+            launch_mul_mat_q<type, GGML_CUDA_MMQ_MAX_J, fallback>(ctx, args, stream);
             break;
         default:
             fprintf(stderr, "J_best=%d\n", J_best);

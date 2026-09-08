@@ -10083,6 +10083,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // For issue 27873
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 1, 1, false, 1, 8192, 4096));
 
+    // Qwen3.8 Flash Next: broadcast activations with a ragged IQ1_S MMQ tile need padding
+    // based on the compact routed rows, even though the activation expert axis has width 1.
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ1_S, GGML_TYPE_F32, 512, 10, true, 128, 42, 2560));
+    // Also cover an MMQ extent below RDNA3/4's smallest IQ1_S tile.
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ1_S, GGML_TYPE_F32,   8,  1, false, 128, 8, 2560));
+    // Native NVFP4 keeps a separate per-row scale allocation that needs the same tail guarantee.
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32,   8,  2, false, 128, 42, 2560));
+
     for (int k : {1, 63, 65}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, k));
     }

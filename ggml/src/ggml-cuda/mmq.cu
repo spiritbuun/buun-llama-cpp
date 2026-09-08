@@ -145,11 +145,11 @@ static void ggml_cuda_mul_mat_q_impl(
 
     if (!ids) {
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block +
-            ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
+            GGML_CUDA_MMQ_MAX_J * sizeof(block_q8_1_mmq);
         ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
         if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
-            src1_scale.alloc(ne13*ne12*ne11);
+            src1_scale.alloc(ne13*ne12*ne11 + GGML_CUDA_MMQ_MAX_J);
         }
 
         {
@@ -213,15 +213,16 @@ static void ggml_cuda_mul_mat_q_impl(
         CUDA_CHECK(cudaGetLastError());
     }
 
-    const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block +
-        ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
+    // MMQ kernels read a complete final tile. Reserve one maximum-width tile so ragged compact
+    // rows remain mapped, including broadcast activations whose expert-axis width (ne11) is 1.
+    const size_t nbytes_src1_q8_1 = ne_get_rows*ne10_padded * y_block_size/y_values_per_block +
+        GGML_CUDA_MMQ_MAX_J * sizeof(block_q8_1_mmq);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
     ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
     if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
-        src1_scale.alloc(ne12*n_expert_used);
+        src1_scale.alloc(ne_get_rows + GGML_CUDA_MMQ_MAX_J);
     }
 
-    const int64_t ne11_flat = ne12*n_expert_used;
     const int64_t ne12_flat = 1;
     const int64_t ne13_flat = 1;
 
@@ -235,17 +236,17 @@ static void ggml_cuda_mul_mat_q_impl(
             const bool use_aligned_float8 = ggml_cuda_is_aligned(src1, align_float8);
             if (dedup_bcast) {
                 quantize_scatter_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10,
-                                        /*stride_token=*/s12, ne10_padded, ne12, ne11_flat, n_expert_used, stream);
+                                        /*stride_token=*/s12, ne10_padded, ne12, ne_get_rows, n_expert_used, stream);
             } else {
                 quantize_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13,
-                                        ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
+                                        ne10_padded, ne_get_rows, ne12_flat, ne13_flat, stream);
             }
         } else if (dedup_bcast) {
             quantize_scatter_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10,
-                                    /*stride_token=*/s12, ne10_padded, ne12, ne11_flat, n_expert_used, stream);
+                                    /*stride_token=*/s12, ne10_padded, ne12, ne_get_rows, n_expert_used, stream);
         } else {
             quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
-                                   ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
+                                   ne10_padded, ne_get_rows, ne12_flat, ne13_flat, stream);
         }
         CUDA_CHECK(cudaGetLastError());
     }
