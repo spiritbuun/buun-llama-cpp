@@ -3852,6 +3852,18 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                 if (!skip) {
                     if (logits_cpu.empty()) {
                         model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode);
+                        assert(model_and_ctx_cpu.first->supports_classic_vbr() ==
+                               (arch == LLM_ARCH_BAILINGMOE3));
+                        if (arch == LLM_ARCH_BAILINGMOE3) {
+                            assert(!model_and_ctx_cpu.first->supports_turbo_vbr());
+                        }
+                        if (arch == LLM_ARCH_QWEN4EXP) {
+                            assert(model_and_ctx_cpu.first->supports_turbo_vbr());
+                        }
+                        if (arch == LLM_ARCH_MINIMAX_M3 || arch == LLM_ARCH_GLM_DSA ||
+                                arch == LLM_ARCH_DEEPSEEK32 || arch == LLM_ARCH_DOTS3NOTE) {
+                            assert(!model_and_ctx_cpu.first->supports_turbo_vbr());
+                        }
                         logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llm_arch_supports_sm_tensor(arch)) {

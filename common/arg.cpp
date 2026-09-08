@@ -4,6 +4,7 @@
 #include "build-info.h"
 #include "chat.h"
 #include "common.h"
+#include "llama-vbr-codec.h"
 #include "download.h"
 #include "json-schema-to-grammar.h"
 #include "json.h"
@@ -375,12 +376,44 @@ static bool common_vbr_budget_is_dynamic(const std::string & raw) {
     return s == "dynamic" || s == "auto";
 }
 
-static bool common_vbr_budget_to_type(const std::string & raw, ggml_type & out, const char *& schedule_name) {
+static llama_vbr_codec common_vbr_codec_from_str(const std::string & raw, bool & auto_select) {
+    const std::string value = common_vbr_lower(raw);
+    if (value == "auto") {
+        auto_select = true;
+        // Provisional parse-time family. Model-aware resolution happens before fit.
+        return LLAMA_VBR_CODEC_TURBO;
+    }
+    auto_select = false;
+    if (value == "turbo") {
+        return LLAMA_VBR_CODEC_TURBO;
+    }
+    if (value == "classic") {
+        return LLAMA_VBR_CODEC_CLASSIC;
+    }
+    throw std::invalid_argument("unsupported VBR codec: " + raw + " (expected auto, turbo or classic)");
+}
+
+static bool common_vbr_budget_to_type(
+        const std::string & raw, llama_vbr_codec codec,
+        ggml_type & out, const char *& schedule_name) {
     const std::string s = common_vbr_lower(raw);
     if (s == "f16" || s == "fp16" || s == "16") {
         out = GGML_TYPE_F16;
         schedule_name = "f16";
         return true;
+    }
+    if (codec == LLAMA_VBR_CODEC_CLASSIC) {
+        if (s == "q8" || s == "q8_0" || s == "8") {
+            out = GGML_TYPE_Q8_0;
+            schedule_name = "q8_0";
+            return true;
+        }
+        if (s == "q4" || s == "q4_0" || s == "4") {
+            out = GGML_TYPE_Q4_0;
+            schedule_name = "q4_0";
+            return true;
+        }
+        return false;
     }
     if (s == "t8" || s == "turbo8" || s == "turbo8_0" || s == "8") {
         out = GGML_TYPE_TURBO8_0;
@@ -410,10 +443,10 @@ static bool common_vbr_budget_to_type(const std::string & raw, ggml_type & out, 
     return false;
 }
 
-ggml_type common_vbr_entry_type(const std::string & entry) {
+ggml_type common_vbr_entry_type(const std::string & entry, llama_vbr_codec codec) {
     ggml_type type = GGML_TYPE_COUNT;
     const char * name = nullptr;
-    if (!common_vbr_budget_to_type(entry, type, name)) {
+    if (!common_vbr_budget_to_type(entry, codec, type, name)) {
         throw std::invalid_argument("unsupported VBR entry tier: " + entry);
     }
     return type;
@@ -449,92 +482,68 @@ static std::string common_vbr_format_bits(double value) {
     return ss.str();
 }
 
-// bits/value of a turbo tier, derived from the ggml block layout — no hardcoded bpv anywhere
-// on the common side (the kv-cache derives its own from ggml_row_size)
-static double common_vbr_type_bits(ggml_type t) {
-    return 8.0 * ggml_type_size(t) / ggml_blck_size(t);
-}
-
-// the turbo tier ladder, descending (used for capacity surrogates and schedule-name pricing)
-static const std::pair<const char *, ggml_type> COMMON_VBR_TIERS[] = {
-    { "t8",    GGML_TYPE_TURBO8_0   },
-    { "t4",    GGML_TYPE_TURBO4_0   },
-    { "t3tcq", GGML_TYPE_TURBO3_TCQ },
-    { "t2tcq", GGML_TYPE_TURBO2_TCQ },
-    { "t1tcq", GGML_TYPE_TURBO1_TCQ },
-};
-
-static bool common_vbr_floor_to_bits(const std::string & raw, std::string & out, double & bits) {
+static bool common_vbr_floor_to_bits(
+        const std::string & raw, llama_vbr_codec codec,
+        std::string & out, double & bits) {
     const std::string s = common_vbr_lower(raw);
     if (s.empty() || s == "auto" || s == "none") {
         out = s.empty() ? "auto" : s;
         bits = 0.0;
         return true;
     }
-    if (s == "f16" || s == "fp16" || s == "16") {
-        bits = 16.0;
-        out = common_vbr_format_bits(bits);
-        return true;
-    }
-    ggml_type alias_type = GGML_TYPE_COUNT;
-    if (s == "t8" || s == "turbo8" || s == "turbo8_0") {
-        alias_type = GGML_TYPE_TURBO8_0;
-    } else if (s == "t4" || s == "turbo4" || s == "turbo4_0") {
-        alias_type = GGML_TYPE_TURBO4_0;
-    } else if (s == "t3" || s == "t3tcq" || s == "turbo3tcq" || s == "turbo3_tcq") {
-        alias_type = GGML_TYPE_TURBO3_TCQ;
-    } else if (s == "t2" || s == "t2tcq" || s == "turbo2tcq" || s == "turbo2_tcq") {
-        alias_type = GGML_TYPE_TURBO2_TCQ;
-    } else if (s == "t1" || s == "t1tcq" || s == "turbo1tcq" || s == "turbo1_tcq") {
-        alias_type = GGML_TYPE_TURBO1_TCQ;
-    }
-    if (alias_type != GGML_TYPE_COUNT) {
-        bits = common_vbr_type_bits(alias_type);
-        out = common_vbr_format_bits(bits);
+    // Bare numbers are literal aggregate bits/value. Named aliases select the exact
+    // physical rung (notably q8_0 is 8.5 bpv and q4_0 is 4.5 bpv).
+    char * end = nullptr;
+    const double parsed = std::strtod(s.c_str(), &end);
+    if (end != s.c_str() && end && *end == '\0') {
+        if (!std::isfinite(parsed) || parsed <= 0.0 || parsed > 16.0) {
+            return false;
+        }
+        bits = parsed;
+        out = common_vbr_format_bits(parsed);
         return true;
     }
 
-    char * end = nullptr;
-    const double parsed = std::strtod(s.c_str(), &end);
-    if (end == s.c_str() || (end && *end != '\0') || !std::isfinite(parsed) || parsed <= 0.0 || parsed > 16.0) {
+    ggml_type alias_type = GGML_TYPE_COUNT;
+    const char * alias_name = nullptr;
+    if (!common_vbr_budget_to_type(s, codec, alias_type, alias_name)) {
         return false;
     }
-    bits = parsed;
-    out = common_vbr_format_bits(parsed);
+    bits = llama_vbr_type_bits_per_value(alias_type);
+    out = common_vbr_format_bits(bits);
     return true;
 }
 
 // public wrapper (declared in common.h): floor spec -> aggregate bits/value, throwing on bad input.
 // Reuses the same table as the main CLI so llama-bench can't drift from the -ctk vbr / --vbr-floor path.
-double common_vbr_floor_bits(const std::string & floor) {
+double common_vbr_floor_bits(const std::string & floor, llama_vbr_codec codec) {
     std::string name;
     double bits = 0.0;
-    if (!common_vbr_floor_to_bits(floor, name, bits)) {
+    if (!common_vbr_floor_to_bits(floor, codec, name, bits)) {
         throw std::invalid_argument("unsupported VBR floor: " + floor);
     }
     return bits;
 }
 
 // smallest tier whose bits/value covers `bits` (ceil onto the ladder); F16 above t8
-static ggml_type common_vbr_capacity_surrogate_type(double bits) {
-    if (bits <= 0.0) {
-        return GGML_TYPE_F16;
-    }
+static ggml_type common_vbr_capacity_surrogate_type(llama_vbr_codec codec, double bits) {
     ggml_type best = GGML_TYPE_F16;
-    for (const auto & [name, t] : COMMON_VBR_TIERS) {
-        if (common_vbr_type_bits(t) + 1e-9 >= bits) {
+    const auto & ladder = llama_vbr_ladder(codec);
+    for (size_t i = 0; i < ladder.n_rungs; ++i) {
+        const ggml_type t = ladder.rungs[i];
+        if (llama_vbr_type_bits_per_value(t) + 1e-9 >= bits) {
             best = t; // tiers are descending; the last one that still covers is the smallest
         }
     }
     return best;
 }
 
-static double common_vbr_capacity_surrogate_bits(double bits) {
+static double common_vbr_capacity_surrogate_bits(llama_vbr_codec codec, double bits) {
     if (bits <= 0.0) {
         return 0.0;
     }
-    const ggml_type t = common_vbr_capacity_surrogate_type(bits);
-    return t == GGML_TYPE_F16 ? 16.0 : common_vbr_type_bits(t);
+    const ggml_type t = common_vbr_capacity_surrogate_type(codec, bits);
+    return llama_vbr_type_bits_per_value(t);
 }
 
 static bool common_vbr_parse_vram_budget(const std::string & raw, std::string & out, uint64_t & bytes) {
@@ -615,19 +624,6 @@ static void common_setenv_default(const char * name, const std::string & value) 
 #else
     setenv(name, value.c_str(), 0);
 #endif
-}
-
-static double common_vbr_tier_bits(const char * schedule_name) {
-    const std::string s = schedule_name ? schedule_name : "";
-    if (s == "f16") {
-        return 16.0;
-    }
-    for (const auto & [name, t] : COMMON_VBR_TIERS) {
-        if (s == name) {
-            return common_vbr_type_bits(t);
-        }
-    }
-    return 0.0;
 }
 
 static std::string common_vbr_dirname(const std::string & path) {
@@ -838,9 +834,10 @@ static double common_vbr_apply_policy_ladder(
     return choice.bpv;
 }
 
-static void common_params_postprocess_vbr(common_params & params) {
+void common_params_postprocess_vbr(common_params & params) {
     const bool vbr_selected =
         params.vbr_budget_explicit ||
+        params.vbr_codec_explicit ||
         params.vbr_entry_explicit ||
         params.vbr_min_bits_explicit ||
         params.vbr_vram_budget_explicit ||
@@ -856,16 +853,31 @@ static void common_params_postprocess_vbr(common_params & params) {
         budget = "dynamic";
     }
     params.vbr_budget = budget;
+    const auto & ladder = llama_vbr_ladder(params.vbr_codec);
 
-    // The common CLI selects dynamic VBR implicitly with a conservative t4 quality floor.
-    // Typing a VBR cache alias is an intentional opt-in to the complete ladder, so preserve
-    // the historical bottom-tier (t1) floor unless --vbr-floor was also typed. Fixed-tier
-    // --vbr-budget modes do not inherit a dynamic floor at all.
+    if (params.vbr_codec == LLAMA_VBR_CODEC_CLASSIC) {
+        if (common_env_present("VBR_LAYER_SCHEDULE")) {
+            throw std::invalid_argument(
+                "VBR_LAYER_SCHEDULE is Turbo-specific and cannot be used with --vbr-codec classic");
+        }
+        bool explicit_policy = false;
+        if (!common_vbr_policy_arg(params, explicit_policy).empty()) {
+            throw std::invalid_argument(
+                "--vbr-policy/VBR_POLICY_LADDER is Turbo-specific and cannot be used with --vbr-codec classic");
+        }
+    }
+
+    // Auto uses Turbo provisionally until model metadata is available. The common CLI uses
+    // a conservative t4 quality floor for Turbo; classic uses its q4_0 endpoint. Typing a Turbo VBR cache alias is an
+    // intentional opt-in to the complete Turbo ladder, so preserve the historical t1 floor
+    // unless --vbr-floor was also typed. Fixed-tier --vbr-budget modes inherit no floor.
     if (!params.vbr_min_bits_explicit) {
         const bool explicit_vbr_alias =
             (params.vbr_cache_type_k && params.vbr_cache_type_k_explicit) ||
             (params.vbr_cache_type_v && params.vbr_cache_type_v_explicit);
-        params.vbr_min_bits = common_vbr_budget_is_dynamic(budget) && !explicit_vbr_alias ? "t4" : "auto";
+        params.vbr_min_bits = params.vbr_codec == LLAMA_VBR_CODEC_CLASSIC
+            ? "q4_0"
+            : (common_vbr_budget_is_dynamic(budget) && !explicit_vbr_alias ? "t4" : "auto");
     }
 
     if (!params.vbr_cache_type_k && !params.vbr_cache_type_v) {
@@ -888,12 +900,13 @@ static void common_params_postprocess_vbr(common_params & params) {
 
     std::string floor_name;
     double floor_bits = 0.0;
-    if (!common_vbr_floor_to_bits(params.vbr_min_bits, floor_name, floor_bits)) {
+    if (!common_vbr_floor_to_bits(params.vbr_min_bits, params.vbr_codec, floor_name, floor_bits)) {
         throw std::invalid_argument("unsupported VBR floor: " + params.vbr_min_bits);
     }
     params.vbr_min_bits = floor_name;
     params.vbr_min_bits_value = floor_bits;
-    params.vbr_capacity_bits = floor_bits > 0.0 ? common_vbr_capacity_surrogate_bits(floor_bits) : 0.0;
+    params.vbr_capacity_bits = floor_bits > 0.0
+        ? common_vbr_capacity_surrogate_bits(params.vbr_codec, floor_bits) : 0.0;
     // The runtime channel is cparams (llama_context_params.vbr_dynamic / vbr_vram_budget_bytes /
     // vbr_min_bits, mapped from these params in common_context_params_to_llama and threaded
     // through create_memory); this function sets NO runtime env. The VBR_VMM / VBR_MODE /
@@ -914,7 +927,7 @@ static void common_params_postprocess_vbr(common_params & params) {
     if (common_vbr_budget_is_dynamic(budget)) {
         ggml_type entry_type = GGML_TYPE_COUNT;
         const char * entry_name = nullptr;
-        if (!common_vbr_budget_to_type(params.vbr_entry, entry_type, entry_name)) {
+        if (!common_vbr_budget_to_type(params.vbr_entry, params.vbr_codec, entry_type, entry_name)) {
             throw std::invalid_argument("unsupported VBR entry tier: " + params.vbr_entry);
         }
         params.vbr_entry = entry_name;
@@ -945,10 +958,10 @@ static void common_params_postprocess_vbr(common_params & params) {
             }
         }
 
-        // The dynamic ladder spans the selected entry down to t1tcq. A floor below t1 is
-        // unreachable; a floor above the entry is contradictory rather than something to clamp.
-        const double floor_lo = common_vbr_type_bits(GGML_TYPE_TURBO1_TCQ);
-        const double entry_bits = entry_type == GGML_TYPE_F16 ? 16.0 : common_vbr_type_bits(entry_type);
+        // The dynamic ladder spans the selected entry down to its codec endpoint. A floor below
+        // that endpoint is unreachable; a floor above the entry is contradictory, not a clamp.
+        const double floor_lo = llama_vbr_type_bits_per_value(ladder.default_floor);
+        const double entry_bits = llama_vbr_type_bits_per_value(entry_type);
         const bool both_sides_movable = params.vbr_cache_type_k && params.vbr_cache_type_v;
         if (both_sides_movable && floor_bits > entry_bits + 1e-9) {
             if (params.vbr_min_bits_explicit) {
@@ -957,13 +970,13 @@ static void common_params_postprocess_vbr(common_params & params) {
                     common_vbr_format_bits(entry_bits) + " bits/value)");
             }
             // A deliberately low entry also bounds the friendly implicit t4 floor. Requiring a
-            // redundant floor flag for t3/t2/t1 entries would make --vbr-entry needlessly brittle.
+            // redundant floor flag for a low entry would make --vbr-entry needlessly brittle.
             LOG_INF("VBR dynamic: lowering the implicit floor to the %s entry tier (%.4g bits/value)\n",
                     params.vbr_entry.c_str(), entry_bits);
             floor_bits = entry_bits;
             params.vbr_min_bits       = common_vbr_format_bits(floor_bits);
             params.vbr_min_bits_value = floor_bits;
-            params.vbr_capacity_bits  = common_vbr_capacity_surrogate_bits(floor_bits);
+            params.vbr_capacity_bits  = common_vbr_capacity_surrogate_bits(params.vbr_codec, floor_bits);
         }
         if (floor_bits > 0.0 && floor_bits < floor_lo - 1e-9) {
             LOG_WRN("VBR dynamic: --vbr-floor %.4g is below the degrade ladder minimum %.4g — clamping to %.4g\n",
@@ -971,7 +984,7 @@ static void common_params_postprocess_vbr(common_params & params) {
             floor_bits = floor_lo;
             params.vbr_min_bits       = common_vbr_format_bits(floor_bits);
             params.vbr_min_bits_value = floor_bits;
-            params.vbr_capacity_bits  = common_vbr_capacity_surrogate_bits(floor_bits);
+            params.vbr_capacity_bits  = common_vbr_capacity_surrogate_bits(params.vbr_codec, floor_bits);
         }
         // Dynamic means the runtime degrade controller (VMM-backed pool, price-ordered in-place
         // transcodes). Whole (layer,side) tensors degrade selectively as mapped bytes approach
@@ -1014,19 +1027,24 @@ static void common_params_postprocess_vbr(common_params & params) {
             params.cache_type_v = entry_type;
         }
         // capacity contract for telemetry/server metadata: the floor the advertised n_ctx is
-        // computed at (implicit CLI default t4; explicit -ct vbr without a floor uses t1)
+        // computed at (implicit Turbo default t4; explicit Turbo -ct vbr uses t1; classic uses q4_0)
         params.vbr_capacity_bits = floor_bits > 0.0 ? floor_bits
-            : 8.0 * ggml_type_size(GGML_TYPE_TURBO1_TCQ) / ggml_blck_size(GGML_TYPE_TURBO1_TCQ);
+            : llama_vbr_type_bits_per_value(ladder.default_floor);
         common_setenv_override("VBR_CAPACITY_BITS", common_vbr_format_bits(params.vbr_capacity_bits));
-        params.vbr_selected_family = "dynamic";
+        params.vbr_selected_family = std::string("dynamic-") + ladder.name;
         params.vbr_selected_policy = "runtime-controller";
         params.vbr_selected_bpv    = params.vbr_capacity_bits;
         const std::string budget_desc = (params.vbr_vram_budget_explicit && vram_budget_bytes > 0)
             ? std::to_string(vram_budget_bytes / (1024ull*1024ull)) + " MiB (explicit)"
             : "auto (remaining VRAM, resolved by fit)";
-        LOG_INF("VBR dynamic runtime controller: KV budget %s, entry tier %s, floor %.4g bits/value, "
-                "price-ordered decode-time degrades\n",
-                budget_desc.c_str(), params.vbr_entry.c_str(), params.vbr_capacity_bits);
+        // Auto initially uses Turbo only as a parser-time placeholder. Do not describe that
+        // provisional ladder as the runtime controller; model inspection reruns this postprocess
+        // after selecting the actual codec.
+        if (!params.vbr_codec_auto) {
+            LOG_INF("VBR dynamic %s runtime controller: KV budget %s, entry tier %s, floor %.4g bits/value, "
+                    "price-ordered decode-time degrades\n",
+                    ladder.name, budget_desc.c_str(), params.vbr_entry.c_str(), params.vbr_capacity_bits);
+        }
         return;
     }
 
@@ -1038,18 +1056,18 @@ static void common_params_postprocess_vbr(common_params & params) {
     const char * schedule_name = nullptr;
     std::string schedule_name_storage;
     double fixed_budget_bits = 0.0;
-    if (common_vbr_budget_to_type(budget, fixed_type, schedule_name)) {
-        fixed_budget_bits = common_vbr_tier_bits(schedule_name);
+    if (common_vbr_budget_to_type(budget, params.vbr_codec, fixed_type, schedule_name)) {
+        fixed_budget_bits = llama_vbr_type_bits_per_value(fixed_type);
     } else {
         std::string fixed_budget_name;
-        if (!common_vbr_floor_to_bits(budget, fixed_budget_name, fixed_budget_bits) || fixed_budget_bits <= 0.0) {
+        if (!common_vbr_floor_to_bits(budget, params.vbr_codec, fixed_budget_name, fixed_budget_bits) || fixed_budget_bits <= 0.0) {
             throw std::invalid_argument("unsupported VBR budget: " + params.vbr_budget);
         }
         bool has_policy = false;
         if (common_vbr_policy_arg(params, has_policy).empty()) {
             throw std::invalid_argument("numeric --vbr-budget values require --vbr-policy or VBR_POLICY_LADDER");
         }
-        fixed_type = common_vbr_capacity_surrogate_type(fixed_budget_bits);
+        fixed_type = common_vbr_capacity_surrogate_type(params.vbr_codec, fixed_budget_bits);
         schedule_name_storage = fixed_budget_name;
         schedule_name = schedule_name_storage.c_str();
     }
@@ -3337,8 +3355,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_VBR_BUDGET").set_hidden());
     add_opt(common_arg(
+        {"--vbr-codec"}, "CODEC",
+        "dynamic VBR codec ladder: auto = prefer Turbo when every KV layer supports it, otherwise "
+        "use classic when supported (default); turbo = F16 -> T8 -> T4 -> T3/T2/T1; "
+        "classic = F16 -> Q8_0 -> Q4_0 (currently for BailingMoE3/Ling)",
+        [](common_params & params, const std::string & value) {
+            params.vbr_codec = common_vbr_codec_from_str(value, params.vbr_codec_auto);
+            params.vbr_codec_explicit = true;
+        }
+    ).set_env("LLAMA_ARG_VBR_CODEC"));
+    add_opt(common_arg(
         {"--vbr-entry"}, "TIER",
-        "dynamic VBR entry tier: f16 (quality-first default), t8, t4, t3, t2, or t1. "
+        "dynamic VBR entry tier: f16 (quality-first default), a Turbo tier, or q8_0/q4_0 "
+        "with --vbr-codec classic. "
         "Starting below F16 is an explicit quality-for-bandwidth trade; tensors still degrade "
         "toward --vbr-floor as the KV VRAM budget fills",
         [](common_params & params, const std::string & value) {
@@ -3348,11 +3377,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_VBR_ENTRY"));
     add_opt(common_arg(
         {"--vbr-floor", "--vbr-min-bits"}, "BITS",
-        "aggregate VBR bits/value floor; accepts decimal bits or tier aliases f16, t8, t4, t3, t2, t1. "
+        "aggregate VBR bits/value floor; accepts decimal bits or aliases from the selected codec ladder. "
         "Dynamic mode enforces it LITERALLY: the degrade order stops at the last step whose aggregate "
         "stays at or above the floor (e.g. 4.25 = t4 layout with a few units held a tier higher), and "
-        "the advertised context capacity is computed at this floor (implicit VBR default: t4 = 4.125; "
-        "explicit -ct vbr without this flag: t1 = 1.25)",
+        "the advertised context capacity is computed at this floor (implicit Turbo default: t4 = 4.125; "
+        "explicit Turbo -ct vbr: t1 = 1.25; classic: q4_0 = 4.5)",
         [](common_params & params, const std::string & value) {
             params.vbr_min_bits = value;
             params.vbr_min_bits_explicit = true;

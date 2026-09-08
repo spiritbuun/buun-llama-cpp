@@ -149,6 +149,8 @@ target_include_directories(${TARGET} PUBLIC . ../vendor)
 # the internal SHA-256 primitive and carry no process-local accounting handles.
 set_source_files_properties(common-cache-plan-estimate.cpp common-retention-sidecar.cpp mtp-vocab-trim.cpp
     PROPERTIES INCLUDE_DIRECTORIES ${PROJECT_SOURCE_DIR}/src)
+set_source_files_properties(arg.cpp fit.cpp
+    PROPERTIES INCLUDE_DIRECTORIES ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries     (${TARGET} PUBLIC vendor::nlohmann vendor::sheredom)
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 

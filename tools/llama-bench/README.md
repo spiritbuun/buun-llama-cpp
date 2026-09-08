@@ -59,8 +59,9 @@ test parameters:
   -ub, --ubatch-size <n>                    (default: 512)
   -ctk, --cache-type-k <t>                  (default: f16)
   -ctv, --cache-type-v <t>                  (default: f16)
-  --vbr-entry <f16|t8|t4|t3|t2|t1>         dynamic VBR entry tier (default: f16)
-  --vbr-floor <t8|t4|t3tcq|t2tcq|t1tcq|auto>
+  --vbr-codec <turbo|classic>               dynamic VBR codec ladder (default: turbo)
+  --vbr-entry <tier>                        dynamic VBR entry tier (default: f16)
+  --vbr-floor <tier|bits|auto>
                                             arm dynamic VBR and set its aggregate floor
   -t, --threads <n>                         (default: system dependent)
   -C, --cpu-mask <hex,hex>                  (default: 0x0)
@@ -234,6 +235,7 @@ The CSV, JSON, JSONL, and SQL printers use the same runtime-generated schema. In
 | `n_gen_warmup` | integer | effective number of untimed generation warmup tokens |
 | `type_k` / `type_v` | string | `vbr` only for the movable side; pinned sides retain their concrete cache type |
 | `vbr_entry` | string | resolved dynamic entry tier, or `none` for a non-VBR matrix row |
+| `vbr_codec` | string | resolved dynamic codec ladder (`turbo` or `classic`) |
 | `vbr_floor` / `vbr_floor_explicit` | number / boolean | resolved aggregate floor and whether it was explicitly supplied |
 | `vbr_vram_bytes` / `vbr_vram_explicit` | integer / boolean | resolved KV VRAM budget (`0` means auto) and whether the option was explicitly supplied |
 

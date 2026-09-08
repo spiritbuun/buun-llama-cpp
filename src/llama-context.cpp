@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "llama-vbr-codec.h"
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -345,6 +346,7 @@ llama_context::llama_context(
     cparams.kv_unified = params.kv_unified;
     cparams.logits_all = params.logits_all;
     cparams.vbr_dynamic = params.vbr_dynamic;
+    cparams.vbr_codec = params.vbr_codec;
     cparams.vbr_min_bits = params.vbr_min_bits;
     cparams.vbr_vram_budget_bytes = params.vbr_vram_budget_bytes;
     cparams.vbr_growth_headroom_bytes = params.vbr_growth_headroom_bytes;
@@ -368,6 +370,7 @@ llama_context::llama_context(
                 "disarming the drafter's own VBR controller (shared layers follow the "
                 "target's tier flips; the drafter's own layers stay at their static types)\n", __func__);
         cparams.vbr_dynamic              = false;
+        cparams.vbr_codec                = LLAMA_VBR_CODEC_TURBO;
         cparams.vbr_min_bits             = 0.0;
         cparams.vbr_vram_budget_bytes    = 0;
         cparams.vbr_growth_headroom_bytes = 0;
@@ -427,9 +430,10 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: flash_attn            = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
     LLAMA_LOG_INFO("%s: kv_unified            = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
     if (cparams.vbr_dynamic || cparams.vbr_vram_budget_bytes > 0 || cparams.vbr_min_bits > 0.0) {
-        LLAMA_LOG_INFO("%s: vbr                    = %s, min_bits=%g, vram_budget=%" PRIu64 "\n",
+        LLAMA_LOG_INFO("%s: vbr                    = %s/%s, min_bits=%g, vram_budget=%" PRIu64 "\n",
                 __func__,
                 cparams.vbr_dynamic ? "dynamic" : "static",
+                llama_vbr_ladder(cparams.vbr_codec).name,
                 cparams.vbr_min_bits,
                 cparams.vbr_vram_budget_bytes);
     }
@@ -7129,6 +7133,7 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.vbr_codec                   =*/ LLAMA_VBR_CODEC_TURBO,
         /*.vbr_min_bits                =*/ 0.0,
         /*.vbr_vram_budget_bytes       =*/ 0,
         /*.vbr_growth_headroom_bytes   =*/ 0,
@@ -7212,6 +7217,36 @@ llama_context * llama_init_from_model(
             LLAMA_LOG_INFO("%s: SPLIT_MODE_TENSOR with quantized KV cache (K=%s, V=%s)\n",
                 __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
         }
+    }
+
+    const bool vbr_active = params.vbr_dynamic ||
+        params.vbr_vram_budget_bytes > 0 || params.vbr_min_bits > 0.0;
+    if (vbr_active &&
+        params.vbr_codec != LLAMA_VBR_CODEC_TURBO &&
+        params.vbr_codec != LLAMA_VBR_CODEC_CLASSIC) {
+        LLAMA_LOG_ERROR("%s: invalid VBR codec %d\n", __func__, int(params.vbr_codec));
+        return nullptr;
+    }
+
+    if (params.vbr_dynamic && params.vbr_codec == LLAMA_VBR_CODEC_CLASSIC) {
+        // Classic live retiering is currently implemented and validated for the
+        // BailingMoE3/Ling coupled cache. DSV4 retains its separate q8_0-capped
+        // policy; ordinary DSA does not thread VBR into its child caches yet.
+        if (!model->supports_classic_vbr()) {
+            LLAMA_LOG_ERROR("%s: classic VBR currently supports BailingMoE3/Ling models only\n", __func__);
+            return nullptr;
+        }
+        if (!llama_vbr_codec_contains(params.vbr_codec, params.type_k) ||
+            !llama_vbr_codec_contains(params.vbr_codec, params.type_v)) {
+            LLAMA_LOG_ERROR("%s: classic VBR entry must be f16, q8_0 or q4_0\n", __func__);
+            return nullptr;
+        }
+    }
+
+    if (params.vbr_dynamic && params.vbr_codec == LLAMA_VBR_CODEC_TURBO &&
+            !model->supports_turbo_vbr()) {
+        LLAMA_LOG_ERROR("%s: model KV geometry does not support the complete Turbo VBR ladder\n", __func__);
+        return nullptr;
     }
 
     if (llama_model_kv_cache_types_coupled(model) && params.type_k != params.type_v) {

@@ -92,6 +92,7 @@ static void test_vbr_prompt_cache_support_contract() {
           status::media_prompt_unsupported);
 
     for (const auto unsupported : {
+             status::codec_unsupported,
              status::draft_context_unsupported,
              status::speculative_slot_unsupported,
              status::media_prompt_unsupported,

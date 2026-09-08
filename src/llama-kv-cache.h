@@ -881,26 +881,26 @@ private:
     vbr_operation_id vbr_import_operation_ = {};
     void vbr_import_receipts_release() noexcept;
     void vbr_import_receipts_release_if_empty() noexcept;
-    std::vector<vbr_degrade_step> vbr_degrade_order_; // global price order, F16->t8 band first
+    std::vector<vbr_degrade_step> vbr_degrade_order_; // global price order, first ladder band first
     size_t         vbr_degrade_cursor_ = 0;
     size_t         vbr_budget_bytes_   = 0;           // global mapped-physical budget; 0 = no trigger
     uint32_t       vbr_stash_rows_     = 0;           // sink-stash rows per (layer,side); 0 = off
     // --vbr-floor (env VBR_MIN_BITS): first order step the aggregate bits/value floor forbids;
     // the cursor never advances past it (default = order size, i.e. unclamped)
     size_t vbr_degrade_limit_ = (size_t) -1;
-    // co-tenancy: end of the leading f16->t8 band of the order (demand sheds stop here);
+    // co-tenancy: end of the leading entry-to-first-rung band (demand sheds stop here);
     // 0 = no band (custom VBR_DEGRADE_ORDER carries no band guarantee -> demand shed off)
-    size_t t8_band_end_ = 0;
+    size_t first_band_end_ = 0;
     // peer-yield consent bound (buun 2026-07-20, explicit-floor-as-consent): a TYPED
     // --vbr-floor (flag or VBR_MIN_BITS env) consents demand sheds down to the floor —
     // the ledger is per-uid, so the demander is the same human who typed it. A defaulted
     // floor keeps the conservative restorable band. 0 = demand shedding disabled.
     size_t vbr_demand_limit() const {
-        if (t8_band_end_ == 0) {
+        if (first_band_end_ == 0) {
             return 0;
         }
         return vbr_floor_typed_ ? vbr_degrade_limit_
-                                : std::min(vbr_degrade_limit_, t8_band_end_);
+                                : std::min(vbr_degrade_limit_, first_band_end_);
     }
     bool vbr_floor_typed_ = false;
     // ---- co-tenancy donor state ----

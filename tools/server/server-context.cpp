@@ -6756,6 +6756,9 @@ private:
         if (params_base.mmproj_gpu_swap && has_mmproj
                 && params_base.speculative.uses_native_mtp_as_primary_drafter()
                 && params_base.fit_params && params_base.n_ctx == 0) {
+            // This path invokes the fitter before common_init_from_params(), so resolve codec
+            // auto here as well. The resolver is idempotent and common init will see concrete state.
+            common_params_resolve_vbr_codec_auto(params_base);
             std::vector<size_t> margins_base = params_base.fit_params_target;
             GGML_ASSERT(!margins_base.empty());
 
@@ -7694,9 +7697,11 @@ private:
                         return slot.can_speculate();
                     });
             vbr_prompt_cache_support =
-                server_vbr_prompt_cache_support_for(
-                    ctx_dft != nullptr, all_slots_speculative,
-                    false, false);
+                params_base.vbr_codec == LLAMA_VBR_CODEC_CLASSIC
+                    ? server_vbr_prompt_cache_support_status::codec_unsupported
+                    : server_vbr_prompt_cache_support_for(
+                        ctx_dft != nullptr, all_slots_speculative,
+                        false, false);
             const auto fallback =
                 server_vbr_prompt_cache_fallback_action_for(
                     vbr_prompt_cache_automatic,
@@ -21837,6 +21842,7 @@ server_context_meta server_context::get_meta() const {
         /* vbr_dynamic            */ impl->params_base.vbr_dynamic(),
         /* vbr_type_k             */ impl->params_base.vbr_cache_type_k,
         /* vbr_type_v             */ impl->params_base.vbr_cache_type_v,
+        /* vbr_codec              */ impl->params_base.vbr_codec == LLAMA_VBR_CODEC_CLASSIC ? "classic" : "turbo",
         /* vbr_entry_type_k       */ ggml_type_name(impl->params_base.cache_type_k),
         /* vbr_entry_type_v       */ ggml_type_name(impl->params_base.cache_type_v),
         /* vbr_min_bits           */ impl->params_base.vbr_min_bits_value,
@@ -23263,6 +23269,7 @@ static json server_vbr_meta_json(const server_context_meta * meta) {
         {"dynamic",           meta->vbr_dynamic},
         {"type_k",            meta->vbr_type_k},
         {"type_v",            meta->vbr_type_v},
+        {"codec",             meta->vbr_codec},
         {"entry_type_k",      meta->vbr_entry_type_k},
         {"entry_type_v",      meta->vbr_entry_type_v},
         {"floor_bpv",         meta->vbr_min_bits},

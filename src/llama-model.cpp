@@ -2292,6 +2292,56 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
     return layers[il].rope_short;
 }
 
+bool llama_model::supports_classic_vbr() const {
+    return arch == LLM_ARCH_BAILINGMOE3;
+}
+
+bool llama_model::supports_turbo_vbr() const {
+    // DSV4 owns a specialized, safe Q8-capped interpretation of Turbo VBR.
+    if (arch == LLM_ARCH_DEEPSEEK4) {
+        return true;
+    }
+
+    // These target contexts use specialized cache owners that do not consume the
+    // ordinary VBR parameters. Do not advertise a dynamic ladder merely because
+    // their metadata happens to contain a compatible attention head dimension.
+    switch (arch) {
+        case LLM_ARCH_MINIMAX_M3:
+        case LLM_ARCH_GLM_DSA:
+        case LLM_ARCH_DEEPSEEK32:
+        case LLM_ARCH_DOTS3NOTE:
+        case LLM_ARCH_DFLASH:
+        case LLM_ARCH_LLADA:
+        case LLM_ARCH_LLADA_MOE:
+        case LLM_ARCH_RND1:
+        case LLM_ARCH_DFLASH_DRAFT:
+        case LLM_ARCH_GEMMA4_DFLASH_DRAFT:
+            return false;
+        default:
+            break;
+    }
+
+    bool has_kv = false;
+    for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+        if (!hparams.has_kv(il) || hparams.n_head_kv(il) == 0) {
+            continue;
+        }
+        has_kv = true;
+
+        // Dynamic Turbo stores the cache in independently 128-padded K/V rows.
+        // Its native FA path supports the resulting matched 128/256/512 geometries.
+        const uint32_t head_k = hparams.n_embd_head_k(il);
+        const uint32_t head_v = hparams.n_embd_head_v(il);
+        const uint32_t padded_k = ((head_k + 127u) / 128u) * 128u;
+        const uint32_t padded_v = ((head_v + 127u) / 128u) * 128u;
+        if (padded_k != padded_v ||
+                (padded_k != 128u && padded_k != 256u && padded_k != 512u)) {
+            return false;
+        }
+    }
+    return has_kv;
+}
+
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
 
@@ -2299,6 +2349,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
     // recurrent/DSA caches do not take them
     const llama_memory_vbr_params vbr = {
         /*.dynamic               =*/ cparams.vbr_dynamic,
+        /*.codec                 =*/ cparams.vbr_codec,
         /*.budget_bytes          =*/ cparams.vbr_vram_budget_bytes,
         /*.min_bits              =*/ cparams.vbr_min_bits,
         /*.min_bits_explicit     =*/ cparams.vbr_min_bits_explicit,
@@ -2922,6 +2973,14 @@ int32_t llama_model_n_head_kv(const llama_model * model) {
 
 bool llama_model_kv_cache_types_coupled(const llama_model * model) {
     return model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4;
+}
+
+bool llama_model_supports_vbr_codec(const llama_model * model, llama_vbr_codec codec) {
+    switch (codec) {
+        case LLAMA_VBR_CODEC_TURBO:   return model->supports_turbo_vbr();
+        case LLAMA_VBR_CODEC_CLASSIC: return model->supports_classic_vbr();
+    }
+    return false;
 }
 
 int32_t llama_model_n_swa(const llama_model * model) {

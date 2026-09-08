@@ -118,6 +118,7 @@ struct llama_memory_params {
 // developer overrides on top of these.
 struct llama_memory_vbr_params {
     bool     dynamic      = false; // arm the VMM pool + decode-time degrade controller
+    enum llama_vbr_codec codec = LLAMA_VBR_CODEC_TURBO;
     uint64_t budget_bytes = 0;     // mapped-physical KV budget; 0 = floor-layout-cost fallback
     double   min_bits     = 0.0;   // aggregate bits/value floor (0 = bottom-tier floor)
     // the floor was TYPED (flag or env): doubles as peer-yield consent down to it

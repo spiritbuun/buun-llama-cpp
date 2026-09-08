@@ -469,6 +469,8 @@ struct cmd_params {
     std::vector<size_t>              fit_params_target;
     std::vector<uint32_t>            fit_params_min_ctx;
     bool                             vbr = false; // arm dynamic VBR and its decode-time degrade controller
+    llama_vbr_codec                  vbr_codec = LLAMA_VBR_CODEC_TURBO;
+    bool                             vbr_codec_explicit = false;
     std::string                      vbr_entry;  // discrete entry tier (quality-first default: f16)
     std::string                      vbr_floor;  // aggregate floor tier (t8/t4/t3tcq/t2tcq/t1tcq, auto = bottom)
     std::string                      vbr_vram;   // KV VRAM budget: auto (floor-layout fallback) or explicit MiB
@@ -530,6 +532,8 @@ static const cmd_params cmd_params_defaults = {
     /* fit_params_target    */ { 0 },
     /* fit_params_min_ctx   */ { 0 },
     /* vbr                  */ false,
+    /* vbr_codec            */ LLAMA_VBR_CODEC_TURBO,
+    /* vbr_codec_explicit   */ false,
     /* vbr_entry            */ "f16",
     /* vbr_floor            */ "auto",
     /* vbr_vram             */ "auto",
@@ -594,8 +598,9 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -ub, --ubatch-size <n>                            (default: %s)\n", join(cmd_params_defaults.n_ubatch, ",").c_str());
     printf("  -ctk, --cache-type-k <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_k, cmd_cache_type_name), ",").c_str());
     printf("  -ctv, --cache-type-v <t>                          (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_v, cmd_cache_type_name), ",").c_str());
-    printf("  --vbr-entry <f16|t8|t4|t3|t2|t1>                 dynamic VBR entry tier (default: f16)\n");
-    printf("  --vbr-floor <t8|t4|t3tcq|t2tcq|t1tcq|auto>        arm dynamic VBR (both sides), aggregate floor tier\n");
+    printf("  --vbr-codec <turbo|classic>                        dynamic VBR codec ladder (default: turbo)\n");
+    printf("  --vbr-entry <tier>                                  dynamic VBR entry tier (default: f16)\n");
+    printf("  --vbr-floor <tier|bits|auto>                        arm dynamic VBR (both sides), aggregate floor\n");
     printf("                                                    (also enabled by -ctk vbr / -ctv vbr; default floor: bottom tier)\n");
     printf("  --vbr-vram <auto|SIZE[K|M|G]>                     VBR KV VRAM budget (default: auto = floor-layout-cost fallback)\n");
     printf("  -t, --threads <n>                                 (default: %s)\n", join(cmd_params_defaults.n_threads, ",").c_str());
@@ -700,6 +705,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.no_warmup            = cmd_params_defaults.no_warmup;
     params.offline              = cmd_params_defaults.offline;
     params.vbr                  = cmd_params_defaults.vbr;
+    params.vbr_codec            = cmd_params_defaults.vbr_codec;
+    params.vbr_codec_explicit   = cmd_params_defaults.vbr_codec_explicit;
     params.vbr_entry            = cmd_params_defaults.vbr_entry;
     params.vbr_floor            = cmd_params_defaults.vbr_floor;
     params.vbr_vram             = cmd_params_defaults.vbr_vram;
@@ -881,6 +888,22 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 params.vbr       = true;
                 params.vbr_entry = argv[i];
                 params.vbr_entry_explicit = true;
+            } else if (arg == "--vbr-codec") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                const std::string codec = argv[i];
+                if (codec == "turbo") {
+                    params.vbr_codec = LLAMA_VBR_CODEC_TURBO;
+                } else if (codec == "classic") {
+                    params.vbr_codec = LLAMA_VBR_CODEC_CLASSIC;
+                } else {
+                    invalid_param = true;
+                    break;
+                }
+                params.vbr = true;
+                params.vbr_codec_explicit = true;
             } else if (arg == "--vbr-vram" || arg == "--vbr-budget") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1557,6 +1580,7 @@ struct cmd_params_instance {
     bool               vbr;
     bool               vbr_k;
     bool               vbr_v;
+    llama_vbr_codec    vbr_codec;
     std::string        vbr_entry;
     double             vbr_min_bits;
     bool               vbr_min_bits_explicit;
@@ -1647,6 +1671,7 @@ struct cmd_params_instance {
         row.v = vbr_v;
         row.type_k = type_k;
         row.type_v = type_v;
+        row.codec = vbr_codec;
         row.entry = vbr_entry;
         row.floor_bits = vbr_min_bits;
         row.floor_explicit = vbr_min_bits_explicit;
@@ -1662,7 +1687,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     std::vector<cmd_params_instance> instances;
     const llama_bench_vbr_plan vbr_plan = llama_bench_vbr_make_plan(
         params.type_k, params.type_v, params.vbr_entry, params.vbr_floor, params.vbr_vram,
-        params.vbr_entry_explicit, params.vbr_floor_explicit, params.vbr_vram_explicit);
+        params.vbr_entry_explicit, params.vbr_floor_explicit, params.vbr_vram_explicit,
+        params.vbr_codec, params.vbr_codec_explicit);
 
     // this ordering minimizes the number of times that each model needs to be reloaded
     // clang-format off
@@ -1735,6 +1761,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .vbr                   = */ vbr.active,
                 /* .vbr_k                 = */ vbr.k,
                 /* .vbr_v                 = */ vbr.v,
+                /* .vbr_codec             = */ vbr.codec,
                 /* .vbr_entry             = */ vbr.entry,
                 /* .vbr_min_bits          = */ vbr.floor_bits,
                 /* .vbr_min_bits_explicit = */ vbr.floor_explicit,
@@ -1784,6 +1811,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .vbr                   = */ vbr.active,
                 /* .vbr_k                 = */ vbr.k,
                 /* .vbr_v                 = */ vbr.v,
+                /* .vbr_codec             = */ vbr.codec,
                 /* .vbr_entry             = */ vbr.entry,
                 /* .vbr_min_bits          = */ vbr.floor_bits,
                 /* .vbr_min_bits_explicit = */ vbr.floor_explicit,
@@ -1833,6 +1861,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .vbr                   = */ vbr.active,
                 /* .vbr_k                 = */ vbr.k,
                 /* .vbr_v                 = */ vbr.v,
+                /* .vbr_codec             = */ vbr.codec,
                 /* .vbr_entry             = */ vbr.entry,
                 /* .vbr_min_bits          = */ vbr.floor_bits,
                 /* .vbr_min_bits_explicit = */ vbr.floor_explicit,
@@ -1867,6 +1896,7 @@ struct test {
     bool                     vbr;
     bool                     vbr_k;
     bool                     vbr_v;
+    std::string              vbr_codec;
     std::string              vbr_entry;
     double                   vbr_floor;
     bool                     vbr_floor_explicit;
@@ -1923,6 +1953,7 @@ struct test {
         vbr            = inst.vbr;
         vbr_k          = inst.vbr_k;
         vbr_v          = inst.vbr_v;
+        vbr_codec      = inst.vbr_codec == LLAMA_VBR_CODEC_CLASSIC ? "classic" : "turbo";
         vbr_entry      = inst.vbr_entry;
         vbr_floor      = inst.vbr_min_bits;
         vbr_floor_explicit = inst.vbr_min_bits_explicit;
@@ -2017,7 +2048,8 @@ struct test {
             "build_commit",   "build_number",   "cpu_info",      "gpu_info",       "backends",
             "model_filename", "model_type",     "model_size",    "model_n_params", "n_batch",
             "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
-            "type_k",         "type_v",         "vbr_entry",     "vbr_floor",      "vbr_floor_explicit",
+            "type_k",         "type_v",         "vbr_codec",     "vbr_entry",      "vbr_floor",
+            "vbr_floor_explicit",
             "vbr_vram_bytes", "vbr_vram_explicit", "n_gpu_layers", "n_cpu_moe",    "moe_cache",
             "moe_cache_fit",  "repack",         "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
@@ -2111,6 +2143,7 @@ struct test {
                                             std::to_string(poll),
                                             vbr_k ? "vbr" : ggml_type_name(type_k),
                                             vbr_v ? "vbr" : ggml_type_name(type_v),
+                                            vbr_codec,
                                             vbr_entry,
                                             std::to_string(vbr_floor),
                                             std::to_string(vbr_floor_explicit),
@@ -2467,6 +2500,7 @@ struct markdown_printer : public printer {
             fields.emplace_back("type_v");
         }
         if (params.vbr) {
+            fields.emplace_back("vbr_codec");
             fields.emplace_back("vbr_entry");
             fields.emplace_back("vbr_floor");
             fields.emplace_back("vbr_floor_explicit");

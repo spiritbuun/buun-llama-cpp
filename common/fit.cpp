@@ -1,4 +1,5 @@
 #include "fit.h"
+#include "llama-vbr-codec.h"
 
 #include "common.h"
 #include "log.h"
@@ -16,8 +17,6 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-
-static ggml_type common_vbr_floor_price_tier(double floor_bpv); // defined near the bottom
 
 // this enum is only used in llama_params_fit_impl but needs to be defined outside of it to fix a Windows compilation issue
 // enum to identify part of a layer for distributing its tensors:
@@ -215,9 +214,9 @@ struct common_vbr_fit_costs {
     ggml_type entry_v = GGML_TYPE_COUNT;
     double    bits_pt_floor = 0.0;       // out: per-token KV bits at the achievable clamped mix
     double    bits_pt_price = 0.0;       // out: per-token KV bits at cparams' (price) types
-    // out: model requires matching K/V cache types (MLA-family). Such caches run a static cap
-    // under dynamic VBR (no per-tier degrade), so the dry-load KV bytes are already the truth
-    // and the floor/price capacity scaling must not be applied.
+    // out: model requires matching K/V cache types and does not implement classic retiering.
+    // These Turbo paths run a static cap under dynamic VBR, so the dry-load KV bytes are already
+    // the truth and floor/price capacity scaling must not be applied.
     bool      types_coupled = false;
     // Per-token bytes of the flash-attention f16 dequant scratch at settled deep fill: a
     // context-linear consumer OUTSIDE the KV budget (it draws from the fit margin). Charged in
@@ -669,7 +668,11 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         }
         vbr_costs->bits_pt_price = llama_vbr_entry_bits_per_token(ctx.get(), cparams->type_k, cparams->type_v);
         vbr_costs->scratch_bytes_pt = llama_vbr_scratch_bytes_per_token(ctx.get(), vbr_costs->entry_k, vbr_costs->entry_v, cparams->vbr_min_bits);
-        vbr_costs->types_coupled = llama_model_kv_cache_types_coupled(model.get());
+        // Turbo cannot retier coupled MLA layouts. The classic ladder was
+        // introduced specifically for their single physical K allocation and
+        // therefore uses the ordinary floor/price mixture accounting.
+        vbr_costs->types_coupled = llama_model_kv_cache_types_coupled(model.get()) &&
+            cparams->vbr_codec == LLAMA_VBR_CODEC_TURBO;
     }
 
     return ret;
@@ -1052,10 +1055,6 @@ static void common_params_fit_impl(
     // controller (env VBR_BUDGET_MIB) = explicit --vbr-vram, or the bytes the KV can take on
     // this box: its (floor-priced) projected footprint plus whatever would remain free above the
     // margin. That formula preserves the margin exactly: mapped - floor_cost <= free - margin.
-    auto vbr_type_bits = [](enum ggml_type t) {
-        return 8.0 * ggml_type_size(t) / ggml_blck_size(t);
-    };
-
     auto vbr_scale_est = [&](uint64_t est) {
         // beyond the trained context rope is invalid and compute growth unaccounted — cap
         // every VBR-derived advert (explicit -c bypasses the estimators for power users)
@@ -1178,7 +1177,7 @@ static void common_params_fit_impl(
         // achievable tier MIX (vbr_kv_scale x the priced cost). Warn up front when the budget
         // cannot deliver the full context there (the runtime will also warn, at fill).
         const double floor_bpv = cparams->vbr_min_bits > 0.0 ? cparams->vbr_min_bits
-                                                             : vbr_type_bits(GGML_TYPE_TURBO1_TCQ);
+            : llama_vbr_type_bits_per_value(llama_vbr_ladder(cparams->vbr_codec).default_floor);
         const int64_t ctx_priced = sum_context_vbr_managed_bytes(dmds_target_full);
         // fire for the tier-exact default floor too (scale 1): a budget below the floor-cost
         // full context is the only startup signal for the runtime's warn-once-exceed state
@@ -1315,7 +1314,8 @@ static void common_params_fit_impl(
         if (cparams->vbr_dynamic) {
             LOG_INF("%s: VBR dynamic: advertised n_ctx = %" PRIu32 " = KV budget capacity at the %.4g bits/value floor (%s budget)\n",
                 __func__, cparams->n_ctx,
-                cparams->vbr_min_bits > 0.0 ? cparams->vbr_min_bits : vbr_type_bits(GGML_TYPE_TURBO1_TCQ),
+                cparams->vbr_min_bits > 0.0 ? cparams->vbr_min_bits
+                    : llama_vbr_type_bits_per_value(llama_vbr_ladder(cparams->vbr_codec).default_floor),
                 vbr_budget_explicit != 0 ? "explicit" : "auto");
         } else {
             LOG_TRC("%s: VBR selected n_ctx = %" PRIu32 " from %s\n",
@@ -2216,30 +2216,14 @@ static void common_params_fit_impl(
     set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
 }
 
-// largest turbo tier whose bits/value does not exceed the requested floor (t1 when 0/auto);
-// used to PRICE the KV during fitting in dynamic VBR mode
-static ggml_type common_vbr_floor_price_tier(double floor_bpv) {
-    const ggml_type tiers[] = {
-        GGML_TYPE_F16, GGML_TYPE_TURBO8_0, GGML_TYPE_TURBO4_0,
-        GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TURBO1_TCQ,
-    };
-    if (floor_bpv > 0.0) {
-        for (ggml_type t : tiers) {
-            if (8.0 * ggml_type_size(t) / ggml_blck_size(t) <= floor_bpv + 1e-9) {
-                return t;
-            }
-        }
-    }
-    return GGML_TYPE_TURBO1_TCQ;
-}
-
-ggml_type common_vbr_fit_price_type(ggml_type entry, double floor_bpv, bool pinned) {
-    if (pinned || (entry != GGML_TYPE_F16 && !ggml_is_turbo_kv_type(entry))) {
+ggml_type common_vbr_fit_price_type(
+        ggml_type entry, double floor_bpv, bool pinned, llama_vbr_codec codec) {
+    if (pinned || !llama_vbr_codec_contains(codec, entry)) {
         return entry;
     }
-    const ggml_type price_t = common_vbr_floor_price_tier(floor_bpv);
-    const double price_bits = 8.0 * ggml_type_size(price_t) / ggml_blck_size(price_t);
-    const double entry_bits = 8.0 * ggml_type_size(entry) / ggml_blck_size(entry);
+    const ggml_type price_t = llama_vbr_floor_price_type(codec, floor_bpv);
+    const double price_bits = llama_vbr_type_bits_per_value(price_t);
+    const double entry_bits = llama_vbr_type_bits_per_value(entry);
     return price_bits < entry_bits ? price_t : entry;
 }
 
@@ -2279,25 +2263,22 @@ enum common_params_fit_status common_fit_params(
     const ggml_type type_k_entry = cparams->type_k;
     const ggml_type type_v_entry = cparams->type_v;
     if (cparams->vbr_dynamic) {
-        const ggml_type price_t = common_vbr_floor_price_tier(cparams->vbr_min_bits);
-        // only the degradable sides price at the floor: a swappable type (F16 dynamic entry or
-        // a turbo tier) on a side that is not pin-flagged. A PINNED side (vbr_pin_k/v, or an
-        // explicit q8_0/bf16 the runtime cannot transcode) keeps its real cost — pricing it at
-        // the floor tier would over-advertise capacity for that half. Mirrors the runtime's
+        const ggml_type price_t = llama_vbr_floor_price_type(cparams->vbr_codec, cparams->vbr_min_bits);
+        // only degradable sides price at the floor: a codec rung on a side that is not
+        // pin-flagged. A PINNED side (vbr_pin_k/v, or an
+        // an entry outside the selected codec ladder) keeps its real cost — pricing it at the
+        // floor tier would over-advertise capacity for that half. Mirrors the runtime's
         // vbr_unit_movable contract: type swappable AND side not pinned.
-        auto movable = [](ggml_type t, bool pinned) {
-            return !pinned && (t == GGML_TYPE_F16 || ggml_is_turbo_kv_type(t));
-        };
-        if (movable(cparams->type_k, cparams->vbr_pin_k)) {
-            cparams->type_k = common_vbr_fit_price_type(type_k_entry, cparams->vbr_min_bits, false);
-        }
-        if (movable(cparams->type_v, cparams->vbr_pin_v)) {
-            cparams->type_v = common_vbr_fit_price_type(type_v_entry, cparams->vbr_min_bits, false);
-        }
+        cparams->type_k = common_vbr_fit_price_type(
+            type_k_entry, cparams->vbr_min_bits, cparams->vbr_pin_k, cparams->vbr_codec);
+        cparams->type_v = common_vbr_fit_price_type(
+            type_v_entry, cparams->vbr_min_bits, cparams->vbr_pin_v, cparams->vbr_codec);
+        const bool both_movable =
+            !cparams->vbr_pin_k && llama_vbr_codec_contains(cparams->vbr_codec, type_k_entry) &&
+            !cparams->vbr_pin_v && llama_vbr_codec_contains(cparams->vbr_codec, type_v_entry);
         LOG_INF("%s: VBR dynamic: fitting with KV priced at the %s floor tier%s\n",
                 __func__, ggml_type_name(price_t),
-                (movable(type_k_entry, cparams->vbr_pin_k) && movable(type_v_entry, cparams->vbr_pin_v))
-                    ? "" : " (pinned side at its own cost)");
+                both_movable ? "" : " (pinned side at its own cost)");
     }
 
     try {

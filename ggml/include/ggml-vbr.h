@@ -1,7 +1,7 @@
 #pragma once
 
-// Backend interface for TurboQuant KV-cache support (turbo-typed KV tensors and the
-// dynamic VBR degrade controller).
+// Backend interface for dynamically retiered KV caches (TurboQuant and classic
+// F16/Q8_0/Q4_0 representation ladders).
 //
 // libllama links NO backend symbols for this feature. At KV-cache init it resolves this
 // vtable through the backend registry:
@@ -44,7 +44,7 @@ static inline void ggml_vbr_kv_dequant_sides(enum ggml_type tk, enum ggml_type t
     *need_v = turbo_v || ((tv == GGML_TYPE_Q8_0 || tv == GGML_TYPE_BF16) && turbo_k);
 }
 
-// Dynamic VBR: transcode the first n_cells rows of a turbo KV tensor (src) to a lower turbo tier
+// Dynamic VBR: transcode the first n_cells rows of a managed KV tensor (src) to another rung
 // (type_B), writing into dst (a region of the KV pool buffer; == src->data for the in-place
 // degrade). src->name must be the cache tensor name (cache_k_l<L>_ms<M> / cache_v_l<L>_ms<M>) so the encoder
 // picks the right K/V codebook. stash_f16/stash_rows (nullable/0): f16 sink-stash — rows

@@ -1,5 +1,6 @@
-// Dynamic VBR transcode, Stage 2 (orchestration): turbo tier A -> lower tier B for n_cells cells.
-// Reuses the fattn dequant (Stage 1, original-domain f32) + the validated set_rows encoder.
+// Dynamic VBR transcode orchestration. Turbo sources reuse the fattn dequant;
+// classic F16/Q8_0/Q4_0 sources use the stock converter. Both share the
+// validated set_rows encoder.
 #include "common.cuh"
 #include "convert.cuh"
 #include "set-rows.cuh"
@@ -374,8 +375,14 @@ static void vbr_fidelity_dequant_all(ggml_backend_cuda_context & ctx, const char
     float * s32 = (float *) (workspace + layout.f32_off);
     for (int64_t c = 0; c < n_cells; c += TILE) {
         const int64_t Te = std::min<int64_t>(TILE, n_cells - c);
-        vbr_dequant_turbo_to_f32(data + (size_t) c * rowbytes, type, type,
-                                 s16, s32, Te, ne0, rowbytes, is_v, ctx.device, stream);
+        if (ggml_is_turbo_kv_type(type)) {
+            vbr_dequant_turbo_to_f32(data + (size_t) c * rowbytes, type, type,
+                                     s16, s32, Te, ne0, rowbytes, is_v, ctx.device, stream);
+        } else {
+            const to_fp32_cuda_t to_f32 = ggml_get_to_fp32_cuda(type);
+            GGML_ASSERT(to_f32 != nullptr);
+            to_f32(data + (size_t) c * rowbytes, s32, Te * ne0, stream);
+        }
         CUDA_CHECK(cudaMemcpyAsync(out.data() + (size_t) c * ne0, s32,
                                    (size_t) Te * ne0 * sizeof(float), cudaMemcpyDeviceToHost, stream));
     }
@@ -426,7 +433,7 @@ static void vbr_fidelity_report(const char * name, ggml_type tA, ggml_type tB,
             (long long) worst_row, worst_rms);
 }
 
-// Transcode the first n_cells rows of p->src (turbo type A) into p->dst as turbo type B.
+// Transcode the first n_cells rows of p->src (type A) into p->dst as type B.
 // p->dst points into the KV pool at the destination region. p->src->name MUST be the real cache
 // tensor name (cache_k_l<L>_ms<M> / cache_v_l<L>_ms<M>) — the encoder keys its K/V codebook,
 // affine-table identity, and kmean tap off it.
@@ -515,16 +522,30 @@ static void ggml_cuda_vbr_kv_transcode_impl(
         dstB->ne[1] = Te; dstB->nb[2] = dstB->nb[1]*Te; dstB->nb[3] = dstB->nb[2];
     };
 
+    const auto is_classic_type = [](ggml_type type) {
+        return type == GGML_TYPE_F16 || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0;
+    };
+    const bool classic_edge = is_classic_type(src_A->type) && is_classic_type(type_B);
+    const auto classic_to_f32 = classic_edge ? ggml_get_to_fp32_cuda(src_A->type) : nullptr;
+
     const int64_t n_tiles = (n_cells + TILE - 1) / TILE;
     int64_t cur_te = TILE;
     for (int64_t ti = 0; ti < n_tiles; ++ti) {
         const int64_t c  = (reverse_tiles ? n_tiles - 1 - ti : ti) * TILE;
         const int64_t Te = (n_cells - c < TILE) ? (n_cells - c) : TILE;
 
-        // Stage 1: dequant cells [c, c+Te) of src_A -> original-domain f32 [Te, ne0]
-        vbr_dequant_turbo_to_f32((const char *) src_A->data + (size_t) c * rA, src_A->type, type_B,
-                                 scratch_f16, scratch_f32,
-                                 Te, ne0, rA, is_v, ctx.device, stream);
+        // Stage 1: reconstruct cells [c, c+Te) in original-domain F32. Classic
+        // VBR uses the stock quant conversion directly; Turbo retains its
+        // FWHT/codebook/alpha path. Both feed the same generic set_rows encoder.
+        if (classic_edge) {
+            classic_to_f32(
+                (const char *) src_A->data + (size_t) c * rA,
+                scratch_f32, Te * ne0, stream);
+        } else {
+            vbr_dequant_turbo_to_f32((const char *) src_A->data + (size_t) c * rA, src_A->type, type_B,
+                                     scratch_f16, scratch_f32,
+                                     Te, ne0, rA, is_v, ctx.device, stream);
+        }
         // f16 sink-stash: rows below stash_rows re-encode from the pristine stash captured at the
         // tensor's FIRST degrade, not from the tier-A recon — sink rows are permanently hot AND
         // permanently old (they survive every wave), so this caps their error at single-hop forever.
@@ -543,7 +564,7 @@ static void ggml_cuda_vbr_kv_transcode_impl(
                 scratch_f32, mean_buf, Te, ne0);
         }
 
-        // Stage 2: re-encode f32 -> turbo B into dst_B_data + c*rB via the set_rows path
+        // Stage 2: re-encode F32 into destination rung B through set_rows.
         if (Te != cur_te) {
             set_rows_count(Te); // partial tile (last in ascending order, FIRST in descending)
             cur_te = Te;

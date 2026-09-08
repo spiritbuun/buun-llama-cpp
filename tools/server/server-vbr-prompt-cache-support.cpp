@@ -5,6 +5,8 @@ const char * server_vbr_prompt_cache_support_status_name(
     switch (status) {
         case server_vbr_prompt_cache_support_status::supported:
             return "supported";
+        case server_vbr_prompt_cache_support_status::codec_unsupported:
+            return "codec_unsupported";
         case server_vbr_prompt_cache_support_status::draft_context_unsupported:
             return "draft_context_unsupported";
         case server_vbr_prompt_cache_support_status::speculative_slot_unsupported:

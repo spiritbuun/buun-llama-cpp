@@ -63,6 +63,7 @@ struct llama_cparams {
     bool logits_all;
     bool pipeline_parallel;
     bool vbr_dynamic;
+    enum llama_vbr_codec vbr_codec = LLAMA_VBR_CODEC_TURBO;
 
     double vbr_min_bits = 0.0;
     uint64_t vbr_vram_budget_bytes = 0;
