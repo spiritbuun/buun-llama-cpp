@@ -52,6 +52,9 @@ struct source_spec {
     // Stack the parts along a third dimension (per-expert targets of equal
     // shape) instead of concatenating rows.
     bool stack_parts = false;
+    // A validated FP8 projection also concatenates its channel-scale vector.
+    bool fp8_channel_parts = false;
+    bool concat_vectors = false;
 
     source_spec() = default;
     source_spec(
@@ -163,6 +166,52 @@ bool fuse_qkvz_enabled() {
         return value == nullptr || std::atoi(value) != 0;
     }();
     return enabled;
+}
+
+std::optional<source_spec> fp8_qkv_source(
+        const llama_safetensors_registry & registry,
+        const llama_safetensors_quant_adapters & quant,
+        const std::string & prefix, int layer, const std::string & suffix) {
+    if (registry.find(prefix + "self_attn.qkv_proj.weight")) return std::nullopt;
+    std::vector<uint8_t> input_marker;
+    ggml_type scale_type = GGML_TYPE_COUNT;
+    int64_t width = 0;
+    for (const char * part : { "q_proj", "k_proj", "v_proj" }) {
+        const std::string module = prefix + "self_attn." + part;
+        // Bias concatenation is not supplied by this path.
+        if (registry.find(module + ".bias")) return std::nullopt;
+        const auto weight = quant.bind(module, llama_safetensors_quant_role::WEIGHT);
+        if (!weight || weight->target_type != GGML_TYPE_F8_E4M3 ||
+                weight->target_shape.size() != 2) return std::nullopt;
+        const auto scale = quant.bind(module, llama_safetensors_quant_role::WEIGHT_SCALE);
+        const auto input = quant.bind(module, llama_safetensors_quant_role::INPUT_SCALE);
+        if (!scale || (scale->target_type != GGML_TYPE_F32 && scale->target_type != GGML_TYPE_BF16) ||
+                scale->target_shape != std::vector<int64_t>{ weight->target_shape[1] } ||
+                !input || input->materialization != llama_safetensors_quant_materialization::DYNAMIC_FP8_MARKER) {
+            return std::nullopt;
+        }
+        const auto marker = quant.read(*input);
+        if (input_marker.empty()) {
+            input_marker = marker;
+            scale_type = scale->target_type;
+            width = weight->target_shape[0];
+        } else if (marker != input_marker || scale->target_type != scale_type || weight->target_shape[0] != width) {
+            return std::nullopt;
+        }
+    }
+    if (suffix == "attn_qkv.input_scale") {
+        const std::string module = prefix + "self_attn.q_proj";
+        return quantized_or_plain(quant, module, llama_safetensors_quant_role::INPUT_SCALE, {}, {});
+    }
+    source_spec result;
+    result.parts_first = true;
+    result.fp8_channel_parts = true;
+    result.concat_vectors = suffix == "attn_qkv.scale";
+    for (const char * part : { "attn_q", "attn_k", "attn_v" }) {
+        result.part_targets.push_back("blk." + std::to_string(layer) + "." + part +
+                                      (result.concat_vectors ? ".scale" : ".weight"));
+    }
+    return result;
 }
 
 source_spec sliced_quantized(
@@ -290,6 +339,7 @@ std::optional<source_spec> map_executorch_moe_target(
 }
 
 source_spec map_target_unchecked(
+        const llama_safetensors_registry & registry,
         const llama_safetensors_quant_adapters & quant,
         const qwen_geometry & geometry,
         const std::string & target_name) {
@@ -393,6 +443,11 @@ source_spec map_target_unchecked(
             transforms.push_back(transform_kind::OFFSET_NORM);
         }
         return bind_source_name(quant, std::move(*ordinary), std::move(transforms));
+    }
+
+    if (!is_recurrent_layer(layer, geometry) && fuse_qkv_enabled() &&
+            (suffix == "attn_qkv.weight" || suffix == "attn_qkv.scale" || suffix == "attn_qkv.input_scale")) {
+        if (auto fused = fp8_qkv_source(registry, quant, prefix, layer, suffix)) return std::move(*fused);
     }
 
     if (!is_recurrent_layer(layer, geometry) && suffix == "attn_qkv.weight") {
@@ -540,10 +595,11 @@ void validate_transform_plan(const source_spec & spec, const std::string & targe
 }
 
 source_spec map_target(
+        const llama_safetensors_registry & registry,
         const llama_safetensors_quant_adapters & quant,
         const qwen_geometry & geometry,
         const std::string & target_name) {
-    source_spec result = map_target_unchecked(quant, geometry, target_name);
+    source_spec result = map_target_unchecked(registry, quant, geometry, target_name);
     validate_transform_plan(result, target_name);
     return result;
 }
@@ -1469,7 +1525,7 @@ bool llama_safetensors_qwen35_importer::describe(
     };
     source_spec spec;
     try {
-        spec = map_target(*quant_, geometry, target_name);
+        spec = map_target(registry_, *quant_, geometry, target_name);
     } catch (const unsupported_target &) {
         return false;
     }
@@ -1499,7 +1555,8 @@ bool llama_safetensors_qwen35_importer::describe(
         return true;
     }
     if (!spec.part_targets.empty() && (spec.parts_first || registry_.find(spec.name) == nullptr)) {
-        // Row-concatenate the parts: same type, same width, summed rows.
+        // Concatenate weight rows or the matching channel-scale vectors.
+        const int axis = spec.concat_vectors ? 0 : 1;
         ne.fill(1);
         type = GGML_TYPE_COUNT;
         for (const std::string & part : spec.part_targets) {
@@ -1509,19 +1566,19 @@ bool llama_safetensors_qwen35_importer::describe(
                 return false;
             }
             if (type == GGML_TYPE_COUNT) {
-                // Only self-contained row blocks concatenate; channel-scaled
-                // formats carry sidecar scale tensors and stay separate.
-                if (part_type == GGML_TYPE_F8_E4M3 || part_type == GGML_TYPE_I8 ||
+                // Channel-scaled FP8 requires a plan that also joins scales;
+                // other sidecar formats keep their separate projections.
+                if ((part_type == GGML_TYPE_F8_E4M3 && !spec.fp8_channel_parts) || part_type == GGML_TYPE_I8 ||
                         part_type == GGML_TYPE_GPTQ_AO) {
                     return false;
                 }
                 type  = part_type;
-                ne[0] = part_ne[0];
-                ne[1] = 0;
-            } else if (part_type != type || part_ne[0] != ne[0]) {
+                ne = part_ne;
+                ne[axis] = 0;
+            } else if (part_type != type || part_ne[1 - axis] != ne[1 - axis]) {
                 return false;
             }
-            ne[1] += part_ne[1];
+            ne[axis] += part_ne[axis];
         }
         return true;
     }
@@ -1551,7 +1608,7 @@ void llama_safetensors_qwen35_importer::bind(const std::string & target_name) co
         n_layer_, n_mtp_, n_key_heads_, n_value_heads_, key_head_dim_, value_head_dim_,
         full_attention_interval_, text_only_, moe_, executorch_flat_, n_expert_,
     };
-    const source_spec spec = map_target(*quant_, geometry, target_name);
+    const source_spec spec = map_target(registry_, *quant_, geometry, target_name);
     if (!spec.part_targets.empty() && (spec.parts_first || registry_.find(spec.name) == nullptr)) {
         for (const std::string & part : spec.part_targets) {
             bind(part);
@@ -1569,7 +1626,7 @@ bool llama_safetensors_qwen35_importer::load(
         n_layer_, n_mtp_, n_key_heads_, n_value_heads_, key_head_dim_, value_head_dim_,
         full_attention_interval_, text_only_, moe_, executorch_flat_, n_expert_,
     };
-    const source_spec spec = map_target(*quant_, geometry, target_name);
+    const source_spec spec = map_target(registry_, *quant_, geometry, target_name);
     if (!spec.part_targets.empty() && (spec.parts_first || spec.stack_parts || registry_.find(spec.name) == nullptr)) {
         return false;
     }
@@ -1611,7 +1668,7 @@ std::vector<uint8_t> llama_safetensors_qwen35_importer::materialize(const std::s
             n_layer_, n_mtp_, n_key_heads_, n_value_heads_, key_head_dim_, value_head_dim_,
             full_attention_interval_, text_only_, moe_, executorch_flat_, n_expert_,
         };
-        const source_spec spec = map_target(*quant_, geometry, target_name);
+        const source_spec spec = map_target(registry_, *quant_, geometry, target_name);
         if (!spec.part_targets.empty() && (spec.parts_first || registry_.find(spec.name) == nullptr)) {
             std::vector<uint8_t> fused;
             fused.reserve(target_size);

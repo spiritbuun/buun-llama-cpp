@@ -1301,6 +1301,111 @@ int main(int argc, char ** argv) {
                     qkv_type == GGML_TYPE_BF16 && qkv_ne[0] == 4,
                 "FP8 QKV fallback lost its channel scales");
 
+        // Full-attention FP8 Q|K|V must preserve both weight bytes and the
+        // matching channel scales, with one compatible dynamic input marker.
+        const auto full_qkv_dir = dir.path / "full-qkv-fp8";
+        const std::string attn_prefix = "model.language_model.layers.3.self_attn.";
+        std::vector<tensor_fixture> full_qkv_tensors;
+        std::vector<uint8_t> joined_weights, joined_scales;
+        auto full_qkv_config = config;
+        auto & targets = full_qkv_config["quantization_config"]["config_groups"]["fp8"]["targets"];
+        targets = json::array();
+        int part_index = 0;
+        for (const char * part : { "q_proj", "k_proj", "v_proj" }) {
+            const std::string module = attn_prefix + part;
+            const uint64_t rows = part_index == 0 ? 4 : 2;
+            std::vector<uint8_t> weights(rows * 2, uint8_t(0x30 + part_index));
+            std::vector<float> scales(rows, 0.50019f + part_index * 0.12345f);
+            std::vector<uint8_t> scale_bytes(rows * sizeof(float));
+            memcpy(scale_bytes.data(), scales.data(), scale_bytes.size());
+            full_qkv_tensors.push_back({ module + ".weight", "F8_E4M3", {rows, 2}, weights });
+            full_qkv_tensors.push_back({ module + ".weight_scale", "F32", {rows, 1}, scale_bytes });
+            joined_weights.insert(joined_weights.end(), weights.begin(), weights.end());
+            joined_scales.insert(joined_scales.end(), scale_bytes.begin(), scale_bytes.end());
+            targets.push_back(module);
+            ++part_index;
+        }
+        write_single_shard_model(full_qkv_dir, full_qkv_tensors);
+        write_text(full_qkv_dir / "generation_config.json", "{}");
+        write_text(full_qkv_dir / "tokenizer.json", "{}");
+        llama_safetensors_qwen35_importer full_qkv_importer(full_qkv_dir, full_qkv_config);
+        require(full_qkv_importer.describe("blk.3.attn_qkv.weight", qkv_type, qkv_ne) &&
+                    qkv_type == GGML_TYPE_F8_E4M3 && qkv_ne == std::array<int64_t, GGML_MAX_DIMS>{2, 8, 1, 1},
+                "FP8 full-attention QKV did not concatenate rows");
+        require(full_qkv_importer.materialize("blk.3.attn_qkv.weight", qkv_type, joined_weights.size()) == joined_weights,
+                "FP8 QKV changed weight bytes or row order");
+        require(full_qkv_importer.describe("blk.3.attn_qkv.scale", qkv_type, qkv_ne) &&
+                    qkv_type == GGML_TYPE_F32 && qkv_ne == std::array<int64_t, GGML_MAX_DIMS>{8, 1, 1, 1},
+                "FP8 QKV lost channel-scale geometry");
+        require(full_qkv_importer.materialize("blk.3.attn_qkv.scale", qkv_type, joined_scales.size()) == joined_scales,
+                "FP8 QKV changed channel-scale precision or order");
+        require(full_qkv_importer.describe("blk.3.attn_qkv.input_scale", qkv_type, qkv_ne) &&
+                    qkv_type == GGML_TYPE_I32 && qkv_ne == std::array<int64_t, GGML_MAX_DIMS>{1, 1, 1, 1} &&
+                    full_qkv_importer.materialize("blk.3.attn_qkv.input_scale", qkv_type, 4) == std::vector<uint8_t>(4, 0),
+                "FP8 QKV did not retain its shared dynamic marker");
+        for (const char * suffix : { "weight", "scale", "input_scale" }) {
+            full_qkv_importer.bind(std::string("blk.3.attn_qkv.") + suffix);
+        }
+        full_qkv_importer.validate_complete();
+
+        auto clipped_qkv_config = full_qkv_config;
+        clipped_qkv_config["quantization_config"] = {
+            {"quant_method", "fbgemm_fp8"}, {"activation_scale_ub", 1200.0f}, {"modules_to_not_convert", json::array()}};
+        llama_safetensors_qwen35_importer clipped_qkv_importer(full_qkv_dir, clipped_qkv_config);
+        float clip = 1200.0f;
+        std::vector<uint8_t> clip_bytes(sizeof(clip));
+        memcpy(clip_bytes.data(), &clip, sizeof(clip));
+        require(clipped_qkv_importer.materialize("blk.3.attn_qkv.input_scale", GGML_TYPE_I32, 4) == clip_bytes,
+                "FP8 QKV discarded the dynamic clipping bound");
+
+        auto bf16_qkv_tensors = full_qkv_tensors;
+        std::vector<uint8_t> bf16_joined_scales;
+        for (size_t index : {1, 3, 5}) {
+            auto & tensor = bf16_qkv_tensors[index];
+            tensor.dtype = "BF16";
+            tensor.data.clear();
+            for (uint64_t row = 0; row < tensor.shape[0]; ++row) {
+                tensor.data.insert(tensor.data.end(), {0x80, 0x3f});
+                bf16_joined_scales.insert(bf16_joined_scales.end(), {0x80, 0x3f});
+            }
+        }
+        const auto bf16_qkv_dir = dir.path / "full-qkv-fp8-bf16-scale";
+        write_single_shard_model(bf16_qkv_dir, bf16_qkv_tensors);
+        write_text(bf16_qkv_dir / "generation_config.json", "{}");
+        write_text(bf16_qkv_dir / "tokenizer.json", "{}");
+        llama_safetensors_qwen35_importer bf16_qkv_importer(bf16_qkv_dir, full_qkv_config);
+        require(bf16_qkv_importer.describe("blk.3.attn_qkv.scale", qkv_type, qkv_ne) && qkv_type == GGML_TYPE_BF16 &&
+                    bf16_qkv_importer.materialize("blk.3.attn_qkv.scale", qkv_type, 16) == bf16_joined_scales,
+                "FP8 QKV did not preserve BF16 scale bytes");
+
+        // Do not silently convert mixed scale precisions just to enable fusion.
+        bf16_qkv_tensors[5] = full_qkv_tensors[5];
+        const auto mixed_qkv_dir = dir.path / "full-qkv-fp8-mixed-scale";
+        write_single_shard_model(mixed_qkv_dir, bf16_qkv_tensors);
+        write_text(mixed_qkv_dir / "generation_config.json", "{}");
+        write_text(mixed_qkv_dir / "tokenizer.json", "{}");
+        llama_safetensors_qwen35_importer mixed_qkv_importer(mixed_qkv_dir, full_qkv_config);
+        require(!mixed_qkv_importer.describe("blk.3.attn_qkv.weight", qkv_type, qkv_ne),
+                "FP8 QKV silently combined mixed channel-scale precisions");
+
+        // Static input quantization is not qualified for this concatenation.
+        auto static_qkv_config = full_qkv_config;
+        auto & static_input = static_qkv_config["quantization_config"]["config_groups"]["fp8"]["input_activations"];
+        static_input["dynamic"] = false;
+        static_input["strategy"] = "tensor";
+        for (const char * part : { "q_proj", "k_proj", "v_proj" }) {
+            full_qkv_tensors.push_back({ attn_prefix + part + ".input_scale", "F32", {1}, {0, 0, 0x80, 0x3f} });
+        }
+        const auto static_qkv_dir = dir.path / "full-qkv-fp8-static";
+        write_single_shard_model(static_qkv_dir, full_qkv_tensors);
+        write_text(static_qkv_dir / "generation_config.json", "{}");
+        write_text(static_qkv_dir / "tokenizer.json", "{}");
+        llama_safetensors_qwen35_importer static_qkv_importer(static_qkv_dir, static_qkv_config);
+        require(!static_qkv_importer.describe("blk.3.attn_qkv.weight", qkv_type, qkv_ne),
+                "unqualified static FP8 inputs unexpectedly fused");
+        require(static_qkv_importer.describe("blk.3.attn_q.weight", qkv_type, qkv_ne),
+                "static FP8 fallback lost its original Q projection");
+
         const std::filesystem::path plain_layout_dir = dir.path / "plain-layout-direct-upload";
         const std::string plain_layout_module = "model.language_model.layers.0.linear_attn.in_proj_z.weight";
         std::vector<uint8_t> plain_layout_source;
