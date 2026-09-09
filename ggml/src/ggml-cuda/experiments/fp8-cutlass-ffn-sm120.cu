@@ -128,8 +128,11 @@ extern "C" int ffn_epilogue_layout_check() {
     return 0;
 }
 
-#include "fp8-cutlass-ffn-dual.cuh"
+// DualMain extends SeparateMain; preserve their definition order.
+// clang-format off
 #include "fp8-cutlass-ffn-load.cuh"
+#include "fp8-cutlass-ffn-dual.cuh"
+// clang-format on
 
 // Standalone reference entry point for exact-output qualification.
 __global__ void ffn_reference(const float * gate, const float * up, float * output, int64_t count) {
