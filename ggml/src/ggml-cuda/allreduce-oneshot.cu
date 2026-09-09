@@ -743,7 +743,9 @@ bool ggml_cuda_ar_oneshot_eligible(const ggml_cuda_ar_oneshot * st, ggml_tensor 
     return true;
 }
 
-bool ggml_cuda_ar_oneshot_allreduce(ggml_cuda_ar_oneshot * st, ggml_backend_t * backends, ggml_tensor ** tensors) {
+// Every rank's launches go to that rank's own stream and the mode decisions depend only on the message, so
+// the ranks can be enqueued independently (one issuer thread per device); the kernels synchronize on-device.
+bool ggml_cuda_ar_oneshot_allreduce_rank(ggml_cuda_ar_oneshot * st, ggml_backend_t backend, ggml_tensor ** tensors, int rank) {
     const int n4 = (int) (ggml_nbytes(tensors[0]) / 16);
     static const int give_up = getenv("GGML_CUDA_AR1_DEBUG") != nullptr;
     // reduce-scatter mode from this message size on (GGML_CUDA_AR1_SCATTER=<bytes>, 0 = never)
@@ -754,9 +756,12 @@ bool ggml_cuda_ar_oneshot_allreduce(ggml_cuda_ar_oneshot * st, ggml_backend_t * 
     // multi-block one advances by its block count, so the two must not interleave: the host serializes them)
     static const size_t mb_from = getenv("GGML_CUDA_AR1_MB_FROM") != nullptr ? (size_t) atoll(getenv("GGML_CUDA_AR1_MB_FROM")) : (size_t) 256 * 1024;
     const int multi_block = ggml_nbytes(tensors[0]) > mb_from && n4 >= st->n_ranks * AR1_MB_BLOCKS;
-    ggml_cuda_ar_oneshot_report_all();
-    for (int i = 0; i < st->n_ranks; i++) {
-        auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+    if (rank == 0) {
+        ggml_cuda_ar_oneshot_report_all();
+    }
+    {
+        const int i = rank;
+        auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
         GGML_ASSERT(cuda_ctx->device == st->devices[i]);
         ggml_cuda_set_device(st->devices[i]);
         cudaStream_t stream = cuda_ctx->stream();
@@ -799,6 +804,13 @@ bool ggml_cuda_ar_oneshot_allreduce(ggml_cuda_ar_oneshot * st, ggml_backend_t * 
                 st->data_bytes, st->max_bytes, st->n_ranks, i, n4, active, st->dev_trace[i], give_up, scatter);
         }
         CUDA_CHECK(cudaGetLastError());
+    }
+    return true;
+}
+
+bool ggml_cuda_ar_oneshot_allreduce(ggml_cuda_ar_oneshot * st, ggml_backend_t * backends, ggml_tensor ** tensors) {
+    for (int i = 0; i < st->n_ranks; i++) {
+        ggml_cuda_ar_oneshot_allreduce_rank(st, backends[i], tensors, i);
     }
     return true;
 }

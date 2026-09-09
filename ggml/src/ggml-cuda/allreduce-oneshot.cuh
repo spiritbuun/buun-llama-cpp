@@ -16,3 +16,5 @@ void                   ggml_cuda_ar_oneshot_free(ggml_cuda_ar_oneshot * st);
 bool                   ggml_cuda_ar_oneshot_eligible(const ggml_cuda_ar_oneshot * st, ggml_tensor ** tensors);
 void                   ggml_cuda_ar_oneshot_report_all();
 bool                   ggml_cuda_ar_oneshot_allreduce(ggml_cuda_ar_oneshot * st, ggml_backend_t * backends, ggml_tensor ** tensors);
+// enqueue only this rank's part (callable concurrently from one thread per rank)
+bool                   ggml_cuda_ar_oneshot_allreduce_rank(ggml_cuda_ar_oneshot * st, ggml_backend_t backend, ggml_tensor ** tensors, int rank);

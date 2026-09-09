@@ -1961,6 +1961,19 @@ static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct gg
     return comm_ctx->try_allreduce(comm_ctx, tensors);
 }
 
+// Per-rank enqueue of the one-shot all-reduce for concurrent issuer threads; false when this message needs a
+// collective (NCCL fallback), which the caller then issues from one thread for all ranks.
+static bool ggml_backend_cuda_comm_allreduce_tensor_rank(void * comm_ctx_v, struct ggml_tensor ** tensors, int rank) {
+    if (comm_ctx_v == nullptr) {
+        return false;
+    }
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    if (comm_ctx->oneshot == nullptr || !ggml_cuda_ar_oneshot_eligible(comm_ctx->oneshot, tensors)) {
+        return false;
+    }
+    return ggml_cuda_ar_oneshot_allreduce_rank(comm_ctx->oneshot, comm_ctx->backends[rank], tensors, rank);
+}
+
 // host buffer type
 
 static const char * ggml_backend_cuda_host_buffer_type_name(ggml_backend_buffer_type_t buft) {
@@ -9110,6 +9123,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
+    }
+    if (strcmp(name, "ggml_backend_comm_allreduce_tensor_rank") == 0) {
+        return (void *)ggml_backend_cuda_comm_allreduce_tensor_rank;
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;
