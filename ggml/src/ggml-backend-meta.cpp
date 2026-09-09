@@ -2273,6 +2273,21 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
 
+    // GGML_META_DEBUG=2: host time of every compute with its mode (replay / record / uncaptured)
+    static const bool compute_trace = getenv("GGML_META_DEBUG") != nullptr && atoi(getenv("GGML_META_DEBUG")) >= 2;
+    struct timespec ts_compute_start;
+    clock_gettime(CLOCK_MONOTONIC, &ts_compute_start);
+    auto compute_ms = [&]() {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return (ts.tv_sec - ts_compute_start.tv_sec) * 1e3 + (ts.tv_nsec - ts_compute_start.tv_nsec) / 1e6;
+    };
+    auto compute_note = [&](const char * mode) {
+        if (compute_trace) {
+            fprintf(stderr, "ggml_backend_meta: compute %s %d nodes host %.2f ms (min reduce %zu B)\n", mode, cgraph->n_nodes, compute_ms(), backend_ctx->cur_min_reduce);
+        }
+    };
+
     // Launching a large executable graph costs on the order of a millisecond, and every device waits at its
     // first all-reduce for the last device launched, so fan the launches out over one thread per device (the
     // CUDA driver is thread-safe per device/stream). Used for the recording step's own launch as well: a
@@ -2381,6 +2396,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 // since that container held the last rebuilt graph's shards, make the next uncaptured graph rebuild
                 rotate_shard_containers();
                 backend_ctx->uid = 0;
+                compute_note("replay");
                 static const bool trace_replay = getenv("GGML_META_TRACE_REPLAY") != nullptr;
                 if (trace_replay) {
                     fprintf(stderr, "ggml_backend_meta: replay signature %016" PRIx64 " (%d nodes, uid %" PRIu64 ")\n",
@@ -2867,12 +2883,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // One pass over the subgraphs: launch every device, then all-reduce the boundary node. Under a
     // step capture, a fallback all-reduce (not a plain backend collective) invalidates the capture.
     auto run_subgraphs = [&](bool capturing, bool & capture_ok) -> ggml_status {
-        // Uncaptured, one host thread issues every device's launches (7250 nodes x 8 devices per prompt chunk
-        // ≈ 58k launches, several hundred ms): give each device its own thread. A capture stays on one thread.
-        static const bool threaded_launch = getenv("GGML_META_NO_THREADED_COMPUTE") == nullptr;
+        // One host thread issuing every device's launches (7250 nodes x 8 devices per prompt chunk ≈ 58k
+        // launches) costs several hundred ms per compute, uncaptured or captured (a recording is the same
+        // launches into capturing streams), so each device's subgraph runs from its own thread; every device
+        // captures on its own stream, so the recording threads are independent too.
+        // GGML_META_NO_THREADED_COMPUTE=1 restores the sequential loop, GGML_META_NO_THREADED_CAPTURE=1 only for captures.
+        static const bool threaded_launch  = getenv("GGML_META_NO_THREADED_COMPUTE") == nullptr;
+        static const bool threaded_capture = threaded_launch && getenv("GGML_META_NO_THREADED_CAPTURE") == nullptr;
         std::vector<ggml_status> status_j(n_backends, GGML_STATUS_SUCCESS);
         for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
-            if (!capturing && threaded_launch && n_backends > 2) {
+            if ((capturing ? threaded_capture : threaded_launch) && n_backends > 2) {
                 std::vector<std::thread> workers;
                 workers.reserve(n_backends - 1);
                 for (size_t j = 1; j < n_backends; j++) {
@@ -2943,9 +2963,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         static const size_t step_max_reduce = getenv("GGML_META_STEP_MAX_REDUCE") != nullptr ?
             (size_t) atoll(getenv("GGML_META_STEP_MAX_REDUCE")) : (size_t) 256 * 1024;
         const bool decode_class = backend_ctx->cur_min_reduce <= step_max_reduce;
+        // A prompt chunk's uncaptured execution is launch-bound too (thousands of host launches per device
+        // per chunk), and with the coarse KV padding consecutive chunks share a shape, so prompt-class
+        // graphs are captured once their shape has recurred GGML_META_CAPTURE_PROMPT times (default 2, i.e.
+        // on the third sighting, since a recording costs ~0.5 s of graph instantiation; 0 disables): the
+        // recording cost then amortizes over the replays (long prompts, servers with many prompts).
+        static const int capture_prompt_after = getenv("GGML_META_CAPTURE_PROMPT") != nullptr ? atoi(getenv("GGML_META_CAPTURE_PROMPT")) : 2;
+        const bool prompt_capture = !decode_class && capture_prompt_after > 0 && backend_ctx->step_same_sig >= capture_prompt_after;
 
         // second consecutive compute of the same shape (the first is the simple backends' warmup)
-        if (backend_ctx->step_same_sig >= 1 && !known_bad && decode_class) {
+        if (backend_ctx->step_same_sig >= 1 && !known_bad && (decode_class || prompt_capture)) {
             bool capturable = true;
             for (size_t j = 0; j < n_backends && capturable; j++) {
                 auto & bcj = backend_ctx->backend_configs[j];
@@ -2966,6 +2993,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 ggml_status status = GGML_STATUS_SUCCESS;
                 if (capture_ok) {
                     status = run_subgraphs(/*capturing =*/ true, capture_ok);
+                }
+                if (compute_trace) {
+                    fprintf(stderr, "ggml_backend_meta: capture recorded at host %.2f ms\n", compute_ms());
                 }
                 // ending a capture instantiates and uploads a graph of thousands of nodes: do the devices in parallel
                 std::vector<void *> steps(n_backends, nullptr);
@@ -3031,6 +3061,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     }
                     // capture recorded the work without executing it: run this compute via replay
                     if (launch_steps(steps)) {
+                        compute_note("record");
                         return GGML_STATUS_SUCCESS;
                     }
                     if (getenv("GGML_META_DEBUG") != nullptr) {
@@ -3060,7 +3091,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     }
 
     bool unused = true;
-    return run_subgraphs(/*capturing =*/ false, unused);
+    const ggml_status status = run_subgraphs(/*capturing =*/ false, unused);
+    compute_note("uncaptured");
+    return status;
 }
 
 static const ggml_backend_i ggml_backend_meta_i = {

@@ -1788,10 +1788,11 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
     // (single-block kernel), prompt-chunk messages up to the window go through a copy-engine publish and a
     // multi-block reduce-scatter, which beats a host-staged NCCL ring on boxes without PCIe P2P and sums in
     // F32 where NCCL rounds large tensors to BF16. GGML_CUDA_ALLREDUCE_ONESHOT=0 disables; the value sets
-    // the byte limit, default 8 MiB (pinned memory: 5 slots x limit per rank).
+    // the byte limit, default 32 MiB (pinned memory: 5 slots x limit per rank), which keeps 2048-token
+    // prompt ubatches of a 2560-wide model on this path (-ub 2048 is the fastest prefill setting).
     {
         const char * env_os = getenv("GGML_CUDA_ALLREDUCE_ONESHOT");
-        const size_t limit = env_os == nullptr ? (size_t) 8 * 1024 * 1024 : (size_t) atoll(env_os);
+        const size_t limit = env_os == nullptr ? (size_t) 32 * 1024 * 1024 : (size_t) atoll(env_os);
         if (limit > 0 && n_backends >= 2) {
             ret->oneshot = ggml_cuda_ar_oneshot_init(ret->dev_ids.data(), n_backends, limit);
         }

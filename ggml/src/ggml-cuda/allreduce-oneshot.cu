@@ -1,5 +1,7 @@
 #include "allreduce-oneshot.cuh"
 
+#include <cuda_bf16.h>
+
 #include <time.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -33,6 +35,7 @@ struct ggml_cuda_ar_oneshot {
 
     // per-rank slice blocks and their device-visible pointers on every device: dev_slices[device][rank]
     void * host_slices[GGML_CUDA_AR1_MAX_RANKS] = {};
+    char * dev_stage[GGML_CUDA_AR1_MAX_RANKS] = {};      // per-rank device staging for the BF16 large-message payload
     bool   slice_mmapped[GGML_CUDA_AR1_MAX_RANKS] = {};   // mmap+mbind+cudaHostRegister (else cudaHostAlloc)
     size_t slice_bytes = 0;
     char * dev_slices[GGML_CUDA_AR1_MAX_RANKS][GGML_CUDA_AR1_MAX_RANKS] = {};
@@ -273,6 +276,93 @@ static __global__ void k_ar1_mb_begin(char * base, int * state, const size_t dat
                     1000000 + AR1_MB_SLOT * 1000 + r, token, n4, t_entry, give_up)) {
                 break;
             }
+        }
+    }
+}
+
+// BF16 payload variant (GGML_CUDA_AR1_BF16=1): the shard is converted to BF16 on the device, published as
+// half the bytes, reduce-scattered with F32 accumulation into a BF16 chunk, and gathered back to F32.
+// Halves the host reads and the memcpy of every multi-MB reduce at the cost of BF16 rounding of the
+// summands (what the NCCL path did for large tensors).
+static __device__ __forceinline__ float4 ar1_bf16x4_to_f32(uint2 v) {
+    return make_float4(__bfloat162float(__ushort_as_bfloat16((unsigned short) (v.x & 0xFFFF))),
+                       __bfloat162float(__ushort_as_bfloat16((unsigned short) (v.x >> 16))),
+                       __bfloat162float(__ushort_as_bfloat16((unsigned short) (v.y & 0xFFFF))),
+                       __bfloat162float(__ushort_as_bfloat16((unsigned short) (v.y >> 16))));
+}
+static __device__ __forceinline__ uint2 ar1_f32_to_bf16x4(float4 v) {
+    uint2 r;
+    r.x = (unsigned int) __bfloat16_as_ushort(__float2bfloat16_rn(v.x)) | ((unsigned int) __bfloat16_as_ushort(__float2bfloat16_rn(v.y)) << 16);
+    r.y = (unsigned int) __bfloat16_as_ushort(__float2bfloat16_rn(v.z)) | ((unsigned int) __bfloat16_as_ushort(__float2bfloat16_rn(v.w)) << 16);
+    return r;
+}
+static __global__ void k_ar1_f32_to_bf16(const float4 * __restrict__ src, uint2 * __restrict__ dst, const int n4) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n4) {
+        dst[i] = ar1_f32_to_bf16x4(src[i]);
+    }
+}
+
+static __global__ void __launch_bounds__(AR1_THREADS)
+k_ar1_mb_reduce_bf16(float4 * __restrict__ dst, char * base, const ar1_bases bases, int * state,
+        const size_t data_bytes, const size_t max_bytes,
+        const int n_ranks, const int rank, const int n4, const int give_up) {
+    const unsigned int t_entry = ar1_now_us();
+    const int token = state[4];
+    const int slot  = AR1_MB_SLOT;
+    const int nb    = gridDim.x;
+    const int b     = blockIdx.x;
+
+    if (threadIdx.x == 0) {
+        if (b == 0) {
+            ar1_store_flag(ar1_flag(base, data_bytes, n_ranks, slot, rank, 0), token);
+        }
+        for (int r = 0; r < n_ranks; r++) {
+            if (!ar1_spin(ar1_flag(base, data_bytes, n_ranks, slot, r, 0), token, ar1_timeout(base, data_bytes, n_ranks, rank),
+                    2000000 + slot * 1000 + r, token, n4, t_entry, give_up)) {
+                break;
+            }
+        }
+        __threadfence();
+    }
+    __syncthreads();
+
+    uint2 * mine = (uint2 *) ar1_slice(bases, max_bytes, slot, rank);
+    const int q  = (n4 + n_ranks - 1) / n_ranks;
+    const int c0 = rank * q;
+    const int c1 = min(c0 + q, n4);
+    for (int i = c0 + b * AR1_THREADS + threadIdx.x; i < c1; i += nb * AR1_THREADS) {
+        float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        for (int r = 0; r < n_ranks; r++) {
+            const float4 o = ar1_bf16x4_to_f32(__ldcv((const uint2 *) ar1_slice(bases, max_bytes, slot, r) + i));
+            acc.x += o.x; acc.y += o.y; acc.z += o.z; acc.w += o.w;
+        }
+        mine[i] = ar1_f32_to_bf16x4(acc);
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        if (atomicAdd(&state[2], 1) % nb == nb - 1) {
+            ar1_store_flag(ar1_flag(base, data_bytes, n_ranks, slot, rank, 2), token);
+        }
+        for (int r = 0; r < n_ranks; r++) {
+            if (!ar1_spin(ar1_flag(base, data_bytes, n_ranks, slot, r, 2), token, ar1_timeout(base, data_bytes, n_ranks, rank),
+                    3000000 + slot * 1000 + r, token, n4, t_entry, give_up)) {
+                break;
+            }
+        }
+        __threadfence();
+    }
+    __syncthreads();
+
+    for (int i = b * AR1_THREADS + threadIdx.x; i < n4; i += nb * AR1_THREADS) {
+        dst[i] = ar1_bf16x4_to_f32(__ldcv((const uint2 *) ar1_slice(bases, max_bytes, slot, i / q) + i));
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence_system();
+        if (atomicAdd(&state[3], 1) % nb == nb - 1) {
+            ar1_store_flag(ar1_flag(base, data_bytes, n_ranks, slot, rank, 1), token);
         }
     }
 }
@@ -561,6 +651,11 @@ ggml_cuda_ar_oneshot * ggml_cuda_ar_oneshot_init(const int * devices, size_t n_d
             return nullptr;
         }
         st->dev_base[i] = (char *) dptr;
+        // BF16 staging for the large-message payload (optional: the F32 path is used without it)
+        if (cudaMalloc((void **) &st->dev_stage[i], st->max_bytes / 2) != cudaSuccess) {
+            (void) cudaGetLastError();
+            st->dev_stage[i] = nullptr;
+        }
         for (size_t r = 0; r < n_devices; r++) {
             void * sptr = nullptr;
             if (cudaHostGetDevicePointer(&sptr, st->host_slices[r], 0) != cudaSuccess) {
@@ -608,6 +703,10 @@ void ggml_cuda_ar_oneshot_free(ggml_cuda_ar_oneshot * st) {
         if (st->dev_state[i] != nullptr) {
             ggml_cuda_set_device(st->devices[i]);
             (void) cudaFree(st->dev_state[i]);
+        }
+        if (st->dev_stage[i] != nullptr) {
+            ggml_cuda_set_device(st->devices[i]);
+            (void) cudaFree(st->dev_stage[i]);
         }
     }
     for (int r = 0; r < st->n_ranks; r++) {
@@ -667,18 +766,33 @@ bool ggml_cuda_ar_oneshot_allreduce(ggml_cuda_ar_oneshot * st, ggml_backend_t * 
             bases.p[r] = st->dev_slices[i][r];
         }
         if (multi_block) {
+            // BF16 payload by default (GGML_CUDA_AR1_BF16=0 keeps F32): halves the host traffic of every
+            // multi-MB reduce; the NCCL path rounded these tensors to BF16 as well
+            static const bool bf16 = getenv("GGML_CUDA_AR1_BF16") == nullptr || atoi(getenv("GGML_CUDA_AR1_BF16")) != 0;
             k_ar1_mb_begin<<<1, 32, 0, stream>>>(st->dev_base[i], st->dev_state[i], st->data_bytes, st->n_ranks, i, n4, give_up);
             // host address of the own slice (UVA resolves the direction); the memset uses the device alias
             char * slice_host = (char *) st->host_slices[i] + (size_t) AR1_MB_SLOT * st->max_bytes;
             char * slice_dev  = st->dev_slices[i][i] + (size_t) AR1_MB_SLOT * st->max_bytes;
-            if (active) {
-                CUDA_CHECK(cudaMemcpyAsync(slice_host, tensors[i]->data, (size_t) n4 * 16, cudaMemcpyDefault, stream));
+            if (bf16 && st->dev_stage[i] != nullptr) {
+                if (active) {
+                    k_ar1_f32_to_bf16<<<(n4 + 255) / 256, 256, 0, stream>>>((const float4 *) tensors[i]->data, (uint2 *) st->dev_stage[i], n4);
+                    CUDA_CHECK(cudaMemcpyAsync(slice_host, st->dev_stage[i], (size_t) n4 * 8, cudaMemcpyDefault, stream));
+                } else {
+                    CUDA_CHECK(cudaMemsetAsync(slice_dev, 0, (size_t) n4 * 8, stream));
+                }
+                k_ar1_mb_reduce_bf16<<<AR1_MB_BLOCKS, AR1_THREADS, 0, stream>>>(
+                    (float4 *) tensors[i]->data, st->dev_base[i], bases, st->dev_state[i],
+                    st->data_bytes, st->max_bytes, st->n_ranks, i, n4, give_up);
             } else {
-                CUDA_CHECK(cudaMemsetAsync(slice_dev, 0, (size_t) n4 * 16, stream));
+                if (active) {
+                    CUDA_CHECK(cudaMemcpyAsync(slice_host, tensors[i]->data, (size_t) n4 * 16, cudaMemcpyDefault, stream));
+                } else {
+                    CUDA_CHECK(cudaMemsetAsync(slice_dev, 0, (size_t) n4 * 16, stream));
+                }
+                k_ar1_mb_reduce<<<AR1_MB_BLOCKS, AR1_THREADS, 0, stream>>>(
+                    (float4 *) tensors[i]->data, st->dev_base[i], bases, st->dev_state[i],
+                    st->data_bytes, st->max_bytes, st->n_ranks, i, n4, give_up, st->dev_trace[i]);
             }
-            k_ar1_mb_reduce<<<AR1_MB_BLOCKS, AR1_THREADS, 0, stream>>>(
-                (float4 *) tensors[i]->data, st->dev_base[i], bases, st->dev_state[i],
-                st->data_bytes, st->max_bytes, st->n_ranks, i, n4, give_up, st->dev_trace[i]);
         } else {
             k_ar1_allreduce<<<1, AR1_THREADS, 0, stream>>>(
                 (float4 *) tensors[i]->data, st->dev_base[i], bases, st->dev_state[i],
