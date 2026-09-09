@@ -1520,6 +1520,10 @@ static void ggml_backend_meta_buffer_memset_tensor(
 
 static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
+    static const bool upload_trace = getenv("GGML_META_DEBUG") != nullptr && atoi(getenv("GGML_META_DEBUG")) >= 2;
+    if (upload_trace && size >= 1024 * 1024) {
+        fprintf(stderr, "ggml_backend_meta: upload(buffer) '%s' %zu bytes at %zu\n", tensor->name, size, offset);
+    }
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
     // A whole-tensor upload is staged per device and handed to the simple buffer as ONE full set_tensor:
@@ -2099,6 +2103,10 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     GGML_ASSERT(offset == 0);
     GGML_ASSERT(ggml_is_contiguous(tensor));
+    static const bool upload_trace = getenv("GGML_META_DEBUG") != nullptr && atoi(getenv("GGML_META_DEBUG")) >= 2;
+    if (upload_trace && size >= 1024 * 1024) {
+        fprintf(stderr, "ggml_backend_meta: upload(async) '%s' %zu bytes at %zu\n", tensor->name, size, offset);
+    }
 
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(split_state.n_segments == 1);
@@ -3030,7 +3038,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 if (capture_ok) {
                     // keep the recent shapes (decode at each KV size, prefill chunks, batches with a slot
                     // missing all alternate in a server); evict the least recently used
-                    if (backend_ctx->step_records.size() >= 16) {
+                    // GGML_META_STEP_RECORDS raises the cap: a busy server with many slot-occupancy /
+                    // KV-extent shape variants churns 16 (each re-record = a slow uncaptured step + capture)
+                    static const size_t max_records = getenv("GGML_META_STEP_RECORDS") != nullptr ?
+                        (size_t) atoi(getenv("GGML_META_STEP_RECORDS")) : 16;
+                    if (backend_ctx->step_records.size() >= max_records) {
                         size_t oldest = 0;
                         for (size_t r = 1; r < backend_ctx->step_records.size(); r++) {
                             if (backend_ctx->step_records[r].last_used < backend_ctx->step_records[oldest].last_used) {
