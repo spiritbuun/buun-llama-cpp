@@ -20,7 +20,29 @@
 using namespace cute;
 namespace fusion = cutlass::epilogue::fusion;
 
-template <bool Scale, bool Add> struct Plan {
+// Each half uses CUTLASS's original MMA loop, including its accumulator reset
+// and pipeline releases. Keep the first result in registers instead of passing
+// a partial matrix between two launches. The caller requires whole K tiles in
+// both halves; the enclosing kernel advances its own state by the full count.
+template <class Base> struct RegisterSplitMain : Base {
+    template <class Fragment>
+    CUTLASS_DEVICE void mma(typename Base::MainloopPipeline pipeline,
+                           typename Base::PipelineState state,
+                           Fragment & accum, int tiles, int thread,
+                           typename Base::TensorStorage & storage,
+                           typename Base::Params const & params) {
+        auto first = make_fragment_like(accum);
+        Base::mma(pipeline, state, first, tiles / 2, thread, storage, params);
+        state.advance(tiles / 2);
+        Base::mma(pipeline, state, accum, tiles / 2, thread, storage, params);
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < size(accum); ++i) {
+            accum(i) = first(i) + accum(i);
+        }
+    }
+};
+
+template <bool Scale, bool Add, bool RegisterSplit = false> struct Plan {
     using Tile    = Shape<_128, _128, _128>;
     using Cluster = Shape<_1, _1, _1>;
     using XScale  = fusion::Sm90ColBroadcast<0, Tile, float, float, Stride<_1, _0, _0>, 4, false>;
@@ -54,7 +76,7 @@ template <bool Scale, bool Add> struct Plan {
                                                                   4,
                                                                   cutlass::epilogue::collective::EpilogueScheduleAuto,
                                                                   EVT>::CollectiveOp;
-    using Main = typename cutlass::gemm::collective::CollectiveBuilder<
+    using BaseMain = typename cutlass::gemm::collective::CollectiveBuilder<
         cutlass::arch::Sm120,
         cutlass::arch::OpClassTensorOp,
         cutlass::float_e4m3_t,
@@ -68,6 +90,7 @@ template <bool Scale, bool Add> struct Plan {
         Cluster,
         cutlass::gemm::collective::StageCountAutoCarveout<sizeof(typename Epi::SharedStorage)>,
         cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+    using Main = std::conditional_t<RegisterSplit, RegisterSplitMain<BaseMain>, BaseMain>;
     using Kernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, Main, Epi, void>;
     using Op     = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
 
@@ -131,6 +154,21 @@ extern "C" int buun_fp8_cutlass(const void *  w,
                                 cudaStream_t  stream) {
     if (m < 1 || n < 1 || k < 1 || (parts != 1 && parts != 2) || n % 16 || k % (16 * parts)) {
         return -1;
+    }
+    if (parts == 2 && k % 256 == 0) {
+        using Register = Plan<true, false, true>;
+        auto args = Register::args(w, x, ws, xs, nullptr, out, m, n, k, k, device, sms);
+        if (Register::Op::can_implement(args) == cutlass::Status::kSuccess) {
+            *required = Register::Op::get_workspace_size(args);
+            if (!workspace) {
+                return 0;
+            }
+            if (capacity < *required) {
+                return -2;
+            }
+            typename Register::Op op;
+            return int(op.run(args, workspace, stream));
+        }
     }
     using Single               = Plan<true, false>;
     using First                = Plan<false, false>;

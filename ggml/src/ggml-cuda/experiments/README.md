@@ -20,6 +20,12 @@ rows and unsupported shapes retain the existing path. Broader numerical and
 lifecycle qualification and dependency packaging are required before
 considering a public default.
 
+For two parts and K divisible by256, one kernel runs the original CUTLASS
+main loop twice, retaining the first accumulator in registers. This preserves
+the two independent accumulations without a global partial matrix. Other
+supported K sizes keep the two-launch implementation; the one-part path is
+unchanged. This uses the unmodified CUTLASS headers, not a forked main loop.
+
 The caller queries scratch size before execution, supplies context-owned
 storage and the CUDA stream, and keeps both valid through GPU completion.
 The provider has no persistent device storage or internal allocation. Its
