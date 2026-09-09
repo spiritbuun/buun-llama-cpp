@@ -525,11 +525,14 @@ void ggml_cuda_gdn_fla_ptx(
         float l2_eps,
         const float * rms_weight, const float * rms_gate, bool rms_gate_bf16,
         float * rms_output, bool rms_output_bf16,
-        bool rms_output_int8, float * rms_output_scale, float rms_eps) {
+        bool rms_output_int8, float * rms_output_scale, float rms_eps,
+        float * prefix_state_out, int prefix_tokens) {
     cudaStream_t stream = ctx.stream();
     fla_modules & m = get_modules(ctx.device, cc);
 
     GGML_ASSERT(n_tokens > 0 && n_tokens <= INT_MAX);
+    GGML_ASSERT(prefix_state_out == nullptr ||
+                (cc == 1200 && prefix_tokens > 0 && prefix_tokens < n_tokens && prefix_state_out != state_out));
     const int n_chunks         = int((n_tokens + GDN_BT - 1) / GDN_BT);
     const int64_t n_qk         = n_tokens * GDN_HK * GDN_D;
     const int64_t n_v          = n_tokens * GDN_H  * GDN_D;
@@ -657,6 +660,21 @@ void ggml_cuda_gdn_fla_ptx(
         unpack_gdn_heads_f32<<<(n_v + threads - 1) / threads, threads, 0, stream>>>(
             out.get(), state_out_p.get(), dst, state_out, int(n_tokens));
     }
+    if (prefix_state_out != nullptr) {
+        // Main output and final state are already consumed above. Reuse the
+        // causal WY intermediates, but replay from the original F32 initial
+        // state, not the rounded BF16 chunk-state storage. Only this second
+        // state traversal is repeated; projections and attention output are not.
+        const int prefix_chunks = (prefix_tokens + GDN_BT - 1) / GDN_BT;
+        init_gdn_varlen_metadata<<<1, 256, 0, stream>>>(
+            cu_seqlens.get(), chunk_indices.get(), chunk_offsets.get(), prefix_tokens, prefix_chunks);
+        void * prefix_args[] = { &k_p.ptr, &u.ptr, &w.ptr, &v_new.ptr, &g_cum.ptr, &h.ptr,
+                                 &state_in_p.ptr, &state_out_p.ptr, &cu_seqlens.ptr,
+                                 &chunk_offsets.ptr, &prefix_tokens, &null_ptr, &null_ptr };
+        launch(m.funcs[K_STATE], {2, GDN_H, 1}, {128, 1, 1}, 90632, cu_stream, prefix_args);
+        unpack_gdn_state_f32<<<(n_state + threads - 1) / threads, threads, 0, stream>>>(
+            state_out_p.get(), prefix_state_out);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -666,6 +684,6 @@ bool ggml_cuda_gdn_fla_ptx_supported(int, bool, bool, int64_t, int64_t, int64_t,
 void ggml_cuda_gdn_fla_ptx(ggml_backend_cuda_context &, int, const float *, const float *, const float *,
         const float *, const float *, const float *, float *, float *, int64_t, int64_t, int64_t,
         int64_t, int64_t, int64_t, int64_t, const void *, float, const float *, const float *, bool, float *, bool,
-        bool, float *, float) { GGML_ABORT("FLA PTX is CUDA-only"); }
+        bool, float *, float, float *, int) { GGML_ABORT("FLA PTX is CUDA-only"); }
 
 #endif

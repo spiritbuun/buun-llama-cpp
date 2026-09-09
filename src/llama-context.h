@@ -288,6 +288,14 @@ struct llama_context {
 
     void synchronize();
 
+    // Experimental one-decode prefix capture. Preparation may decline; callers
+    // then retain their ordinary batch/checkpoint schedule. Export is available
+    // only after a successful matching decode, in the usual PARTIAL_ONLY format.
+    bool prefix_snapshot_prepare(const llama_batch & batch, int32_t prefix_tokens);
+    void prefix_snapshot_cancel();
+    size_t prefix_snapshot_get_size();
+    size_t prefix_snapshot_get_data(uint8_t * dst, size_t size);
+
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
 
@@ -566,6 +574,16 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
+
+    struct prefix_checkpoint_state {
+        std::shared_ptr<llama_memory_recurrent> owner;
+        int32_t n_tokens = 0;
+        int32_t prefix_tokens = 0;
+        llama_pos start = 0;
+        bool active = false;
+        bool ready = false;
+        int graphs_computed = 0;
+    } prefix_checkpoint;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

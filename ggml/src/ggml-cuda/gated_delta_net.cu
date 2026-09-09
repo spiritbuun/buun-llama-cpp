@@ -341,6 +341,9 @@ static void ggml_cuda_op_gated_delta_net_impl(
     // K (snapshot slot count) is an op param; state holds s0 only [S_v, S_v, H, n_seqs].
     const int K = ggml_get_op_params_i32(dst, 0);
     const bool keep_rs = K > 1;
+    const int prefix = dst->op == GGML_OP_GATED_DELTA_NET_PREFIX
+        ? ggml_get_op_params_i32(dst, 1) : 0;
+    GGML_ASSERT(prefix == 0 || (K == 2 && prefix > 0 && prefix < n_tokens));
 
     // recurrent state -> gdn_out tail (after attention scores), or the cache when fusing
     float * state_d           = dst_d + S_v * H * n_tokens * n_seqs;
@@ -349,9 +352,12 @@ static void ggml_cuda_op_gated_delta_net_impl(
         state_d           = cache->data;
         state_slot_stride = cache->slot_stride;
     }
+    float * prefix_d = prefix > 0
+        ? (cache != nullptr ? cache->prefix_data : state_d + state_slot_stride) : nullptr;
+    GGML_ASSERT(prefix == 0 || prefix_d != nullptr);
 
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
-    if (ggml_cuda_gdn_fla_ptx_supported(cc, kda, keep_rs, S_v, H, neqk1, n_tokens, n_seqs)) {
+    if (ggml_cuda_gdn_fla_ptx_supported(cc, kda, keep_rs && prefix == 0, S_v, H, neqk1, n_tokens, n_seqs)) {
         ggml_cuda_gdn_fla_ptx(ctx, cc, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                               n_tokens, sq1, sq2, sq3, sv1, sv2, sv3,
                               nullptr,
@@ -363,9 +369,14 @@ static void ggml_cuda_op_gated_delta_net_impl(
                               cache != nullptr ? cache->rms_output_bf16 : false,
                               cache != nullptr ? cache->rms_output_int8 : false,
                               cache != nullptr ? cache->rms_output_scale : nullptr,
-                              cache != nullptr ? cache->rms_eps : 0.0f);
+                              cache != nullptr ? cache->rms_eps : 0.0f,
+                              prefix_d, prefix);
         return;
     }
+
+    // The prefix operation is advertised only for the SM120 FLA route.
+    // Other shapes/backends must use the explicit CPU prefix implementation.
+    GGML_ASSERT(prefix == 0);
 
     if (kda) {
         if (keep_rs) {

@@ -3548,6 +3548,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_gated_linear_attn(ctx, dst);
             break;
         case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_GATED_DELTA_NET_PREFIX:
             ggml_cuda_op_gated_delta_net(ctx, dst);
             break;
         case GGML_OP_GATED_DELTA_NET_TREE:
@@ -4053,12 +4054,15 @@ static const ggml_tensor * ggml_cuda_find_int8_projection_input(
 
 // match gated_delta_net + the strided cpy that scatters its state snapshots into the cache
 // (slot i -> rollback group i, slot 0 newest), so the kernel can write them and skip the cpy.
+static bool ggml_cuda_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b);
+
 static int ggml_cuda_try_gdn_cache_fusion(
         const ggml_cgraph * cgraph, int node_idx, ggml_backend_cuda_context * cuda_ctx,
         ggml_cuda_gated_delta_net_fused_cache & fused_state_cpy) {
     const ggml_tensor * gdn = cgraph->nodes[node_idx];
+    const bool prefix_op = gdn->op == GGML_OP_GATED_DELTA_NET_PREFIX;
     // the kernel skips the snapshot tail, so the gdn output must not be a graph output
-    if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32 ||
+    if ((!prefix_op && gdn->op != GGML_OP_GATED_DELTA_NET) || gdn->type != GGML_TYPE_F32 ||
         (gdn->flags & GGML_TENSOR_FLAG_OUTPUT)) {
         return 0;
     }
@@ -4070,7 +4074,7 @@ static int ggml_cuda_try_gdn_cache_fusion(
     const int64_t       n_seqs    = src_v->ne[3];
     const int64_t       D         = S_v * S_v * H;
     const int64_t       K         = ggml_get_op_params_i32(gdn, 0); // snapshot slot count
-    const int64_t       n_written = std::min<int64_t>(n_tokens, K); // newest n_written slots are written
+    const int64_t       n_written = prefix_op ? 1 : std::min<int64_t>(n_tokens, K);
 
     // snapshot tail starts right after the attention scores
     const size_t tail_off = ggml_row_size(GGML_TYPE_F32, S_v * H * n_tokens * n_seqs);
@@ -4114,7 +4118,47 @@ static int ggml_cuda_try_gdn_cache_fusion(
     }
 
     fused_state_cpy.data        = (float *) dst->data; // rollback group 0 (newest)
-    fused_state_cpy.slot_stride = K > 1 ? (int64_t) (dst->nb[2] / sizeof(float)) : 0;
+    fused_state_cpy.slot_stride = K > 1 && !prefix_op ? (int64_t) (dst->nb[2] / sizeof(float)) : 0;
+
+    // The prefix operation has two independent state destinations, not two
+    // adjacent rollback slots. Require the second copy before the RMS chain.
+    const ggml_tensor * prefix_src = nullptr;
+    const ggml_tensor * prefix_dst = nullptr;
+    const ggml_tensor * prefix_cpy = nullptr;
+    if (prefix_op) {
+        int j = cpy_idx + 1;
+        while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+            ++j;
+        }
+        if (j == cgraph->n_nodes) {
+            return 0;
+        }
+        prefix_cpy = cgraph->nodes[j];
+        prefix_src = prefix_cpy->src[0];
+        prefix_dst = prefix_cpy->src[1];
+        if (prefix_cpy->op != GGML_OP_CPY || !prefix_src || !prefix_dst ||
+                prefix_cpy->type != GGML_TYPE_F32 ||
+                (prefix_cpy->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+                (prefix_src->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+                prefix_src->op != GGML_OP_VIEW || prefix_src->view_src != gdn ||
+                prefix_src->view_offs != tail_off + D * n_seqs * sizeof(float) ||
+                !ggml_is_contiguous(prefix_src) ||
+                prefix_dst->op != GGML_OP_VIEW || prefix_dst->type != GGML_TYPE_F32 ||
+                prefix_dst->data == nullptr || !ggml_is_contiguous(prefix_dst) ||
+                !std::equal(expected_ne.begin(), expected_ne.end(), prefix_dst->ne) ||
+                ggml_cuda_tensors_overlap(prefix_dst, dst) ||
+                ggml_cuda_tensors_overlap(prefix_dst, gdn)) {
+            return 0;
+        }
+        for (const ggml_tensor * input : gdn->src) {
+            if (input && ggml_cuda_tensors_overlap(prefix_dst, input)) {
+                return 0;
+            }
+        }
+        fused_state_cpy.prefix_data = static_cast<float *>(prefix_dst->data);
+        cpy_idx = j;
+        skip = j - node_idx;
+    }
 
     const ggml_tensor * rms_result = nullptr;
 
@@ -4125,7 +4169,7 @@ static int ggml_cuda_try_gdn_cache_fusion(
     const bool kda = gdn->src[3]->ne[0] == S_v;
     const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
     if (ggml_cuda_gdn_fla_ptx_supported(
-            cc, kda, K > 1, S_v, H, gdn->src[0]->ne[1], n_tokens, n_seqs)) {
+            cc, kda, K > 1 && !prefix_op, S_v, H, gdn->src[0]->ne[1], n_tokens, n_seqs)) {
         int rms_idx = -1;
         for (int j = cpy_idx + 1; j < cgraph->n_nodes; ++j) {
             if (ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
@@ -4161,7 +4205,10 @@ static int ggml_cuda_try_gdn_cache_fusion(
                 !(src->flags & GGML_TENSOR_FLAG_OUTPUT) &&
                 !(attn_view->flags & GGML_TENSOR_FLAG_OUTPUT) &&
                 !(rms->flags & GGML_TENSOR_FLAG_OUTPUT) &&
-                has_exact_consumers(gdn, { src, attn_view }) &&
+                (prefix_op ?
+                    has_exact_consumers(gdn, { src, prefix_src, attn_view }) &&
+                    has_exact_consumers(prefix_src, { prefix_cpy }) :
+                    has_exact_consumers(gdn, { src, attn_view })) &&
                 has_exact_consumers(src, { cpy }) &&
                 has_exact_consumers(attn_view, { rms });
             const std::array<int64_t, GGML_MAX_DIMS> expected_attn = { S_v, H, n_tokens, n_seqs };
@@ -4208,6 +4255,21 @@ static int ggml_cuda_try_gdn_cache_fusion(
                         rms_result = gated;
                         skip = gated_idx - node_idx;
                     }
+                }
+            }
+        }
+    }
+    // Prefix storage is written after the fused RMS output. Prove both the
+    // output closure above and that delaying this copy cannot change an input
+    // or result of any fused epilogue. Otherwise run the ordinary graph.
+    if (prefix_op) {
+        if (rms_result == nullptr || ggml_cuda_tensors_overlap(prefix_dst, rms_result)) {
+            return 0;
+        }
+        for (int j = cpy_idx + 1; j <= node_idx + skip; ++j) {
+            for (const ggml_tensor * input : cgraph->nodes[j]->src) {
+                if (input && ggml_cuda_tensors_overlap(prefix_dst, input)) {
+                    return 0;
                 }
             }
         }
@@ -5612,7 +5674,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     ggml_node_get_use_count(cgraph, i + 2) == 1) {
                 for (int j = i + 3; j < cgraph->n_nodes; ++j) {
                     ggml_tensor * gdn = cgraph->nodes[j];
-                    if (gdn->op != GGML_OP_GATED_DELTA_NET ||
+                    if ((gdn->op != GGML_OP_GATED_DELTA_NET && gdn->op != GGML_OP_GATED_DELTA_NET_PREFIX) ||
                             gdn->src[0] != node || gdn->src[1] != k_norm) {
                         continue;
                     }
@@ -5623,7 +5685,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                         ggml_cuda_gdn_fla_ptx_supported(
                             ggml_cuda_info().devices[cuda_ctx->device].cc,
                             gdn->src[3]->ne[0] == v->ne[0],
-                            ggml_get_op_params_i32(gdn, 0) > 1,
+                            ggml_get_op_params_i32(gdn, 0) > 1 && gdn->op != GGML_OP_GATED_DELTA_NET_PREFIX,
                             v->ne[0], v->ne[1], node->ne[1], v->ne[2], v->ne[3]);
 #if !defined(GGML_USE_HIP)
                     // The standard kernel also normalizes q/k in place (bit-
@@ -5949,7 +6011,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
-    if (node->op == GGML_OP_GATED_DELTA_NET) {
+    if (node->op == GGML_OP_GATED_DELTA_NET || node->op == GGML_OP_GATED_DELTA_NET_PREFIX) {
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy{};
         const int nodes_to_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, i, cuda_ctx, fused_state_cpy);
         if (nodes_to_skip > 0) {
@@ -8694,6 +8756,18 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 #else
             return true;
 #endif // GGML_USE_MUSA
+        case GGML_OP_GATED_DELTA_NET_PREFIX:
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+            return false;
+#else
+            {
+                const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
+                const ggml_tensor * v = op->src[2];
+                return cc == 1200 && ggml_cuda_gdn_fla_ptx_supported(
+                    cc, op->src[3]->ne[0] == v->ne[0], false,
+                    v->ne[0], v->ne[1], op->src[0]->ne[1], v->ne[2], v->ne[3]);
+            }
+#endif
         case GGML_OP_DSV4_HC_PARAMS:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&

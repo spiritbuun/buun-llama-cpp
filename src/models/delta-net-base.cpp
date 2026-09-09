@@ -479,7 +479,9 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v      && s->ne[3] == n_seqs);
 
     // K=1: output carries the final state only. state s is 4D [S_v, S_v, H_v, n_seqs].
-    ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*K=*/1);
+    ggml_tensor * result = prefix_snapshot
+        ? ggml_gated_delta_net_prefix(ctx0, q, k, v, g, b, s, prefix_tokens)
+        : ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*K=*/1);
     if (n_tokens == 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_AR, result, il});
     } else {
@@ -548,6 +550,19 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     qkv_mixed = ggml_transpose(ctx0, qkv_mixed);
     cb(qkv_mixed, "qkv_mixed_transposed", il);
+
+    if (prefix_snapshot) {
+        GGML_ASSERT(n_seqs == 1 && prefix_tokens >= conv_kernel_size - 1 &&
+                    prefix_tokens < ubatch.n_seq_tokens);
+        // This history lies entirely in the current projection. Reading it
+        // directly leaves CONCAT's observer set unchanged, preserving the
+        // existing convolution/state/SiLU prefill fusion.
+        auto * rows = ggml_view_2d(ctx0, qkv_mixed, conv_channels, conv_kernel_size - 1,
+            qkv_mixed->nb[0], (prefix_tokens - (conv_kernel_size - 1)) * qkv_mixed->nb[0]);
+        auto * history = ggml_transpose(ctx0, rows);
+        auto * target = ggml_view_tensor(ctx0, prefix_snapshot->r_l[il]);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, history, target));
+    }
 
     ggml_tensor * conv_input = ggml_concat(ctx0, conv_states, qkv_mixed, 0);
     cb(conv_input, "conv_input", il);
@@ -636,6 +651,17 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
                 ggml_cpy(ctx0, new_state,
                     ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
                         kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+
+        if (prefix_snapshot) {
+            GGML_ASSERT(new_state->view_src &&
+                        new_state->view_src->op == GGML_OP_GATED_DELTA_NET_PREFIX);
+            auto * state = ggml_view_2d(ctx0, new_state->view_src,
+                hparams.n_embd_s(), 1, ggml_row_size(GGML_TYPE_F32, hparams.n_embd_s()),
+                new_state->view_offs + ggml_nbytes(new_state));
+            auto * storage = prefix_snapshot->s_l[il];
+            auto * target = ggml_view_2d(ctx0, storage, hparams.n_embd_s(), 1, storage->nb[1], 0);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, state, target));
+        }
 
         return output;
     }

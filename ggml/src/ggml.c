@@ -1444,9 +1444,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+    "GATED_DELTA_NET_PREFIX",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1564,9 +1565,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+    "gated_delta_net_prefix(q, k, v, g, beta, s)",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6789,6 +6791,22 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[4] = beta;
     result->src[5] = state;
 
+    return result;
+}
+
+struct ggml_tensor * ggml_gated_delta_net_prefix(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        int32_t               prefix_tokens) {
+    GGML_ASSERT(prefix_tokens > 0 && prefix_tokens < v->ne[2]);
+    struct ggml_tensor * result = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 2);
+    result->op = GGML_OP_GATED_DELTA_NET_PREFIX;
+    ggml_set_op_params_i32(result, 1, prefix_tokens);
     return result;
 }
 

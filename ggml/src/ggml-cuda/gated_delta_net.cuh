@@ -5,6 +5,7 @@
 struct ggml_cuda_gated_delta_net_fused_cache {
     float * data;        // rollback slot 0
     int64_t slot_stride; // between rollback slots (0 when K==1)
+    float * prefix_data = nullptr; // explicit prefix op only; separate from the live cache
 
     // Optional FLA-only output epilogue. When populated, the imported BF16
     // attention result is normalized directly into rms_output instead of

@@ -1834,7 +1834,9 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
-    gf               (res->get_gf()) {
+    gf               (res->get_gf()),
+    prefix_snapshot  (params.prefix_snapshot),
+    prefix_tokens    (params.prefix_tokens) {
         res->set_params(params);
     }
 

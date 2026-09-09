@@ -4169,6 +4169,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     ret = GGML_STATUS_SUCCESS;
 
+    if (gparams.prefix_snapshot) {
+        ++prefix_checkpoint.graphs_computed;
+    }
+
     return res;
 }
 
@@ -4453,6 +4457,12 @@ struct vbr_decode_txn {
 }  // namespace
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    prefix_checkpoint.ready = false;
+    prefix_checkpoint.graphs_computed = 0;
+    struct clear_prefix_request {
+        bool & active;
+        ~clear_prefix_request() { active = false; }
+    } prefix_request_guard { prefix_checkpoint.active };
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -5050,6 +5060,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // finish(true) -> extents submitted, owners awaiting the synchronize fence.
     decode_txn.succeed();
 
+    prefix_checkpoint.ready = prefix_checkpoint.active &&
+        prefix_checkpoint.graphs_computed == 1 && batch_inp.n_tokens == prefix_checkpoint.n_tokens;
+    if (prefix_checkpoint.ready) {
+        prefix_checkpoint.owner->cells[0].pos =
+            prefix_checkpoint.start + prefix_checkpoint.prefix_tokens - 1;
+    }
+
     return 0;
 }
 
@@ -5610,6 +5627,14 @@ llm_graph_params llama_context::graph_params(
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
+    bool capture_prefix = prefix_checkpoint.active &&
+        ubatch.n_tokens == uint32_t(prefix_checkpoint.n_tokens) &&
+        ubatch.n_seq_tokens == uint32_t(prefix_checkpoint.n_tokens) &&
+        ubatch.n_seqs == 1 && ubatch.n_seqs_unq == 1 && ubatch.pos && ubatch.seq_id && ubatch.n_seq_id;
+    for (uint32_t i = 0; capture_prefix && i < ubatch.n_tokens; ++i) {
+        capture_prefix = ubatch.n_seq_id[i] == 1 && ubatch.seq_id[i][0] == 0 &&
+            ubatch.pos[i] == prefix_checkpoint.start + int32_t(i);
+    }
     return {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
@@ -5630,6 +5655,8 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.prefix_snapshot =*/ capture_prefix ? prefix_checkpoint.owner : nullptr,
+        /*.prefix_tokens =*/ capture_prefix ? prefix_checkpoint.prefix_tokens : 0,
     };
 }
 
@@ -6197,11 +6224,135 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
 
 static constexpr uint32_t io_magic = 0xaf143cd8;
 
+static void write_seq_header(llama_io_write_i & io, llama_seq_id seq_id) {
+    io.write(&io_magic, sizeof(io_magic));
+    io.write(&seq_id, sizeof(seq_id));
+}
+
+bool llama_context::prefix_snapshot_prepare(const llama_batch & batch, int32_t prefix_tokens) {
+    prefix_snapshot_cancel();
+    const auto & hp = model.hparams;
+    // Initial prototype: one fully-offloaded Qwen hybrid stream, without
+    // speculative state, PLE companions or representation-changing KV.
+    auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get());
+    if (model.arch != LLM_ARCH_QWEN35 || !hybrid || cparams.n_seq_max != 1 ||
+            cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || cparams.n_rs_seq != 0 ||
+            cparams.vbr_dynamic || !cparams.fused_gdn_ch ||
+            !cparams.dflash_capture_layers.empty() || hp.ple_conv_state() != 0 ||
+            hp.ssm_d_conv != 4 || hp.ssm_d_state != 128 ||
+            hp.ssm_dt_rank != 48 || hp.ssm_n_group != 16 || batch.n_tokens < 508 ||
+            uint32_t(batch.n_tokens) > cparams.n_ubatch || prefix_tokens < 3 ||
+            prefix_tokens >= batch.n_tokens || !batch.token || batch.embd ||
+            !batch.pos || !batch.n_seq_id || !batch.seq_id) {
+        return false;
+    }
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        if (batch.n_seq_id[i] != 1 || batch.seq_id[i][0] != 0 ||
+                int64_t(batch.pos[i]) != int64_t(batch.pos[0]) + i) {
+            return false;
+        }
+    }
+    if (batch.pos[0] < 0) {
+        return false;
+    }
+    auto * dev = model.dev_layer(0);
+    if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+        return false;
+    }
+    for (uint32_t il = 0; il < hp.n_layer(); ++il) {
+        if (model.dev_layer(il) != dev) {
+            return false;
+        }
+    }
+    ggml_backend_t backend = nullptr;
+    for (const auto & candidate : backends) {
+        if (ggml_backend_get_device(candidate.get()) == dev) {
+            backend = candidate.get();
+            break;
+        }
+    }
+    if (!backend) {
+        return false;
+    }
+    // Probe the actual operation contract, rather than inferring capability
+    // from a device name. Unsupported GPU architectures retain the old path.
+    ggml_context_ptr probe_ctx(ggml_init({32 * ggml_tensor_overhead(), nullptr, true}));
+    if (!probe_ctx) {
+        return false;
+    }
+    auto * q = ggml_new_tensor_4d(probe_ctx.get(), GGML_TYPE_F32, 128, 16, batch.n_tokens, 1);
+    auto * v = ggml_new_tensor_4d(probe_ctx.get(), GGML_TYPE_F32, 128, 48, batch.n_tokens, 1);
+    auto * g = ggml_new_tensor_4d(probe_ctx.get(), GGML_TYPE_F32, 1, 48, batch.n_tokens, 1);
+    auto * s = ggml_new_tensor_4d(probe_ctx.get(), GGML_TYPE_F32, 128, 128, 48, 1);
+    auto * probe = ggml_gated_delta_net_prefix(probe_ctx.get(), q, q, v, g, g, s, prefix_tokens);
+    if (!ggml_backend_supports_op(backend, probe) || hp.n_embd_s() != 128 * 128 * 48) {
+        return false;
+    }
+    auto * recurrent = hybrid->get_mem_recr();
+    for (uint32_t il = 0; il < hp.n_layer(); ++il) {
+        if (hp.is_recr(il) && (!recurrent->r_l[il] || !recurrent->s_l[il] ||
+                recurrent->r_l[il]->type != GGML_TYPE_F32 || recurrent->s_l[il]->type != GGML_TYPE_F32)) {
+            return false;
+        }
+    }
+    synchronize();
+    if (!prefix_checkpoint.owner) {
+        try {
+            prefix_checkpoint.owner = std::make_shared<llama_memory_recurrent>(
+                model, GGML_TYPE_F32, GGML_TYPE_F32, true, 1, 1, 0,
+                [&](int il) { return hp.is_recr(il); });
+            auto & snapshot = *prefix_checkpoint.owner;
+            snapshot.cells[0].seq_id.insert(0);
+            snapshot.cells[0].src = snapshot.cells[0].src0 = snapshot.cells[0].tail = 0;
+            snapshot.used = snapshot.n = 1;
+        } catch (const std::exception & e) {
+            LLAMA_LOG_WARN("%s: prefix storage unavailable: %s\n", __func__, e.what());
+            prefix_checkpoint.owner.reset();
+            return false;
+        }
+    }
+    prefix_checkpoint.start = batch.pos[0];
+    prefix_checkpoint.n_tokens = batch.n_tokens;
+    prefix_checkpoint.prefix_tokens = prefix_tokens;
+    prefix_checkpoint.active = true;
+    return true;
+}
+
+void llama_context::prefix_snapshot_cancel() {
+    prefix_checkpoint.active = false;
+    prefix_checkpoint.ready = false;
+}
+
+size_t llama_context::prefix_snapshot_get_size() {
+    if (!prefix_checkpoint.ready) {
+        return 0;
+    }
+    llama_io_write_dummy io(false);
+    write_seq_header(io, 0);
+    prefix_checkpoint.owner->state_write(io, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    return io.n_bytes();
+}
+
+size_t llama_context::prefix_snapshot_get_data(uint8_t * dst, size_t size) {
+    if (!prefix_checkpoint.ready) {
+        return 0;
+    }
+    synchronize();
+    try {
+        llama_io_write_host io(dst, size);
+        write_seq_header(io, 0);
+        prefix_checkpoint.owner->state_write(io, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        return io.n_bytes();
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: prefix export failed: %s\n", __func__, e.what());
+        return 0;
+    }
+}
+
 size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags) {
     llama_io_write_dummy io(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
     try {
-        io.write(&io_magic, sizeof(io_magic));
-        io.write(&seq_id, sizeof(seq_id));
+        write_seq_header(io, seq_id);
 
         return state_seq_write_data(io, seq_id, flags);
     } catch (const std::exception & err) {
@@ -6219,8 +6370,7 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
     }
 
     try {
-        io->write(&io_magic, sizeof(io_magic));
-        io->write(&seq_id, sizeof(seq_id));
+        write_seq_header(*io, seq_id);
 
         return state_seq_write_data(*io, seq_id, flags);
     } catch (const std::exception & err) {
@@ -6233,8 +6383,7 @@ size_t llama_context::state_seq_write_data_stream(
         llama_io_write_i & io,
         llama_seq_id seq_id,
         llama_state_seq_flags flags) {
-    io.write(&io_magic, sizeof(io_magic));
-    io.write(&seq_id, sizeof(seq_id));
+    write_seq_header(io, seq_id);
     return state_seq_write_data(io, seq_id, flags);
 }
 

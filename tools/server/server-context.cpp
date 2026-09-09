@@ -16243,6 +16243,58 @@ private:
     bool    cycle_has_output = false;
     bool    cycle_failed = false;
 
+    // Private prefix-checkpoint experiment. The payload is filled while GPU
+    // work runs, but publication stays outside the queue's concurrent readers.
+    struct prefix_checkpoint_pending {
+        int32_t batch_tokens = 0;
+        llama_pos position = -1;
+        common_shared_byte_buffer data;
+        std::function<void()> publish;
+    } prefix_checkpoint;
+
+    bool prepare_prefix_checkpoint(server_slot & slot) {
+        static const bool enabled = std::getenv("BUUN_PRIVATE_PREFIX_CHECKPOINT") != nullptr;
+        // First serving gate: one complete 2K text prefill, static KV, no
+        // speculative/media/adapter companions. All other schedules are intact.
+        if (!enabled || params_base.n_parallel != 1 || spec || ctx_dft || mctx ||
+                params_base.vbr_prompt_cache || !slot.lora.empty() ||
+                slot.id != 0 || slot.need_embd() || n_swa != 0 ||
+                slot.retention_geometry_failed || batch.has_embd ||
+                batch.size() != 2044 || llama_n_batch(ctx_tgt) < 2048 ||
+                llama_n_ubatch(ctx_tgt) < 2048 ||
+                slot.task->n_tokens() != slot.prompt.n_tokens() + 4) {
+            return false;
+        }
+        for (const auto & token : batch.tokens) {
+            if (token.id_slot != 0 || !token.is_prompt) return false;
+        }
+        for (int j=0; j<4; ++j) {
+            const auto i=slot.prompt.n_tokens()+j;
+            if (slot.task->tokens[i] == LLAMA_TOKEN_NULL ||
+                    slot.task->params.message_spans.is_user_start(i+1)) {
+                return false;
+            }
+        }
+        struct batch_guard {
+            llama_batch value;
+            ~batch_guard() { llama_batch_free(value); }
+        } planned { llama_batch_init(2048, 0, 1) };
+        planned.value.n_tokens=2048;
+        for (int i=0; i<2048; ++i) {
+            planned.value.token[i] = i<2044 ? batch.tokens[i].token :
+                slot.task->tokens[slot.prompt.n_tokens()+i-2044];
+            planned.value.pos[i] = i<2044 ? batch.tokens[i].pos :
+                slot.prompt.tokens.pos_next()+i-2044;
+            planned.value.n_seq_id[i]=1;
+            planned.value.seq_id[i][0]=0;
+            planned.value.logits[i]=i==2047;
+        }
+        if (!ctx_tgt->prefix_snapshot_prepare(planned.value,2044)) return false;
+        prefix_checkpoint.batch_tokens=2048;
+        prefix_checkpoint.position=planned.value.pos[2043];
+        return true;
+    }
+
     // TG tokens in the current batch — pure-verify batches allow multi-seq batching
     int32_t n_tg_tokens = 0;
 
@@ -16436,6 +16488,8 @@ private:
     }
 
     void pre_decode() {
+        prefix_checkpoint = {};
+        ctx_tgt->prefix_snapshot_cancel();
         frontier_logits_sampled_cycle = false;
         // apply context-shift if needed
         // TODO: simplify and improve
@@ -18189,6 +18243,9 @@ private:
                             for (int offset : checkpoint_offsets) {
                                 const int n_last = std::min(n_batch, offset);
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
+                                    if (n_last == 4 && prepare_prefix_checkpoint(slot)) {
+                                        continue;
+                                    }
                                     should_break = true;
                                     break;
                                 }
@@ -18233,8 +18290,18 @@ private:
                         }
                     }
 
-                    const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
-                    const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                    const bool checkpoint_from_prefix = prefix_checkpoint.batch_tokens != 0;
+                    auto capture_checkpoint = [this, &slot, do_checkpoint, has_mtmd,
+                            near_prompt_end, checkpoint_from_prefix,
+                            n_tokens_cur = checkpoint_from_prefix ? 4 : n_tokens_cur,
+                            n_tokens_start = checkpoint_from_prefix ? slot.prompt.n_tokens()-4 : n_tokens_start,
+                            is_last_user_message = checkpoint_from_prefix
+                                ? slot.prompt.n_tokens()-4 == last_user_pos : is_last_user_message]() mutable {
+                    if (checkpoint_from_prefix && prefix_checkpoint.data.empty()) return;
+                    const auto pos_min = checkpoint_from_prefix ? prefix_checkpoint.position :
+                        llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+                    const auto pos_max = checkpoint_from_prefix ? prefix_checkpoint.position :
+                        llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
 
                     // no need for empty or small checkpoints
                     // for hybrid/recurrent models, lower the checkpoint threshold so short prompts also get checkpointed
@@ -18275,8 +18342,8 @@ private:
                     }
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
-                    // note: we create the checkpoint before calling llama_decode(), so the current batch is not
-                    //       yet processed and therefore it is not part of the checkpoint.
+                    // Ordinary capture precedes decode; prefix capture publishes
+                    // the separately produced earlier frontier after successful decode.
                     const int ckpt_id_task = slot.task->id;
                     const int64_t ckpt_n_tokens = slot.prompt.n_tokens() - n_tokens_cur;
                     const llama_pos ckpt_pos_min = checkpoint_exact_frontier ? pos_max : pos_min;
@@ -18383,7 +18450,7 @@ private:
                             next.computation_frontier = ckpt_frontier;
                             next.cache_family = slot.cache_family;
 
-                            const size_t checkpoint_size =
+                            const size_t checkpoint_size = checkpoint_from_prefix ? prefix_checkpoint.data.size() :
                                 llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                             llama_memory_hybrid_idx * qsa_owner = nullptr;
                             bool qsa_topology_ready = true;
@@ -18448,6 +18515,8 @@ private:
                             } else if (checkpoint_size == 0) {
                                 SLT_ERR(slot, "%s", "skipping context checkpoint: target state size is zero\n");
                                 staged.clear();
+                            } else if (checkpoint_from_prefix) {
+                                next.data_tgt = prefix_checkpoint.data;
                             } else {
                                 size_t n = 0;
                                 next.data_tgt.overwrite(
@@ -18875,6 +18944,12 @@ private:
                                     cur.pos_max, cur.n_tokens, (float) cur.size() / 1024.0 / 1024.0);
                         }
                     }
+                    };
+                    if (checkpoint_from_prefix) {
+                        prefix_checkpoint.publish = std::move(capture_checkpoint);
+                    } else {
+                        capture_checkpoint();
+                    }
                 }
 
                 if (!slot_batched) {
@@ -19050,6 +19125,18 @@ private:
     bool decode(int32_t & n_batch, int32_t off, llama_batch & batch_view) {
         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
 
+        struct prefix_cleanup {
+            prefix_checkpoint_pending & pending;
+            llama_context * ctx;
+            ~prefix_cleanup() { pending = {}; ctx->prefix_snapshot_cancel(); }
+        } prefix_guard { prefix_checkpoint, ctx_tgt };
+        const bool capture_prefix = prefix_checkpoint.publish && off == 0 &&
+            batch_view.n_tokens == prefix_checkpoint.batch_tokens;
+        if (!capture_prefix) {
+            prefix_checkpoint = {};
+            ctx_tgt->prefix_snapshot_cancel();
+        }
+
         metrics_pre_decode();
 
         if (batch.size() == 0) {
@@ -19095,6 +19182,28 @@ private:
         const std::exception_ptr yield_exception =
             queue_tasks.yield_to_queue_capture_exception([&]() {
             ret = llama_decode(ctx_tgt, batch_view);
+            if (ret == 0 && capture_prefix) {
+                // Allocate before synchronization, matching the ordinary
+                // checkpoint path's overlap with the queued prefill. Only the
+                // private payload changes here: queue readers must not observe
+                // checkpoint-list or retention publication during this yield.
+                try {
+                    const size_t size=ctx_tgt->prefix_snapshot_get_size();
+                    size_t written=0;
+                    if (size != 0) {
+                        prefix_checkpoint.data.overwrite(size, [&](uint8_t * data, size_t n) {
+                            written=ctx_tgt->prefix_snapshot_get_data(data,n);
+                        });
+                    }
+                    if (size == 0 || written != size) {
+                        prefix_checkpoint.data.clear();
+                        SRV_WRN("%s", "prefix checkpoint capture unavailable\n");
+                    }
+                } catch (const std::exception & e) {
+                    prefix_checkpoint.data.clear();
+                    SRV_WRN("prefix checkpoint capture failed: %s\n", e.what());
+                }
+            }
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
@@ -19241,6 +19350,12 @@ private:
 
             SRV_ERR("%s", "failed to process speculative batch\n");
             throw std::runtime_error("failed to process speculative batch");
+        }
+
+        if (capture_prefix && !prefix_checkpoint.data.empty()) {
+            // Same scheduler thread and publication path as ordinary capture,
+            // after the queue worker has finished and decode has succeeded.
+            prefix_checkpoint.publish();
         }
 
         // DFlash: flush captured hidden states into the ring buffer before
