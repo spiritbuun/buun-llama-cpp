@@ -174,8 +174,16 @@ bool llama_kv_cache::vbr_hard_seal_step_blocked(
 // Floor for the n_kv read-extent padding (256 = the fattn padding). Every crossing of a padding boundary
 // is a new graph shape; a multi-device tensor split re-records its step graphs for each new shape, so it
 // can raise the floor with LLAMA_KV_PAD=<cells> (power of two, >= 256) to change shapes less often.
+static uint32_t g_kv_pad_floor_req = 256u;
+
+void llama_kv_cache::set_pad_floor(uint32_t cells) {
+    if (cells >= 256u && (cells & (cells - 1)) == 0) {
+        g_kv_pad_floor_req = std::max(g_kv_pad_floor_req, cells);
+    }
+}
+
 static uint32_t llama_kv_pad_floor() {
-    static const uint32_t floor_cells = [] {
+    static const uint32_t env_cells = [] {
         const char * env = getenv("LLAMA_KV_PAD");
         uint32_t v = env != nullptr ? (uint32_t) atoi(env) : 256u;
         if (v < 256u || (v & (v - 1)) != 0) {
@@ -183,7 +191,7 @@ static uint32_t llama_kv_pad_floor() {
         }
         return v;
     }();
-    return floor_cells;
+    return std::max(env_cells, g_kv_pad_floor_req);
 }
 
 // a type the degrade ladder can move: the five turbo tiers plus F16, which is the default dynamic
