@@ -57,7 +57,8 @@ struct PairedEpilogue {
     }
 
     template <class Shape> static bool can_implement(const Shape & shape, const Arguments & args) {
-        return get<0>(shape) > 0 && get<1>(shape) % 128 == 0 && args.xs && args.ws && args.output;
+        return get<0>(shape) > 0 && get<1>(shape) % 128 == 0 && args.xs && args.ws && args.output &&
+               uintptr_t(args.output) % alignof(float2) == 0;
     }
 
     template <class Shape> CUTLASS_HOST_DEVICE static constexpr int get_store_pipe_increment(Shape) { return 1; }
@@ -92,16 +93,22 @@ struct PairedEpilogue {
         auto          coordinates = mma.get_slice(thread).partition_C(make_identity_tensor(Shape<_128, _128>{}));
         constexpr int pair_stride = PairGroup == 1 ? 1 : (PairGroup / 16) * size<0>(Layout{}) * size<1>(Layout{});
         CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < size(accum); ++i) {
+        for (int i = 0; i < size(accum); i += 2) {
             const int row = get<0>(tile) * 128 + get<0>(coordinates(i));
             const int col = get<1>(tile) * 128 + get<1>(coordinates(i));
             if ((col & PairGroup) == 0 && row < get<0>(problem) && col < get<1>(problem)) {
-                const float xs      = params.xs[row];
-                const int   dst_col = (col / (2 * PairGroup)) * PairGroup + col % PairGroup;
-                const float gate    = (accum(i) * xs) * params.ws[params.ws_up ? dst_col : col];
-                const float up      = (accum(i ^ pair_stride) * (params.xs_up ? params.xs_up[row] : xs)) *
-                                 (params.ws_up ? params.ws_up[dst_col] : params.ws[col + PairGroup]);
-                params.output[int64_t(row) * (get<1>(problem) / 2) + dst_col] = (gate / (1.0f + expf(-gate))) * up;
+                const float xs = params.xs[row];
+                const int dst_col = (col / (2 * PairGroup)) * PairGroup + col % PairGroup;
+                float values[2];
+                CUTLASS_PRAGMA_UNROLL
+                for (int j = 0; j < 2; ++j) {
+                    const float gate = (accum(i + j) * xs) * params.ws[params.ws_up ? dst_col + j : col + j];
+                    const float up = (accum((i + j) ^ pair_stride) * (params.xs_up ? params.xs_up[row] : xs)) *
+                        (params.ws_up ? params.ws_up[dst_col + j] : params.ws[col + j + PairGroup]);
+                    values[j] = (gate / (1.0f + expf(-gate))) * up;
+                }
+                *reinterpret_cast<float2 *>(params.output + int64_t(row) * (get<1>(problem) / 2) + dst_col) =
+                    make_float2(values[0], values[1]);
             }
         }
         return cute::make_tuple(load, store);
@@ -115,6 +122,12 @@ extern "C" int ffn_epilogue_layout_check() {
         const int step   = PairGroup == 1 ? 1 : (PairGroup / 16) * size<0>(coords) * size<1>(coords);
         for (int i = 0; i < size(coords); ++i) {
             const auto a = coords(i), b = coords(i ^ step);
+            if (i % 2 == 0) {
+                const auto next = coords(i + 1);
+                if (get<0>(a) != get<0>(next) || get<1>(next) != get<1>(a) + 1 || get<1>(a) % 2) {
+                    return -2;
+                }
+            }
             if (get<0>(a) != get<0>(b) || (get<1>(a) ^ PairGroup) != get<1>(b)) {
                 printf("thread=%d step=%d size=%d,%d,%d\n", thread, step, int(size<0>(coords)), int(size<1>(coords)),
                        int(size<2>(coords)));

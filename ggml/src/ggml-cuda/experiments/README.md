@@ -95,6 +95,17 @@ those old libraries. Layout-check and F32-reference entry points are retained
 for standalone correctness tests. The adapted dual-input MMA routine preserves
 the upstream BSD notice; the main single-input path reuses the retained GEMM.
 
+The paired epilogue writes adjacent F32 values together. Its output must be
+8-byte aligned; an unsupported pointer is declined during the workspace query,
+before launch. Host layout checks validate the register-coordinate pairing.
+This reduced the compiled epilogue from 32 scalar stores to 16 paired stores,
+without changing register use or adding spills. Balanced PP2048 improved from
+6483.2 to 6542.9 tok/s (0.92%) with the later checkpoint experiments enabled.
+Full logits remained byte-identical, all 26 serving output comparisons matched,
+and decode varied by about 0.1%. A paired profile reduced FFN time from 110.70
+to 108.93 ms, with no extra launches. These remain experimental results below
+the matched vLLM throughput.
+
 ## Prefix-checkpoint state replay
 
 The private `BUUN_PRIVATE_PREFIX_CHECKPOINT` server pilot captures a separate
