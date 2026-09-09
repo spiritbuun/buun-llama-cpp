@@ -481,7 +481,10 @@ ggml_backend_buffer_t ggml_backend_meta_buffer_simple_buffer(ggml_backend_buffer
 }
 
 struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct ggml_tensor * tensor, size_t index) {
-    GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer));
+    if (!ggml_backend_buffer_is_meta(tensor->buffer)) {
+        GGML_ABORT("tensor '%s' (%s) lives in buffer '%s', not a meta buffer", tensor->name, ggml_op_desc(tensor),
+            tensor->buffer ? ggml_backend_buffer_name(tensor->buffer) : "(none)");
+    }
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
     GGML_ASSERT(index < buf_ctx->bufs.size());
 
