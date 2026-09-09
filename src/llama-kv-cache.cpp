@@ -171,6 +171,21 @@ bool llama_kv_cache::vbr_hard_seal_step_blocked(
     return verdict == vbr_hard_seal_guard_result::hard_lease_blocked;
 }
 
+// Floor for the n_kv read-extent padding (256 = the fattn padding). Every crossing of a padding boundary
+// is a new graph shape; a multi-device tensor split re-records its step graphs for each new shape, so it
+// can raise the floor with LLAMA_KV_PAD=<cells> (power of two, >= 256) to change shapes less often.
+static uint32_t llama_kv_pad_floor() {
+    static const uint32_t floor_cells = [] {
+        const char * env = getenv("LLAMA_KV_PAD");
+        uint32_t v = env != nullptr ? (uint32_t) atoi(env) : 256u;
+        if (v < 256u || (v & (v - 1)) != 0) {
+            v = 256u;
+        }
+        return v;
+    }();
+    return floor_cells;
+}
+
 // a type the degrade ladder can move: the five turbo tiers plus F16, which is the default dynamic
 // entry tier (full-quality until budget pressure; the measured orders' first band is
 // fp16->t8). Anything else living in a VMM pool — an explicitly non-vbr side of a mixed
@@ -3204,7 +3219,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
                 used_max_p1[s] = v_cells[s].used_max_p1();
             }
             scratch_cells = 0;
-            const uint32_t n_pad_cur = std::max(n_pad, 256u);
+            const uint32_t n_pad_cur = std::max(n_pad, llama_kv_pad_floor());
             for (const auto & sinfo : sinfos) {
                 uint32_t n_kv = 0;
                 for (size_t s = 0; s < sinfo.n_stream(); ++s) {
@@ -3932,7 +3947,7 @@ void llama_kv_cache::vbr_commit_submitted() {
 // floor), optionally projected forward by an incoming batch's tokens. prepare()'s predictive
 // budget check and ensure_mapped's backing MUST agree on this formula — keep it in one place.
 uint32_t llama_kv_cache::vbr_watermark_cells(uint32_t extra_tokens) const {
-    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+    const uint32_t n_pad_cur = std::max(n_pad, llama_kv_pad_floor());
     uint32_t wm = 0;
     for (uint32_t s = 0; s < n_stream; ++s) {
         const auto & cells = v_cells[s];
@@ -11799,7 +11814,7 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
-    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+    const uint32_t n_pad_cur = std::max(n_pad, llama_kv_pad_floor());
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
