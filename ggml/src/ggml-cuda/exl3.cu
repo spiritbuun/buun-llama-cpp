@@ -185,9 +185,9 @@ size_t exl3_int8_smem_cap(int device) {
 }
 
 // k-split geometry: ~640 blocks in flight, 128-aligned slices, rows bounded by the shared-memory cap
-// at the worst-case per-row cost (M = MAX_M with residual). The split is therefore a function of the
-// shape alone: a token gets bit-identical partial sums whether it is decoded alone or verified in a
-// batch, which keeps greedy speculative decoding lossless.
+// at the worst-case per-row cost (M = MAX_M with residual). For dense calls the split is therefore a
+// function of the shape alone: a token gets bit-identical partial sums whether it is decoded alone or
+// verified in a batch, which keeps greedy speculative decoding lossless on dense models.
 void exl3_int8_geometry(int bits, int nacc, int m, int k, int colblocks, int pairs, size_t cap, int & ksplit, int & nrows, size_t & smem) {
     constexpr int worst_row_bytes = 2 * exl3_int8::MAX_M * 64 + exl3_int8::MAX_M * 32;
     const int kslices = k / 16;
@@ -214,11 +214,13 @@ void exl3_gemv_int8_launch(ggml_backend_cuda_context & ctx, const uint8_t * B, c
     }
     const int colblocks = (n + exl3_int8::COLS - 1) / exl3_int8::COLS;
     const int nacc = GROUPED ? (cb == 2 ? 1 : 0) : (RESID ? 2 : 1) * M;
-    // the grouped split is sized for one token's expert set, so a verify batch of several tokens
-    // reuses the single-token geometry instead of getting its own (batch-dependent) k-split
-    const int pairs_ref = GROUPED ? ga.n_expert_used : 1;
+    // The grouped split is sized for the batch's pair count (deliberately batch-dependent): sizing it for
+    // one token's expert set cost 3% of speculative throughput on Qwen3.8-Flash-Next (2800 verify blocks
+    // instead of 800) and bought nothing, because that model's other batch-keyed kernels (F16 hyper-
+    // connection matmuls, attention) already change its numerics between batch sizes and MoE routing
+    // amplifies any such difference. Dense models get batch-independent results from the cap above.
     int ksplit, nrows; size_t smem;
-    exl3_int8_geometry(bits, nacc, M, k, colblocks, pairs_ref, cap, ksplit, nrows, smem);
+    exl3_int8_geometry(bits, nacc, M, k, colblocks, pairs, cap, ksplit, nrows, smem);
     ggml_cuda_pool_alloc<float> partials(ctx.pool(), size_t(ksplit) * M * pairs * n);
     int * counters = exl3_int8_counters(ctx.device, stream);
     kernel<<<dim3(colblocks, ksplit, pairs), exl3_int8::THREADS, smem, stream>>>(
