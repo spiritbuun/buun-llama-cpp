@@ -39,7 +39,8 @@ struct ggml_cuda_ar_oneshot {
 
     // device-visible pointers to the flag block, per rank (mapped memory may map differently per device)
     char * dev_base[GGML_CUDA_AR1_MAX_RANKS] = {};
-    // device-side per-rank state: [0] launch counter (token), [1] blocks finished writing, [2] blocks finished reading
+    // device-side per-rank state: [0] launch counter (token x blocks), [1..3] large-message phase counters,
+    // [4] current large token, [5] previous large token, [6 + slot] last token that used each small slot
     int  * dev_state[GGML_CUDA_AR1_MAX_RANKS] = {};
 
     // GGML_CUDA_AR1_TRACE=lo:hi — per-rank ring of kernel timelines (token, entry, arrived, peers seen, end) in
@@ -78,7 +79,7 @@ static __device__ __forceinline__ int * ar1_flag(char * base, size_t data_bytes,
 }
 // diagnostics: rank's timeout word lives after all slot flags
 static __device__ __forceinline__ int * ar1_timeout(char * base, size_t data_bytes, int n_ranks, int rank) {
-    return (int *) (base + data_bytes + ((size_t) GGML_CUDA_AR1_SLOTS * n_ranks * AR1_FLAGS_PER_RANK + rank) * GGML_CUDA_AR1_LINE);
+    return (int *) (base + data_bytes + ((size_t) (GGML_CUDA_AR1_SLOTS + 1) * n_ranks * AR1_FLAGS_PER_RANK + rank) * GGML_CUDA_AR1_LINE);
 }
 static __device__ __forceinline__ unsigned int ar1_now_us() {
     unsigned long long t;
@@ -149,10 +150,13 @@ k_ar1_allreduce(float4 * __restrict__ dst, char * base, const ar1_bases bases, i
     const int token = s_token;
     const int slot  = token % GGML_CUDA_AR1_SLOTS;
 
-    // slot reuse: every peer must have finished reading the launch that used this slot last time
-    if (threadIdx.x == 0 && token > GGML_CUDA_AR1_SLOTS) {
-        const int need = token - GGML_CUDA_AR1_SLOTS;
-        for (int r = 0; r < n_ranks; r++) {
+    // slot reuse: every peer must have finished reading the launch that used this slot last time. That token
+    // is tracked per slot (state[6 + slot]); it is not token - n_slots when large messages, which use their
+    // own slot, were interleaved. Every rank runs the same sequence, so the peers' done flags reach it.
+    if (threadIdx.x == 0) {
+        const int need = state[6 + slot];
+        state[6 + slot] = token;
+        for (int r = 0; need > 0 && r < n_ranks; r++) {
             if (r == rank) continue;
             const int * f = ar1_flag(base, data_bytes, n_ranks, slot, r, 1);
             if (!ar1_spin(f, need, ar1_timeout(base, data_bytes, n_ranks, rank), 1000000 + slot * 1000 + r, token, n4, t_entry, give_up)) {
@@ -240,51 +244,52 @@ k_ar1_allreduce(float4 * __restrict__ dst, char * base, const ar1_bases bases, i
     }
 }
 
-// Multi-block variant for multi-megabyte messages (prompt processing): one block cannot drive PCIe, so
-// AR1_MB_BLOCKS blocks each move their own range and the flag protocol runs through per-rank device
-// counters (state[1..3], monotonic, token * blocks when a phase is complete): the last block to finish a
-// phase publishes the rank's host flag, every block polls the peers' flags itself. Always reduce-scatter:
-// rank r reduces chunk r in place, then everyone gathers. All blocks must be co-resident (blocks <= SMs).
+// Multi-megabyte messages (prompt processing). GPU-initiated stores to mapped host memory run at ~3 GB/s
+// while kernel loads reach ~18 GB/s and a copy-engine memcpy runs at PCIe rate, so the slice is published
+// with a D2H memcpy issued by the host between two kernels (stream-ordered, capturable):
+//   k_ar1_mb_begin  (1 block)  token; wait until every peer is done with the previous large message
+//   cudaMemcpyAsync D2H        dst -> own slice in the dedicated large-message slot (zeros if inactive)
+//   k_ar1_mb_reduce (16 blocks) publish, wait peers, reduce-scatter chunk `rank` in place, publish, wait,
+//                              gather; the last block of a phase (per-launch device counter) sets the flag
+// Large messages use their own slot (index GGML_CUDA_AR1_SLOTS) so they never share memory with the small
+// pipelined ones, and the host cannot know a token under graph replay, so there is exactly one such slot:
+// consecutive large reduces are serialized by the begin kernel's wait. All blocks must be co-resident.
+static constexpr int AR1_MB_SLOT = GGML_CUDA_AR1_SLOTS;
 
-static __global__ void __launch_bounds__(AR1_THREADS)
-k_ar1_allreduce_mb(float4 * __restrict__ dst, char * base, const ar1_bases bases, int * state,
-        const size_t data_bytes, const size_t max_bytes,
-        const int n_ranks, const int rank, const int n4, const int active, const int give_up) {
-    __shared__ int s_token;
-    const unsigned int t_entry = ar1_now_us();
-    if (threadIdx.x == 0) {
-        s_token = atomicAdd(&state[0], 1) / AR1_MB_BLOCKS + 1;
+static __global__ void k_ar1_mb_begin(char * base, int * state, const size_t data_bytes,
+        const int n_ranks, const int rank, const int n4, const int give_up) {
+    if (threadIdx.x != 0) {
+        return;
     }
-    __syncthreads();
-    const int token = s_token;
-    const int slot  = token % GGML_CUDA_AR1_SLOTS;
-    const int nb    = gridDim.x;
-    const int b     = blockIdx.x;
-
-    // slot reuse: every peer must be done with the launch that used this slot last time
-    if (threadIdx.x == 0 && token > GGML_CUDA_AR1_SLOTS) {
-        const int need = token - GGML_CUDA_AR1_SLOTS;
+    const unsigned int t_entry = ar1_now_us();
+    const int token = atomicAdd(&state[0], AR1_MB_BLOCKS) / AR1_MB_BLOCKS + 1;
+    state[4] = token;
+    const int prev = state[5]; // this rank's previous large-message token; every rank runs the same sequence
+    state[5] = token;
+    if (prev > 0) {
         for (int r = 0; r < n_ranks; r++) {
             if (r == rank) continue;
-            if (!ar1_spin(ar1_flag(base, data_bytes, n_ranks, slot, r, 1), need, ar1_timeout(base, data_bytes, n_ranks, rank),
-                    1000000 + slot * 1000 + r, token, n4, t_entry, give_up)) {
+            if (!ar1_spin(ar1_flag(base, data_bytes, n_ranks, AR1_MB_SLOT, r, 1), prev, ar1_timeout(base, data_bytes, n_ranks, rank),
+                    1000000 + AR1_MB_SLOT * 1000 + r, token, n4, t_entry, give_up)) {
                 break;
             }
         }
     }
-    __syncthreads();
+}
 
-    // phase 1: publish own slice, this block's range
-    float4 * mine = ar1_slice(bases, max_bytes, slot, rank);
-    for (int i = b * AR1_THREADS + threadIdx.x; i < n4; i += nb * AR1_THREADS) {
-        mine[i] = active ? dst[i] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    }
-    __threadfence_system();
-    __syncthreads();
+static __global__ void __launch_bounds__(AR1_THREADS)
+k_ar1_mb_reduce(float4 * __restrict__ dst, char * base, const ar1_bases bases, int * state,
+        const size_t data_bytes, const size_t max_bytes,
+        const int n_ranks, const int rank, const int n4, const int give_up) {
+    const unsigned int t_entry = ar1_now_us();
+    const int token = state[4];
+    const int slot  = AR1_MB_SLOT;
+    const int nb    = gridDim.x;
+    const int b     = blockIdx.x;
+
+    // the memcpy that published this rank's slice completed before this kernel started (stream order)
     if (threadIdx.x == 0) {
-        // per-launch counters: every multi-block launch adds exactly nb (single-block launches do not touch
-        // them), so the block that brings the count to a multiple of nb is this launch's last
-        if (atomicAdd(&state[1], 1) % nb == nb - 1) {
+        if (b == 0) {
             ar1_store_flag(ar1_flag(base, data_bytes, n_ranks, slot, rank, 0), token);
         }
         for (int r = 0; r < n_ranks; r++) {
@@ -297,7 +302,8 @@ k_ar1_allreduce_mb(float4 * __restrict__ dst, char * base, const ar1_bases bases
     }
     __syncthreads();
 
-    // phase 2: reduce this block's part of chunk `rank` in place
+    // reduce this block's part of chunk `rank` in place (position `rank` of the own slice is read by nobody else)
+    float4 * mine = ar1_slice(bases, max_bytes, slot, rank);
     const int q  = (n4 + n_ranks - 1) / n_ranks;
     const int c0 = rank * q;
     const int c1 = min(c0 + q, n4);
@@ -312,6 +318,8 @@ k_ar1_allreduce_mb(float4 * __restrict__ dst, char * base, const ar1_bases bases
     __threadfence_system();
     __syncthreads();
     if (threadIdx.x == 0) {
+        // per-launch counter: every launch adds exactly nb, so the block that brings the count to a multiple
+        // of nb is this launch's last
         if (atomicAdd(&state[2], 1) % nb == nb - 1) {
             ar1_store_flag(ar1_flag(base, data_bytes, n_ranks, slot, rank, 2), token);
         }
@@ -325,7 +333,7 @@ k_ar1_allreduce_mb(float4 * __restrict__ dst, char * base, const ar1_bases bases
     }
     __syncthreads();
 
-    // phase 3: gather the reduced chunks, this block's range
+    // gather the reduced chunks, this block's range
     for (int i = b * AR1_THREADS + threadIdx.x; i < n4; i += nb * AR1_THREADS) {
         dst[i] = __ldcv(ar1_slice(bases, max_bytes, slot, i / q) + i);
     }
@@ -440,7 +448,7 @@ void ggml_cuda_ar_oneshot_report_all() {
             }
         }
     }
-    const char * host_flags = (const char *) st->host_base + st->data_bytes + (size_t) GGML_CUDA_AR1_SLOTS * st->n_ranks * AR1_FLAGS_PER_RANK * GGML_CUDA_AR1_LINE;
+    const char * host_flags = (const char *) st->host_base + st->data_bytes + (size_t) (GGML_CUDA_AR1_SLOTS + 1) * st->n_ranks * AR1_FLAGS_PER_RANK * GGML_CUDA_AR1_LINE;
     for (int i = 0; i < st->n_ranks; i++) {
         volatile int * w = (volatile int *) (host_flags + (size_t) i * GGML_CUDA_AR1_LINE);
         const int n = w[0];
@@ -474,7 +482,7 @@ ggml_cuda_ar_oneshot * ggml_cuda_ar_oneshot_init(const int * devices, size_t n_d
         st->devices[i] = devices[i];
     }
     st->data_bytes = 0;
-    st->flag_bytes = (size_t) GGML_CUDA_AR1_SLOTS * n_devices * AR1_FLAGS_PER_RANK * GGML_CUDA_AR1_LINE + n_devices * GGML_CUDA_AR1_LINE;
+    st->flag_bytes = (size_t) (GGML_CUDA_AR1_SLOTS + 1) * n_devices * AR1_FLAGS_PER_RANK * GGML_CUDA_AR1_LINE + n_devices * GGML_CUDA_AR1_LINE;
     if (cudaHostAlloc(&st->host_base, st->flag_bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
         (void) cudaGetLastError();
         delete st;
@@ -484,7 +492,7 @@ ggml_cuda_ar_oneshot * ggml_cuda_ar_oneshot_init(const int * devices, size_t n_d
     // one slice block per rank on the NUMA node of its GPU (GGML_CUDA_AR1_NUMA=0 keeps plain pinned allocations)
     static const bool numa_slices = getenv("GGML_CUDA_AR1_NUMA") == nullptr || atoi(getenv("GGML_CUDA_AR1_NUMA")) != 0;
     const size_t page = (size_t) sysconf(_SC_PAGESIZE);
-    st->slice_bytes = ((size_t) GGML_CUDA_AR1_SLOTS * st->max_bytes + page - 1) / page * page;
+    st->slice_bytes = ((size_t) (GGML_CUDA_AR1_SLOTS + 1) * st->max_bytes + page - 1) / page * page;
     for (size_t r = 0; r < n_devices; r++) {
         const int node = numa_slices ? ar1_gpu_numa_node(devices[r]) : -1;
         void * p = nullptr;
@@ -535,8 +543,8 @@ ggml_cuda_ar_oneshot * ggml_cuda_ar_oneshot_init(const int * devices, size_t n_d
         ggml_cuda_set_device(devices[i]);
         void * dptr = nullptr;
         if (cudaHostGetDevicePointer(&dptr, st->host_base, 0) != cudaSuccess ||
-                cudaMalloc(&st->dev_state[i], 4 * sizeof(int)) != cudaSuccess ||
-                cudaMemset(st->dev_state[i], 0, 4 * sizeof(int)) != cudaSuccess) {
+                cudaMalloc(&st->dev_state[i], (6 + GGML_CUDA_AR1_SLOTS) * sizeof(int)) != cudaSuccess ||
+                cudaMemset(st->dev_state[i], 0, (6 + GGML_CUDA_AR1_SLOTS) * sizeof(int)) != cudaSuccess) {
             (void) cudaGetLastError();
             ggml_cuda_ar_oneshot_free(st);
             return nullptr;
@@ -648,9 +656,18 @@ bool ggml_cuda_ar_oneshot_allreduce(ggml_cuda_ar_oneshot * st, ggml_backend_t * 
             bases.p[r] = st->dev_slices[i][r];
         }
         if (multi_block) {
-            k_ar1_allreduce_mb<<<AR1_MB_BLOCKS, AR1_THREADS, 0, stream>>>(
+            k_ar1_mb_begin<<<1, 32, 0, stream>>>(st->dev_base[i], st->dev_state[i], st->data_bytes, st->n_ranks, i, n4, give_up);
+            // host address of the own slice (UVA resolves the direction); the memset uses the device alias
+            char * slice_host = (char *) st->host_slices[i] + (size_t) AR1_MB_SLOT * st->max_bytes;
+            char * slice_dev  = st->dev_slices[i][i] + (size_t) AR1_MB_SLOT * st->max_bytes;
+            if (active) {
+                CUDA_CHECK(cudaMemcpyAsync(slice_host, tensors[i]->data, (size_t) n4 * 16, cudaMemcpyDefault, stream));
+            } else {
+                CUDA_CHECK(cudaMemsetAsync(slice_dev, 0, (size_t) n4 * 16, stream));
+            }
+            k_ar1_mb_reduce<<<AR1_MB_BLOCKS, AR1_THREADS, 0, stream>>>(
                 (float4 *) tensors[i]->data, st->dev_base[i], bases, st->dev_state[i],
-                st->data_bytes, st->max_bytes, st->n_ranks, i, n4, active, give_up);
+                st->data_bytes, st->max_bytes, st->n_ranks, i, n4, give_up);
         } else {
             k_ar1_allreduce<<<1, AR1_THREADS, 0, stream>>>(
                 (float4 *) tensors[i]->data, st->dev_base[i], bases, st->dev_state[i],
