@@ -21,6 +21,7 @@
 #include <vector>
 #include <thread>
 #include <functional>
+#include <unordered_map>
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
@@ -2080,6 +2081,9 @@ struct ggml_backend_meta_context {
     ggml_backend_meta_thread_pool pool; // per-device launch/issue workers
     uint64_t                 step_last_sig    = 0;
     int                      step_same_sig    = 0;   // consecutive computes with the same signature (warmup)
+    // sightings per signature over the whole run: a decode-class shape that recurs non-consecutively (the
+    // server's 4-token checkpoint tail after every prompt) is recorded on its second sighting
+    std::unordered_map<uint64_t, int> step_sightings;
     uint64_t                 step_sig_uid     = 0;   // graph uid the cached signature belongs to
     uint64_t                 step_sig_cached  = 0;
     size_t                   cur_min_reduce   = 0;   // smallest all-reduce of the last rebuilt graph (bytes)
@@ -2488,6 +2492,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             backend_ctx->step_last_sig = step_sig;
             backend_ctx->step_same_sig = 0;
         }
+        if (backend_ctx->step_sightings.size() > 4096) {
+            backend_ctx->step_sightings.clear();
+        }
+        backend_ctx->step_sightings[step_sig]++;
     }
 
     // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
@@ -3202,7 +3210,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         const bool prompt_capture = !decode_class && capture_prompt_after > 0 && backend_ctx->step_same_sig >= capture_prompt_after;
 
         // second consecutive compute of the same shape (the first is the simple backends' warmup)
-        if (backend_ctx->step_same_sig >= 1 && !known_bad && (decode_class || prompt_capture)) {
+        // second sighting of the shape (the first is the simple backends' warmup): consecutive for prompt
+        // chunks, over the whole run for decode-class steps (the server's 4-token checkpoint tail recurs after
+        // every prompt but never consecutively, and ran uncaptured at ≈250 ms per request)
+        const bool decode_seen_before = decode_class && backend_ctx->step_sightings[step_sig] >= 2;
+        if ((backend_ctx->step_same_sig >= 1 || decode_seen_before) && !known_bad && (decode_class || prompt_capture)) {
             bool capturable = true;
             for (size_t j = 0; j < n_backends && capturable; j++) {
                 auto & bcj = backend_ctx->backend_configs[j];
