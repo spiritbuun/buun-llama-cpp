@@ -777,6 +777,10 @@ static std::mutex ggml_cuda_lock;
 static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#include "prefix-export.cuh"
+#endif
+
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
@@ -793,6 +797,11 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     }
     ggml_cuda_fattn_scratch_free(*this);
     ggml_cuda_vbr_transcode_workspace_free(*this);
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    ggml_cuda_set_device(device);
+    ggml_cuda_prefix_destroy(this);
+#endif
 
 #if !defined(GGML_USE_HIP)
     ggml_cuda_set_device(device);
@@ -7221,6 +7230,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, uint64_t graph_key) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    auto * prefix_export = ggml_cuda_prefix_find(cuda_ctx);
+#endif
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu
@@ -7363,6 +7375,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+                    if (prefix_export) prefix_export->after_nodes(cgraph, i, i + nodes_to_skip, cuda_ctx->stream());
+#endif
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
@@ -7395,12 +7410,21 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
                 GGML_ASSERT(ok);
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+                if (prefix_export) prefix_export->after_nodes(cgraph, i, i, cuda_ctx->stream());
+#endif
+
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
                }
             }
         }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        if ((!use_cuda_graph || cuda_graph_update_required) && prefix_export) {
+            prefix_export->join(cuda_ctx->stream());
+        }
+#endif
 #ifdef USE_CUDA_GRAPH
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (use_cuda_graph && cuda_graph_update_required) { // End CUDA graph capture
@@ -7498,6 +7522,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     bool cuda_graph_update_required = false;
     uint64_t graph_key = 0;
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    auto * prefix_export = ggml_cuda_prefix_find(cuda_ctx);
+    if (prefix_export) prefix_export->begin_graph(cgraph);
+#endif
+
     if (cuda_ctx->external_capture) {
         // The meta backend is recording the whole step on our stream: plain launches only.
         try {
@@ -7511,6 +7540,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
 #ifdef USE_CUDA_GRAPH
     graph_key = ggml_cuda_graph_get_key(cgraph);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (prefix_export && prefix_export->scheduled) graph_key ^= UINT64_C(0x96f02c1946a35bd7);
+#endif
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
@@ -7580,6 +7612,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         GGML_LOG_ERROR("%s: CUDA pool allocation failed (out of VRAM), failing graph compute\n", __func__);
         return GGML_STATUS_ALLOC_FAILED;
     }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (prefix_export && prefix_export->scheduled) {
+        CUDA_CHECK(cudaEventRecord(prefix_export->done, cuda_ctx->stream()));
+        prefix_export->launched = true;
+    }
+#endif
 
     return GGML_STATUS_SUCCESS;
 }
@@ -9035,6 +9074,9 @@ const ggml_vbr_cross_domain_iface_v1 * ggml_backend_cuda_vbr_cross_domain_iface_
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (strcmp(name, "buun_private_prefix_export_iface") == 0) return (void *) ggml_cuda_prefix_iface;
+#endif
     if (strcmp(name, GGML_VBR_BACKEND_IFACE_PROC) == 0) {
         return (void *)ggml_backend_cuda_vbr_iface;
     }

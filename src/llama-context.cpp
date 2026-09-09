@@ -22,6 +22,7 @@
 #include "ggml-alloc.h"
 
 #include "../ggml/src/ggml-backend-moe-cache.h"
+#include "../ggml/src/ggml-prefix-export.h"
 
 #include <algorithm>
 #include <atomic>
@@ -5746,6 +5747,30 @@ private:
     size_t size_written = 0;
 };
 
+class llama_io_write_prefix_plan : public llama_io_write_i {
+public:
+    llama_io_write_prefix_plan(uint8_t * dst = nullptr, size_t size = SIZE_MAX) : dst(dst), capacity(size) {}
+    void write(const void * src, size_t size) override {
+        check(size);
+        if (dst) memcpy(dst + used, src, size);
+        used += size;
+    }
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        check(size);
+        if (!dst) ranges.push_back({tensor, offset, size, used});
+        used += size;
+    }
+    size_t n_bytes() override { return used; }
+    std::vector<ggml_prefix_export_range> ranges;
+private:
+    void check(size_t size) {
+        if (size > capacity - used) throw std::runtime_error("prefix export buffer too small");
+    }
+    uint8_t * dst;
+    size_t capacity;
+    size_t used = 0;
+};
+
 class llama_io_write_host : public llama_io_write_i {
 public:
     llama_io_write_host(
@@ -6315,10 +6340,34 @@ bool llama_context::prefix_snapshot_prepare(const llama_batch & batch, int32_t p
     prefix_checkpoint.n_tokens = batch.n_tokens;
     prefix_checkpoint.prefix_tokens = prefix_tokens;
     prefix_checkpoint.active = true;
+    if (std::getenv("BUUN_PRIVATE_PREFIX_EXPORT_OVERLAP")) {
+        auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        auto get_iface = reinterpret_cast<ggml_prefix_export_get_iface>(
+            ggml_backend_reg_get_proc_address(reg, "buun_private_prefix_export_iface"));
+        if (get_iface) {
+            try {
+                llama_io_write_prefix_plan plan;
+                write_seq_header(plan, 0);
+                prefix_checkpoint.owner->state_write(plan, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                const auto * iface = get_iface();
+                if (iface->prepare(backend, plan.ranges.data(), plan.ranges.size())) {
+                    prefix_checkpoint.export_backend = backend;
+                    prefix_checkpoint.export_iface = iface;
+                }
+            } catch (const std::bad_alloc &) {
+                LLAMA_LOG_WARN("%s: export staging unavailable; using synchronous export\n", __func__);
+            }
+        }
+    }
     return true;
 }
 
 void llama_context::prefix_snapshot_cancel() {
+    if (prefix_checkpoint.export_iface) {
+        prefix_checkpoint.export_iface->cancel(prefix_checkpoint.export_backend);
+        prefix_checkpoint.export_iface = nullptr;
+        prefix_checkpoint.export_backend = nullptr;
+    }
     prefix_checkpoint.active = false;
     prefix_checkpoint.ready = false;
 }
@@ -6337,8 +6386,17 @@ size_t llama_context::prefix_snapshot_get_data(uint8_t * dst, size_t size) {
     if (!prefix_checkpoint.ready) {
         return 0;
     }
-    synchronize();
     try {
+        if (prefix_checkpoint.export_iface) {
+            llama_io_write_prefix_plan plan(dst, size);
+            write_seq_header(plan, 0);
+            prefix_checkpoint.owner->state_write(plan, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            if (prefix_checkpoint.export_iface->read(prefix_checkpoint.export_backend, dst, size)) {
+                synchronize();
+                return plan.n_bytes();
+            }
+        }
+        synchronize();
         llama_io_write_host io(dst, size);
         write_seq_header(io, 0);
         prefix_checkpoint.owner->state_write(io, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);

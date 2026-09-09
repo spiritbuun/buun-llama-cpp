@@ -19,6 +19,7 @@ class llama_batch_allocr;
 
 class llama_io_read_i;
 class llama_io_write_i;
+struct ggml_prefix_export_iface;
 
 // Authenticated immutable sequence-file bytes. The pathname is consumed only
 // during prepare; inspection and application use this retained snapshot.
@@ -583,6 +584,8 @@ private:
         bool active = false;
         bool ready = false;
         int graphs_computed = 0;
+        ggml_backend_t export_backend = nullptr;
+        const ggml_prefix_export_iface * export_iface = nullptr;
     } prefix_checkpoint;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
