@@ -138,14 +138,28 @@ void exl3_reconstruct_launch(const uint8_t * data, half * dst, int k, int n0, in
     }
 
 // ---- int8 activation path (4 bpw, m <= 4) ---------------------------------------------------
-// GGML_EXL3_INT8: 0 = off (fp16 tensor-core gemv), 1 = int8 + error-feedback residual, 2 = plain int8.
+// GGML_EXL3_INT8: 0 = off (fp16 tensor-core gemv), 1 = int8 + error-feedback residual everywhere,
+// 2 = plain int8 (residual only for the head), unset = per-tensor rule: plain for K <= 6, residual for K >= 7.
+// The activation rounding of plain int8 is invisible next to the weight error up to 6 bpw but becomes the
+// dominant error at 7-8 bpw (worst-token KLD vs exllamav3 0.07 at K7, 0.56 at K8; residual restores 0.001/0.0005
+// for 7% / 1% of decode speed on a 1.7B model).
 
 int exl3_int8_mode() {
     static const int mode = [] {
         const char * e = getenv("GGML_EXL3_INT8");
-        return e ? atoi(e) : 2;
+        return e ? atoi(e) : -1;
     }();
     return mode;
+}
+
+// whether the int8 path takes the error-feedback residual pass for a weight of this bit width
+static bool exl3_int8_resid(int bits, bool head) {
+    const int mode = exl3_int8_mode();
+    if (mode == 1) {
+        return true;
+    }
+    // The head (output.weight) feeds the logits directly and is DRAM-bound anyway, so it always takes it
+    return head || (mode != 2 && bits >= 7);
 }
 
 // Self-cleaning per-device counter block (one int per 256-column group), zero at rest.
@@ -277,9 +291,7 @@ void ggml_cuda_mul_mat_exl3(ggml_backend_cuda_context & ctx, const ggml_tensor *
         // int8 activation path: fused input transform, per-slice quantization, fused output transform
         const uint8_t * B = static_cast<const uint8_t *>(src0->data);
         const float * x = static_cast<const float *>(src1->data);
-        // The head (output.weight) feeds the logits directly and is DRAM-bound anyway, so it always
-        // takes the residual (error-feedback) pass; plain mode only drops it on the layer weights.
-        const bool resid = exl3_int8_mode() == 1 || strcmp(src0->name, "output.weight") == 0;
+        const bool resid = exl3_int8_resid(bits, strcmp(src0->name, "output.weight") == 0);
         switch (bits) {
 #define EXL3_INT8_CASE(K) case K: resid ? exl3_int8_run<K, true>(ctx, x, suh, B, svh, y, m, k, n, stream) \
                                        : exl3_int8_run<K, false>(ctx, x, suh, B, svh, y, m, k, n, stream); break;
