@@ -825,12 +825,28 @@ static __device__ __forceinline__ float vec_dot_f8_e4m3_q8_1_lut(
         const half * __restrict__ lut) {
     const uint4 packed = ((const uint4 *) vf8)[kbx*(QK8_1/16) + iqs];
     float sum = 0.0f;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200 && __CUDA_ARCH__ < 1300
+    // E4M3 values are exactly representable in F16. Convert pairs in hardware
+    // instead of fetching arbitrary entries from shared memory; retain the
+    // original scalar F32 FMA order and Q8_1 activation scaling.
+#pragma unroll
+    for (int i = 0; i < 16; i += 2) {
+        const uint32_t word = i < 4 ? packed.x : i < 8 ? packed.y : i < 12 ? packed.z : packed.w;
+        const auto pair = __nv_cvt_fp8x2_to_halfraw2(
+            uint16_t(word >> (8*(i & 3))), __NV_E4M3);
+        const float2 values = __half22float2(static_cast<half2>(pair));
+        sum = fmaf(values.x, float(bq8_1->qs[16*iqs + i]), sum);
+        sum = fmaf(values.y, float(bq8_1->qs[16*iqs + i + 1]), sum);
+    }
+    GGML_UNUSED(lut);
+#else
 #pragma unroll
     for (int i = 0; i < 16; ++i) {
         const uint32_t word = i < 4 ? packed.x : i < 8 ? packed.y : i < 12 ? packed.z : packed.w;
         const uint8_t value = uint8_t(word >> (8*(i & 3)));
         sum = fmaf(__half2float(lut[value]), float(bq8_1->qs[16*iqs + i]), sum);
     }
+#endif
     return sum * __low2float(bq8_1->ds);
 }
 
