@@ -81,3 +81,31 @@ different entry points and incompatible argument lists. Do not substitute
 those old libraries. Layout-check and F32-reference entry points are retained
 for standalone correctness tests. The adapted dual-input MMA routine preserves
 the upstream BSD notice; the main single-input path reuses the retained GEMM.
+
+## Prefix-checkpoint state replay
+
+The private `BUUN_PRIVATE_PREFIX_CHECKPOINT` server pilot captures a separate
+F32 recurrent state after token 2044 while evaluating a full 2048-token prompt.
+It retains the existing checkpoint serializer, frontier, and publication policy.
+Only eligible single-slot, fully offloaded Qwen35 hybrid text prompts use it;
+other configurations retain the ordinary split. Its extra roughly 150 MiB GPU
+plane is not yet integrated into auto-fit, so it is not a public default.
+
+`gdn-prefix-chunk-sm120.py` adapts the pinned vLLM FLA state kernel to preserve
+an additional F32 state before chunk 31. The backend can then replay only the
+last partial chunk instead of the whole prefix. It does not restart from the
+ordinary BF16 chunk-state storage. Generate the optional module on SM120 with
+the pinned vLLM/Triton environment used for the existing FLA modules:
+
+```sh
+python ggml/src/ggml-cuda/experiments/gdn-prefix-chunk-sm120.py /path/to/output
+```
+
+Set `BUUN_PRIVATE_PREFIX_CHUNK_CUBIN` to the generated `prefix_chunk_state.cubin`.
+Its ABI is specific to H=48, Hg=16, D=128, BT=BV=64, four warps, three stages,
+and chunk 31; the native dispatch additionally requires a 2048-token batch and
+a prefix after token 1984. Other prefixes retain full replay. The temporary
+F32 plane uses 3 MiB of backend scratch, shared across layer executions.
+The experiment preserves full output, final state and prefix state exactly in
+component/graph-replay and full-model checkpoint/restore gates. This is not a
+generic checkpoint architecture or support for speculative rollback planes.

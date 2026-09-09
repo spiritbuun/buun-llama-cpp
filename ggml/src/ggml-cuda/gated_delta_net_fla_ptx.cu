@@ -47,6 +47,22 @@ struct fla_modules {
     std::array<CUfunction, K_COUNT> funcs{};
 };
 
+// Private SM120 prefix experiment: this module captures the unrounded state
+// before chunk 31. Other prefix positions keep the full state replay below.
+static CUfunction get_prefix_chunk_kernel(int device) {
+    static const char * path = std::getenv("BUUN_PRIVATE_PREFIX_CHUNK_CUBIN");
+    if (path == nullptr) return nullptr;
+    static std::array<CUmodule, GGML_CUDA_MAX_DEVICES> modules{};
+    static std::array<CUfunction, GGML_CUDA_MAX_DEVICES> funcs{};
+    static std::array<std::once_flag, GGML_CUDA_MAX_DEVICES> once;
+    std::call_once(once[device], [device] {
+        CU_CHECK(cuModuleLoad(&modules[device], path));
+        CU_CHECK(cuModuleGetFunction(&funcs[device], modules[device], "prefix_chunk_state"));
+        CU_CHECK(cuFuncSetAttribute(funcs[device], CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 90632));
+    });
+    return funcs[device];
+}
+
 static fla_modules & get_modules(int device, int cc) {
     GGML_ASSERT(device >= 0 && device < GGML_CUDA_MAX_DEVICES);
     GGML_ASSERT(cc == 800 || cc == 860 || cc == 1200);
@@ -492,6 +508,11 @@ static void launch(CUfunction fn, dim3 grid, dim3 block, unsigned shared, CUstre
                            shared, stream, args, nullptr));
 }
 
+__global__ void init_gdn_prefix_range(int * cu_seqlens, int begin, int end) {
+    cu_seqlens[0] = begin;
+    cu_seqlens[1] = end;
+}
+
 } // namespace
 
 bool ggml_cuda_gdn_fla_ptx_supported(
@@ -541,6 +562,10 @@ void ggml_cuda_gdn_fla_ptx(
     const int64_t n_h          = int64_t(n_chunks) * GDN_H * GDN_D * GDN_D;
     constexpr int64_t n_state = int64_t(GDN_H) * GDN_D * GDN_D;
 
+    const CUfunction prefix_chunk_kernel = prefix_state_out != nullptr &&
+        n_tokens == 2048 && prefix_tokens > 31 * GDN_BT
+        ? get_prefix_chunk_kernel(ctx.device) : nullptr;
+
     ggml_cuda_pool_alloc<nv_bfloat16> q_p(ctx.pool(), n_qk);
     ggml_cuda_pool_alloc<nv_bfloat16> k_p(ctx.pool(), n_qk);
     ggml_cuda_pool_alloc<nv_bfloat16> v_p(ctx.pool(), n_v);
@@ -559,6 +584,10 @@ void ggml_cuda_gdn_fla_ptx(
     ggml_cuda_pool_alloc<int>         cu_seqlens(ctx.pool(), 2);
     ggml_cuda_pool_alloc<int>         chunk_indices(ctx.pool(), 2 * n_chunks);
     ggml_cuda_pool_alloc<int64_t>     chunk_offsets(ctx.pool(), 2);
+    ggml_cuda_pool_alloc<float>       prefix_chunk_state(ctx.pool());
+    if (prefix_chunk_kernel != nullptr) {
+        prefix_chunk_state.alloc(n_state);
+    }
 
     constexpr int threads = 256;
     if (compact_conv_bf16 != nullptr) {
@@ -609,7 +638,14 @@ void ggml_cuda_gdn_fla_ptx(
     launch(m.funcs[K_RECOMPUTE], {(unsigned) n_chunks, GDN_H, 1}, {sm80 ? 64u : 128u, 1, 1}, sm120 ? 20480 : sm80 ? 36864 : 32768, cu_stream, recompute_args);
     void * state_args[] = { &k_p.ptr, &u.ptr, &w.ptr, &v_new.ptr, &g_cum.ptr, &h.ptr,
                             &state_in_p.ptr, &state_out_p.ptr, &cu_seqlens.ptr, &chunk_offsets.ptr, &T, &null_ptr, &null_ptr };
-    launch(m.funcs[K_STATE], {2, GDN_H, 1}, {128, 1, 1}, sm80 || sm120 ? 90632 : 49412, cu_stream, state_args);
+    if (prefix_chunk_kernel != nullptr) {
+        void * capture_args[] = { &k_p.ptr, &u.ptr, &w.ptr, &v_new.ptr, &g_cum.ptr, &h.ptr,
+            &state_in_p.ptr, &state_out_p.ptr, &cu_seqlens.ptr, &chunk_offsets.ptr, &T,
+            &prefix_chunk_state.ptr, &null_ptr, &null_ptr };
+        launch(prefix_chunk_kernel, {2, GDN_H, 1}, {128, 1, 1}, 90632, cu_stream, capture_args);
+    } else {
+        launch(m.funcs[K_STATE], {2, GDN_H, 1}, {128, 1, 1}, sm80 || sm120 ? 90632 : 49412, cu_stream, state_args);
+    }
     void * output_args[] = { &q_p.ptr, &k_p.ptr, &v_new.ptr, &h.ptr, &g_cum.ptr, &out.ptr,
                              &cu_seqlens.ptr, &chunk_indices.ptr, &scale, &T, &null_ptr, &null_ptr };
     launch(m.funcs[K_OUTPUT], {sm120 ? 2u : sm80 ? 1u : 4u, (unsigned) n_chunks, GDN_H}, {sm80 || sm120 ? 128u : 64u, 1, 1}, sm120 ? 24576 : sm80 ? 32768 : 20480, cu_stream, output_args);
@@ -665,11 +701,20 @@ void ggml_cuda_gdn_fla_ptx(
         // causal WY intermediates, but replay from the original F32 initial
         // state, not the rounded BF16 chunk-state storage. Only this second
         // state traversal is repeated; projections and attention output are not.
-        const int prefix_chunks = (prefix_tokens + GDN_BT - 1) / GDN_BT;
-        init_gdn_varlen_metadata<<<1, 256, 0, stream>>>(
-            cu_seqlens.get(), chunk_indices.get(), chunk_offsets.get(), prefix_tokens, prefix_chunks);
+        float * replay_initial = state_in_p.get();
+        if (prefix_chunk_kernel != nullptr) {
+            // The captured plane is F32, unlike h's BF16 chunk snapshots.
+            // Only the final partial chunk needs replay; WY inputs use the
+            // original token offsets through the varlen begin position.
+            init_gdn_prefix_range<<<1, 1, 0, stream>>>(cu_seqlens.get(), 31 * GDN_BT, prefix_tokens);
+            replay_initial = prefix_chunk_state.get();
+        } else {
+            const int prefix_chunks = (prefix_tokens + GDN_BT - 1) / GDN_BT;
+            init_gdn_varlen_metadata<<<1, 256, 0, stream>>>(
+                cu_seqlens.get(), chunk_indices.get(), chunk_offsets.get(), prefix_tokens, prefix_chunks);
+        }
         void * prefix_args[] = { &k_p.ptr, &u.ptr, &w.ptr, &v_new.ptr, &g_cum.ptr, &h.ptr,
-                                 &state_in_p.ptr, &state_out_p.ptr, &cu_seqlens.ptr,
+                                 &replay_initial, &state_out_p.ptr, &cu_seqlens.ptr,
                                  &chunk_offsets.ptr, &prefix_tokens, &null_ptr, &null_ptr };
         launch(m.funcs[K_STATE], {2, GDN_H, 1}, {128, 1, 1}, 90632, cu_stream, prefix_args);
         unpack_gdn_state_f32<<<(n_state + threads - 1) / threads, threads, 0, stream>>>(
