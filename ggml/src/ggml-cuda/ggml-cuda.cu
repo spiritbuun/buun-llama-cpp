@@ -5508,6 +5508,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // not. Keep these nodes on that path until an individual fusion consumes
     // the scale/marker explicitly.
     if (node->op == GGML_OP_MUL_MAT && node->src[3] != nullptr) {
+        const ggml_op ops[] = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU };
+        const int output = i + 2;
+        if (ggml_can_fuse_subgraph(cgraph, i, 3, ops, &output, 1) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, &output, 1)) {
+            ggml_tensor * glu = cgraph->nodes[output];
+            ggml_tensor * gate = glu->src[0]; ggml_tensor * up = glu->src[1];
+            if (((gate == node && up == cgraph->nodes[i + 1]) || (up == node && gate == cgraph->nodes[i + 1])) &&
+                    ggml_cuda_fp8_channel_pair(*cuda_ctx, gate, up, glu)) return 2;
+        }
         return 0;
     }
 

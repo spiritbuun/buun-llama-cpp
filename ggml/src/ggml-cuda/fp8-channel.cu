@@ -5,6 +5,7 @@
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
 #include <cublasLt.h>
 #include "unary.cuh"
+#include "experiments/fp8-channel-dual-pack.cuh"
 #if defined(__linux__)
 #include <dlfcn.h>
 
@@ -247,6 +248,78 @@ static __global__ void fp8_channel_compare_all(
     }
 }
 #endif
+
+bool ggml_cuda_fp8_channel_pair(ggml_backend_cuda_context & ctx, ggml_tensor * gate, ggml_tensor * up, ggml_tensor * dst) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080 && defined(__linux__)
+    using fn_type = int (*)(const void *, const void *, const void *, const void *,
+        const float *, const float *, const float *, const float *, float *, const int32_t *, const int32_t *,
+        int, int, int, int, int, int, void *, size_t, size_t *, cudaStream_t);
+    static const auto provider = []() -> fn_type {
+        const char * path = getenv("BUUN_PRIVATE_FFN_PAIR_LIBRARY");
+        if (!path) return nullptr;
+        void * library = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+        if (!library) GGML_ABORT("FFN probe: %s", dlerror());
+        auto fn = reinterpret_cast<fn_type>(dlsym(library, "buun_fp8_cutlass_ffn"));
+        if (!fn) GGML_ABORT("FFN probe: missing entry point");
+        return fn;
+    }();
+    if (!provider || !getenv("GGML_CUDA_FP8_LT") || !fp8_cutlass_provider() ||
+            !getenv("GGML_CUDA_FP8_LT_SPLIT_K") || atoi(getenv("GGML_CUDA_FP8_LT_SPLIT_K")) != 2 ||
+            getenv("GGML_CUDA_FP8_LT_REFERENCE") || getenv("GGML_CUDA_FP8_LT_ROUND_CORRECTION") ||
+            getenv("GGML_CUDA_FP8_LT_WIDE_SCALE") || getenv("GGML_CUDA_FP8_LT_CHECK_ALL") ||
+            getenv("GGML_CUDA_FP8_LT_CHECK") || getenv("GGML_CUDA_FP8_LT_DUMP")) return false;
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (cc < 1200 || cc >= 1300 || !gate || !up || gate->op != GGML_OP_MUL_MAT || up->op != GGML_OP_MUL_MAT ||
+            dst->op != GGML_OP_GLU || ggml_get_glu_op(dst) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(dst, 1) ||
+            dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) ||
+            ctx.humming_bf16_activations.count(dst) || ctx.humming_bf16_activation_uses.count(dst) ||
+            ctx.bf16_glu_outputs.count(dst) ||
+            !ggml_are_same_shape(gate, up) || !ggml_are_same_shape(gate, dst) ||
+            gate->src[1] != up->src[1]) return false;
+    const auto * x = gate->src[1];
+    if (!x || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[2] != 1 || x->ne[3] != 1 ||
+            x->ne[0] != 5120 || x->ne[1] < 1009 || x->ne[1] > 65535 ||
+            ctx.humming_bf16_activations.count(x) || ctx.humming_bf16_activation_uses.count(x)) return false;
+    const int64_t k = x->ne[0], m = x->ne[1], n = dst->ne[0], padded_m = (m + 15)/16*16;
+    if (n % 64 || dst->ne[1] != m || (getenv("GGML_CUDA_FP8_LT_KEEP_SKINNY") && n <= 128)) return false;
+    for (auto * mm : {gate, up}) {
+        const auto * w = mm->src[0]; const auto * s = mm->src[2]; const auto * marker = mm->src[3];
+        if (!w || !s || !marker || w->type != GGML_TYPE_F8_E4M3 || s->type != GGML_TYPE_F32 ||
+                marker->type != GGML_TYPE_I32 || ggml_nelements(marker) != 1 || !ggml_is_contiguous(marker) ||
+                !ggml_is_contiguous(w) || !ggml_is_contiguous(s) || !ggml_is_contiguous(mm) ||
+                mm->type != GGML_TYPE_F32 || w->ne[0] != k || w->ne[1] != n || w->ne[2] != 1 || w->ne[3] != 1 ||
+                s->ne[0] != n || ggml_nelements(s) != n || uintptr_t(w->data)%16 ||
+                ggml_cuda_humming_fp8_is_repacked(w) ||
+                ctx.humming_bf16_activations.count(mm) || ctx.humming_bf16_activation_uses.count(mm)) return false;
+    }
+    ggml_cuda_pool_alloc<__nv_fp8_e4m3> input(ctx.pool(), k*padded_m);
+    ggml_cuda_pool_alloc<__nv_fp8_e4m3> input_up(ctx.pool(), k*padded_m);
+    ggml_cuda_pool_alloc<float> scales(ctx.pool(), padded_m);
+    ggml_cuda_pool_alloc<float> scales_up(ctx.pool(), padded_m);
+    size_t required = 0;
+    const auto invoke = [&](void * workspace, size_t capacity) {
+        return provider(gate->src[0]->data, up->src[0]->data, input.get(), input_up.get(),
+            static_cast<const float *>(gate->src[2]->data), static_cast<const float *>(up->src[2]->data),
+            scales.get(), scales_up.get(), static_cast<float *>(dst->data),
+            static_cast<const int32_t *>(gate->src[3]->data), static_cast<const int32_t *>(up->src[3]->data),
+            int(m), int(n), int(k), 2,
+            ctx.device, ggml_cuda_info().devices[ctx.device].nsm, workspace, capacity, &required, ctx.stream());
+    };
+    if (invoke(nullptr, 0) != 0) return false;
+    ggml_cuda_pool_alloc<char> workspace(ctx.pool(), std::max(size_t(1), required));
+    ffn_dual_pack_kernel<<<padded_m, 256, 0, ctx.stream()>>>(
+        static_cast<const float *>(x->data), input.get(), input_up.get(), scales.get(), scales_up.get(),
+        static_cast<const int32_t *>(gate->src[3]->data), static_cast<const int32_t *>(up->src[3]->data), int(m));
+    CUDA_CHECK(cudaGetLastError());
+    const int status = invoke(workspace.get(), std::max(size_t(1), required));
+    if (status != 0) GGML_ABORT("FFN probe: launch status %d", status);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+#else
+    GGML_UNUSED(ctx); GGML_UNUSED(gate); GGML_UNUSED(up); GGML_UNUSED(dst);
+    return false;
+#endif
+}
 
 bool ggml_cuda_mul_mat_fp8_channel_lt(ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool fuse_swiglu) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080

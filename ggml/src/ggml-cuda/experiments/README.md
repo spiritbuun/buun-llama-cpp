@@ -38,3 +38,46 @@ Configuration informed by vLLM v0.28.0 (commit
 writes FP32 outputs, uses native scale order, and supports a two-part reduction
 inside the final epilogue. See LICENSE (Apache2.0); external CUTLASS headers
 retain their own BSD3-Clause notices.
+
+## Paired channel-FP8 FFN experiment
+
+`fp8-cutlass-ffn-sm120.cu` combines two dense gate/up projections with their
+SwiGLU epilogue. It reads the original weight tensors directly, with no weight
+repack or duplicate resident weights. Build separately against the same
+**unmodified** CUTLASS headers:
+
+```sh
+nvcc -O3 -std=c++17 -use_fast_math -arch=sm_120a \
+  --expt-relaxed-constexpr --cudart shared -Xcompiler=-fPIC -shared \
+  -I /path/to/cutlass/include \
+  ggml/src/ggml-cuda/experiments/fp8-cutlass-ffn-sm120.cu \
+  -o /path/to/libfp8-cutlass-ffn-sm120.so
+```
+
+Set `BUUN_PRIVATE_FFN_PAIR_LIBRARY` to this library alongside the FP8 research
+settings above. The host matcher currently selects SM120, dense contiguous
+F32 inputs, F32 channel scales, dynamic I32 activation markers, K=5120,
+split2, and batches padded to at least 1024 rows. Other shapes use the existing
+path. Graph use-count and memory-range checks remain mandatory.
+
+The two clipping settings need not match. The packer computes their row scales
+independently; the device GEMM uses one activation matrix when the markers
+agree and two otherwise. Its transfer byte count follows the same condition.
+This works across CUDA-graph replays with changed marker values and introduces
+no host scalar cache. It reserves a second packed-activation workspace and
+additional shared-memory capacity; these costs are not inherently free.
+The unequal-marker path is correct but is not claimed faster on every shape.
+
+On the tested Qwen3.8-27B channel-FP8 / RTX5090 workload, balanced warmed PP2048
+rose from 5788.7 to 5849.9 tok/s (~1.06%). The source-packaged recheck gave
+5789.7 to 5853.5 tok/s (~1.10%). Exact model-logit repeats, a 1020-token
+ubatch boundary, 24 serving token comparisons and 18 changing-marker graph-replay
+cells passed. Decode changed by less than 0.25%; measured device occupancy
+remained 27456 MiB. These are model-specific research results, not parity with
+vLLM or qualification for a public default. No checkpoint feature was disabled.
+
+The provider exports `buun_fp8_cutlass_ffn`; early private prototypes had
+different entry points and incompatible argument lists. Do not substitute
+those old libraries. Layout-check and F32-reference entry points are retained
+for standalone correctness tests. The adapted dual-input MMA routine preserves
+the upstream BSD notice; the main single-input path reuses the retained GEMM.
