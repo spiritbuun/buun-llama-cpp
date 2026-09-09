@@ -835,8 +835,12 @@ static __device__ __forceinline__ float vec_dot_f8_e4m3_q8_1_lut(
         const auto pair = __nv_cvt_fp8x2_to_halfraw2(
             uint16_t(word >> (8*(i & 3))), __NV_E4M3);
         const float2 values = __half22float2(static_cast<half2>(pair));
-        sum = fmaf(values.x, float(bq8_1->qs[16*iqs + i]), sum);
-        sum = fmaf(values.y, float(bq8_1->qs[16*iqs + i + 1]), sum);
+        // Q8_1 blocks and their qs payload are four-byte aligned. Load one
+        // word per four activations, preserving signed bytes and FMA order.
+        const uint32_t activations = get_int_b4(bq8_1->qs, 4*iqs + i/4);
+        const int shift = 8*(i & 3);
+        sum = fmaf(values.x, float(int8_t(activations >> shift)), sum);
+        sum = fmaf(values.y, float(int8_t(activations >> (shift + 8))), sum);
     }
     GGML_UNUSED(lut);
 #else
