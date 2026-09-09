@@ -39,6 +39,19 @@ writes FP32 outputs, uses native scale order, and supports a two-part reduction
 inside the final epilogue. See LICENSE (Apache2.0); external CUTLASS headers
 retain their own BSD3-Clause notices.
 
+For split2 control projections at K=5120, N<=128 and M=1024..4096, the provider
+uses a 32x64x128 tile with a 32x32 epilogue. Other shapes keep the original
+128x128x128 tile and fallbacks. This preserves the two accumulation partitions,
+scale order and F32 output; it introduces no persistent storage.
+
+On the Qwen3.8-27B channel-FP8 / RTX5090 PP2048 workload with the checkpoint
+experiments below, balanced warmed throughput improved from 6423.7 to 6495.6
+tok/s (1.12%). The 96 small projections decreased from 6.01 to 1.28 ms in the
+paired profile, with 2324 total launches in both arms. Full-model logit repeats
+and the batch-boundary reference matched byte-for-byte; 26 serving output
+comparisons matched and decode changed by less than 0.04%. These measurements
+do not qualify other hidden widths or imply vLLM parity.
+
 ## Paired channel-FP8 FFN experiment
 
 `fp8-cutlass-ffn-sm120.cu` combines two dense gate/up projections with their

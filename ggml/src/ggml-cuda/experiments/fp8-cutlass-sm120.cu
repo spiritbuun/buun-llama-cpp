@@ -42,8 +42,8 @@ template <class Base> struct RegisterSplitMain : Base {
     }
 };
 
-template <bool Scale, bool Add, bool RegisterSplit = false> struct Plan {
-    using Tile    = Shape<_128, _128, _128>;
+template <bool Scale, bool Add, bool RegisterSplit = false, bool SmallN = false> struct Plan {
+    using Tile    = std::conditional_t<SmallN, Shape<_32, _64, _128>, Shape<_128, _128, _128>>;
     using Cluster = Shape<_1, _1, _1>;
     using XScale  = fusion::Sm90ColBroadcast<0, Tile, float, float, Stride<_1, _0, _0>, 4, false>;
     using WScale  = fusion::Sm90RowBroadcast<0, Tile, float, float, Stride<_0, _1, _0>, 4, false>;
@@ -65,7 +65,8 @@ template <bool Scale, bool Add, bool RegisterSplit = false> struct Plan {
                                                                   cutlass::arch::OpClassTensorOp,
                                                                   Tile,
                                                                   Cluster,
-                                                                  cutlass::epilogue::collective::EpilogueTileAuto,
+                                                                  std::conditional_t<SmallN, Shape<_32, _32>,
+                                                                      cutlass::epilogue::collective::EpilogueTileAuto>,
                                                                   float,
                                                                   float,
                                                                   float,
@@ -89,7 +90,8 @@ template <bool Scale, bool Add, bool RegisterSplit = false> struct Plan {
         Tile,
         Cluster,
         cutlass::gemm::collective::StageCountAutoCarveout<sizeof(typename Epi::SharedStorage)>,
-        cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+        std::conditional_t<SmallN, cutlass::gemm::KernelTmaWarpSpecializedPingpong,
+            cutlass::gemm::collective::KernelScheduleAuto>>::CollectiveOp;
     using Main = std::conditional_t<RegisterSplit, RegisterSplitMain<BaseMain>, BaseMain>;
     using Kernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, Main, Epi, void>;
     using Op     = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
@@ -156,9 +158,12 @@ extern "C" int buun_fp8_cutlass(const void *  w,
         return -1;
     }
     if (parts == 2 && k % 256 == 0) {
-        using Register = Plan<true, false, true>;
-        auto args = Register::args(w, x, ws, xs, nullptr, out, m, n, k, k, device, sms);
-        if (Register::Op::can_implement(args) == cutlass::Status::kSuccess) {
+        const auto run_register = [&](auto small) {
+            using Register = Plan<true, false, true, decltype(small)::value>;
+            auto args = Register::args(w, x, ws, xs, nullptr, out, m, n, k, k, device, sms);
+            if (Register::Op::can_implement(args) != cutlass::Status::kSuccess) {
+                return -1;
+            }
             *required = Register::Op::get_workspace_size(args);
             if (!workspace) {
                 return 0;
@@ -168,6 +173,18 @@ extern "C" int buun_fp8_cutlass(const void *  w,
             }
             typename Register::Op op;
             return int(op.run(args, workspace, stream));
+        };
+        // Small control projections otherwise launch very few large CTAs.
+        // Keep the ordinary tile outside the measured prefill/hidden-width range.
+        if (k == 5120 && n <= 128 && m >= 1024 && m <= 4096) {
+            const int status = run_register(std::true_type{});
+            if (status != -1) {
+                return status;
+            }
+        }
+        const int status = run_register(std::false_type{});
+        if (status != -1) {
+            return status;
         }
     }
     using Single               = Plan<true, false>;
