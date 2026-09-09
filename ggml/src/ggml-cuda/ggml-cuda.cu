@@ -5786,7 +5786,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const ggml_tensor * conv_weight = nullptr;
             ggml_tensor * silu = nullptr;
             ggml_tensor * conv = nullptr;
-            if (n_t <= 8) {
+            // Wide DConv4 can avoid materializing CONCAT entirely when the
+            // state copy and convolution are its only observers.
+            const bool prefill_conv = n_t > 32 && n_prefix == 3 &&
+                ggml_node_get_use_count(cgraph, i) == 2 && ggml_node_get_use_count(cgraph, i + 1) == 1 &&
+                !(node->flags & GGML_TENSOR_FLAG_OUTPUT) && !(view->flags & GGML_TENSOR_FLAG_OUTPUT);
+            if (n_t <= 8 || prefill_conv) {
                 for (int j = cpy_index + 1; j < cgraph->n_nodes; ++j) {
                     ggml_tensor * cand = cgraph->nodes[j];
                     if (cand->op != GGML_OP_SSM_CONV || cand->src[0] != node) {
@@ -5802,7 +5807,33 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                             next->type == GGML_TYPE_F32 && ggml_is_contiguous(next) &&
                             next->ne[0] == node->ne[1] && next->ne[1] == n_t && next->ne[2] == node->ne[2] &&
                             !ggml_cuda_tensors_overlap(next, prefix) && !ggml_cuda_tensors_overlap(next, body) &&
-                            !ggml_cuda_tensors_overlap(next, node) && !ggml_cuda_tensors_overlap(next, cpy)) {
+                            !ggml_cuda_tensors_overlap(next, node) && !ggml_cuda_tensors_overlap(next, cpy) &&
+                            (!prefill_conv || (ggml_is_contiguous(cand->src[1]) &&
+                                cand->src[1]->op == GGML_OP_NONE))) {
+                        // Prefill moves the SiLU write before any intervening
+                        // state-gather nodes. It must not overwrite their live
+                        // inputs or outputs, even when the allocator reuses storage.
+                        // The leaf weight must also remain unchanged until conv.
+                        bool safe = true;
+                        if (prefill_conv) {
+                            safe = !ggml_cuda_tensors_overlap(next, cand->src[1]) &&
+                                !ggml_cuda_tensors_overlap(cpy, cand->src[1]);
+                            for (int k = cpy_index + 1; safe && k < j; ++k) {
+                                const ggml_tensor * between = cgraph->nodes[k];
+                                if (ggml_cuda_tensors_overlap(next, between) ||
+                                        ggml_cuda_tensors_overlap(cand->src[1], between)) {
+                                    safe = false;
+                                }
+                                for (const ggml_tensor * src : between->src) {
+                                    if (src != nullptr && ggml_cuda_tensors_overlap(next, src)) {
+                                        safe = false;
+                                    }
+                                }
+                            }
+                        }
+                        if (!safe) {
+                            break;
+                        }
                         conv_weight = cand->src[1];
                         conv = cand;
                         silu = next;

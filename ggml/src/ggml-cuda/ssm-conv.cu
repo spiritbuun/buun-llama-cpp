@@ -458,6 +458,57 @@ static __global__ void conv_state_concat_tiled(
     }
 }
 
+// Prefill DConv4: read the token-major projection directly, retaining the
+// three-token halo in shared memory. The matcher proves the concatenation
+// has no remaining observer, so only SiLU output and saved state are written.
+// All prefix reads finish before state writes, including an in-place prefix.
+static __global__ void conv_state_silu_prefill(
+        const float * prefix, const float * body, const float * weight,
+        float * state, float * out, int64_t channels, int n_t,
+        int64_t prefix_seq_stride, int64_t body_seq_stride, int64_t body_row_stride,
+        int64_t state_seq_stride, int64_t out_seq_stride) {
+    __shared__ float tile[35][32];
+    const int seq = blockIdx.z;
+    const int64_t channel = int64_t(blockIdx.x) * 32 + threadIdx.x;
+    const int t0 = blockIdx.y * 32;
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    prefix += seq * prefix_seq_stride;
+    body += seq * body_seq_stride;
+    state += seq * state_seq_stride;
+    out += seq * out_seq_stride;
+
+    for (int j = ty; j < 35; j += 8) {
+        const int t = t0 + j - 3;
+        float x = 0.0f;
+        if (channel < channels && t < n_t) {
+            x = t < 0 ? prefix[channel * 3 + t + 3] : body[int64_t(t) * body_row_stride + channel];
+        }
+        tile[j][tx] = x;
+    }
+    __syncthreads();
+    if (channel >= channels) {
+        return;
+    }
+    if (t0 == 0 && ty < 3) {
+        state[channel * 3 + ty] = body[int64_t(n_t - 3 + ty) * body_row_stride + channel];
+    }
+    float w[4];
+#pragma unroll
+    for (int d = 0; d < 4; ++d) {
+        w[d] = weight[channel * 4 + d];
+    }
+    for (int j = ty; j < 32 && t0 + j < n_t; j += 8) {
+        float sum = 0.0f;
+#pragma unroll
+        for (int d = 0; d < 4; ++d) {
+            sum += tile[j + d][tx] * w[d];
+        }
+        sum += 0.0f;
+        out[int64_t(t0 + j) * channels + channel] = ggml_cuda_op_silu_single(sum);
+    }
+}
+
 void ggml_cuda_op_conv_state_concat(
         ggml_backend_cuda_context & ctx,
         const ggml_tensor * prefix,
@@ -471,7 +522,18 @@ void ggml_cuda_op_conv_state_concat(
     const int64_t n_s      = prefix->ne[2];
     const int64_t n_t      = body->ne[0];
     GGML_ASSERT(n_prefix <= 16);
-    GGML_ASSERT(silu == nullptr || (n_t <= 8 && conv_weight != nullptr && conv_weight->ne[0] == n_prefix + 1));
+    GGML_ASSERT(silu == nullptr || (conv_weight != nullptr && conv_weight->ne[0] == n_prefix + 1));
+    if (silu != nullptr && n_t > 8) {
+        GGML_ASSERT(n_prefix == 3 && n_t > 32 && ggml_is_contiguous(conv_weight));
+        const dim3 blocks((channels + 31) / 32, (n_t + 31) / 32, n_s);
+        conv_state_silu_prefill<<<blocks, dim3(32, 8), 0, ctx.stream()>>>(
+            static_cast<const float *>(prefix->data), static_cast<const float *>(body->data),
+            static_cast<const float *>(conv_weight->data), static_cast<float *>(state->data),
+            static_cast<float *>(silu->data), channels, int(n_t),
+            prefix->nb[2] / sizeof(float), body->nb[2] / sizeof(float), body->nb[0] / sizeof(float),
+            state->nb[1] / sizeof(float), silu->nb[2] / sizeof(float));
+        return;
+    }
     if (n_t <= 8) {
         const dim3 blocks((channels + 255) / 256, n_s);
         conv_state_concat<<<blocks, 256, 0, ctx.stream()>>>(
