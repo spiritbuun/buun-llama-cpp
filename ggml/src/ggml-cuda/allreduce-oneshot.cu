@@ -280,8 +280,11 @@ static __global__ void k_ar1_mb_begin(char * base, int * state, const size_t dat
 static __global__ void __launch_bounds__(AR1_THREADS)
 k_ar1_mb_reduce(float4 * __restrict__ dst, char * base, const ar1_bases bases, int * state,
         const size_t data_bytes, const size_t max_bytes,
-        const int n_ranks, const int rank, const int n4, const int give_up) {
+        const int n_ranks, const int rank, const int n4, const int give_up, unsigned long long * trace) {
     const unsigned int t_entry = ar1_now_us();
+    unsigned long long t_ns[4];
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_ns[0]));
+    t_ns[1] = t_ns[2] = t_ns[0];
     const int token = state[4];
     const int slot  = AR1_MB_SLOT;
     const int nb    = gridDim.x;
@@ -292,12 +295,14 @@ k_ar1_mb_reduce(float4 * __restrict__ dst, char * base, const ar1_bases bases, i
         if (b == 0) {
             ar1_store_flag(ar1_flag(base, data_bytes, n_ranks, slot, rank, 0), token);
         }
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_ns[1]));
         for (int r = 0; r < n_ranks; r++) {
             if (!ar1_spin(ar1_flag(base, data_bytes, n_ranks, slot, r, 0), token, ar1_timeout(base, data_bytes, n_ranks, rank),
                     2000000 + slot * 1000 + r, token, n4, t_entry, give_up)) {
                 break;
             }
         }
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_ns[2]));
         __threadfence();
     }
     __syncthreads();
@@ -342,6 +347,12 @@ k_ar1_mb_reduce(float4 * __restrict__ dst, char * base, const ar1_bases bases, i
         __threadfence_system();
         if (atomicAdd(&state[3], 1) % nb == nb - 1) {
             ar1_store_flag(ar1_flag(base, data_bytes, n_ranks, slot, rank, 1), token);
+        }
+        if (trace != nullptr && b == 0) {
+            // block 0's view: entry, slice published, peers seen, end (the memcpy phase precedes the kernel)
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_ns[3]));
+            unsigned long long * e = trace + ((size_t) rank * AR1_TRACE_N + (token % AR1_TRACE_N)) * AR1_TRACE_W;
+            e[0] = token; e[1] = t_ns[0]; e[2] = t_ns[1]; e[3] = t_ns[2]; e[4] = t_ns[3];
         }
     }
 }
@@ -667,7 +678,7 @@ bool ggml_cuda_ar_oneshot_allreduce(ggml_cuda_ar_oneshot * st, ggml_backend_t * 
             }
             k_ar1_mb_reduce<<<AR1_MB_BLOCKS, AR1_THREADS, 0, stream>>>(
                 (float4 *) tensors[i]->data, st->dev_base[i], bases, st->dev_state[i],
-                st->data_bytes, st->max_bytes, st->n_ranks, i, n4, give_up);
+                st->data_bytes, st->max_bytes, st->n_ranks, i, n4, give_up, st->dev_trace[i]);
         } else {
             k_ar1_allreduce<<<1, AR1_THREADS, 0, stream>>>(
                 (float4 *) tensors[i]->data, st->dev_base[i], bases, st->dev_state[i],
