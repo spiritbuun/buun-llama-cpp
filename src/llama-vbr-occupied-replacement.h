@@ -66,6 +66,8 @@ struct vbr_occupied_replacement_cell {
     llama_pos ext_y = 0;
     llama_seq_id owner_sequence = -1;
     uint32_t reference_count = 0;
+    bool owns_destination = false;
+    llama_token token = LLAMA_TOKEN_NULL;
 };
 
 struct vbr_occupied_replacement_unit_currency {
@@ -131,6 +133,10 @@ public:
         relocation_runs() const noexcept;
     const std::vector<vbr_occupied_replacement_relocation_run> &
         recovery_runs() const noexcept;
+    // Live cells belonging exclusively to other logical sequences. Occupied
+    // replacement republishes these unchanged alongside the new destination.
+    const std::vector<vbr_occupied_replacement_cell> &
+        preserved_cells() const noexcept;
     // Internal stage authority. The guard retains this immutable capability
     // through validation/adoption; callers must not resolve a second package.
     const vbr_artifact_package_view & recovery_package() const noexcept;

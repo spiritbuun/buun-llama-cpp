@@ -1865,6 +1865,10 @@ void test_lifecycle_defaults_and_reuse_thresholds() {
     accepted_handoff.family_matches = true;
     CHECK(server_vbr_empty_handoff_lookup_allowed(accepted_handoff));
     CHECK(server_vbr_empty_handoff_allowed(accepted_handoff));
+    CHECK(server_vbr_live_source_displacement_allowed(false, 8));
+    CHECK(server_vbr_live_source_displacement_allowed(true, 1));
+    CHECK(!server_vbr_live_source_displacement_allowed(true, 2));
+    CHECK(!server_vbr_live_source_displacement_allowed(true, 8));
     const auto rejects_handoff = [&](auto mutate) {
         auto gate = accepted_handoff;
         mutate(gate);
@@ -1914,6 +1918,7 @@ void test_lifecycle_defaults_and_reuse_thresholds() {
     CHECK(vbr_reclaim.token_identity_distinguishes_attempt);
     CHECK(vbr_reclaim.successful_attempt_is_state_sealed);
     CHECK(vbr_reclaim.multi_fresh_pressure_isolated);
+    CHECK(vbr_reclaim.isolated_capture_drains_without_backoff);
     CHECK(vbr_reclaim.unchanged_admission_refusal_is_suppressed);
     CHECK(vbr_reclaim.checkpoint_admission_refusals_are_independent);
     CHECK(vbr_reclaim.admission_refusal_reopens_on_currency_change);

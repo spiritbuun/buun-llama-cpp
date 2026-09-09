@@ -1,8 +1,10 @@
 #include "llama-vbr-artifact-stage.h"
 
 #include <algorithm>
+#include <future>
 #include <limits>
 #include <new>
+#include <thread>
 #include <utility>
 
 const char * vbr_h2d_status_name(vbr_h2d_status status) noexcept {
@@ -875,7 +877,10 @@ bool stage_relocated_child(
             failure = vbr_adopt_stage_status::source_unavailable;
             return false;
         }
-        const auto digest = vbr_capture_stream_digest(*source);
+        auto digest = source->sealed_digest();
+        if (!digest_nonzero(digest)) {
+            digest = vbr_capture_stream_digest(*source);
+        }
         if (!digest_nonzero(digest)) {
             failure = vbr_adopt_stage_status::source_hash_mismatch;
             return false;
@@ -1043,8 +1048,11 @@ vbr_adopt_stage_result vbr_stage_validated_manifest(
                 return false;
             }
             if (!projected) {
-                read.verified_digest =
-                    vbr_capture_stream_digest(*read.source);
+                read.verified_digest = read.source->sealed_digest();
+                if (!digest_nonzero(read.verified_digest)) {
+                    read.verified_digest =
+                        vbr_capture_stream_digest(*read.source);
+                }
             }
             if (!digest_nonzero(read.verified_digest)) {
                 return false;
@@ -1053,25 +1061,86 @@ vbr_adopt_stage_result vbr_stage_validated_manifest(
             return true;
         };
 
-        for (const auto & child : out.manifest->children()) {
-            const bool staged = prefix_projection
-                ? occupied_replacement
-                    ? stage_projection_relocated_child(
-                        child, out.manifest->relocation_runs(), policy.lanes,
-                        append_read, out.status)
-                    : stage_projection_child(
-                        child, policy.lanes, append_read, out.status)
-                : occupied_replacement
-                    ? stage_relocated_child(
-                        child, out.manifest->relocation_runs(),
-                        vbr_staged_read_kind::unit_payload, nullptr, policy.lanes,
-                        append_read, out.status)
-                : stage_child(
-                    child, out.manifest->source_package(), policy.lanes,
-                    append_read, out.status);
-            if (!staged) {
-                return out;
+        struct child_stage_result {
+            bool ok = false;
+            vbr_adopt_stage_status status =
+                vbr_adopt_stage_status::internal_error;
+            std::vector<vbr_staged_read_descriptor> reads;
+        };
+        const auto stage_children =
+                [&](size_t count, bool parallel, auto && stage_one) {
+            std::vector<child_stage_result> results(count);
+            const uint32_t available = std::thread::hardware_concurrency();
+            const size_t worker_count = parallel
+                ? std::min<size_t>(
+                    16, std::min<size_t>(
+                        count, available == 0 ? 1 : available))
+                : std::min<size_t>(count, 1);
+            const auto worker = [&](size_t worker_index) {
+                const size_t begin = count*worker_index/worker_count;
+                const size_t end = count*(worker_index + 1)/worker_count;
+                for (size_t i = begin; i < end; ++i) {
+                    auto & result = results[i];
+                    const auto collect = [&](vbr_staged_read_descriptor read) {
+                        result.reads.push_back(std::move(read));
+                        return true;
+                    };
+                    result.ok = stage_one(i, collect, result.status);
+                }
+            };
+            if (worker_count == 1) {
+                worker(0);
+            } else {
+                std::vector<std::future<void>> workers;
+                workers.reserve(worker_count);
+                for (size_t i = 0; i < worker_count; ++i) {
+                    workers.push_back(std::async(
+                        std::launch::async, worker, i));
+                }
+                for (auto & pending : workers) {
+                    pending.get();
+                }
             }
+            for (auto & result : results) {
+                if (!result.ok) {
+                    out.status = result.status;
+                    return false;
+                }
+                for (auto & read : result.reads) {
+                    if (!append_read(std::move(read))) {
+                        out.status =
+                            vbr_adopt_stage_status::source_hash_mismatch;
+                        return false;
+                    }
+                }
+            }
+            return true;
+        };
+
+        const auto & manifest_children = out.manifest->children();
+        if (!stage_children(
+                manifest_children.size(),
+                prefix_projection,
+                [&](size_t i, const auto & collect,
+                    vbr_adopt_stage_status & status) {
+                    const auto & child = manifest_children[i];
+                    return prefix_projection
+                        ? occupied_replacement
+                            ? stage_projection_relocated_child(
+                                child, out.manifest->relocation_runs(),
+                                policy.lanes, collect, status)
+                            : stage_projection_child(
+                                child, policy.lanes, collect, status)
+                        : occupied_replacement
+                            ? stage_relocated_child(
+                                child, out.manifest->relocation_runs(),
+                                vbr_staged_read_kind::unit_payload, nullptr,
+                                policy.lanes, collect, status)
+                            : stage_child(
+                                child, out.manifest->source_package(),
+                                policy.lanes, collect, status);
+                })) {
+            return out;
         }
         const auto * replacement = out.manifest->occupied_replacement();
         const bool recycle = replacement && replacement->strategy() ==
@@ -1084,15 +1153,22 @@ vbr_adopt_stage_result vbr_stage_validated_manifest(
                 return out;
             }
             const auto & recovery_units = recovery.units();
-            for (const auto & child : out.manifest->children()) {
-                if (child.logical_unit_id >= recovery_units.size() ||
-                    !stage_relocated_child(
-                        child, runs,
-                        vbr_staged_read_kind::recovery_unit_payload,
-                        &recovery_units[child.logical_unit_id], policy.lanes,
-                        append_read, out.status)) {
-                    return out;
-                }
+            if (!stage_children(
+                    manifest_children.size(), false,
+                    [&](size_t i, const auto & collect,
+                        vbr_adopt_stage_status & status) {
+                        const auto & child = manifest_children[i];
+                        if (child.logical_unit_id >= recovery_units.size()) {
+                            status = vbr_adopt_stage_status::source_unavailable;
+                            return false;
+                        }
+                        return stage_relocated_child(
+                                child, runs,
+                                vbr_staged_read_kind::recovery_unit_payload,
+                                &recovery_units[child.logical_unit_id],
+                                policy.lanes, collect, status);
+                    })) {
+                return out;
             }
         }
         for (uint32_t i = 0; i < out.manifest->companions().size(); ++i) {

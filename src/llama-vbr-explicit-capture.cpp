@@ -748,17 +748,6 @@ void add_accounting(
         llama_cache_acct_attr_kind::artifact });
 }
 
-vbr_artifact_portable_domain portable_domain(
-        uint32_t topology,
-        uint16_t ordinal) {
-    return {
-        llama_cache_acct_residency::device,
-        llama_cache_acct_domain_kind::device_topology,
-        topology,
-        ordinal,
-    };
-}
-
 vbr_explicit_capture_status stream_status(
         vbr_capture_stream_status status) {
     switch (status) {
@@ -1993,6 +1982,8 @@ public:
                 cells.seq_count(physical) == 1
                     ? cells.seq_get(physical) : -1,
                 uint32_t(cells.seq_count(physical)),
+                cells.seq_has(physical, destination),
+                ext.tok,
             });
         }
         units_out.reserve(tracker->unit_count());
@@ -2079,15 +2070,16 @@ public:
                 if (cells.is_empty(physical)) {
                     continue;
                 }
-                if (cells.seq_count(physical) != 1 ||
-                    !cells.seq_has(physical, destination)) {
+                if (cells.seq_count(physical) != 1) {
                     return false;
                 }
                 const auto & ext = cells.ext_get(physical);
                 writer.u64(physical);
+                writer.u64(uint64_t(cells.seq_get(physical)));
                 writer.u64(uint64_t(cells.pos_get(physical)));
                 writer.u64(uint64_t(ext.x));
                 writer.u64(uint64_t(ext.y));
+                writer.u64(uint64_t(ext.tok));
             }
             writer.u64(tracker->unit_count());
             for (uint32_t unit = 0; unit < tracker->unit_count(); ++unit) {
@@ -3260,12 +3252,11 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
                                 segment.first_dependency + dependency]);
                     }
                 }
-                const auto owner = std::lower_bound(
+                const auto owner = std::find(
                     manifest_ids.begin(), manifest_ids.end(),
                     owner_manifest);
                 if (owner_manifest == UINT64_MAX ||
-                    owner == manifest_ids.end() ||
-                    *owner != owner_manifest) {
+                    owner == manifest_ids.end()) {
                     result.status =
                         vbr_explicit_capture_status::internal_error;
                     return false;
@@ -3279,12 +3270,8 @@ vbr_projected_capture_batch_result vbr_capture_projected_batch(
                                 vbr_explicit_capture_status::size_overflow;
                             return false;
                         }
-                        const vbr_artifact_portable_domain domain {
-                            llama_cache_acct_residency::device,
-                            llama_cache_acct_domain_kind::device_topology,
-                            shard.topology_index,
-                            shard.device_ordinal,
-                        };
+                        const auto domain =
+                            vbr_artifact_payload_storage_domain();
                         if (!add_planned_bytes(
                                 domain,
                                 projected_rows*shard.row_bytes)) {
@@ -4659,18 +4646,14 @@ vbr_explicit_capture_result vbr_prepare_explicit_manifest(
                     add_accounting(
                         package.manifest.accounting,
                         vbr_artifact_accounting_role::unit_payload,
-                        portable_domain(
-                            shard.topology_index,
-                            shard.device_ordinal),
+                        vbr_artifact_payload_storage_domain(),
                         shard.payload_bytes);
                     if (has_stash) {
                         add_accounting(
                             package.manifest.accounting,
                             vbr_artifact_accounting_role::
                                 clean_stash_payload,
-                            portable_domain(
-                                shard.topology_index,
-                                shard.device_ordinal),
+                            vbr_artifact_payload_storage_domain(),
                             shard.stash_bytes);
                     }
                 }

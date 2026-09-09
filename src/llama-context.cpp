@@ -14,6 +14,7 @@
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-hybrid-iswa.h"
+#include "llama-memory-tree.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -6881,6 +6882,21 @@ llama_live_memory_breakdown llama_context::live_memory_breakdown() const {
     }
 
     return ret;
+}
+
+void llama_context::vbr_import_accounting_observed() noexcept {
+    if (!memory) {
+        return;
+    }
+    std::vector<llama_memory_tree_child> tree;
+    if (!llama_memory_tree_collect(memory.get(), tree)) {
+        return;
+    }
+    for (const auto & child : tree) {
+        if (child.attention != nullptr) {
+            child.attention->vbr_import_accounting_observed();
+        }
+    }
 }
 
 //

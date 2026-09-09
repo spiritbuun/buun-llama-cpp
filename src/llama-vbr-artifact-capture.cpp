@@ -4,12 +4,16 @@
 #include "llama-sha256.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstring>
+#include <future>
 #include <limits>
 #include <map>
 #include <new>
 #include <set>
 #include <tuple>
+#include <thread>
 #include <utility>
 
 namespace {
@@ -671,15 +675,51 @@ struct artifact_segment_chain::impl {
     size_t max_segment = 0;
     uint32_t authenticated_chunk_bytes = 0;
     uint32_t max_authenticated_chunks = 0;
-    uint32_t authenticated_current_bytes = 0;
     bool authenticated_closed = false;
-    llama_sha256_writer authenticated_current_hash;
+    std::array<uint8_t, 32> authenticated_root = {};
     std::vector<std::array<uint8_t, 32>> authenticated_leaves;
     bool stream_digest_enabled = false;
     bool stream_digest_complete = false;
     uint64_t stream_digest_expected = 0;
     llama_sha256_writer stream_digest_hash;
     std::array<uint8_t, 32> stream_digest = {};
+
+    template<typename Consumer>
+    bool for_each_span(
+            uint64_t offset, size_t size,
+            Consumer && consume) const noexcept {
+        if (offset > total || size > total - offset) {
+            return false;
+        }
+        const auto first = std::upper_bound(
+            segment_ends.begin(), segment_ends.end(), offset);
+        size_t segment_index = size_t(first - segment_ends.begin());
+        uint64_t cursor = segment_index == 0 ? 0 :
+            segment_ends[segment_index - 1];
+        size_t remaining = size;
+        for (; remaining != 0 && segment_index < segments.size();
+             ++segment_index) {
+            const auto & segment = segments[segment_index];
+            const uint64_t end = segment_ends[segment_index];
+            const uint64_t within = offset > cursor ? offset - cursor : 0;
+            if (within > segment.length || !segment.storage ||
+                segment.offset > segment.storage->size() ||
+                within > segment.storage->size() - segment.offset) {
+                return false;
+            }
+            const size_t available = size_t(segment.length - within);
+            const size_t take = std::min(available, remaining);
+            const size_t storage_offset = size_t(segment.offset + within);
+            if (take > segment.storage->size() - storage_offset) {
+                return false;
+            }
+            consume(segment.storage->data() + storage_offset, take);
+            remaining -= take;
+            offset += take;
+            cursor = end;
+        }
+        return remaining == 0;
+    }
 };
 
 artifact_segment_chain::artifact_segment_chain()
@@ -760,17 +800,6 @@ bool artifact_segment_chain::append_storage(
             if (chunks > impl_->max_authenticated_chunks) {
                 return false;
             }
-            const uint64_t completed =
-                new_total/impl_->authenticated_chunk_bytes;
-            if (completed > impl_->authenticated_leaves.capacity()) {
-                const uint64_t doubled =
-                    impl_->authenticated_leaves.capacity() == 0 ? 1 :
-                    std::min<uint64_t>(
-                        impl_->max_authenticated_chunks,
-                        uint64_t(impl_->authenticated_leaves.capacity())*2);
-                impl_->authenticated_leaves.reserve(size_t(std::max(
-                    completed, doubled)));
-            }
         }
         if (impl_->segments.size() == impl_->segments.capacity()) {
             const size_t next = impl_->segments.empty() ? 1 :
@@ -797,31 +826,6 @@ bool artifact_segment_chain::append_storage(
         impl_->segment_ends.push_back(impl_->total);
         impl_->max_segment =
             std::max(impl_->max_segment, size);
-        if (impl_->authenticated_chunk_bytes != 0) {
-            size_t consumed = 0;
-            while (consumed < size) {
-                const size_t take = std::min<size_t>(
-                    size - consumed,
-                    impl_->authenticated_chunk_bytes -
-                        impl_->authenticated_current_bytes);
-                impl_->authenticated_current_hash.bytes(
-                    data + consumed, take);
-                impl_->authenticated_current_bytes += uint32_t(take);
-                consumed += take;
-                if (impl_->authenticated_current_bytes ==
-                        impl_->authenticated_chunk_bytes) {
-                    const auto payload =
-                        impl_->authenticated_current_hash.finish();
-                    impl_->authenticated_leaves.push_back(
-                        capture_range_leaf_digest(
-                            impl_->authenticated_leaves.size(),
-                            impl_->authenticated_current_bytes,
-                            payload));
-                    impl_->authenticated_current_hash = {};
-                    impl_->authenticated_current_bytes = 0;
-                }
-            }
-        }
         if (impl_->stream_digest_enabled &&
             !impl_->stream_digest_complete) {
             impl_->stream_digest_hash.bytes(data, size);
@@ -853,53 +857,24 @@ bool artifact_segment_chain::authenticated() const noexcept {
     return impl_->authenticated_chunk_bytes != 0;
 }
 
+std::array<uint8_t, 32> artifact_segment_chain::sealed_digest() const noexcept {
+    return impl_->authenticated_closed ? impl_->authenticated_root
+                                       : std::array<uint8_t, 32> {};
+}
+
 bool artifact_segment_chain::read(
         uint64_t offset, uint8_t * destination,
         size_t size) const noexcept {
-    if ((!destination && size != 0) ||
-        offset > impl_->total ||
-        size > impl_->total - offset) {
+    if (!destination && size != 0) {
         return false;
     }
-    if (size == 0) {
-        return true;
-    }
-    const auto first = std::upper_bound(
-        impl_->segment_ends.begin(), impl_->segment_ends.end(), offset);
-    size_t segment_index = size_t(first - impl_->segment_ends.begin());
-    uint64_t cursor = segment_index == 0 ? 0 :
-        impl_->segment_ends[segment_index - 1];
-    size_t remaining = size;
-    for (; segment_index < impl_->segments.size(); ++segment_index) {
-        const auto & segment = impl_->segments[segment_index];
-        const uint64_t end = impl_->segment_ends[segment_index];
-        const uint64_t within = offset > cursor
-            ? offset - cursor : 0;
-        const size_t available =
-            size_t(segment.length - within);
-        const size_t take = std::min(available, remaining);
-        if (take != 0) {
-            if (!segment.storage ||
-                segment.offset + within >
-                    segment.storage->size() ||
-                take > segment.storage->size() -
-                    size_t(segment.offset + within)) {
-                return false;
-            }
-            std::memcpy(
-                destination + (size - remaining),
-                segment.storage->data() +
-                    size_t(segment.offset + within),
-                take);
-            remaining -= take;
-            offset += take;
-            if (remaining == 0) {
-                return true;
-            }
-        }
-        cursor = end;
-    }
-    return remaining == 0;
+    size_t copied = 0;
+    return impl_->for_each_span(
+        offset, size,
+        [&](const uint8_t * data, size_t count) noexcept {
+            std::memcpy(destination + copied, data, count);
+            copied += count;
+        });
 }
 
 namespace {
@@ -1140,8 +1115,14 @@ uint64_t vbr_capture_range_proof::metadata_bytes() const noexcept {
 bool vbr_capture_range_seal(
         artifact_segment_chain & chain,
         uint64_t max_metadata_bytes,
-        vbr_capture_range_tree & output) noexcept {
+        vbr_capture_range_tree & output,
+        void * continue_context,
+        vbr_capture_continue_fn continue_work,
+        bool * was_cancelled) noexcept {
     output = {};
+    if (was_cancelled) {
+        *was_cancelled = false;
+    }
     auto & state = *chain.impl_;
     if (state.authenticated_chunk_bytes !=
             VBR_CAPTURE_RANGE_CHUNK_BYTES ||
@@ -1152,24 +1133,97 @@ bool vbr_capture_range_seal(
     }
     state.authenticated_closed = true;
     try {
-        if (state.authenticated_current_bytes != 0) {
-            if (state.authenticated_leaves.size() >=
-                    state.max_authenticated_chunks) {
+        const uint64_t chunk_count =
+            (state.total - 1)/state.authenticated_chunk_bytes + 1;
+        if (chunk_count == 0 || chunk_count > UINT32_MAX ||
+            chunk_count > state.max_authenticated_chunks) {
+            return false;
+        }
+        state.authenticated_leaves.resize(size_t(chunk_count));
+        const uint32_t available = std::thread::hardware_concurrency();
+        const size_t worker_count = std::min<size_t>(
+            16, std::min<size_t>(
+                chunk_count, available == 0 ? 1 : available));
+        std::atomic_bool cancelled { false };
+        const auto continue_hashing = [&]() {
+            if (cancelled.load(std::memory_order_relaxed)) {
                 return false;
             }
-            state.authenticated_leaves.reserve(
-                state.authenticated_leaves.size() + 1);
-            const auto payload =
-                state.authenticated_current_hash.finish();
-            state.authenticated_leaves.push_back(
-                capture_range_leaf_digest(
-                    state.authenticated_leaves.size(),
-                    state.authenticated_current_bytes, payload));
-            state.authenticated_current_bytes = 0;
-        }
-        if (state.authenticated_leaves.empty() ||
-            state.authenticated_leaves.size() > UINT32_MAX) {
+            if (continue_work && !continue_work(continue_context)) {
+                cancelled.store(true, std::memory_order_relaxed);
+                return false;
+            }
+            return true;
+        };
+        const auto finish_cancelled = [&]() {
+            if (was_cancelled) {
+                *was_cancelled = true;
+            }
             return false;
+        };
+        if (!continue_hashing()) {
+            return finish_cancelled();
+        }
+        const auto hash_worker = [&](size_t worker) {
+            const uint64_t begin = chunk_count*worker/worker_count;
+            const uint64_t end = chunk_count*(worker + 1)/worker_count;
+            for (uint64_t index = begin; index < end; ++index) {
+                if (cancelled.load(std::memory_order_relaxed) ||
+                    (worker_count == 1 && !continue_hashing())) {
+                    return false;
+                }
+                const uint64_t offset =
+                    index*state.authenticated_chunk_bytes;
+                const size_t bytes = size_t(std::min<uint64_t>(
+                    state.authenticated_chunk_bytes,
+                    state.total - offset));
+                llama_sha256_writer hash;
+                if (!state.for_each_span(
+                        offset, bytes,
+                        [&](const uint8_t * data, size_t count) noexcept {
+                            hash.bytes(data, count);
+                        })) {
+                    return false;
+                }
+                state.authenticated_leaves[size_t(index)] =
+                    capture_range_leaf_digest(
+                        index, uint32_t(bytes), hash.finish());
+            }
+            return true;
+        };
+        if (worker_count == 1) {
+            if (!hash_worker(0)) {
+                if (was_cancelled) {
+                    *was_cancelled = cancelled.load(std::memory_order_relaxed);
+                }
+                return false;
+            }
+        } else {
+            std::vector<std::future<bool>> workers;
+            bool worker_failed = false;
+            workers.reserve(worker_count);
+            for (size_t worker = 0; worker < worker_count; ++worker) {
+                workers.push_back(std::async(
+                    std::launch::async, hash_worker, worker));
+            }
+            for (auto & worker : workers) {
+                while (worker.wait_for(std::chrono::milliseconds(1)) !=
+                       std::future_status::ready) {
+                    (void) continue_hashing();
+                }
+                if (!worker.get()) {
+                    worker_failed = true;
+                }
+            }
+            if (cancelled.load(std::memory_order_relaxed)) {
+                return finish_cancelled();
+            }
+            if (worker_failed) {
+                return false;
+            }
+        }
+        if (!continue_hashing()) {
+            return finish_cancelled();
         }
         uint64_t metadata_bytes = 0;
         uint32_t padded = 0;
@@ -1191,9 +1245,20 @@ bool vbr_capture_range_seal(
         leaves.reserve(padded);
         llama_sha256_writer empty_payload_hash;
         const auto empty_payload = empty_payload_hash.finish();
+        size_t nodes_until_poll = 64;
+        const auto continue_tree = [&]() {
+            if (--nodes_until_poll != 0) {
+                return true;
+            }
+            nodes_until_poll = 64;
+            return continue_hashing();
+        };
         while (leaves.size() < padded) {
             leaves.push_back(capture_range_leaf_digest(
                 leaves.size(), 0, empty_payload));
+            if (!continue_tree()) {
+                return finish_cancelled();
+            }
         }
         uint32_t level = 0;
         while (result->levels.back().size() > 1) {
@@ -1203,6 +1268,9 @@ bool vbr_capture_range_seal(
             for (size_t i = 0; i < prior.size(); i += 2) {
                 next.push_back(capture_range_node_digest(
                     level, prior[i], prior[i + 1]));
+                if (!continue_tree()) {
+                    return finish_cancelled();
+                }
             }
             result->levels.push_back(std::move(next));
             ++level;
@@ -1214,6 +1282,10 @@ bool vbr_capture_range_seal(
         if (!capture_digest_nonzero(result->root)) {
             return false;
         }
+        if (!continue_hashing()) {
+            return finish_cancelled();
+        }
+        state.authenticated_root = result->root;
         output = vbr_capture_range_tree(std::move(result));
         return true;
     } catch (...) {
@@ -2502,11 +2574,17 @@ vbr_capture_stream_status vbr_capture_projected_unit_transfer(
             unit_hash.u64(shard->row_bytes);
             unit_hash.u64(shard->source_identity);
             vbr_capture_range_tree authenticated_ranges;
+            bool seal_cancelled = false;
             if (!vbr_capture_range_seal(
                     *chain, shard_authenticated_metadata[shard_index],
-                    authenticated_ranges) ||
+                    authenticated_ranges,
+                    shard->source.continue_context,
+                    shard->source.continue_transfer,
+                    &seal_cancelled) ||
                 authenticated_ranges.total_bytes() != chain->size()) {
-                return vbr_capture_stream_status::internal_error;
+                return seal_cancelled
+                    ? vbr_capture_stream_status::cancelled
+                    : vbr_capture_stream_status::internal_error;
             }
             stats.streaming_digest = authenticated_ranges.root();
             unit_hash.bytes(

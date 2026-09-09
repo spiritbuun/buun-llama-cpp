@@ -1254,12 +1254,7 @@ bool accounting_payloads_match(const vbr_artifact_package & package) {
     try {
         for (const auto & blob : package.unit_blobs) {
             for (const auto & shard : blob.descriptor.shards) {
-                const vbr_artifact_portable_domain domain {
-                    llama_cache_acct_residency::device,
-                    llama_cache_acct_domain_kind::device_topology,
-                    shard.topology_index,
-                    shard.device_ordinal,
-                };
+                const auto domain = vbr_artifact_payload_storage_domain();
                 if (!add(vbr_artifact_accounting_role::unit_payload,
                          domain, shard.payload_bytes)) {
                     return false;
@@ -1269,12 +1264,8 @@ bool accounting_payloads_match(const vbr_artifact_package & package) {
                 vbr_artifact_clean_stash_state::present) {
                 for (const auto & shard :
                      blob.descriptor.clean_stash.shards) {
-                    const vbr_artifact_portable_domain domain {
-                        llama_cache_acct_residency::device,
-                        llama_cache_acct_domain_kind::device_topology,
-                        shard.topology_index,
-                        shard.device_ordinal,
-                    };
+                    const auto domain =
+                        vbr_artifact_payload_storage_domain();
                     if (!add(
                             vbr_artifact_accounting_role::clean_stash_payload,
                             domain, shard.payload_bytes)) {

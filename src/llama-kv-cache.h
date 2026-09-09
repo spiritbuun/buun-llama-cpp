@@ -316,6 +316,9 @@ public:
     // iSWA attaches both children after their pools exist so ownership follows the
     // actually active controller and the last child in parent execution order is root.
     bool vbr_controller_active() const { return vbr_vmm_active(); }
+    void vbr_import_accounting_observed() noexcept {
+        vbr_import_receipts_release();
+    }
     void vbr_attach_ledger_tree(llama_kv_cache * root, llama_kv_cache * peer, double device_share);
     void vbr_finalize_ledger_tree();
     void vbr_finalize_failed_child(uint32_t n_tokens, bool root_ran);

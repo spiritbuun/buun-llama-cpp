@@ -3528,21 +3528,21 @@ llama_vbr_artifact_catalog::publish_stream_complete(
             return true;
         };
         for (size_t u = 0; u < working.unit_blobs.size(); ++u) {
-            std::map<std::pair<uint32_t, uint16_t>, uint64_t>
-                payload_by_domain;
+            uint64_t payload_bytes = 0;
             for (const auto & shard :
                  working.unit_blobs[u].descriptor.shards) {
-                payload_by_domain[{
-                    shard.topology_index,
-                    shard.device_ordinal }] += shard.payload_bytes;
+                if (shard.payload_bytes > UINT64_MAX - payload_bytes) {
+                    result.status =
+                        llama_vbr_artifact_publish_status::format_rejected;
+                    impl_->n_refusals++;
+                    return result;
+                }
+                payload_bytes += shard.payload_bytes;
             }
-            for (const auto & row : payload_by_domain) {
+            if (payload_bytes != 0) {
                 llama_cache_acct_resource_domain domain;
-                const vbr_artifact_portable_domain portable {
-                    llama_cache_acct_residency::device,
-                    llama_cache_acct_domain_kind::device_topology,
-                    row.first.first, row.first.second,
-                };
+                const auto portable =
+                    vbr_artifact_payload_storage_domain();
                 if (!impl_->resolve_domain(portable, domain)) {
                     result.status =
                         llama_vbr_artifact_publish_status::
@@ -3554,8 +3554,8 @@ llama_vbr_artifact_catalog::publish_stream_complete(
                 binding.category =
                     llama_cache_acct_category::unit_version_payload;
                 binding.domain = domain;
-                binding.logical = row.second;
-                binding.resident = row.second;
+                binding.logical = payload_bytes;
+                binding.resident = payload_bytes;
                 binding.artifact = pending_blobs[u].artifact;
                 binding.content = pending_blobs[u].content;
                 binding.lineage = pending_blobs[u].lineage;
@@ -3579,21 +3579,21 @@ llama_vbr_artifact_catalog::publish_stream_complete(
                 if (stash_alias[u] != SIZE_MAX) {
                     continue;
                 }
-                std::map<std::pair<uint32_t, uint16_t>, uint64_t>
-                    stash_by_domain;
+                uint64_t stash_bytes = 0;
                 for (const auto & shard :
                      working.unit_blobs[u].descriptor.clean_stash.shards) {
-                    stash_by_domain[{
-                        shard.topology_index,
-                        shard.device_ordinal }] += shard.payload_bytes;
+                    if (shard.payload_bytes > UINT64_MAX - stash_bytes) {
+                        result.status =
+                            llama_vbr_artifact_publish_status::format_rejected;
+                        impl_->n_refusals++;
+                        return result;
+                    }
+                    stash_bytes += shard.payload_bytes;
                 }
-                for (const auto & row : stash_by_domain) {
+                if (stash_bytes != 0) {
                     llama_cache_acct_resource_domain domain;
-                    const vbr_artifact_portable_domain portable {
-                        llama_cache_acct_residency::device,
-                        llama_cache_acct_domain_kind::device_topology,
-                        row.first.first, row.first.second,
-                    };
+                    const auto portable =
+                        vbr_artifact_payload_storage_domain();
                     if (!impl_->resolve_domain(portable, domain)) {
                         result.status =
                             llama_vbr_artifact_publish_status::
@@ -3606,8 +3606,8 @@ llama_vbr_artifact_catalog::publish_stream_complete(
                         llama_cache_acct_category::
                             clean_stash_payload;
                     binding.domain = domain;
-                    binding.logical = row.second;
-                    binding.resident = row.second;
+                    binding.logical = stash_bytes;
+                    binding.resident = stash_bytes;
                     binding.artifact = pending_stashes[u].artifact;
                     binding.content = pending_stashes[u].content;
                     binding.lineage = pending_stashes[u].lineage;
@@ -4138,11 +4138,8 @@ bool llama_vbr_artifact_catalog::publish_projected_batch_impl(
                         continue;
                     }
                     for (const auto & shard : unit.descriptor.shards) {
-                        const vbr_artifact_portable_domain domain {
-                            llama_cache_acct_residency::device,
-                            llama_cache_acct_domain_kind::device_topology,
-                            shard.topology_index, shard.device_ordinal,
-                        };
+                        const auto domain =
+                            vbr_artifact_payload_storage_domain();
                         const auto found = std::find_if(
                             request.reserve_accounting.begin(),
                             request.reserve_accounting.end(),

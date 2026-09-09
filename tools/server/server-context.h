@@ -111,6 +111,10 @@ bool server_vbr_empty_handoff_lookup_allowed(
 bool server_vbr_empty_handoff_allowed(
     const server_vbr_empty_handoff_gate & gate) noexcept;
 
+bool server_vbr_live_source_displacement_allowed(
+    bool kv_unified,
+    size_t slot_count) noexcept;
+
 bool server_vbr_stem_matches_capture_source(
     bool valid,
     const std::array<uint8_t, 32> & stem_source,
@@ -193,6 +197,7 @@ struct server_vbr_reclaim_policy_result {
     bool token_identity_distinguishes_attempt = false;
     bool successful_attempt_is_state_sealed = false;
     bool multi_fresh_pressure_isolated = false;
+    bool isolated_capture_drains_without_backoff = false;
     bool unchanged_admission_refusal_is_suppressed = false;
     bool checkpoint_admission_refusals_are_independent = false;
     bool admission_refusal_reopens_on_currency_change = false;

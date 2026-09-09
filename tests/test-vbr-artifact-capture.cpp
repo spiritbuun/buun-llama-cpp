@@ -368,6 +368,10 @@ static void test_authenticated_range_tree() {
     }
 
     artifact_segment_chain chain(VBR_CAPTURE_RANGE_CHUNK_BYTES, 5);
+    const auto unsealed_digest = chain.sealed_digest();
+    CHECK(!std::any_of(
+        unsealed_digest.begin(), unsealed_digest.end(),
+        [](uint8_t value) { return value != 0; }));
     CHECK(chain.append(bytes.data(), 17));
     CHECK(chain.append(bytes.data() + 17, CHUNK + 91));
     CHECK(chain.append(
@@ -383,6 +387,7 @@ static void test_authenticated_range_tree() {
     CHECK(std::any_of(
         tree.root().begin(), tree.root().end(),
         [](uint8_t value) { return value != 0; }));
+    CHECK(chain.sealed_digest() == tree.root());
     CHECK(!chain.append(bytes.data(), 1));
 
     // Append boundaries do not affect the authenticated root.
@@ -595,6 +600,39 @@ static void test_authenticated_range_tree() {
     CHECK(!vbr_capture_range_seal(
         metadata_cap, tree.metadata_bytes() - 1, unavailable_tree));
     CHECK(!unavailable_tree);
+
+    artifact_segment_chain cancelled_chain(
+        VBR_CAPTURE_RANGE_CHUNK_BYTES, 5);
+    CHECK(cancelled_chain.append(bytes.data(), bytes.size()));
+    bool cancelled = false;
+    bool allow_seal = false;
+    CHECK(!vbr_capture_range_seal(
+        cancelled_chain, 1024, unavailable_tree, &allow_seal,
+        [](void * opaque) noexcept {
+            return *static_cast<const bool *>(opaque);
+        }, &cancelled));
+    CHECK(cancelled);
+    CHECK(!unavailable_tree);
+
+    // Cancellation remains authoritative after leaf hashing and before the
+    // authenticated root becomes visible.
+    artifact_segment_chain post_leaf_cancelled_chain(
+        VBR_CAPTURE_RANGE_CHUNK_BYTES, 1);
+    CHECK(post_leaf_cancelled_chain.append(bytes.data(), 4));
+    uint32_t seal_polls = 0;
+    cancelled = false;
+    CHECK(!vbr_capture_range_seal(
+        post_leaf_cancelled_chain, 1024, unavailable_tree, &seal_polls,
+        [](void * opaque) noexcept {
+            return ++*static_cast<uint32_t *>(opaque) < 3;
+        }, &cancelled));
+    CHECK(seal_polls == 3);
+    CHECK(cancelled);
+    CHECK(!unavailable_tree);
+    const auto cancelled_digest = post_leaf_cancelled_chain.sealed_digest();
+    CHECK(!std::any_of(
+        cancelled_digest.begin(), cancelled_digest.end(),
+        [](uint8_t value) { return value != 0; }));
 }
 
 static void test_registry_quiescence_query() {
@@ -1625,11 +1663,7 @@ static vbr_projected_manifest_publication projected_publication(
     }
     vbr_artifact_portable_accounting_row payload;
     payload.role = vbr_artifact_accounting_role::unit_payload;
-    payload.domain = {
-        llama_cache_acct_residency::device,
-        llama_cache_acct_domain_kind::device_topology,
-        0, 0,
-    };
+    payload.domain = vbr_artifact_payload_storage_domain();
     payload.logical_bytes = packed_bytes;
     payload.resident_bytes = packed_bytes;
     out.accounting.push_back(payload);
@@ -1769,7 +1803,7 @@ static bool make_occupied_guard_fixture(
     for (const auto & cell : placement.cells) {
         out.cells.push_back({
             0, cell.physical_cell, cell.logical_position,
-            cell.ext_x, cell.ext_y, destination, 1,
+            cell.ext_x, cell.ext_y, destination, 1, true,
         });
     }
     std::sort(out.cells.begin(), out.cells.end(),
@@ -1943,11 +1977,6 @@ static void test_projected_publication_claim_preparation() {
     CHECK(ledger.certify_complete(
         host, llama_cache_acct_producer::retention_sidecar));
 
-    const vbr_artifact_portable_domain portable_device {
-        llama_cache_acct_residency::device,
-        llama_cache_acct_domain_kind::device_topology,
-        0, 0,
-    };
     const vbr_artifact_portable_domain portable_host {
         llama_cache_acct_residency::pageable_host,
         llama_cache_acct_domain_kind::not_applicable,
@@ -1955,7 +1984,7 @@ static void test_projected_publication_claim_preparation() {
     };
     std::vector<vbr_artifact_portable_accounting_row> rows {
         { vbr_artifact_accounting_role::unit_payload,
-          portable_device, 64, 64,
+          portable_host, 64, 64,
           llama_cache_acct_attr_kind::artifact },
         { vbr_artifact_accounting_role::descriptor_metadata,
           portable_host, 16, 16,
@@ -2013,7 +2042,7 @@ static void test_projected_publication_claim_preparation() {
     };
     CHECK(reserved_total(
               llama_cache_acct_category::unit_version_payload,
-              device) == 64);
+              host) == 64);
     CHECK(reserved_total(
               llama_cache_acct_category::artifact_descriptor_metadata,
               host) == 16*4);
@@ -2027,7 +2056,7 @@ static void test_projected_publication_claim_preparation() {
     CHECK(ledger.snapshot().live_ops == baseline + rows.size()*2);
     CHECK(reserved_total(
               llama_cache_acct_category::unit_version_payload,
-              device) == 64);
+              host) == 64);
     CHECK(reserved_total(
               llama_cache_acct_category::artifact_descriptor_metadata,
               host) == 16*2);
@@ -2094,7 +2123,7 @@ static void test_projected_publication_claim_preparation() {
 
     auto wrong_kind_rows = rows;
     wrong_kind_rows.front().domain.kind =
-        llama_cache_acct_domain_kind::not_applicable;
+        llama_cache_acct_domain_kind::device_topology;
     auto wrong_kind = catalog.prepare_projected_publication_claim(
         1, wrong_kind_rows, budget);
     CHECK(!wrong_kind.ready());
@@ -2257,7 +2286,8 @@ static void test_dependency_scoped_projected_catalog_publication() {
             llama_cache_acct_category::live_attention_state,
             llama_cache_acct_category::live_recurrent_state,
             llama_cache_acct_category::recurrent_rollback_planes,
-            llama_cache_acct_category::rolling_window_tape }) {
+            llama_cache_acct_category::rolling_window_tape,
+            llama_cache_acct_category::transfer_staging }) {
         for (const auto measure : {
                 llama_cache_acct_measure::logical_payload,
                 llama_cache_acct_measure::resident_allocated,
@@ -2455,6 +2485,57 @@ static void test_dependency_scoped_projected_catalog_publication() {
     CHECK(vbr_recheck_occupied_replacement_guard(
               recycle_guard, full_pool.target, full_pool.observation) ==
           vbr_occupied_replacement_guard_status::ready);
+
+    // A unified cache can hold several independent server slots. The guard
+    // maps the destination through its exact recovery image while retaining
+    // every single-owner foreign cell in the same authenticated snapshot.
+    occupied_guard_fixture shared_pool = full_pool;
+    shared_pool.observation.cell_capacity = 16;
+    for (uint32_t physical = 8; physical < 16; ++physical) {
+        shared_pool.cells.push_back({
+            0, physical, llama_pos(physical-8), 0, 0, 93, 1, false,
+            llama_token(1000+physical),
+        });
+    }
+    shared_pool.bind();
+    vbr_occupied_replacement_guard shared_guard;
+    CHECK(vbr_prepare_occupied_replacement_guard(
+              shared_pool.target, occupied_view, occupied_view,
+              shared_pool.observation, shared_guard) ==
+          vbr_occupied_replacement_guard_status::ready);
+    CHECK(shared_guard.strategy() ==
+          vbr_occupied_replacement_strategy::recycle_incumbent_cells);
+    CHECK(shared_guard.preserved_cells().size() == 8);
+    CHECK(shared_guard.preserved_cells().front().owner_sequence == 93);
+    CHECK(shared_guard.preserved_cells().front().token == 1008);
+    CHECK(vbr_recheck_occupied_replacement_guard(
+              shared_guard, shared_pool.target, shared_pool.observation) ==
+          vbr_occupied_replacement_guard_status::ready);
+
+    auto shared_mutant = shared_pool;
+    ++shared_mutant.cells.back().token;
+    shared_mutant.bind();
+    CHECK(vbr_recheck_occupied_replacement_guard(
+              shared_guard, shared_mutant.target,
+              shared_mutant.observation) ==
+          vbr_occupied_replacement_guard_status::currency_changed);
+    CHECK(!shared_guard.ready());
+
+    CHECK(vbr_prepare_occupied_replacement_guard(
+              shared_pool.target, occupied_view, occupied_view,
+              shared_pool.observation, shared_guard) ==
+          vbr_occupied_replacement_guard_status::ready);
+
+    auto shared_alias = shared_pool;
+    shared_alias.cells.front().owner_sequence = -1;
+    shared_alias.cells.front().reference_count = 2;
+    shared_alias.bind();
+    vbr_occupied_replacement_guard shared_alias_guard;
+    CHECK(vbr_prepare_occupied_replacement_guard(
+              shared_alias.target, occupied_view, occupied_view,
+              shared_alias.observation, shared_alias_guard) ==
+          vbr_occupied_replacement_guard_status::ownership_mismatch);
+    shared_guard.reset();
     auto full_pool_mutant = full_pool;
     full_pool_mutant.cells.back().physical_cell = 6;
     full_pool_mutant.bind();
@@ -3034,13 +3115,15 @@ static void test_dependency_scoped_projected_catalog_publication() {
     }
     CHECK(occupied_staged.status == vbr_adopt_stage_status::staged);
     CHECK(occupied_staged.staged);
-    CHECK(occupied_staged.staged->reads().size() ==
-          VBR_OCCUPIED_REPLACEMENT_MAX_RUNS);
-    CHECK(occupied_staged.staged->reads().front()
-              .projection_ranges.front().source_offset == 0);
-    CHECK(occupied_staged.staged->reads().back()
-              .projection_ranges.front().source_offset ==
-          VBR_OCCUPIED_REPLACEMENT_MAX_RUNS-1);
+    if (occupied_staged.staged) {
+        CHECK(occupied_staged.staged->reads().size() ==
+              VBR_OCCUPIED_REPLACEMENT_MAX_RUNS);
+        CHECK(occupied_staged.staged->reads().front()
+                  .projection_ranges.front().source_offset == 0);
+        CHECK(occupied_staged.staged->reads().back()
+                  .projection_ranges.front().source_offset ==
+              VBR_OCCUPIED_REPLACEMENT_MAX_RUNS-1);
+    }
     occupied_staged.staged.reset();
     occupied_staged.manifest.reset();
     run_view.reset();
