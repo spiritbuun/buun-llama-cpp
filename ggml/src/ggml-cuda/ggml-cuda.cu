@@ -7324,6 +7324,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            // GGML_CUDA_OP_TRACE=<n>: host time per op type inside ggml_cuda_compute_forward and the loop's
+            // remaining overhead (fusion checks, dispatch), summed over n graph_compute calls per thread,
+            // then printed — where the uncaptured tensor-split issue time goes (no sampling profiler in containers)
+            static const int op_trace_every = getenv("GGML_CUDA_OP_TRACE") != nullptr ? atoi(getenv("GGML_CUDA_OP_TRACE")) : 0;
+            struct op_trace_acc { double loop_ns = 0, fwd_ns[GGML_OP_COUNT] = {}; int cnt[GGML_OP_COUNT] = {}; int calls = 0; };
+            thread_local op_trace_acc op_trace;
+            auto op_now = []() {
+                struct timespec ts;
+                clock_gettime(CLOCK_MONOTONIC, &ts);
+                return ts.tv_sec * 1e9 + ts.tv_nsec;
+            };
+            const double op_loop0 = op_trace_every ? op_now() : 0.0;
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -7395,7 +7408,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                const double op_t0 = op_trace_every ? op_now() : 0.0;
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                if (op_trace_every) {
+                    op_trace.fwd_ns[node->op] += op_now() - op_t0;
+                    op_trace.cnt[node->op]++;
+                }
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
@@ -7404,6 +7422,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
                }
+            }
+            if (op_trace_every) {
+                op_trace.loop_ns += op_now() - op_loop0;
+                if (++op_trace.calls >= op_trace_every) {
+                    double fwd_total = 0; int n_ops = 0;
+                    for (int op = 0; op < GGML_OP_COUNT; op++) { fwd_total += op_trace.fwd_ns[op]; n_ops += op_trace.cnt[op]; }
+                    fprintf(stderr, "ggml_cuda op trace dev %d: %d calls, %d ops, loop %.1f ms, in compute_forward %.1f ms, loop overhead %.1f ms;",
+                            cuda_ctx->device, op_trace.calls, n_ops, op_trace.loop_ns / 1e6, fwd_total / 1e6, (op_trace.loop_ns - fwd_total) / 1e6);
+                    for (int op = 0; op < GGML_OP_COUNT; op++) {
+                        if (op_trace.cnt[op] > 0 && op_trace.fwd_ns[op] >= 1e6) {
+                            fprintf(stderr, " %s %d×%.0fus", ggml_op_name((ggml_op) op), op_trace.cnt[op], op_trace.fwd_ns[op] / 1e3 / op_trace.cnt[op]);
+                        }
+                    }
+                    fprintf(stderr, "\n");
+                    op_trace = op_trace_acc{};
+                }
             }
         }
 
