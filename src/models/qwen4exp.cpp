@@ -344,8 +344,18 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         // strict GGUF tensor accounting without allocating the draft weights.
         if (flags & TENSOR_SKIP) {
             const int skip = flags | TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL;
+            // EXL3 keeps per-channel F16 vectors in the scale slots (svh/suh) and F8 keeps
+            // block grids; every other format stores a scalar per tensor/expert. A skipped
+            // tensor is never read, so consume it under the source's own shape.
             const auto skip_scale = [&](llm_tensor tensor, const char * suffix, int64_t count = 1) {
-                create_tensor(tn(tensor, suffix, il), { count }, skip);
+                const LLM_TN_IMPL name = tn(tensor, suffix, il);
+                ggml_type type = GGML_TYPE_COUNT;
+                std::array<int64_t, GGML_MAX_DIMS> ne{};
+                if (ml.get_tensor_info(name.str().c_str(), type, ne)) {
+                    create_tensor(name, { ne[0], ne[1], ne[2], ne[3] }, skip);
+                } else {
+                    create_tensor(name, { count }, skip);
+                }
             };
 
             for (llm_tensor tensor : { LLM_TENSOR_ATTN_QKV, LLM_TENSOR_ATTN_Q,

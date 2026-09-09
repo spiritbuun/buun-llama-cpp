@@ -176,43 +176,52 @@ int * exl3_int8_counters(int device, cudaStream_t stream) {
     return ws[device];
 }
 
-template <int bits, int cb, int M, bool RESID, bool GROUPED>
-void exl3_gemv_int8_launch(const uint8_t * B, const float * x, const half * suh, const half * svh, float * y, float * partials, int * counters,
-        int k, int n, int colblocks, int ksplit, int nrows, size_t smem, int pairs, exl3_int8::grouped_args ga, cudaStream_t stream) {
-    static bool attr_set = false;
-    if (!attr_set) {
-        CUDA_CHECK(cudaFuncSetAttribute(exl3_int8::gemv_int8_kernel<bits, cb, M, RESID, GROUPED>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024));
-        attr_set = true;
-    }
-    exl3_int8::gemv_int8_kernel<bits, cb, M, RESID, GROUPED><<<dim3(colblocks, ksplit, pairs), exl3_int8::THREADS, smem, stream>>>(
-        B, x, suh, svh, y, partials, counters, k, n, nrows, ga);
-}
-
-// k-split geometry: ~640 blocks in flight, 128-aligned slices, shared memory cap
-void exl3_int8_geometry(int bits, int nacc, int m, int k, int colblocks, int pairs, int & ksplit, int & nrows, size_t & smem) {
+// k-split geometry: ~640 blocks in flight, 128-aligned slices, dynamic shared memory under `cap`
+void exl3_int8_geometry(int bits, int nacc, int m, int k, int colblocks, int pairs, size_t cap, int & ksplit, int & nrows, size_t & smem) {
     const int kslices = k / 16;
     ksplit = std::max(1, (640 + colblocks * pairs - 1) / (colblocks * pairs));
     nrows  = std::max(8, ((kslices + ksplit - 1) / ksplit + 7) / 8 * 8);
-    nrows  = std::min(nrows, (96 * 1024 - exl3_int8::stage_bytes(bits)) / (nacc * 64 + m * 32) / 8 * 8);
+    nrows  = std::min(nrows, int(cap - exl3_int8::stage_bytes(bits)) / (nacc * 64 + m * 32) / 8 * 8);
+    GGML_ASSERT(nrows >= 8 && "EXL3 int8 gemv: device shared memory too small");
     ksplit = (kslices + nrows - 1) / nrows;
     smem   = size_t(nrows) * 16 * (size_t(nacc) * 4 + size_t(m) * 2) + exl3_int8::stage_bytes(bits);
+}
+
+// One launch = grid (n/256, ksplit, pairs); dense calls pass pairs = 1 with M tokens, the grouped
+// MoE path M = 1 with one (token, expert) pair per block-z.
+template <int bits, int cb, int M, bool RESID, bool GROUPED>
+void exl3_gemv_int8_launch(ggml_backend_cuda_context & ctx, const uint8_t * B, const float * x, const half * suh, const half * svh,
+        float * y, int k, int n, int pairs, exl3_int8::grouped_args ga, cudaStream_t stream) {
+    const auto kernel = exl3_int8::gemv_int8_kernel<bits, cb, M, RESID, GROUPED>;
+    // Dynamic shared memory budget: the 96 KB design cap, or what the device leaves after this
+    // instantiation's static smem (sh_y grows with M; sm_86 opts in to 99 KB total). Function
+    // attributes are per device, so set it once on each.
+    static size_t cap[GGML_CUDA_MAX_DEVICES] = {};
+    if (cap[ctx.device] == 0) {
+        cudaFuncAttributes attr;
+        CUDA_CHECK(cudaFuncGetAttributes(&attr, kernel));
+        cap[ctx.device] = std::min<size_t>(96 * 1024, ggml_cuda_info().devices[ctx.device].smpbo - attr.sharedSizeBytes);
+        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(cap[ctx.device])));
+    }
+    const int colblocks = (n + exl3_int8::COLS - 1) / exl3_int8::COLS;
+    const int nacc = GROUPED ? (cb == 2 ? 1 : 0) : (RESID ? 2 : 1) * M;
+    int ksplit, nrows; size_t smem;
+    exl3_int8_geometry(bits, nacc, M, k, colblocks, pairs, cap[ctx.device], ksplit, nrows, smem);
+    ggml_cuda_pool_alloc<float> partials(ctx.pool(), size_t(ksplit) * M * pairs * n);
+    int * counters = exl3_int8_counters(ctx.device, stream);
+    kernel<<<dim3(colblocks, ksplit, pairs), exl3_int8::THREADS, smem, stream>>>(
+        B, x, suh, svh, y, partials.get(), counters, k, n, nrows, ga);
 }
 
 template <int bits, bool RESID>
 void exl3_int8_run(ggml_backend_cuda_context & ctx, const float * x, const half * suh, const uint8_t * B, const half * svh,
         float * y, int m, int k, int n, cudaStream_t stream) {
-    const int colblocks = (n + exl3_int8::COLS - 1) / exl3_int8::COLS;
-    const int nacc = (RESID ? 2 : 1) * m;
-    int ksplit, nrows; size_t smem;
-    exl3_int8_geometry(bits, nacc, m, k, colblocks, 1, ksplit, nrows, smem);
-    ggml_cuda_pool_alloc<float> partials(ctx.pool(), size_t(ksplit) * m * n);
-    int * counters = exl3_int8_counters(ctx.device, stream);
     const exl3_int8::grouped_args ga {};
     switch (m) {
-        case 1: exl3_gemv_int8_launch<bits, 2, 1, RESID, false>(B, x, suh, svh, y, partials.get(), counters, k, n, colblocks, ksplit, nrows, smem, 1, ga, stream); break;
-        case 2: exl3_gemv_int8_launch<bits, 2, 2, RESID, false>(B, x, suh, svh, y, partials.get(), counters, k, n, colblocks, ksplit, nrows, smem, 1, ga, stream); break;
-        case 3: exl3_gemv_int8_launch<bits, 2, 3, RESID, false>(B, x, suh, svh, y, partials.get(), counters, k, n, colblocks, ksplit, nrows, smem, 1, ga, stream); break;
-        default: exl3_gemv_int8_launch<bits, 2, 4, RESID, false>(B, x, suh, svh, y, partials.get(), counters, k, n, colblocks, ksplit, nrows, smem, 1, ga, stream); break;
+        case 1: exl3_gemv_int8_launch<bits, 2, 1, RESID, false>(ctx, B, x, suh, svh, y, k, n, 1, ga, stream); break;
+        case 2: exl3_gemv_int8_launch<bits, 2, 2, RESID, false>(ctx, B, x, suh, svh, y, k, n, 1, ga, stream); break;
+        case 3: exl3_gemv_int8_launch<bits, 2, 3, RESID, false>(ctx, B, x, suh, svh, y, k, n, 1, ga, stream); break;
+        default: exl3_gemv_int8_launch<bits, 2, 4, RESID, false>(ctx, B, x, suh, svh, y, k, n, 1, ga, stream); break;
     }
 }
 
@@ -220,13 +229,7 @@ void exl3_int8_run(ggml_backend_cuda_context & ctx, const float * x, const half 
 template <int bits, int cb>
 void exl3_moe_run(ggml_backend_cuda_context & ctx, const float * x, const half * suh, const uint8_t * B, const half * svh,
         float * y, int k, int n, int pairs, exl3_int8::grouped_args ga, cudaStream_t stream) {
-    constexpr bool INT8 = cb == 2;
-    const int colblocks = (n + exl3_int8::COLS - 1) / exl3_int8::COLS;
-    int ksplit, nrows; size_t smem;
-    exl3_int8_geometry(bits, INT8 ? 1 : 0, 1, k, colblocks, pairs, ksplit, nrows, smem);
-    ggml_cuda_pool_alloc<float> partials(ctx.pool(), size_t(ksplit) * pairs * n);
-    int * counters = exl3_int8_counters(ctx.device, stream);
-    exl3_gemv_int8_launch<bits, cb, 1, false, true>(B, x, suh, svh, y, partials.get(), counters, k, n, colblocks, ksplit, nrows, smem, pairs, ga, stream);
+    exl3_gemv_int8_launch<bits, cb, 1, false, true>(ctx, B, x, suh, svh, y, k, n, pairs, ga, stream);
 }
 
 // MoE decode shapes the grouped kernel takes: F32 in/out, contiguous dst, few pairs
