@@ -4808,7 +4808,8 @@ struct test_gated_delta_net : public test_case {
     double max_nmse_err() override {
         // The production Qwen3.5 FLA kernel changes the reduction order across
         // a full 512-token tile. Its observed CPU-reference NMSE is ~9.7e-6.
-        if (head_count == 16 && head_size == 128 && n_seq_tokens == 512 && n_seqs == 1 && v_repeat == 3) {
+        // The same kernels run on a head subset under a tensor split (head_count 2 or 4).
+        if (head_size == 128 && n_seq_tokens % 512 == 0 && n_seqs == 1 && v_repeat == 3 && !kda) {
             return 2e-5;
         }
         return test_case::max_nmse_err();
@@ -11681,6 +11682,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 1, 3)); // Qwen3.5-27B FLA shape
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  2, 128,  512, 1, 3)); // same kernels on one device of an 8-way tensor split (head subset)
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4, 128,  512, 1, 3)); // 4-way split
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  2, 128, 1024, 1, 3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1, 1, true));
     // KDA (vector gate)

@@ -353,7 +353,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     if (ggml_cuda_gdn_fla_ptx_supported(cc, kda, keep_rs, S_v, H, neqk1, n_tokens, n_seqs)) {
         ggml_cuda_gdn_fla_ptx(ctx, cc, q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-                              n_tokens, sq1, sq2, sq3, sv1, sv2, sv3,
+                              n_tokens, H, neqk1, sq1, sq2, sq3, sv1, sv2, sv3,
                               nullptr,
                               l2_eps,
                               cache != nullptr ? cache->rms_weight : nullptr,
