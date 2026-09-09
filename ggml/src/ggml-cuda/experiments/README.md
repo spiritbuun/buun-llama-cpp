@@ -109,3 +109,22 @@ F32 plane uses 3 MiB of backend scratch, shared across layer executions.
 The experiment preserves full output, final state and prefix state exactly in
 component/graph-replay and full-model checkpoint/restore gates. This is not a
 generic checkpoint architecture or support for speculative rollback planes.
+
+## Checkpoint host-page experiment
+
+On Linux, `BUUN_PRIVATE_CHECKPOINT_HUGE_PAGES=1` advises transparent huge pages
+for newly allocated checkpoint byte buffers of at least 8 MiB, before their
+normal zero initialization. It changes neither the serialized format nor
+immutable ownership/accounting: invalidated buffers are still freed immediately,
+and failed overwrites still leave the old payload intact. Unset the variable for
+the ordinary allocation path; failed advice falls back to ordinary pages.
+
+On the same RTX5090 host, a balanced warmed PP2048 run with both prefix experiments
+above improved from 6200.7 to 6399.0 tok/s (3.20%). Timers attributed most of the
+gain to freeing the previous ~150 MiB checkpoint: ~8–10 ms became ~0.8 ms.
+The GPU computations are unchanged. This remains below the matched vLLM result.
+
+This is not a recommended public default: transparent huge-page allocation can
+perform synchronous reclaim/compaction under memory pressure, depending on the
+host's Linux settings. The experiment does not change those settings or reserve
+a persistent host pool. Memory-pressure/tail-latency qualification is still needed.

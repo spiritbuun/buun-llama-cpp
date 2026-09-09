@@ -31,6 +31,11 @@
 #include <unordered_set>
 #include <vector>
 
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 #if defined(__APPLE__) && defined(__MACH__)
 #include <sys/types.h>
 #include <sys/sysctl.h>
@@ -2564,6 +2569,26 @@ bool common_prompt_batch_decode(
     }
 
     return true;
+}
+
+common_shared_byte_buffer::storage::storage(size_t size) {
+    bytes.reserve(size);
+#if defined(__linux__)
+    static const bool huge_pages = std::getenv("BUUN_PRIVATE_CHECKPOINT_HUGE_PAGES") != nullptr;
+    if (huge_pages && size >= 8 * 1024 * 1024) {
+        const long page_size = sysconf(_SC_PAGESIZE);
+        if (page_size > 0) {
+            const uintptr_t p = reinterpret_cast<uintptr_t>(bytes.data());
+            const uintptr_t page = uintptr_t(page_size);
+            const uintptr_t begin = (p + page - 1) / page * page;
+            const uintptr_t end = (p + size) / page * page;
+            // Advise only fully-owned pages before zero initialization faults
+            // them in. Advice failure leaves the normal vector contract intact.
+            (void) madvise(reinterpret_cast<void *>(begin), end - begin, MADV_HUGEPAGE);
+        }
+    }
+#endif
+    bytes.resize(size);
 }
 
 common_shared_byte_buffer::common_shared_byte_buffer(
