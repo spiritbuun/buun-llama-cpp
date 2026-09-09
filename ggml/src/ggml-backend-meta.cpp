@@ -20,6 +20,7 @@
 #include <utility>
 #include <vector>
 #include <thread>
+#include <functional>
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
@@ -1960,6 +1961,68 @@ static ggml_guid_t ggml_backend_meta_guid() {
     return &guid;
 }
 
+// One long-lived worker thread per extra device. Spawning 7 std::threads per step launch (or per uncaptured
+// compute) costs ≈0.6 ms of skew between the first and last device's launch, which every first all-reduce of
+// the step then absorbs; the pool wakes all workers with one notification. Workers sleep between jobs.
+struct ggml_backend_meta_thread_pool {
+    std::vector<std::thread>      threads;
+    std::mutex                    m;
+    std::condition_variable       cv;
+    std::function<void(size_t)>   job;
+    size_t                        generation = 0;
+    size_t                        done       = 0;
+    bool                          stop       = false;
+
+    ~ggml_backend_meta_thread_pool() {
+        {
+            std::lock_guard<std::mutex> lock(m);
+            stop = true;
+        }
+        cv.notify_all();
+        for (auto & t : threads) {
+            t.join();
+        }
+    }
+
+    // runs fn(j) for j = 1..n-1 on the workers and fn(0) on the caller; returns when all are done
+    void run(size_t n, const std::function<void(size_t)> & fn) {
+        while (threads.size() + 1 < n) {
+            const size_t j = threads.size() + 1;
+            threads.emplace_back([this, j]() {
+                size_t seen = 0;
+                for (;;) {
+                    std::function<void(size_t)> my_job;
+                    {
+                        std::unique_lock<std::mutex> lock(m);
+                        cv.wait(lock, [&] { return stop || generation != seen; });
+                        if (stop) {
+                            return;
+                        }
+                        seen   = generation;
+                        my_job = job;
+                    }
+                    my_job(j);
+                    {
+                        std::lock_guard<std::mutex> lock(m);
+                        done++;
+                    }
+                    cv.notify_all();
+                }
+            });
+        }
+        {
+            std::lock_guard<std::mutex> lock(m);
+            job  = fn;
+            done = 0;
+            generation++;
+        }
+        cv.notify_all();
+        fn(0);
+        std::unique_lock<std::mutex> lock(m);
+        cv.wait(lock, [&] { return done == n - 1; });
+    }
+};
+
 struct ggml_backend_meta_context {
     struct cgraph_config {
         ggml_cgraph * cgraph_main = nullptr;
@@ -2014,6 +2077,7 @@ struct ggml_backend_meta_context {
         int64_t               last_used = 0;
     };
     std::vector<step_record> step_records;
+    ggml_backend_meta_thread_pool pool; // per-device launch/issue workers
     uint64_t                 step_last_sig    = 0;
     int                      step_same_sig    = 0;   // consecutive computes with the same signature (warmup)
     uint64_t                 step_sig_uid     = 0;   // graph uid the cached signature belongs to
@@ -2328,15 +2392,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         };
         if (n_backends > 2) {
-            std::vector<std::thread> workers;
-            workers.reserve(n_backends - 1);
-            for (size_t j = 1; j < n_backends; j++) {
-                workers.emplace_back([&, j]() { launch_one(j); });
-            }
-            launch_one(0);
-            for (auto & w : workers) {
-                w.join();
-            }
+            backend_ctx->pool.run(n_backends, launch_one);
         } else {
             for (size_t j = 0; j < n_backends; j++) {
                 launch_one(j);
@@ -3014,15 +3070,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     issue_ms[j] = now_ms() - t0;
                 }
             };
-            std::vector<std::thread> workers;
-            workers.reserve(n_backends - 1);
-            for (size_t j = 1; j < n_backends; j++) {
-                workers.emplace_back([&, j]() { worker(j); });
-            }
-            worker(0);
-            for (auto & w : workers) {
-                w.join();
-            }
+            backend_ctx->pool.run(n_backends, worker);
             if (issue_trace) {
                 fprintf(stderr, "ggml_backend_meta: issue trace (persistent): loop %.1f ms, per-device thread totals:", now_ms() - t_loop0);
                 for (size_t j = 0; j < n_backends; j++) {
