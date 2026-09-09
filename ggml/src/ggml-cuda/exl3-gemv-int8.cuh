@@ -27,7 +27,7 @@ namespace exl3_int8 {
 
 constexpr int THREADS = 256;
 constexpr int COLS    = 256;   // columns per block: 8 warps x 2 tiles
-constexpr int MAX_M   = 4;
+constexpr int MAX_M   = 8;     // covers speculative verify batches (draft-max 3 default, up to 7)
 
 __device__ __forceinline__ void cp_async16(void * smem, const void * glob) {
     const unsigned s = unsigned(__cvta_generic_to_shared(smem));

@@ -137,7 +137,7 @@ void exl3_reconstruct_launch(const uint8_t * data, half * dst, int k, int n0, in
         default: GGML_ABORT("invalid EXL3 codebook");         \
     }
 
-// ---- int8 activation path (4 bpw, m <= 4) ---------------------------------------------------
+// ---- int8 activation path (m <= MAX_M) ---------------------------------------------------
 // GGML_EXL3_INT8: 0 = off (fp16 tensor-core gemv), 1 = int8 + error-feedback residual everywhere,
 // 2 = plain int8 (residual only for the head), unset = per-tensor rule: plain for K <= 6, residual for K >= 7.
 // The activation rounding of plain int8 is invisible next to the weight error up to 6 bpw but becomes the
@@ -176,12 +176,24 @@ int * exl3_int8_counters(int device, cudaStream_t stream) {
     return ws[device];
 }
 
-// k-split geometry: ~640 blocks in flight, 128-aligned slices, dynamic shared memory under `cap`
+// Dynamic shared-memory budget per device: the 96 KB design cap, or what the device leaves after the
+// largest instantiation's static smem (sh_y[MAX_M][COLS] + reductions; sm_86 opts in to 99 KB total).
+// One value for every instantiation so the k-split below does not depend on M.
+size_t exl3_int8_smem_cap(int device) {
+    constexpr size_t static_worst = size_t(exl3_int8::MAX_M) * exl3_int8::COLS * sizeof(float) + 4096;
+    return std::min<size_t>(96 * 1024, ggml_cuda_info().devices[device].smpbo - static_worst);
+}
+
+// k-split geometry: ~640 blocks in flight, 128-aligned slices, rows bounded by the shared-memory cap
+// at the worst-case per-row cost (M = MAX_M with residual). The split is therefore a function of the
+// shape alone: a token gets bit-identical partial sums whether it is decoded alone or verified in a
+// batch, which keeps greedy speculative decoding lossless.
 void exl3_int8_geometry(int bits, int nacc, int m, int k, int colblocks, int pairs, size_t cap, int & ksplit, int & nrows, size_t & smem) {
+    constexpr int worst_row_bytes = 2 * exl3_int8::MAX_M * 64 + exl3_int8::MAX_M * 32;
     const int kslices = k / 16;
     ksplit = std::max(1, (640 + colblocks * pairs - 1) / (colblocks * pairs));
     nrows  = std::max(8, ((kslices + ksplit - 1) / ksplit + 7) / 8 * 8);
-    nrows  = std::min(nrows, int(cap - exl3_int8::stage_bytes(bits)) / (nacc * 64 + m * 32) / 8 * 8);
+    nrows  = std::min(nrows, int(cap - exl3_int8::stage_bytes(bits)) / worst_row_bytes / 8 * 8);
     GGML_ASSERT(nrows >= 8 && "EXL3 int8 gemv: device shared memory too small");
     ksplit = (kslices + nrows - 1) / nrows;
     smem   = size_t(nrows) * 16 * (size_t(nacc) * 4 + size_t(m) * 2) + exl3_int8::stage_bytes(bits);
@@ -193,20 +205,20 @@ template <int bits, int cb, int M, bool RESID, bool GROUPED>
 void exl3_gemv_int8_launch(ggml_backend_cuda_context & ctx, const uint8_t * B, const float * x, const half * suh, const half * svh,
         float * y, int k, int n, int pairs, exl3_int8::grouped_args ga, cudaStream_t stream) {
     const auto kernel = exl3_int8::gemv_int8_kernel<bits, cb, M, RESID, GROUPED>;
-    // Dynamic shared memory budget: the 96 KB design cap, or what the device leaves after this
-    // instantiation's static smem (sh_y grows with M; sm_86 opts in to 99 KB total). Function
-    // attributes are per device, so set it once on each.
-    static size_t cap[GGML_CUDA_MAX_DEVICES] = {};
-    if (cap[ctx.device] == 0) {
-        cudaFuncAttributes attr;
-        CUDA_CHECK(cudaFuncGetAttributes(&attr, kernel));
-        cap[ctx.device] = std::min<size_t>(96 * 1024, ggml_cuda_info().devices[ctx.device].smpbo - attr.sharedSizeBytes);
-        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(cap[ctx.device])));
+    const size_t cap = exl3_int8_smem_cap(ctx.device);
+    // function attributes are per device: opt this instantiation in once on each
+    static bool attr_set[GGML_CUDA_MAX_DEVICES] = {};
+    if (!attr_set[ctx.device]) {
+        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(cap)));
+        attr_set[ctx.device] = true;
     }
     const int colblocks = (n + exl3_int8::COLS - 1) / exl3_int8::COLS;
     const int nacc = GROUPED ? (cb == 2 ? 1 : 0) : (RESID ? 2 : 1) * M;
+    // the grouped split is sized for one token's expert set, so a verify batch of several tokens
+    // reuses the single-token geometry instead of getting its own (batch-dependent) k-split
+    const int pairs_ref = GROUPED ? ga.n_expert_used : 1;
     int ksplit, nrows; size_t smem;
-    exl3_int8_geometry(bits, nacc, M, k, colblocks, pairs, cap[ctx.device], ksplit, nrows, smem);
+    exl3_int8_geometry(bits, nacc, M, k, colblocks, pairs_ref, cap, ksplit, nrows, smem);
     ggml_cuda_pool_alloc<float> partials(ctx.pool(), size_t(ksplit) * M * pairs * n);
     int * counters = exl3_int8_counters(ctx.device, stream);
     kernel<<<dim3(colblocks, ksplit, pairs), exl3_int8::THREADS, smem, stream>>>(
@@ -221,7 +233,12 @@ void exl3_int8_run(ggml_backend_cuda_context & ctx, const float * x, const half 
         case 1: exl3_gemv_int8_launch<bits, 2, 1, RESID, false>(ctx, B, x, suh, svh, y, k, n, 1, ga, stream); break;
         case 2: exl3_gemv_int8_launch<bits, 2, 2, RESID, false>(ctx, B, x, suh, svh, y, k, n, 1, ga, stream); break;
         case 3: exl3_gemv_int8_launch<bits, 2, 3, RESID, false>(ctx, B, x, suh, svh, y, k, n, 1, ga, stream); break;
-        default: exl3_gemv_int8_launch<bits, 2, 4, RESID, false>(ctx, B, x, suh, svh, y, k, n, 1, ga, stream); break;
+        case 4: exl3_gemv_int8_launch<bits, 2, 4, RESID, false>(ctx, B, x, suh, svh, y, k, n, 1, ga, stream); break;
+        case 5: exl3_gemv_int8_launch<bits, 2, 5, RESID, false>(ctx, B, x, suh, svh, y, k, n, 1, ga, stream); break;
+        case 6: exl3_gemv_int8_launch<bits, 2, 6, RESID, false>(ctx, B, x, suh, svh, y, k, n, 1, ga, stream); break;
+        case 7: exl3_gemv_int8_launch<bits, 2, 7, RESID, false>(ctx, B, x, suh, svh, y, k, n, 1, ga, stream); break;
+        case 8: exl3_gemv_int8_launch<bits, 2, 8, RESID, false>(ctx, B, x, suh, svh, y, k, n, 1, ga, stream); break;
+        default: GGML_ABORT("EXL3 int8 gemv: m = %d exceeds MAX_M", m);
     }
 }
 
