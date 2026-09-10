@@ -3,6 +3,16 @@
 Source of truth: exllamav3 (MIT, turboderp) `exllamav3_ext/quant/{codebook,exl3_dq,exl3_gemv_kernel,
 hadamard_inner,reconstruct,pack}.cu*` and `modules/quant/exl3_lib/quantize.py`; QTIP (arXiv 2406.11235).
 
+## Placement limitation
+
+Use one CUDA GPU or `--split-mode layer` across multiple GPUs. Multi-device
+`--split-mode tensor` is rejected during model loading: EXL3 projection sign/scale
+vectors and expert windows do not yet have a qualified tensor-sharding path.
+This applies to dense and MoE EXL3 models, not just Flash-Next. Whole-expert CUDA
+layer placement is distinct from the unsupported per-device expert windows.
+CPU execution of EXL3 weights is also unsupported; do not assume that another
+format's MoE CPU-cache/offload results establish EXL3 support.
+
 ## Format (as stored, e.g. turboderp/Qwen3.8-27B-exl3 @ 4.00bpw)
 Per linear module `M` (in features `k`, out features `n`, both multiples of 128):
 - `M.trellis` int16 `[k/16, n/16, 16*K]` — one 16x16 weight tile per `[kt][nt]`, `256*K` bits.

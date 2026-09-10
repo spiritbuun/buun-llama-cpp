@@ -2299,9 +2299,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
-    return ml.create_tensor(
+    ggml_tensor * tensor = ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);
+    if (tensor != nullptr && ggml_type_is_exl3(tensor->type) &&
+            params.split_mode == LLAMA_SPLIT_MODE_TENSOR && get_split_state_ud.n_devices > 1) {
+        throw std::runtime_error("EXL3 weights do not support multi-device tensor splitting yet; use --split-mode layer");
+    }
+    return tensor;
 }
 
 std::string llama_model::arch_name() const {
