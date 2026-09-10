@@ -6,6 +6,7 @@
 // statuses describe semantic support, not transient capture/admission failures.
 enum class server_vbr_prompt_cache_support_status : uint8_t {
     supported = 0,
+    codec_unsupported,
     draft_context_unsupported,
     speculative_slot_unsupported,
     media_prompt_unsupported,

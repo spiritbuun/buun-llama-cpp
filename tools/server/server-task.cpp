@@ -2981,7 +2981,8 @@ bool server_prompt_cache::prepare_vbr_restore(
         const std::string & execution_identity,
         const std::string & adapter_config_key,
         server_prompt_cache_vbr_restore_candidate & candidate,
-        bool allow_prefix_projection) noexcept {
+        bool allow_prefix_projection,
+        const common_cache_family_binding * required_family) noexcept {
     candidate = {};
     // The first automatic-import slice is text-only. A later-media suffix has
     // a different exact DF scope from its cached media stem; fail closed until
@@ -3005,6 +3006,7 @@ bool server_prompt_cache::prepare_vbr_restore(
             const server_tokens * request;
             const std::string * execution;
             const std::string * adapter;
+            const common_cache_family_binding * required_family;
             uint64_t prefix;
             uint64_t source_tokens;
             llama_pos selected_next_position;
@@ -3013,7 +3015,8 @@ bool server_prompt_cache::prepare_vbr_restore(
             bool projected;
         } exact {
             nullptr, &request_tokens, &execution_identity,
-            &adapter_config_key, 0, 0, -1, false, 0, false,
+            &adapter_config_key, required_family,
+            0, 0, -1, false, 0, false,
         };
         const auto select =
             [](void * opaque, const server_retention_instance_key & key,
@@ -3032,6 +3035,8 @@ bool server_prompt_cache::prepare_vbr_restore(
                         server_prompt_cache_payload_kind::vbr_artifact ||
                     state->adapter_config_key != *current.adapter ||
                     state->vbr_execution_identity != *current.execution ||
+                    (current.required_family &&
+                     state->cache_family != *current.required_family) ||
                     source_tokens == 0 ||
                     (current.projected
                         ? prefix >= source_tokens ||
@@ -3097,7 +3102,8 @@ bool server_prompt_cache::prepare_vbr_restore(
         }
         selection projected {
             nullptr, &request_tokens, &execution_identity,
-            &adapter_config_key, 0, 0, -1, false, 0, true,
+            &adapter_config_key, required_family,
+            0, 0, -1, false, 0, true,
         };
         if (allow_prefix_projection) {
             if (!retention_obs->visit_common_prefix_instances(

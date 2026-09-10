@@ -236,7 +236,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 }
 
 #if defined(GGML_CUDA_TURBO_FA)
-// Turbo MMA fused dispatch: ncols1 selection (mirrors f16 version but calls turbo case).
+// Turbo MMA fused dispatch: ncols1 selection for the <= 4-token decode path.
 template <int DKQ, int DV, int ncols2, ggml_type type_K, ggml_type type_V>
 static void ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -254,13 +254,8 @@ static void ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols1(ggml_backend_cuda_c
         return;
     }
 
-    // Turing (sm_75) is capped at ncols=32 — the kernel has NO_DEVICE_CODE for ncols>32.
-    if (ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING || Q->ne[1] <= 32/ncols2) {
-        ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 32/ncols2, ncols2, type_K, type_V>(ctx, dst);
-        return;
-    }
-
-    ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 64/ncols2, ncols2, type_K, type_V>(ctx, dst);
+    GGML_ASSERT(Q->ne[1] <= 4 && ncols2 == 8);
+    ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 4, 8, type_K, type_V>(ctx, dst);
 }
 
 // Turbo MMA fused dispatch: ncols2 selection based on GQA ratio.
@@ -1589,6 +1584,17 @@ void ggml_cuda_fattn_scratch_free(ggml_backend_cuda_context & ctx) {
     }
 }
 
+enum best_fattn_kernel {
+    BEST_FATTN_KERNEL_NONE      =   0,
+    BEST_FATTN_KERNEL_VEC       = 100,
+    BEST_FATTN_KERNEL_TILE      = 200,
+    BEST_FATTN_KERNEL_WMMA_F16 = 300,
+    BEST_FATTN_KERNEL_MMA_F16  = 400,
+};
+
+static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(int device, const ggml_tensor * dst);
+
 static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     load_tcq_decode_alpha(ctx.device);
     cudaStream_t stream = ctx.stream();
@@ -1806,8 +1812,25 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
     dst->src[2] = v_fp16 ? &V_f16 : orig_v;
     std::atomic_signal_fence(std::memory_order_seq_cst);
 
-    // Dispatch to MMA kernel (sees rotated Q, fp16 K/V, uses tensor cores)
-    ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+    // Re-select the native attention kernel after materialization. The original Turbo tensors
+    // select this wrapper, but the temporary tensors are ordinary F16 and must follow the same
+    // backend-specific dispatch as a native F16 cache (rocWMMA/tile on AMD, MMA on NVIDIA).
+    switch (ggml_cuda_get_best_fattn_kernel(ctx.device, dst)) {
+        case BEST_FATTN_KERNEL_VEC:
+            ggml_cuda_flash_attn_ext_vec(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_TILE:
+            ggml_cuda_flash_attn_ext_tile(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_WMMA_F16:
+            ggml_cuda_flash_attn_ext_wmma_f16(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_MMA_F16:
+            ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_NONE:
+            GGML_ABORT("fatal error");
+    }
 
     // Restore original tensor pointers
     dst->src[0] = orig_q;
@@ -1951,15 +1974,6 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
 
     GGML_ABORT("fatal error");
 }
-
-// Best FlashAttention kernel for a specific GPU:
-enum best_fattn_kernel {
-    BEST_FATTN_KERNEL_NONE    =   0,
-    BEST_FATTN_KERNEL_TILE    = 200,
-    BEST_FATTN_KERNEL_VEC     = 100,
-    BEST_FATTN_KERNEL_WMMA_F16 = 300,
-    BEST_FATTN_KERNEL_MMA_F16 = 400,
-};
 
 static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
     // TurboQuant KV types (turbo2/3/4/8_0, turbo3/2/1_tcq) are handled by the fork's
@@ -2357,18 +2371,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     };
     const bool turbo_fused_asym = turbo_fused_asym_pair(K->type, V->type) && Q->ne[0] == 256 &&
         (t1_fused_ok || (K->type != GGML_TYPE_TURBO1_TCQ && V->type != GGML_TYPE_TURBO1_TCQ));
-    // TURBO_FUSED_PREFILL=1 (experiment knob): route BATCHED attention through the fused MMA path
-    // (ncols1 instances up to 64 exist). ⚠ MEASURED A LOSS (2026-07-03, 27B/3090, pp512): ~neutral
-    // at d0 but −6% (t8/t4) to −11% (t3/t1_tcq) at d8192 — re-decoding the K/V tile once per
-    // 64-column block swamps the DRAM savings vs the materialize path's decode-once f16 round
-    // trip, and the win the codecs DO get from materialize grows with depth. Keep default OFF;
-    // the knob stays for future probing (e.g. if a shared-tile multi-column loader lands).
-    static const int turbo_fused_prefill = [] {
-        const char * e = getenv("TURBO_FUSED_PREFILL");
-        return e ? atoi(e) : 0;
-    }();
 #if defined(GGML_CUDA_TURBO_FA)
-    if (turbo_mma_fused && (turbo_matched || turbo_fused_asym || turbo1_tcq_matched) && (Q->ne[1] <= 4 || turbo_fused_prefill) &&
+    if (turbo_mma_fused && (turbo_matched || turbo_fused_asym || turbo1_tcq_matched) && Q->ne[1] <= 4 &&
         (Q->ne[0] == 128 || Q->ne[0] == 256) &&
         (turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) ||
          // AMD RDNA WMMA: trying D=128 AND D=256 (gemma) after lifting the upstream DKQ<=128 cap.

@@ -741,6 +741,9 @@ struct common_params {
     bool cache_type_k_explicit = false;      // whether -ct/-ctk explicitly selected the K type
     bool cache_type_v_explicit = false;      // whether -ct/-ctv explicitly selected the V type
     std::string vbr_budget = "dynamic"; // VBR target budget: dynamic or a fixed tier/bit width
+    enum llama_vbr_codec vbr_codec = LLAMA_VBR_CODEC_TURBO; // concrete/provisional family; never AUTO at runtime
+    bool vbr_codec_auto = true;     // resolve from model KV geometry before fit/context creation
+    bool vbr_codec_explicit = false;
     std::string vbr_entry = "f16";       // dynamic VBR entry tier; quality-first default remains F16
     std::string vbr_min_bits = "auto";  // VBR aggregate effective bits/value floor for dynamic capacity planning
     std::string vbr_vram_budget = "auto"; // VBR KV VRAM budget: auto or explicit byte/suffixed size
@@ -778,18 +781,21 @@ struct common_params {
     // canonical predicates — use these instead of re-deriving the flag combinations
     bool vbr_enabled() const {
         return vbr_cache_type_k || vbr_cache_type_v || vbr_budget_explicit ||
-               vbr_entry_explicit || vbr_min_bits_explicit || vbr_vram_budget_explicit || vbr_policy_explicit;
+               vbr_codec_explicit || vbr_entry_explicit || vbr_min_bits_explicit ||
+               vbr_vram_budget_explicit || vbr_policy_explicit;
     }
     bool vbr_dynamic() const {
         return vbr_enabled() && (vbr_budget == "dynamic" || vbr_budget == "auto" || vbr_budget.empty());
     }
     bool vbr_explicitly_selected() const {
         return vbr_cache_type_k_explicit || vbr_cache_type_v_explicit ||
-               vbr_budget_explicit || vbr_entry_explicit || vbr_min_bits_explicit ||
+               vbr_budget_explicit || vbr_codec_explicit || vbr_entry_explicit || vbr_min_bits_explicit ||
                vbr_vram_budget_explicit || vbr_policy_explicit;
     }
     void reset_vbr_runtime_state() {
         vbr_budget = "dynamic";
+        vbr_codec = LLAMA_VBR_CODEC_TURBO;
+        vbr_codec_auto = true;
         vbr_entry = "f16";
         vbr_min_bits = "auto";
         vbr_vram_budget = "auto";
@@ -803,6 +809,7 @@ struct common_params {
         vbr_selected_kld = 0.0;
         vbr_vram_budget_bytes = 0;
         vbr_budget_explicit = false;
+        vbr_codec_explicit = false;
         vbr_entry_explicit = false;
         vbr_min_bits_explicit = false;
         vbr_vram_budget_explicit = false;
@@ -1058,14 +1065,18 @@ void common_init();
 void common_params_print_info(const common_params & params, bool print_devices = true);
 std::string common_params_get_system_info(const common_params & params);
 
-// Resolve a VBR floor spec ("t8"/"t4"/"t3tcq"/"t2tcq"/"t1tcq", "auto"/"none", or a bits value) to an
-// aggregate floor in effective bits/value (0 == bottom-tier floor). Throws std::invalid_argument on
-// bad input. Single source of truth for the floor→bits mapping, shared by the main CLI and llama-bench.
-double common_vbr_floor_bits(const std::string & floor);
+// Resolve a codec-relative VBR floor spec (tier alias, "auto"/"none", or bits value) to an
+// aggregate floor in effective bits/value (0 == bottom rung). Throws std::invalid_argument on bad
+// input. Single source of truth for the floor→bits mapping, shared by the main CLI and llama-bench.
+double common_vbr_floor_bits(
+        const std::string & floor,
+        llama_vbr_codec codec = LLAMA_VBR_CODEC_TURBO);
 
-// Resolve a discrete dynamic-VBR entry tier (f16/t8/t4/t3/t2/t1 and aliases) to its ggml type.
+// Resolve a discrete dynamic-VBR entry tier and alias to its codec-relative ggml type.
 // Unlike the floor, the entry cannot be fractional. Throws std::invalid_argument on bad input.
-ggml_type common_vbr_entry_type(const std::string & entry);
+ggml_type common_vbr_entry_type(
+        const std::string & entry,
+        llama_vbr_codec codec = LLAMA_VBR_CODEC_TURBO);
 
 struct common_vbr_cache_choice {
     ggml_type type = GGML_TYPE_F16;
@@ -1093,7 +1104,9 @@ common_vbr_side_selection common_vbr_resolve_sides(
 
 // Fit-time representation for a cache side: never price a movable side wider than its selected
 // entry, and never alter a pinned side.
-ggml_type common_vbr_fit_price_type(ggml_type entry, double floor_bpv, bool pinned);
+ggml_type common_vbr_fit_price_type(
+        ggml_type entry, double floor_bpv, bool pinned,
+        llama_vbr_codec codec = LLAMA_VBR_CODEC_TURBO);
 double common_vbr_fit_kv_scale(double floor_bits_per_token, double price_bits_per_token, bool types_coupled);
 
 // Resolve a VBR VRAM budget spec ("auto"/"none" or a size with optional K/M/G[i]B suffix) to bytes
@@ -1287,6 +1300,12 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 
 struct llama_model_params   common_model_params_to_llama  (      common_params & params);
 struct llama_context_params common_context_params_to_llama(const common_params & params);
+
+// Recompute codec-dependent entry/floor/runtime fields after model-aware auto selection.
+// Core llama_context_params must only ever receive the resolved Turbo or classic codec.
+void common_params_postprocess_vbr(common_params & params);
+// Resolve default/explicit auto against model metadata. Safe to call repeatedly.
+void common_params_resolve_vbr_codec_auto(common_params & params);
 
 // clear LoRA adapters from context, then apply new list of adapters
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora);

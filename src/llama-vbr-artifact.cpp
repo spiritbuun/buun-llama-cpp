@@ -10,6 +10,7 @@
 #include <new>
 #include <set>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -150,7 +151,9 @@ bool read_source_chunks(const vbr_artifact_byte_source & source, Fn && fn) {
     if (!source.valid()) {
         return false;
     }
-    std::array<uint8_t, STREAM_CHUNK_SIZE> buffer;
+    // Keep the 1 MiB transfer buffer off the stack. MSVC's default process
+    // stack is also 1 MiB, so this otherwise overflows before the first read.
+    std::vector<uint8_t> buffer(STREAM_CHUNK_SIZE);
     uint64_t offset = 0;
     while (offset < source.size) {
         const size_t n = size_t(std::min<uint64_t>(
@@ -1251,12 +1254,7 @@ bool accounting_payloads_match(const vbr_artifact_package & package) {
     try {
         for (const auto & blob : package.unit_blobs) {
             for (const auto & shard : blob.descriptor.shards) {
-                const vbr_artifact_portable_domain domain {
-                    llama_cache_acct_residency::device,
-                    llama_cache_acct_domain_kind::device_topology,
-                    shard.topology_index,
-                    shard.device_ordinal,
-                };
+                const auto domain = vbr_artifact_payload_storage_domain();
                 if (!add(vbr_artifact_accounting_role::unit_payload,
                          domain, shard.payload_bytes)) {
                     return false;
@@ -1266,12 +1264,8 @@ bool accounting_payloads_match(const vbr_artifact_package & package) {
                 vbr_artifact_clean_stash_state::present) {
                 for (const auto & shard :
                      blob.descriptor.clean_stash.shards) {
-                    const vbr_artifact_portable_domain domain {
-                        llama_cache_acct_residency::device,
-                        llama_cache_acct_domain_kind::device_topology,
-                        shard.topology_index,
-                        shard.device_ordinal,
-                    };
+                    const auto domain =
+                        vbr_artifact_payload_storage_domain();
                     if (!add(
                             vbr_artifact_accounting_role::clean_stash_payload,
                             domain, shard.payload_bytes)) {
@@ -2517,7 +2511,7 @@ bool read_payload_bytes(
     section_payload_hash.u32(object_index);
     section_payload_hash.u32(shard_index);
     section_payload_hash.u64(encoded_size);
-    std::array<uint8_t, STREAM_CHUNK_SIZE> buffer;
+    std::vector<uint8_t> buffer(STREAM_CHUNK_SIZE);
     uint64_t offset = 0;
     while (offset < encoded_size) {
         const size_t n = size_t(std::min<uint64_t>(
@@ -2761,7 +2755,7 @@ bool decode_companion_section(
     }
     payload_hash.u64(encoded_size);
 
-    std::array<uint8_t, STREAM_CHUNK_SIZE> buffer;
+    std::vector<uint8_t> buffer(STREAM_CHUNK_SIZE);
     uint64_t offset = 0;
     while (offset < encoded_size) {
         const size_t n = size_t(std::min<uint64_t>(

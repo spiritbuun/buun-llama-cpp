@@ -802,6 +802,9 @@ struct llama_model {
 
     ggml_tensor * get_rope_factors(const llama_cparams & cparams, int il) const;
 
+    bool supports_classic_vbr() const;
+    bool supports_turbo_vbr() const;
+
     llama_memory_i * create_memory(const llama_memory_params & params, const llama_cparams & cparams) const;
 
     ggml_cgraph * build_graph(const llm_graph_params & params) const;

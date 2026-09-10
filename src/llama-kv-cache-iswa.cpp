@@ -86,42 +86,16 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         size_swa = size_base;
     }
 
-    // split the dynamic-VBR budget across the two caches proportional to their worst-case
-    // (entry-tier) footprints — layers x cells; both instances arming with the FULL budget
-    // would target ~2x the configured mapped-physical total before degrading
+    // Both children see the scalar and parent device share while constructing so even a tiny
+    // budget creates their VBR ownership/tracker state. Once their placement, per-layer types,
+    // and VMM page geometry are resolved, the tree normalizes device reach and the aggregate
+    // scalar is repartitioned before either child can prepare a graph.
     llama_memory_vbr_params vbr_base = vbr;
     llama_memory_vbr_params vbr_swa  = vbr;
     // Distinct VBR_TRACE files per child record both schedules without the
     // second open truncating the first.
     vbr_base.trace_label = "base";
     vbr_swa.trace_label  = "swa";
-    if (vbr.dynamic || vbr.budget_bytes > 0) {
-        uint64_t n_base_l = 0;
-        uint64_t n_swa_l  = 0;
-        for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
-            if (filter && !filter(il)) {
-                continue;
-            }
-            (hparams.is_swa(il) ? n_swa_l : n_base_l)++;
-        }
-        const double w_base = (double) n_base_l * size_base;
-        const double w_swa  = (double) n_swa_l  * size_swa;
-        if (w_base + w_swa > 0.0) {
-            // the same footprint weights split BOTH the configured budget and the children's
-            // claim on the device's spare VRAM (device_share): two independent controllers on
-            // one device must never both re-derive against the full free amount
-            vbr_base.device_share = vbr.device_share * (w_base / (w_base + w_swa));
-            vbr_swa.device_share  = vbr.device_share - vbr_base.device_share;
-            if (vbr.budget_bytes > 0) {
-                vbr_base.budget_bytes = (uint64_t) ((double) vbr.budget_bytes * (w_base / (w_base + w_swa)));
-                vbr_swa.budget_bytes  = vbr.budget_bytes - vbr_base.budget_bytes;
-                if (vbr.dynamic) {
-                    LLAMA_LOG_INFO("%s: VBR budget split: %.2f MiB base / %.2f MiB SWA (by entry-tier footprint)\n",
-                            __func__, vbr_base.budget_bytes/1024.0/1024.0, vbr_swa.budget_bytes/1024.0/1024.0);
-                }
-            }
-        }
-    }
 
     LLAMA_LOG_INFO("%s: creating non-SWA KV cache, size = %u cells\n", __func__, size_base);
 
@@ -147,6 +121,11 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
             v_trans, offload, unified, size_swa, n_seq_max, n_pad,
             hparams.n_swa, hparams.swa_type, mem_other_swa, filter_swa, reuse, share, vbr_swa);
 
+    const uint64_t scalar_budget = llama_memory_vbr_budget_bytes_resolve(vbr);
+    if (scalar_budget > 0) {
+        vbr_repartition_scalar_budget(scalar_budget);
+    }
+
     // Run the process-external protocol once per composite. Choose the last active child
     // in the parent's fixed base->SWA execution order so the root can finalize both samples
     // and fence either child's service wave before graph launch.
@@ -159,6 +138,47 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         peer       ->vbr_attach_ledger_tree(kv_vbr_root, kv_vbr_root, vbr.device_share);
         kv_vbr_root->vbr_finalize_ledger_tree();
     }
+}
+
+void llama_kv_cache_iswa::vbr_repartition_scalar_budget(uint64_t budget_bytes) {
+    struct target {
+        llama_kv_cache * child;
+        llama_kv_cache::vbr_pool * pool;
+    };
+
+    std::vector<target> targets;
+    std::vector<llama_memory_vbr_budget_cost> costs;
+    for (llama_kv_cache * child : { kv_base.get(), kv_swa.get() }) {
+        for (auto & pool : child->vbr_pools_) {
+            if (pool.vmm == nullptr) {
+                continue;
+            }
+            const size_t entry = pool.entry_cost;
+            const size_t floor = pool.floor_cost;
+            targets.push_back({ child, &pool });
+            costs.push_back({ entry, floor });
+        }
+        child->vbr_budget_bytes_ = 0;
+    }
+    if (targets.empty()) {
+        return;
+    }
+
+    std::vector<uint64_t> shares;
+    llama_memory_vbr_budget_partition(budget_bytes, costs, shares);
+    for (size_t i = 0; i < targets.size(); ++i) {
+        auto & t = targets[i];
+        const size_t share = (size_t) shares[i];
+        t.pool->budget = share;
+        t.pool->budget_base = t.child->vbr_budget_explicit_ ? share : t.pool->floor_cost;
+        t.pool->budget_eff_stamp = ~0ull;
+        t.child->vbr_budget_bytes_ += share;
+    }
+
+    LLAMA_LOG_INFO("%s: final VBR scalar split: %.2f MiB base / %.2f MiB SWA "
+            "(resolved entry/floor pool geometry)\n", __func__,
+            kv_base->vbr_budget_bytes_/1024.0/1024.0,
+            kv_swa ->vbr_budget_bytes_/1024.0/1024.0);
 }
 
 void llama_kv_cache_iswa::vbr_finalize_prepare_failure(

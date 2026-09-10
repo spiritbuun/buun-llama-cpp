@@ -118,6 +118,7 @@ struct llama_memory_params {
 // developer overrides on top of these.
 struct llama_memory_vbr_params {
     bool     dynamic      = false; // arm the VMM pool + decode-time degrade controller
+    enum llama_vbr_codec codec = LLAMA_VBR_CODEC_TURBO;
     uint64_t budget_bytes = 0;     // mapped-physical KV budget; 0 = floor-layout-cost fallback
     double   min_bits     = 0.0;   // aggregate bits/value floor (0 = bottom-tier floor)
     // the floor was TYPED (flag or env): doubles as peer-yield consent down to it
@@ -129,7 +130,7 @@ struct llama_memory_vbr_params {
     // --fit-target so startup and runtime encode the same worst case)
     uint64_t growth_headroom_bytes = 0;
     // this cache's fraction of its device's spare VRAM (iSWA children share a device; the
-    // parent splits by entry-tier footprint so the children never double-claim the same free)
+    // parent normalizes their resolved pools so they never double-claim the same free)
     double   device_share = 1.0;
     // mixed-config side pins, see llama.h vbr_pin_k
     bool     pin_k = false;
@@ -140,6 +141,21 @@ struct llama_memory_vbr_params {
 
     std::function<ggml_backend_t(ggml_backend_buffer_type_t)> compute_backend_for_buft;
 };
+
+// Resolve the developer environment override with the same precedence for standalone and
+// composite caches. The returned value is the aggregate scalar; iSWA divides it only after its
+// children have materialized their real pool geometry.
+uint64_t llama_memory_vbr_budget_bytes_resolve(const llama_memory_vbr_params & params);
+
+struct llama_memory_vbr_budget_cost {
+    uint64_t entry = 0;
+    uint64_t floor = 0;
+};
+
+void llama_memory_vbr_budget_partition(
+        uint64_t total,
+        const std::vector<llama_memory_vbr_budget_cost> & costs,
+        std::vector<uint64_t> & result);
 
 enum llama_memory_status {
     LLAMA_MEMORY_STATUS_SUCCESS = 0,

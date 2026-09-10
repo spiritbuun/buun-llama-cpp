@@ -258,6 +258,18 @@ struct vbr_artifact_portable_accounting_row {
     llama_cache_acct_attr_kind attribution = llama_cache_acct_attr_kind::artifact;
 };
 
+// Artifact payloads are retained in immutable pageable segment chains. Their
+// tensor descriptors keep the source/destination device topology; accounting
+// follows the bytes' actual storage residency instead of charging host copies
+// against the accelerator that produced them.
+inline vbr_artifact_portable_domain vbr_artifact_payload_storage_domain() {
+    return {
+        llama_cache_acct_residency::pageable_host,
+        llama_cache_acct_domain_kind::not_applicable,
+        UINT32_MAX, UINT16_MAX,
+    };
+}
+
 struct vbr_artifact_shard_descriptor {
     uint32_t shard_index = 0;
     uint32_t topology_index = 0;

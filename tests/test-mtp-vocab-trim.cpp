@@ -91,6 +91,64 @@ void test_mtp_carry_lifecycle() {
     assert(common_speculative_mtp_process_preflight_resolve(
                batch_carry, only_first, positions) ==
            common_speculative_mtp_process_preflight::target_only);
+
+    std::vector<float> source = { 1.25f, -2.5f, 17.0f, 0.0f };
+    std::vector<uint8_t> state;
+    common_speculative_mtp_carry_lifecycle source_lifecycle;
+    assert(!common_speculative_mtp_carry_state_save(
+        source_lifecycle, source, state));
+    source_lifecycle.target_process_refreshed();
+    assert(common_speculative_mtp_carry_state_save(
+        source_lifecycle, source, state));
+    assert(!state.empty());
+
+    std::vector<float> restored(source.size(), 99.0f);
+    common_speculative_mtp_carry_lifecycle restored_lifecycle;
+    restored_lifecycle.target_process_refreshed();
+    restored_lifecycle.sequence_transition(
+        common_speculative_sequence_event::composite_image_restored);
+    assert(!restored_lifecycle.draft_ready());
+    assert(common_speculative_mtp_carry_state_load(
+        restored_lifecycle, restored, state));
+    assert(restored_lifecycle.draft_ready());
+    assert(restored == source);
+
+    auto corrupt = state;
+    corrupt[0] ^= 0x80;
+    assert(!common_speculative_mtp_carry_state_load(
+        restored_lifecycle, restored, corrupt));
+    assert(!restored_lifecycle.draft_ready());
+
+    corrupt = state;
+    corrupt.pop_back();
+    assert(!common_speculative_mtp_carry_state_load(
+        restored_lifecycle, restored, corrupt));
+    assert(!restored_lifecycle.draft_ready());
+
+    std::vector<float> wrong_width(source.size() + 1, 0.0f);
+    assert(!common_speculative_mtp_carry_state_load(
+        restored_lifecycle, wrong_width, state));
+    assert(!restored_lifecycle.draft_ready());
+
+    const auto none = common_speculative_checkpoint_policy_resolve(
+        false, false, true, true);
+    assert(!none.capture_draft);
+    assert(!none.require_complete_draft_and_state);
+
+    const auto vbr_only = common_speculative_checkpoint_policy_resolve(
+        true, true, false, false);
+    assert(vbr_only.capture_draft);
+    assert(!vbr_only.require_complete_draft_and_state);
+
+    const auto mtp = common_speculative_checkpoint_policy_resolve(
+        true, false, true, true);
+    assert(mtp.capture_draft);
+    assert(mtp.require_complete_draft_and_state);
+
+    const auto inactive_mtp = common_speculative_checkpoint_policy_resolve(
+        true, false, false, true);
+    assert(!inactive_mtp.capture_draft);
+    assert(!inactive_mtp.require_complete_draft_and_state);
 }
 
 struct files_cleanup {

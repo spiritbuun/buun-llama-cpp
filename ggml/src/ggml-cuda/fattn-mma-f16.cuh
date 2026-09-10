@@ -67,7 +67,7 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(192, 128, 32, 128, 2,  32,  96,  64,  64, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(192, 128, 64, 128, 2,  32,  96,  64,  64, 2, true);
 
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256,  8,  64, 4,  64, 128, 128, 128, 2, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256,  8, 128, 2,  64, 128, 128, 128, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 16,  64, 4,  32, 128, 128, 128, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 2,  32, 128, 128, 128, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 128, 2,  32, 128, 128, 128, 2, true);
@@ -1537,20 +1537,29 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     half2 * tile_V    =           nstages > 1 ? tile_K + nbatch_fa * stride_tile_K : tile_K;
     half  * tile_mask = (half *) (nstages > 1 ? tile_V + nbatch_fa * stride_tile_V : tile_V + nbatch_fa * stride_tile_KV_max);
 
-    constexpr bool is_tcq3_cb = (type_K == GGML_TYPE_TURBO3_TCQ || type_V == GGML_TYPE_TURBO3_TCQ);
-    constexpr bool is_tcq2_cb = (type_K == GGML_TYPE_TURBO2_TCQ || type_V == GGML_TYPE_TURBO2_TCQ);
-    constexpr bool is_tcq1_cb = (type_K == GGML_TYPE_TURBO1_TCQ || type_V == GGML_TYPE_TURBO1_TCQ);
-    constexpr int  cb_size    = is_tcq3_cb ? 512 : ((is_tcq2_cb || is_tcq1_cb) ? 256 : 1);
-    __shared__ float smem_cb[cb_size];
-    __shared__ float smem_cb_v[cb_size];   // separate V codebook: V may use a different book than K (asymmetric K/V)
-    if constexpr (is_tcq3_cb || is_tcq2_cb || is_tcq1_cb) {
-        const float * cb_src   = is_tcq3_cb ? d_turbo3_tcq_codebook_fattn   : (is_tcq2_cb ? d_turbo2_tcq_codebook_fattn   : d_turbo1_tcq_codebook);
-        // K reads the K book, V reads the separate V book (asymmetric K/V split).
-        const float * cb_src_v = is_tcq3_cb ? d_turbo3_tcq_codebook_v_fattn : (is_tcq2_cb ? d_turbo2_tcq_codebook_v_fattn : d_turbo1_tcq_codebook_v);
-        for (int i = threadIdx.y * warp_size + threadIdx.x; i < cb_size; i += nwarps * warp_size) {
-            smem_cb[i]   = cb_src[i];
+    constexpr int cb_size_k = type_K == GGML_TYPE_TURBO3_TCQ ? 512 :
+                              type_K == GGML_TYPE_TURBO2_TCQ || type_K == GGML_TYPE_TURBO1_TCQ ? 256 : 0;
+    constexpr int cb_size_v = type_V == GGML_TYPE_TURBO3_TCQ ? 512 :
+                              type_V == GGML_TYPE_TURBO2_TCQ || type_V == GGML_TYPE_TURBO1_TCQ ? 256 : 0;
+    __shared__ float smem_cb  [cb_size_k > 0 ? cb_size_k : 1];
+    __shared__ float smem_cb_v[cb_size_v > 0 ? cb_size_v : 1];
+    if constexpr (cb_size_k > 0) {
+        const float * cb_src_k = type_K == GGML_TYPE_TURBO3_TCQ ? d_turbo3_tcq_codebook_fattn :
+                                     type_K == GGML_TYPE_TURBO2_TCQ ? d_turbo2_tcq_codebook_fattn :
+                                                                      d_turbo1_tcq_codebook;
+        for (int i = threadIdx.y * warp_size + threadIdx.x; i < cb_size_k; i += nwarps * warp_size) {
+            smem_cb[i] = cb_src_k[i];
+        }
+    }
+    if constexpr (cb_size_v > 0) {
+        const float * cb_src_v = type_V == GGML_TYPE_TURBO3_TCQ ? d_turbo3_tcq_codebook_v_fattn :
+                                     type_V == GGML_TYPE_TURBO2_TCQ ? d_turbo2_tcq_codebook_v_fattn :
+                                                                      d_turbo1_tcq_codebook_v;
+        for (int i = threadIdx.y * warp_size + threadIdx.x; i < cb_size_v; i += nwarps * warp_size) {
             smem_cb_v[i] = cb_src_v[i];
         }
+    }
+    if constexpr (cb_size_k > 0 || cb_size_v > 0) {
         __syncthreads();
     }
 
@@ -1668,8 +1677,17 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
              KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
     } else {
         constexpr bool oob_check = false;
-        if constexpr (sparse_mask && V_is_K_view && DKQ == 512 && ncols1 == 8 && ncols2 == 8 &&
-                nbatch_fa == 32 && warp_size == 32 && nwarps * warp_size == ncols1 * nbatch_fa) {
+        // The sparse bitmap specialization is a CUDA-only optimization. HIP still parses
+        // discarded template branches aggressively enough to instantiate its CUDA-specific
+        // block-shape assertion for unrelated wave32 kernels (notably gfx1201).
+#if defined(GGML_USE_HIP)
+        constexpr bool use_sparse_bitmap = false;
+#else
+        constexpr bool use_sparse_bitmap = sparse_mask && V_is_K_view && DKQ == 512 &&
+                                           ncols1 == 8 && ncols2 == 8 && nbatch_fa == 32 && warp_size == 32 &&
+                                           nwarps * warp_size == ncols1 * nbatch_fa;
+#endif
+        if constexpr (use_sparse_bitmap) {
             // Scan 32 KV tiles at a time. Each warp covers one query row and each lane
             // covers one KV row, producing a 32-bit occupied-tile bitmap. Keeping that
             // bitmap in registers replaces one block-wide vote per empty tile with two
@@ -2227,11 +2245,9 @@ static __global__ void flash_attn_ext_f16(
 
     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
 
-    constexpr bool is_turbo_kv = (type_K != GGML_TYPE_F16 || type_V != GGML_TYPE_F16);
-
     const int stride_Q1   = nb01 / sizeof(float2);
     const int stride_Q2   = nb02 / sizeof(float2);
-    // Stride unit is PER SIDE, keyed on each side's own type — not the combined is_turbo_kv flag.
+    // Stride unit is PER SIDE, keyed on each side's own type rather than a combined Turbo flag.
     // Turbo loaders cast to char* and want the raw byte stride; the f16 loader indexes a half2*
     // and wants the half2-element stride. In an asymmetric f16<->t8 pair each side takes its own
     // path, so a single is_turbo_kv-based stride mis-indexes the f16 side (VBR entry-band garbage).

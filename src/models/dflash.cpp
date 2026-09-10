@@ -606,9 +606,10 @@ std::unique_ptr<llm_graph_context> llama_model_dflash::build_arch_graph(const ll
 
 template <>
 ggml_tensor * llama_model_dflash::graph<true>::build_inp_embd_enc() const {
-    auto inp_target = std::make_unique<llm_graph_input_embd>(hparams.n_embd_inp_enc());
+    const int64_t n_embd_inp = hparams.n_embd_inp_enc();
+    auto inp_target = std::make_unique<llm_graph_input_embd>(n_embd_inp);
 
-    inp_target->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp_enc(), n_tokens);
+    inp_target->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
     ggml_set_input(inp_target->embd);
 
     ggml_tensor * cur = inp_target->embd;
@@ -652,7 +653,7 @@ static ggml_tensor * build_dflash_staged_enc(llm_graph_context & g, const llama_
     g.res->add_input(std::move(inp));
     g.cb(cur, "inp_g_embeddings", -1);
 
-    cur = g.build_lora_mm(model.fc, cur);
+    cur = g.build_lora_mm(model.fc, cur, model.fc_s);
     g.cb(cur, "fc_out", -1);
 
     cur = g.build_norm(cur, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
@@ -678,7 +679,7 @@ static ggml_tensor * build_dflash_inject_input(llm_graph_context & g, const llam
     g.cb(cur, "inp_g_embeddings", -1);
 
     if (fused) {
-        cur = g.build_lora_mm(model.fc, cur);
+        cur = g.build_lora_mm(model.fc, cur, model.fc_s);
         g.cb(cur, "fc_out", -1);
 
         cur = g.build_norm(cur, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
@@ -959,6 +960,7 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
 //   * token batch -> noise-block diffusion: attend over [committed, MASK...] to generate draft tokens
 template <>
 llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+    const int64_t n_embd_inp = hparams.n_embd_inp_enc();
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
@@ -999,8 +1001,8 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         for (int il = 0; il < n_layer; ++il) {
             const auto & layer = model.layers[il];
 
-            ggml_tensor * Kcur = build_lora_mm(layer.wk, inp_g);
-            ggml_tensor * Vcur = build_lora_mm(layer.wv, inp_g);
+            ggml_tensor * Kcur = build_lora_mm(layer.wk, inp_g, layer.wk_s);
+            ggml_tensor * Vcur = build_lora_mm(layer.wv, inp_g, layer.wv_s);
 
             Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
             Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
@@ -1098,7 +1100,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
             cb(attn_inp, "attn_conv_in", il);
         }
 
-        ggml_tensor * Qcur = build_lora_mm(layer.wq, attn_inp);
+        ggml_tensor * Qcur = build_lora_mm(layer.wq, attn_inp, layer.wq_s);
         ggml_tensor * Kcur;
         ggml_tensor * Vcur;
         if (inp_g) {
@@ -1106,11 +1108,15 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
             // from the noise tokens — per-row math matches both standalone graphs
             ggml_tensor * tail = ggml_view_2d(ctx0, attn_inp, n_embd, n_tokens - n_inj,
                     attn_inp->nb[1], (size_t) n_inj * attn_inp->nb[1]);
-            Kcur = ggml_concat(ctx0, build_lora_mm(layer.wk, inp_g), build_lora_mm(layer.wk, tail), 1);
-            Vcur = ggml_concat(ctx0, build_lora_mm(layer.wv, inp_g), build_lora_mm(layer.wv, tail), 1);
+            Kcur = ggml_concat(ctx0,
+                    build_lora_mm(layer.wk, inp_g, layer.wk_s),
+                    build_lora_mm(layer.wk, tail,  layer.wk_s), 1);
+            Vcur = ggml_concat(ctx0,
+                    build_lora_mm(layer.wv, inp_g, layer.wv_s),
+                    build_lora_mm(layer.wv, tail,  layer.wv_s), 1);
         } else {
-            Kcur = build_lora_mm(layer.wk, attn_inp);
-            Vcur = build_lora_mm(layer.wv, attn_inp);
+            Kcur = build_lora_mm(layer.wk, attn_inp, layer.wk_s);
+            Vcur = build_lora_mm(layer.wv, attn_inp, layer.wv_s);
         }
 
         Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
@@ -1128,8 +1134,8 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
         // cache-aware, non-causal attention
         ggml_tensor * cur = use_iswa
-            ? build_attn(inp_attn_iswa, layer.wo, NULL, NULL, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il)
-            : build_attn(inp_attn,      layer.wo, NULL, NULL, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il);
+            ? build_attn(inp_attn_iswa, layer.wo, NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il)
+            : build_attn(inp_attn,      layer.wo, NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il);
 
         if (attn_coeff) {
             cur = build_dflash2_conv_finish_tail(*this, cur, n_inj,
@@ -1245,6 +1251,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 //   * token batch -> noise block through 3 full DSV4 stages (hc + MLA + MoE), markov + confidence heads
 llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_graph_params & params) :
     llama_model_deepseek4::graph(params) {
+    const int64_t n_embd_inp       = hparams.n_embd_inp_enc();
     const int64_t n_embd_head      = hparams.n_embd_head_k();
     const int64_t n_embd_head_rope = hparams.n_rot();
     const int64_t n_embd_head_nope = n_embd_head - n_embd_head_rope;

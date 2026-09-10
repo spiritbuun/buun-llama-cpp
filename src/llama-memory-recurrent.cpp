@@ -1169,6 +1169,7 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
     for (uint32_t il = 0; il < n_recur; ++il) {
         inspect(r_l[il]);
         inspect(s_l[il]);
+        inspect(p_l[il]);
     }
 
     if (compatible && copy_dev && n_tensors > 0) {
@@ -1213,6 +1214,7 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
             for (uint32_t il = 0; il < n_recur; ++il) {
                 add_copy(r_l[il]);
                 add_copy(s_l[il]);
+                add_copy(p_l[il]);
             }
 
             const ggml_status status =
@@ -1271,6 +1273,9 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
         }
         if (s_l[il]) {
             copy_row(s_l[il]);
+        }
+        if (p_l[il]) {
+            copy_row(p_l[il]);
         }
     }
 
@@ -1600,6 +1605,16 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_brea
             // fit probe: the buffer is a 0-size dummy — report what the real allocation costs,
             // or the fit stops billing RS entirely and under-projects by the whole cache
             ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
+        } else if (ggml_backend_buffer_is_meta(buf.get())) {
+            const size_t n = ggml_backend_meta_buffer_n_bufs(buf.get());
+            for (size_t i = 0; i < n; ++i) {
+                ggml_backend_buffer_t physical =
+                    ggml_backend_meta_buffer_simple_buffer(buf.get(), i);
+                if (physical != nullptr) {
+                    ret[ggml_backend_buffer_get_type(physical)] +=
+                        ggml_backend_buffer_get_size(physical);
+                }
+            }
         } else {
             ret[buft] += ggml_backend_buffer_get_size(buf.get());
         }

@@ -3324,6 +3324,7 @@ server_vbr_artifact_store::import_host_prefix_payload_impl(
                     accounting_snapshot.serial, &representation_policy,
                     vbr_explicit_capture_representation_identity,
                     occupied_guard, schedule_quote);
+            output.occupied_guard_status = guard_status;
             if (guard_status !=
                     vbr_occupied_replacement_guard_status::ready) {
                 output.validation_status =

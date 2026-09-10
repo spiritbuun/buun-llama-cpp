@@ -240,6 +240,14 @@ extern "C" {
         LLAMA_MOE_CACHE_MODE_ON = 2,
     };
 
+    // Dynamic VBR representation family. Turbo preserves the existing
+    // F16 -> Turbo8 -> Turbo4 -> Turbo3/2/1 ladder. Classic uses the stock
+    // F16 -> Q8_0 -> Q4_0 codecs and is initially supported for BailingMoE3/Ling.
+    enum llama_vbr_codec {
+        LLAMA_VBR_CODEC_TURBO   = 0,
+        LLAMA_VBR_CODEC_CLASSIC = 1,
+    };
+
     // TODO: simplify (https://github.com/ggml-org/llama.cpp/pull/9294#pullrequestreview-2286561979)
     typedef struct llama_token_data {
         llama_token id; // token id
@@ -409,7 +417,7 @@ extern "C" {
 
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
-        // TurboQuant dynamic VBR (see vbr_dynamic below) [EXPERIMENTAL]
+        enum llama_vbr_codec vbr_codec; // representation ladder used by dynamic VBR [EXPERIMENTAL]
         double vbr_min_bits;              // aggregate KV floor in effective bits/value, 0 = bottom-tier floor; not a per-codec ban
         uint64_t vbr_vram_budget_bytes;   // mapped-physical KV VRAM budget in bytes, 0 = floor-layout-cost fallback
         uint64_t vbr_growth_headroom_bytes; // free-VRAM headroom the runtime keeps while growing
@@ -655,6 +663,10 @@ extern "C" {
     // where V is a view of the K latent so the declared types must agree and any
     // per-side cache tiering is inherently coupled
     LLAMA_API bool llama_model_kv_cache_types_coupled(const struct llama_model * model);
+    // Whether model metadata/topology can safely execute this dynamic VBR codec (including any
+    // topology-specific capped implementation). Backend/device support is validated at context creation.
+    LLAMA_API bool llama_model_supports_vbr_codec(
+            const struct llama_model * model, enum llama_vbr_codec codec);
     LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);
 
     // Get the model's RoPE frequency scaling factor
@@ -1481,8 +1493,8 @@ extern "C" {
     // DDTree: rollback SSM state to committed token using stored intermediates
     LLAMA_API void llama_tree_rollback(struct llama_context * ctx, int commit_n, const int32_t * parents, int n_seq0);
 
-    // DFlash: share tok_embd and output tensors from src model to dst model
-    // Used to avoid duplicating embedding/lm_head weights between target and drafter
+    // Drafter: populate missing or already-borrowed tok_embd/output tensors from src.
+    // Distinct tensors owned by a self-contained drafter are left unchanged.
     LLAMA_API void llama_model_share_tensors(struct llama_model * dst, const struct llama_model * src);
 
     //

@@ -576,6 +576,11 @@ if (TARGET ggml-cuda AND NOT GGML_BACKEND_DL)
             SKIP_RETURN_CODE 77 ENVIRONMENT "GGML_CUDA_AR1_BF16=0")
     endforeach()
 
+    llama_build(test-cuda-tcq-asym-codebooks.cpp)
+    llama_test(test-cuda-tcq-asym-codebooks LABEL "main;backend")
+    set_tests_properties(test-cuda-tcq-asym-codebooks PROPERTIES
+        ENVIRONMENT "GGML_TURBO_MMA_FUSED=1"
+        SKIP_RETURN_CODE 77)
     llama_build(test-cuda-hc-combine-match.cpp)
     target_link_libraries(test-cuda-hc-combine-match PRIVATE ggml-cuda)
     llama_test(test-cuda-hc-combine-match LABEL "main;backend")
@@ -701,6 +706,14 @@ if ((TARGET ggml-cuda OR TARGET ggml-hip) AND NOT GGML_BACKEND_DL)
         target_link_libraries(test-vbr-vmm PRIVATE ggml-hip)
     endif()
     llama_test(test-vbr-vmm LABEL "backend")
+endif()
+
+# the tensor API kernels come from a separate metallib - check they produce correct results
+# ref: https://github.com/ggml-org/llama.cpp/issues/27473
+if (GGML_METAL AND NOT GGML_METAL_EMBED_LIBRARY)
+    llama_test(test-backend-ops NAME test-backend-ops-metallib-tensor
+               ARGS test -b MTL0 -o MUL_MAT -p type_a=q6_K)
+    set_tests_properties(test-backend-ops-metallib-tensor PROPERTIES ENVIRONMENT GGML_METAL_TENSOR_ENABLE=1)
 endif()
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")

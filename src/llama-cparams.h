@@ -63,6 +63,7 @@ struct llama_cparams {
     bool logits_all;
     bool pipeline_parallel;
     bool vbr_dynamic;
+    enum llama_vbr_codec vbr_codec = LLAMA_VBR_CODEC_TURBO;
 
     double vbr_min_bits = 0.0;
     uint64_t vbr_vram_budget_bytes = 0;
@@ -76,6 +77,7 @@ struct llama_cparams {
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
     enum llama_context_type ctx_type;
+    enum llama_rope_scaling_type rope_scaling_type;
     enum llama_pooling_type pooling_type;
 
     // DFlash: target layer indices to capture hidden states from (empty = disabled)

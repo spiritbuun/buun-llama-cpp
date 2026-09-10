@@ -1773,6 +1773,7 @@ struct ggml_cuda_mm_fusion_args_host {
     bool retain_bf16_output = false;
     float rms_eps = 0.0f;
     ggml_glu_op glu_op;
+    float glu_limit = 0.0f;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1782,6 +1783,7 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate_scale = nullptr;
     const float * residual = nullptr;
     ggml_glu_op glu_op;
+    float glu_limit = 0.0f;
 };
 
 struct ggml_cuda_kernel_launch_params {

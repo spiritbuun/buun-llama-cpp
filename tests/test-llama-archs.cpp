@@ -1,5 +1,6 @@
 #include "common.h"
 #include "log.h"
+#include "speculative.h"
 #include "ggml-backend.h"
 #include "ggml-vbr.h"
 #include "ggml.h"
@@ -158,7 +159,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v/--verbose] [-h/--help]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -351,6 +352,30 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK, uint32_t(8));
         // without this the QSA layers fall back to dense and go uncovered
         ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>(n_layer, 4));
+
+        // has_cell_ext() needs ple_n_heads here: the indexer cache serializes no ext without it
+        const uint32_t ple_ngram_size      = 3;
+        const uint32_t ple_heads_per_ngram = 2;
+        const uint32_t ple_n_heads         = (ple_ngram_size - 1)*ple_heads_per_ngram;
+        GGML_ASSERT(n_embd % ple_n_heads == 0);
+        const uint32_t ple_head_dim = n_embd/ple_n_heads;
+
+        std::vector<uint64_t> ple_head_offsets(ple_n_heads);
+        std::vector<uint64_t> ple_head_vocab_sizes(ple_n_heads, n_vocab);
+        for (uint32_t h = 0; h < ple_n_heads; h++) {
+            ple_head_offsets[h] = uint64_t(h)*n_vocab;
+        }
+
+        // the PLE history lives in the recurrent cache, so it must sit on a linear attention layer
+        ms.add_kv(LLM_KV_PLE_LAYERS,                  std::vector<uint32_t>({ 0 }));
+        ms.add_kv(LLM_KV_PLE_NGRAM_SIZE,              ple_ngram_size);
+        ms.add_kv(LLM_KV_PLE_HEADS_PER_NGRAM,         ple_heads_per_ngram);
+        ms.add_kv(LLM_KV_PLE_CONV_KERNEL,             uint32_t(4));
+        ms.add_kv(LLM_KV_PLE_EOS_TOKEN_ID,            uint32_t(0));
+        ms.add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER,  ple_head_dim);
+        ms.add_kv(LLM_KV_PLE_LAYER_MULTIPLIERS,       std::vector<uint64_t>({ 1, 3, 5 }));
+        ms.add_kv(LLM_KV_PLE_HEAD_OFFSETS,            ple_head_offsets);
+        ms.add_kv(LLM_KV_PLE_HEAD_VOCAB_SIZES,        ple_head_vocab_sizes);
     }
 
     // minimax-m3 keeps one indexer head per GQA head; the rest use a fixed 64 to match the fused
@@ -442,6 +467,34 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
 }
 
 static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/) {
+    return true;
+}
+
+static bool devices_support_vbr_vmm(const std::vector<ggml_backend_dev_t> & devices) {
+    if (devices.empty()) {
+        return false;
+    }
+    for (ggml_backend_dev_t device : devices) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
+        const auto get_iface = reg != nullptr
+            ? reinterpret_cast<ggml_backend_vbr_iface_fn_t>(
+                ggml_backend_reg_get_proc_address(reg, GGML_VBR_BACKEND_IFACE_PROC))
+            : nullptr;
+        const ggml_vbr_backend_iface * iface = get_iface != nullptr ? get_iface() : nullptr;
+        bool found = false;
+        if (iface != nullptr) {
+            const ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(device);
+            for (int i = 0; i < iface->get_device_count(); ++i) {
+                if (iface->buffer_type(i) == buft) {
+                    found = iface->vmm_available(i);
+                    break;
+                }
+            }
+        }
+        if (!found) {
+            return false;
+        }
+    }
     return true;
 }
 
@@ -2425,7 +2478,9 @@ static void test_qwen4_vbr_cuda(const size_t seed) {
     assert_qsa_image(qsa_layout);
 
     decode_range(ctx.get(), 321, 1);
-    GGML_ASSERT(nmse(qsa_continuation_reference, last_logits(ctx.get())) <= 1e-12);
+    const double qsa_restore_nmse = nmse(qsa_continuation_reference, last_logits(ctx.get()));
+    std::printf("Qwen4 occupied QSA rollback continuation NMSE %.17g\n", qsa_restore_nmse);
+    GGML_ASSERT(qsa_restore_nmse <= 1e-12);
 
     // Qwen4 recurrent sequence images interleave the PLE convolution-history
     // row immediately after each R row.  Prove the atomic recurrent companion
@@ -2886,6 +2941,9 @@ static gguf_context_ptr get_qwen4_mtp_gguf_ctx(uint32_t n_nextn = 1) {
 
     // The ordinary fixture has two trunk blocks. Reinterpret the second as the
     // single dense MTP block and pin its lack of QSA compression in metadata.
+    // This fixture exercises MTP rather than PLE, so remove the inherited PLE
+    // layer before making the sole target block full attention.
+    GGML_ASSERT(gguf_remove_key(gguf_ctx.get(), "qwen4exp.ple.layers") >= 0);
     metadata.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, n_nextn);
     metadata.add_kv(LLM_KV_FULL_ATTENTION_INTERVAL, uint32_t(1));
     metadata.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>({ 4, 0 }));
@@ -3197,6 +3255,18 @@ static void test_qwen4_mtp_sidecar_contract(const size_t seed) {
     llama_model_ptr target_model(llama_model_load_from_file_ptr(
             target_file.get(), target_model_params));
     GGML_ASSERT(target_model != nullptr);
+
+    // A self-contained MTP drafter owns its embedding and output head. Sharing
+    // setup must not replace them with the target's tensors merely because the
+    // drafter was supplied through -md --spec-type draft-mtp.
+    ggml_tensor * self_embd = model->tok_embd;
+    ggml_tensor * self_out  = model->output;
+    GGML_ASSERT(self_embd != nullptr && self_out != nullptr);
+    GGML_ASSERT(self_embd != target_model->tok_embd);
+    llama_model_share_tensors(model.get(), target_model.get());
+    GGML_ASSERT(model->tok_embd == self_embd);
+    GGML_ASSERT(model->output   == self_out);
+
     uint8_t semantic_digest[32] = {};
     // This synthetic fixture intentionally has no production vocabulary, so
     // semantic identity is unavailable. It must nevertheless traverse the
@@ -3258,6 +3328,81 @@ static void test_qwen4_mtp_sidecar_contract(const size_t seed) {
     GGML_ASSERT(shared_gf != nullptr);
     GGML_ASSERT(ggml_graph_get_tensor(shared_gf, "mtp_h_input") != nullptr);
     GGML_ASSERT(ggml_graph_get_tensor(shared_gf, "result_output") != nullptr);
+
+    // A target-only VBR restore cannot recover the predecessor hidden row for
+    // its first suffix batch. That batch must become a bounded recovery
+    // boundary: discard stale draft KV, seed the next carry from the verified
+    // target output, then resume filling the draft cache on the following
+    // batch instead of remaining target-only forever.
+    {
+        llama_context_params recovery_target_params = target_ctx_params;
+        recovery_target_params.n_ctx = 8;
+        recovery_target_params.n_batch = 8;
+        recovery_target_params.n_ubatch = 8;
+        recovery_target_params.n_seq_max = 1;
+        recovery_target_params.n_outputs_max = 8;
+        llama_context_ptr recovery_target(llama_init_from_model(
+                target_model.get(), recovery_target_params));
+        GGML_ASSERT(recovery_target != nullptr);
+
+        llama_context_params recovery_draft_params = ctx_params;
+        recovery_draft_params.n_seq_max = 1;
+        recovery_draft_params.n_outputs_max = 1;
+        recovery_draft_params.ctx_other = recovery_target.get();
+        llama_context_ptr recovery_draft(llama_init_from_model(
+                shared_model.get(), recovery_draft_params));
+        GGML_ASSERT(recovery_draft != nullptr);
+
+        common_params_speculative recovery_params;
+        recovery_params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+        recovery_params.draft.ctx_tgt = recovery_target.get();
+        recovery_params.draft.ctx_dft = recovery_draft.get();
+        recovery_params.draft.backend_sampling = false;
+        common_speculative_ptr recovery_spec(
+            common_speculative_init(recovery_params, 1));
+        GGML_ASSERT(recovery_spec != nullptr);
+
+        auto decode_target = [&](llama_token token, llama_pos pos) {
+            llama_batch target_batch = llama_batch_init(1, 0, 1);
+            common_batch_add(target_batch, token, pos, { 0 }, true);
+            GGML_ASSERT(llama_decode(recovery_target.get(), target_batch) == 0);
+            llama_synchronize(recovery_target.get());
+            GGML_ASSERT(common_speculative_process(
+                recovery_spec.get(), target_batch));
+            llama_batch_free(target_batch);
+        };
+
+        decode_target(5, 0);
+        decode_target(6, 1);
+        GGML_ASSERT(llama_memory_seq_pos_max(
+            llama_get_memory(recovery_draft.get()), 0) == 1);
+
+        common_speculative_sequence_transition(
+            recovery_spec.get(), 0,
+            common_speculative_sequence_event::target_restored_without_draft);
+        std::vector<uint8_t> recovered_carry;
+        GGML_ASSERT(!common_speculative_get_state(
+            recovery_spec.get(), 0, recovered_carry));
+
+        decode_target(7, 2);
+        GGML_ASSERT(llama_memory_seq_pos_max(
+            llama_get_memory(recovery_draft.get()), 0) < 0);
+        GGML_ASSERT(common_speculative_get_state(
+            recovery_spec.get(), 0, recovered_carry));
+        const float * verified_h = llama_get_embeddings_nextn_ith(
+            recovery_target.get(), 0);
+        constexpr size_t carry_header_size = 3*sizeof(uint32_t);
+        GGML_ASSERT(verified_h != nullptr);
+        GGML_ASSERT(recovered_carry.size() == carry_header_size +
+            target_h.size()*sizeof(float));
+        GGML_ASSERT(std::memcmp(
+            recovered_carry.data() + carry_header_size, verified_h,
+            target_h.size()*sizeof(float)) == 0);
+
+        decode_target(8, 3);
+        GGML_ASSERT(llama_memory_seq_pos_max(
+            llama_get_memory(recovery_draft.get()), 0) == 3);
+    }
 
     llama_context_ptr ctx(llama_init_from_model(model.get(), ctx_params));
     if (!ctx) {
@@ -3531,22 +3676,27 @@ static bool arch_tensor_split_supported(const llm_arch arch) {
     return true;
 }
 
-static int save_models(const llm_arch target_arch, const size_t seed, const ggml_log_level log_level, const std::string & dir) {
+static int save_models(const llm_arch target_arch, const size_t seed, const int verbosity, const std::string & dir) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
             void * user_data;
-        } original_logger;
-        ggml_log_level min_level; // prints below this log level go to debug log
+        } log_old;
+
+        int verbosity;
+
+        user_data_t(int verbosity) : verbosity(verbosity) {
+            llama_log_get(&log_old.callback, &log_old.user_data);
+        }
     };
-    user_data_t ud;
-    llama_log_get(&ud.original_logger.callback, &ud.original_logger.user_data);
-    ud.min_level = log_level;
+    user_data_t ud(verbosity);
 
     llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
         const user_data_t * ud = (const user_data_t *) user_data;
-        const ggml_log_level level_eff = level >= ud->min_level ? level : GGML_LOG_LEVEL_DEBUG;
-        ud->original_logger.callback(level_eff, text, ud->original_logger.user_data);
+        int verbosity = common_log_get_verbosity(level);
+        if (verbosity <= ud->verbosity) {
+            ud->log_old.callback(level, text, ud->log_old.user_data);
+        }
     }, &ud);
 
     for (const llm_arch & arch : llm_arch_all()) {
@@ -3580,26 +3730,31 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
             llama_model_save_to_file(model_and_ctx.first.get(), path.c_str());
         }
     }
-    llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+    llama_log_set(ud.log_old.callback, ud.log_old.user_data);
     return 0;
 }
 
-static int test_backends(const llm_arch target_arch, const size_t seed, const ggml_log_level log_level) {
+static int test_backends(const llm_arch target_arch, const size_t seed, const int verbosity) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
             void * user_data;
-        } original_logger;
-        ggml_log_level min_level; // prints below this log level go to debug log
+        } log_old;
+
+        int verbosity;
+
+        user_data_t(int verbosity) : verbosity(verbosity) {
+            llama_log_get(&log_old.callback, &log_old.user_data);
+        }
     };
-    user_data_t ud;
-    llama_log_get(&ud.original_logger.callback, &ud.original_logger.user_data);
-    ud.min_level = log_level;
+    user_data_t ud(verbosity);
 
     llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
         const user_data_t * ud = (const user_data_t *) user_data;
-        const ggml_log_level level_eff = level >= ud->min_level ? level : GGML_LOG_LEVEL_DEBUG;
-        ud->original_logger.callback(level_eff, text, ud->original_logger.user_data);
+        int verbosity = common_log_get_verbosity(level);
+        if (verbosity <= ud->verbosity) {
+            ud->log_old.callback(level, text, ud->log_old.user_data);
+        }
     }, &ud);
 
     const std::vector<llama_token> tokens = get_tokens(128, 128, seed);
@@ -3700,10 +3855,153 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                 if (!skip) {
                     if (logits_cpu.empty()) {
                         model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode);
+                        assert(model_and_ctx_cpu.first->supports_classic_vbr() ==
+                               (arch == LLM_ARCH_BAILINGMOE3));
+                        if (arch == LLM_ARCH_BAILINGMOE3) {
+                            assert(!model_and_ctx_cpu.first->supports_turbo_vbr());
+                        }
+                        if (arch == LLM_ARCH_QWEN4EXP) {
+                            assert(model_and_ctx_cpu.first->supports_turbo_vbr());
+                        }
+                        if (arch == LLM_ARCH_MINIMAX_M3 || arch == LLM_ARCH_GLM_DSA ||
+                                arch == LLM_ARCH_DEEPSEEK32 || arch == LLM_ARCH_DOTS3NOTE) {
+                            assert(!model_and_ctx_cpu.first->supports_turbo_vbr());
+                        }
                         logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llm_arch_supports_sm_tensor(arch)) {
                         model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, dc.devs, dc.split_mode, encode);
+                        if (dc.split_mode == LLAMA_SPLIT_MODE_TENSOR &&
+                            (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 ||
+                             arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP)) {
+                            const auto live = llama_get_live_memory_breakdown(
+                                model_and_ctx_dev.second.get());
+                            std::vector<ggml_backend_dev_t> state_devices;
+                            for (const auto & [buft, row] : live) {
+                                const size_t bytes = row.attention + row.recurrent +
+                                    row.recurrent_rollback + row.rolling_window_tape;
+                                if (bytes == 0 || ggml_backend_buft_is_host(buft)) {
+                                    continue;
+                                }
+                                GGML_ASSERT(!ggml_backend_buft_is_meta(buft));
+                                const ggml_backend_dev_t device =
+                                    ggml_backend_buft_get_device(buft);
+                                GGML_ASSERT(device != nullptr);
+                                if (std::find(state_devices.begin(), state_devices.end(), device) ==
+                                    state_devices.end()) {
+                                    state_devices.push_back(device);
+                                }
+                            }
+                            GGML_ASSERT(!state_devices.empty());
+                            // The fixture has two KV heads, so only a two-device split is
+                            // guaranteed to give every child a nonzero state shard.
+                            if (dc.devs.size() == 2) {
+                                GGML_ASSERT(state_devices.size() == dc.devs.size());
+                                for (ggml_backend_dev_t device : dc.devs) {
+                                    GGML_ASSERT(std::find(
+                                        state_devices.begin(), state_devices.end(), device) !=
+                                        state_devices.end());
+                                }
+                            }
+                            const auto total = llama_get_memory_breakdown(
+                                model_and_ctx_dev.second.get());
+                            std::vector<ggml_backend_dev_t> compute_devices;
+                            for (const auto & [buft, row] : total) {
+                                if (row.compute == 0 || ggml_backend_buft_is_host(buft)) {
+                                    continue;
+                                }
+                                GGML_ASSERT(!ggml_backend_buft_is_meta(buft));
+                                const ggml_backend_dev_t device =
+                                    ggml_backend_buft_get_device(buft);
+                                GGML_ASSERT(device != nullptr);
+                                if (std::find(compute_devices.begin(), compute_devices.end(), device) ==
+                                    compute_devices.end()) {
+                                    compute_devices.push_back(device);
+                                }
+                            }
+                            GGML_ASSERT(compute_devices.size() == dc.devs.size());
+                            for (ggml_backend_dev_t device : dc.devs) {
+                                GGML_ASSERT(std::find(
+                                    compute_devices.begin(), compute_devices.end(), device) !=
+                                    compute_devices.end());
+                            }
+
+                            // A dry fit still owns one logical Meta device, so its estimated
+                            // compute row must remain Meta instead of being expanded into child
+                            // devices that the fitter cannot associate with the model.
+                            if (arch == LLM_ARCH_QWEN35 && dc.devs.size() > 1) {
+                                llama_model_params estimate_model_params = llama_model_default_params();
+                                estimate_model_params.progress_callback = silent_model_load_progress;
+                                estimate_model_params.no_alloc = true;
+                                estimate_model_params.load_mode = LLAMA_LOAD_MODE_NONE;
+                                estimate_model_params.split_mode = LLAMA_SPLIT_MODE_TENSOR;
+                                std::vector<ggml_backend_dev_t> estimate_devices = dc.devs;
+                                estimate_devices.push_back(nullptr);
+                                estimate_model_params.devices = estimate_devices.data();
+                                size_t estimate_seed = seed;
+                                llama_model_ptr estimate_model(llama_model_init_from_user(
+                                    gguf_ctx.get(), set_tensor_data, &estimate_seed,
+                                    estimate_model_params));
+                                GGML_ASSERT(estimate_model != nullptr);
+                                llama_context_params estimate_ctx_params = llama_context_default_params();
+                                estimate_ctx_params.n_ctx = 256;
+                                estimate_ctx_params.n_batch = 64;
+                                estimate_ctx_params.n_ubatch = 64;
+                                llama_context_ptr estimate_ctx(llama_init_from_model(
+                                    estimate_model.get(), estimate_ctx_params));
+                                GGML_ASSERT(estimate_ctx != nullptr);
+                                size_t non_host_compute_rows = 0;
+                                for (const auto & [buft, row] :
+                                        llama_get_memory_breakdown(estimate_ctx.get())) {
+                                    if (row.compute == 0 || ggml_backend_buft_is_host(buft)) {
+                                        continue;
+                                    }
+                                    ++non_host_compute_rows;
+                                    GGML_ASSERT(ggml_backend_buft_is_meta(buft));
+                                }
+                                GGML_ASSERT(non_host_compute_rows == 1);
+                            }
+
+                            // Pool discovery has a separate physical-backend contract from
+                            // memory accounting. Exercise it on one representative hybrid
+                            // architecture when exactly two VMM-capable devices are present.
+                            const bool supports_vbr_vmm = devices_support_vbr_vmm(dc.devs);
+                            if (arch == LLM_ARCH_QWEN35 && dc.devs.size() == 2 &&
+                                supports_vbr_vmm) {
+                                llama_context_params vbr_params = llama_context_default_params();
+                                vbr_params.n_ctx = 256;
+                                vbr_params.n_batch = 64;
+                                vbr_params.n_ubatch = 64;
+                                vbr_params.n_threads = 4;
+                                vbr_params.n_threads_batch = 4;
+                                vbr_params.kv_unified = true;
+                                vbr_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+                                vbr_params.vbr_dynamic = true;
+                                vbr_params.vbr_budget_explicit = true;
+                                vbr_params.vbr_vram_budget_bytes = 64ull * 1024 * 1024;
+                                llama_context_ptr vbr_ctx(llama_init_from_model(
+                                    model_and_ctx_dev.first.get(), vbr_params));
+                                GGML_ASSERT(vbr_ctx != nullptr);
+
+                                std::vector<vbr_explicit_capture_runtime_pool> pools;
+                                uint32_t attention_children = 0;
+                                GGML_ASSERT(vbr_explicit_capture_runtime_pools(
+                                    *llama_get_memory(vbr_ctx.get()), pools, attention_children));
+                                GGML_ASSERT(attention_children == 1);
+                                GGML_ASSERT(pools.size() == dc.devs.size());
+                                std::vector<ggml_backend_dev_t> unmatched = dc.devs;
+                                for (const auto & pool : pools) {
+                                    GGML_ASSERT(pool.backend != nullptr);
+                                    GGML_ASSERT(pool.backend_device ==
+                                                ggml_backend_get_device(pool.backend));
+                                    const auto it = std::find(
+                                        unmatched.begin(), unmatched.end(), pool.backend_device);
+                                    GGML_ASSERT(it != unmatched.end());
+                                    unmatched.erase(it);
+                                }
+                                GGML_ASSERT(unmatched.empty());
+                            }
+                        }
                         logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode);
                         const double nmse_val = nmse(logits_cpu, logits_dev);
                         snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
@@ -3746,19 +4044,22 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
             }
         }
     }
-    llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+    llama_log_set(ud.log_old.callback, ud.log_old.user_data);
     return all_ok ? 0 : 1;
 }
 
 int main(int argc, char ** argv) {
-    // FIXME these tests are disabled in the CI for macOS-latest-cmake-arm64 because they are segfaulting
+    // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
+    common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
     common_init();
+
     std::random_device rd;
 
     llm_arch arch = LLM_ARCH_UNKNOWN;
     size_t seed = rd();
-    ggml_log_level log_level = GGML_LOG_LEVEL_ERROR;
     std::string out;
+
+    int verbosity = LOG_LEVEL_ERROR;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -3786,9 +4087,13 @@ int main(int argc, char ** argv) {
                 return 1;
             }
         }
-        if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
-            log_level = GGML_LOG_LEVEL_INFO;
-            continue;
+        if (strcmp(argv[i], "-v") == 0) {
+            if (i + 1 < argc) {
+                verbosity = std::stoull(argv[++i]);
+            } else {
+                usage(argv);
+                return 1;
+            }
         }
         if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--out") == 0) {
             if (i + 1 < argc) {
@@ -3805,7 +4110,7 @@ int main(int argc, char ** argv) {
         test_dflash_selector_family_contract();
         test_dflash_loader_exact_identity();
         if (!out.empty()) {
-            return save_models(arch, seed, log_level, out);
+            return save_models(arch, seed, verbosity, out);
         }
         if (arch == LLM_ARCH_UNKNOWN || arch == LLM_ARCH_QWEN35) {
             test_qwen35_mtp_d2t_contract(seed);
@@ -3816,7 +4121,7 @@ int main(int argc, char ** argv) {
             test_qwen4_vbr_cuda(seed);
             test_qwen4_mtp_sidecar_contract(seed);
         }
-        return test_backends(arch, seed, log_level);
+        return test_backends(arch, seed, verbosity);
     } catch (const std::exception & err) {
         fprintf(stderr, "encountered runtime error: %s\n", err.what());
         return -1;

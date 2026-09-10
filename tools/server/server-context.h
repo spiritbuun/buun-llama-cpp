@@ -6,6 +6,7 @@
 
 #include "json.h"
 
+#include <array>
 #include <cstddef>
 #include <memory>
 #include <mutex>
@@ -91,6 +92,34 @@ struct server_vbr_occupied_quarantine_reset_result {
 server_vbr_occupied_quarantine_reset_result
 server_vbr_occupied_quarantine_reset_for_test();
 
+struct server_vbr_empty_handoff_gate {
+    size_t slot_count = 0;
+    uint64_t incoming_prefix = 0;
+    uint64_t incumbent_lcp = 0;
+    uint64_t durable_incumbent_prefix = 0;
+    bool exact_incumbent_durable = false;
+    bool hard_lease = false;
+    bool recovery_pin = false;
+    bool deferred_task = false;
+    bool incumbent_supported = false;
+    bool family_matches = false;
+};
+
+bool server_vbr_empty_handoff_lookup_allowed(
+    const server_vbr_empty_handoff_gate & gate) noexcept;
+
+bool server_vbr_empty_handoff_allowed(
+    const server_vbr_empty_handoff_gate & gate) noexcept;
+
+bool server_vbr_live_source_displacement_allowed(
+    bool kv_unified,
+    size_t slot_count) noexcept;
+
+bool server_vbr_stem_matches_capture_source(
+    bool valid,
+    const std::array<uint8_t, 32> & stem_source,
+    const std::array<uint8_t, 32> & capture_source) noexcept;
+
 // TEST-ONLY door. It constructs the private server_slot, resolves a
 // scheduler family token, exercises the real no-restore cache load, and then
 // verifies that host/checkpoint carriers are sourced from that same slot.
@@ -168,6 +197,7 @@ struct server_vbr_reclaim_policy_result {
     bool token_identity_distinguishes_attempt = false;
     bool successful_attempt_is_state_sealed = false;
     bool multi_fresh_pressure_isolated = false;
+    bool isolated_capture_drains_without_backoff = false;
     bool unchanged_admission_refusal_is_suppressed = false;
     bool checkpoint_admission_refusals_are_independent = false;
     bool admission_refusal_reopens_on_currency_change = false;
@@ -222,6 +252,7 @@ struct server_context_meta {
     bool vbr_dynamic;
     bool vbr_type_k;
     bool vbr_type_v;
+    std::string vbr_codec;
     std::string vbr_entry_type_k;
     std::string vbr_entry_type_v;
     double vbr_min_bits;

@@ -1856,6 +1856,56 @@ void test_lifecycle_defaults_and_reuse_thresholds() {
     CHECK(vbr_wiring.prefix_tracking_enabled);
     CHECK(vbr_wiring.authority_prefix_tracking_enabled);
     CHECK(vbr_wiring.external_coverage_exact);
+    server_vbr_empty_handoff_gate accepted_handoff;
+    accepted_handoff.slot_count = 1;
+    accepted_handoff.incoming_prefix = 1024;
+    accepted_handoff.incumbent_lcp = 32;
+    accepted_handoff.durable_incumbent_prefix = 1000;
+    accepted_handoff.incumbent_supported = true;
+    accepted_handoff.family_matches = true;
+    CHECK(server_vbr_empty_handoff_lookup_allowed(accepted_handoff));
+    CHECK(server_vbr_empty_handoff_allowed(accepted_handoff));
+    CHECK(server_vbr_live_source_displacement_allowed(false, 8));
+    CHECK(server_vbr_live_source_displacement_allowed(true, 1));
+    CHECK(!server_vbr_live_source_displacement_allowed(true, 2));
+    CHECK(!server_vbr_live_source_displacement_allowed(true, 8));
+    const auto rejects_handoff = [&](auto mutate) {
+        auto gate = accepted_handoff;
+        mutate(gate);
+        CHECK(!server_vbr_empty_handoff_allowed(gate));
+        return gate;
+    };
+    CHECK(!server_vbr_empty_handoff_lookup_allowed(rejects_handoff(
+        [](auto & gate) { gate.slot_count = 2; })));
+    rejects_handoff(
+        [](auto & gate) { gate.incoming_prefix = gate.incumbent_lcp; });
+    rejects_handoff(
+        [](auto & gate) { gate.exact_incumbent_durable = true; });
+    rejects_handoff(
+        [](auto & gate) { gate.durable_incumbent_prefix = 0; });
+    rejects_handoff([](auto & gate) {
+        gate.durable_incumbent_prefix = gate.incumbent_lcp;
+    });
+    CHECK(!server_vbr_empty_handoff_lookup_allowed(rejects_handoff(
+        [](auto & gate) { gate.hard_lease = true; })));
+    CHECK(!server_vbr_empty_handoff_lookup_allowed(rejects_handoff(
+        [](auto & gate) { gate.recovery_pin = true; })));
+    CHECK(!server_vbr_empty_handoff_lookup_allowed(rejects_handoff(
+        [](auto & gate) { gate.deferred_task = true; })));
+    CHECK(!server_vbr_empty_handoff_lookup_allowed(rejects_handoff(
+        [](auto & gate) { gate.incumbent_supported = false; })));
+    rejects_handoff(
+        [](auto & gate) { gate.family_matches = false; });
+    std::array<uint8_t, 32> capture_source {};
+    capture_source[0] = 1;
+    auto stale_source = capture_source;
+    stale_source[0] = 2;
+    CHECK(server_vbr_stem_matches_capture_source(
+        true, capture_source, capture_source));
+    CHECK(!server_vbr_stem_matches_capture_source(
+        true, stale_source, capture_source));
+    CHECK(!server_vbr_stem_matches_capture_source(
+        false, capture_source, capture_source));
     const auto vbr_reclaim = server_vbr_reclaim_policy_for_test();
     CHECK(vbr_reclaim.learned_kept_hot);
     CHECK(vbr_reclaim.learned_removed_cold);
@@ -1868,6 +1918,7 @@ void test_lifecycle_defaults_and_reuse_thresholds() {
     CHECK(vbr_reclaim.token_identity_distinguishes_attempt);
     CHECK(vbr_reclaim.successful_attempt_is_state_sealed);
     CHECK(vbr_reclaim.multi_fresh_pressure_isolated);
+    CHECK(vbr_reclaim.isolated_capture_drains_without_backoff);
     CHECK(vbr_reclaim.unchanged_admission_refusal_is_suppressed);
     CHECK(vbr_reclaim.checkpoint_admission_refusals_are_independent);
     CHECK(vbr_reclaim.admission_refusal_reopens_on_currency_change);

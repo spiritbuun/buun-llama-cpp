@@ -88,5 +88,25 @@ int main() {
     assert(cparams.type_k == GGML_TYPE_TURBO2_TCQ && cparams.type_v == GGML_TYPE_TURBO2_TCQ);
     assert(cparams.vbr_min_bits == t2_bits && !cparams.vbr_min_bits_explicit);
 
+    plan = llama_bench_vbr_make_plan(
+        { unset }, { unset }, "q8", "q4", "auto", true, true, false,
+        LLAMA_VBR_CODEC_CLASSIC);
+    row = llama_bench_vbr_resolve_row(plan, unset, unset);
+    assert(row.active && row.codec == LLAMA_VBR_CODEC_CLASSIC);
+    assert(row.type_k == GGML_TYPE_Q8_0 && row.type_v == GGML_TYPE_Q8_0);
+    assert(row.floor_bits == 4.5);
+    cparams = llama_context_default_params();
+    llama_bench_vbr_apply_row(row, cparams);
+    assert(cparams.vbr_dynamic && cparams.vbr_codec == LLAMA_VBR_CODEC_CLASSIC);
+
+    // Selecting only the codec is itself a VBR option: it must arm the otherwise-unset row.
+    plan = llama_bench_vbr_make_plan(
+        { unset }, { unset }, "f16", "auto", "auto", false, false, false,
+        LLAMA_VBR_CODEC_CLASSIC, true);
+    row = llama_bench_vbr_resolve_row(plan, unset, unset);
+    assert(row.active && row.k && row.v && row.codec == LLAMA_VBR_CODEC_CLASSIC);
+    assert(row.type_k == GGML_TYPE_F16 && row.type_v == GGML_TYPE_F16);
+    assert(row.floor_bits == 4.5);
+
     return 0;
 }

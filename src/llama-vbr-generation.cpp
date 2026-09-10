@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <limits>
+#include <map>
 #include <new>
 #include <set>
 
@@ -805,7 +806,13 @@ bool vbr_generation_tracker::prepare_import_image_impl(
         next->lineage = plan.transition ==
                 vbr_tracker_install_transition::native_clone
             ? plan.lineage_uuid : lineage_uuid_;
-        next->global_generation = plan.global_generation;
+        // An occupied replacement changes one logical sequence while the
+        // guarded map retains the other live sequences.  Their durable host
+        // images remain valid only if the controller representation lineage
+        // is preserved; the empty-cache whole-import generation belongs to
+        // the ordinary import path.
+        next->global_generation = replacement
+            ? global_generation_ : plan.global_generation;
         if (!vbr_lineage_uuid_is_set(next->lineage) ||
             next->global_generation == 0) {
             return false;
@@ -845,13 +852,105 @@ bool vbr_generation_tracker::prepare_import_image_impl(
         }
 
         if (replacement) {
-            // The guard mints this map by walking destination physical cells in
-            // increasing order.  Reassert that least-authority shape here, then
-            // install each destination exactly once without a per-cell tree.
+            // Rebuild one coherent tracker image for the shared physical
+            // stream. The guard authenticates the destination mapping and all
+            // single-owner cells retained for the other logical sequences.
             uint32_t previous_physical = 0;
             bool first = true;
             auto & stream = next->streams.front();
-            const auto handle = import_extents.front();
+            std::map<llama_seq_id, std::pair<llama_pos, llama_pos>> ranges;
+            for (const auto & cell : replacement->preserved_cells()) {
+                if (cell.stream_index != 0 ||
+                    cell.physical_cell >= n_cells_ ||
+                    cell.logical_position < 0 ||
+                    cell.reference_count != 1 ||
+                    cell.owner_sequence < 0 ||
+                    cell.owner_sequence == destination ||
+                    cell.owns_destination) {
+                    return false;
+                }
+                auto inserted = ranges.emplace(
+                    cell.owner_sequence,
+                    std::make_pair(
+                        cell.logical_position, cell.logical_position));
+                inserted.first->second.first = std::min(
+                    inserted.first->second.first, cell.logical_position);
+                inserted.first->second.second = std::max(
+                    inserted.first->second.second, cell.logical_position);
+            }
+            std::map<llama_seq_id, vbr_extent_handle> retained_extents;
+            for (const auto & entry : ranges) {
+                if (entry.second.second ==
+                        std::numeric_limits<llama_pos>::max()) {
+                    return false;
+                }
+                const auto handle = extents_.reserve(
+                    vbr_mutation_family::import,
+                    vbr_operation_class::state_api,
+                    0, entry.first, entry.second.first,
+                    entry.second.second + 1);
+                if (!handle) {
+                    return false;
+                }
+                const auto guard = extents_.add_ref(handle);
+                if (!guard) {
+                    extents_.fail(handle);
+                    return false;
+                }
+                next->extent_guard_refs.push_back(guard);
+                if (!extents_.commit(handle)) {
+                    return false;
+                }
+                next->extent_handles.push_back(handle);
+                retained_extents.emplace(entry.first, handle);
+            }
+            const auto stamp = [&](uint32_t physical, llama_seq_id seq,
+                                   vbr_extent_handle handle) {
+                if (physical >= n_cells_ || seq < 0 || !handle ||
+                    stream.cell_last_dependency_gen[physical] != 0 ||
+                    stream.cell_last_membership_gen[physical] != 0) {
+                    return false;
+                }
+                const uint32_t page =
+                    physical / VBR_GENERATION_PAGE_CELLS;
+                constexpr uint32_t generation = 1;
+                stream.page_event_gen[page] = std::max(
+                    stream.page_event_gen[page], generation);
+                stream.page_last_import_gen[page] = std::max(
+                    stream.page_last_import_gen[page], generation);
+                stream.cell_last_dependency_gen[physical] = generation;
+                stream.cell_last_membership_gen[physical] = generation;
+                const uint16_t provenance = pack_provenance(
+                    vbr_mutation_family::import,
+                    vbr_operation_class::state_api);
+                stream.cell_dependency_provenance[physical] = provenance;
+                stream.cell_membership_provenance[physical] = provenance;
+                stream.cell_last_membership_seq[physical] =
+                    static_cast<int16_t>(seq);
+                stream.cell_dependency_extent[physical] =
+                    extents_.add_ref(handle);
+                stream.cell_membership_extent[physical] =
+                    extents_.add_ref(handle);
+                if (!stream.cell_dependency_extent[physical] ||
+                    !stream.cell_membership_extent[physical]) {
+                    return false;
+                }
+                set_range_bit(
+                    stream.cell_dependency_in_range, physical, true);
+                set_range_bit(
+                    stream.cell_membership_in_range, physical, true);
+                return true;
+            };
+            for (const auto & cell : replacement->preserved_cells()) {
+                const auto handle = retained_extents.find(
+                    cell.owner_sequence);
+                if (handle == retained_extents.end() ||
+                    !stamp(cell.physical_cell, cell.owner_sequence,
+                           handle->second)) {
+                    return false;
+                }
+            }
+            const auto destination_handle = import_extents.front();
             for (const auto & cell : replacement->cell_mapping()) {
                 if (cell.source_stream != 0 ||
                     cell.destination_physical_cell >= n_cells_ ||
@@ -862,29 +961,9 @@ bool vbr_generation_tracker::prepare_import_image_impl(
                 first = false;
                 previous_physical = cell.destination_physical_cell;
                 const uint32_t physical = cell.destination_physical_cell;
-                const uint32_t page = physical / VBR_GENERATION_PAGE_CELLS;
-                constexpr uint32_t generation = 1;
-                stream.page_event_gen[page] =
-                    std::max(stream.page_event_gen[page], generation);
-                stream.page_last_import_gen[page] =
-                    std::max(stream.page_last_import_gen[page], generation);
-                stream.cell_last_dependency_gen[physical] = generation;
-                stream.cell_last_membership_gen[physical] = generation;
-                const uint16_t provenance = pack_provenance(
-                    vbr_mutation_family::import,
-                    vbr_operation_class::state_api);
-                stream.cell_dependency_provenance[physical] = provenance;
-                stream.cell_membership_provenance[physical] = provenance;
-                stream.cell_last_membership_seq[physical] =
-                    static_cast<int16_t>(destination);
-                stream.cell_dependency_extent[physical] = extents_.add_ref(handle);
-                stream.cell_membership_extent[physical] = extents_.add_ref(handle);
-                if (!stream.cell_dependency_extent[physical] ||
-                    !stream.cell_membership_extent[physical]) {
+                if (!stamp(physical, destination, destination_handle)) {
                     return false;
                 }
-                set_range_bit(stream.cell_dependency_in_range, physical, true);
-                set_range_bit(stream.cell_membership_in_range, physical, true);
             }
         } else {
             std::set<std::pair<uint32_t, uint32_t>> installed_cells;
@@ -972,20 +1051,32 @@ bool vbr_generation_tracker::prepare_import_image_impl(
         }
         next->extent_guard_refs.clear();
 
-        next->units.reserve(plan.units.size());
-        for (const auto & unit : plan.units) {
-            if (unit.repr_gen == 0) {
+        if (replacement) {
+            std::lock_guard<std::mutex> lock(units_mutex_);
+            if (std::any_of(units_.begin(), units_.end(),
+                    [](const vbr_unit_generation & unit) {
+                        return unit.repr_gen == 0 ||
+                               (unit.publish_seq & 1u) != 0;
+                    })) {
                 return false;
             }
-            vbr_unit_generation installed;
-            installed.repr_gen = unit.repr_gen;
-            installed.publish_seq = 0;
-            installed.current_type = unit.current_type;
-            installed.last_source_type = unit.last_source_type;
-            installed.domain = unit.domain;
-            installed.promote_hops = unit.promote_hops;
-            installed.last_transition = unit.last_transition;
-            next->units.push_back(installed);
+            next->units = units_;
+        } else {
+            next->units.reserve(plan.units.size());
+            for (const auto & unit : plan.units) {
+                if (unit.repr_gen == 0) {
+                    return false;
+                }
+                vbr_unit_generation installed;
+                installed.repr_gen = unit.repr_gen;
+                installed.publish_seq = 0;
+                installed.current_type = unit.current_type;
+                installed.last_source_type = unit.last_source_type;
+                installed.domain = unit.domain;
+                installed.promote_hops = unit.promote_hops;
+                installed.last_transition = unit.last_transition;
+                next->units.push_back(installed);
+            }
         }
         next->mutation_serial = 0;
         next->ready = true;

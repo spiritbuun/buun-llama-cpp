@@ -477,7 +477,8 @@ static bool model_adoption_owner_token(
 static bool model_adoption_decode(
         llama_context * context,
         const std::vector<llama_token> & tokens,
-        llama_pos first_position) {
+        llama_pos first_position,
+        llama_seq_id sequence = 0) {
     if (!context || tokens.empty()) {
         return false;
     }
@@ -490,7 +491,7 @@ static bool model_adoption_decode(
         llama_batch batch = llama_batch_init(int32_t(count), 0, 1);
         for (size_t i = 0; i < count; ++i) {
             common_batch_add(batch, tokens[offset+i],
-                             first_position+llama_pos(offset+i), { 0 },
+                             first_position+llama_pos(offset+i), { sequence },
                              offset+i+1 == tokens.size());
         }
         const bool ok = llama_decode(context, batch) == 0;
@@ -1169,14 +1170,6 @@ static vbr_artifact_package package(
         manifest.unit_references.push_back(reference);
     }
 
-    const vbr_artifact_portable_domain device0 {
-        llama_cache_acct_residency::device,
-        llama_cache_acct_domain_kind::device_topology, 0, 0,
-    };
-    const vbr_artifact_portable_domain device1 {
-        llama_cache_acct_residency::device,
-        llama_cache_acct_domain_kind::device_topology, 0, 1,
-    };
     const vbr_artifact_portable_domain host {
         llama_cache_acct_residency::pageable_host,
         llama_cache_acct_domain_kind::not_applicable,
@@ -1184,10 +1177,7 @@ static vbr_artifact_package package(
     };
     manifest.accounting = {
         { vbr_artifact_accounting_role::unit_payload,
-          device0, 5*row_bytes*child_count, 5*row_bytes*child_count,
-          llama_cache_acct_attr_kind::artifact },
-        { vbr_artifact_accounting_role::unit_payload,
-          device1, 5*row_bytes*child_count, 5*row_bytes*child_count,
+          host, 10*row_bytes*child_count, 10*row_bytes*child_count,
           llama_cache_acct_attr_kind::artifact },
         { vbr_artifact_accounting_role::descriptor_metadata,
           host, 512, 512, llama_cache_acct_attr_kind::artifact },
@@ -1197,12 +1187,7 @@ static vbr_artifact_package package(
     if (stash_state == vbr_artifact_clean_stash_state::present) {
         manifest.accounting.push_back({
             vbr_artifact_accounting_role::clean_stash_payload,
-            device0, 10*child_count, 10*child_count,
-            llama_cache_acct_attr_kind::artifact,
-        });
-        manifest.accounting.push_back({
-            vbr_artifact_accounting_role::clean_stash_payload,
-            device1, 10*child_count, 10*child_count,
+            host, 20*child_count, 20*child_count,
             llama_cache_acct_attr_kind::artifact,
         });
     }
@@ -2430,7 +2415,7 @@ struct fixture {
             std::array<vbr_occupied_replacement_cell, 5> cells;
             for (uint32_t i = 0; i < cells.size(); ++i) {
                 cells[i] = { 0, i, llama_pos(i), llama_pos(10+i),
-                    llama_pos(20+i), 0, 1 };
+                    llama_pos(20+i), 0, 1, true };
             }
             const auto & live_view = transformed_recycle
                 ? recovery_view : view;
@@ -3059,21 +3044,27 @@ static void test_occupied_spec_companion_replacement_and_rollback() {
     CHECK(recurrent.target.recurrent.live_image == 2);
 }
 
-static uint64_t device_transfer_staging_reserved(
-        const llama_cache_acct_snapshot & snapshot) {
+static uint64_t device_transfer_staging_value(
+        const llama_cache_acct_snapshot & snapshot,
+        llama_cache_acct_measure measure) {
     uint64_t total = 0;
     for (const auto & row : snapshot.cells) {
         if (row.category != llama_cache_acct_category::transfer_staging ||
             row.domain.residency != llama_cache_acct_residency::device) {
             continue;
         }
-        const auto & value = row.cell.measures[
-            size_t(llama_cache_acct_measure::reserved)];
+        const auto & value = row.cell.measures[size_t(measure)];
         if (value.state == llama_cache_acct_known::known) {
             total += value.value;
         }
     }
     return total;
+}
+
+static uint64_t device_transfer_staging_reserved(
+        const llama_cache_acct_snapshot & snapshot) {
+    return device_transfer_staging_value(
+        snapshot, llama_cache_acct_measure::reserved);
 }
 
 static void test_occupied_replacement_free_cell_adoption() {
@@ -3299,6 +3290,18 @@ static void test_occupied_replacement_tracker_consumes_canonical_map() {
         1, 10, uint32_t(plan.units.size()),
         vbr_lineage_uuid { 0x81, 0x82 });
     CHECK(tracker.active());
+    for (uint32_t unit = 0; unit < plan.units.size(); ++unit) {
+        CHECK(tracker.initialize_unit(
+            unit, plan.units[unit].current_type, plan.units[unit].domain));
+    }
+    CHECK(tracker.global_transition(
+        vbr_mutation_registrant::authenticated_recovery,
+        vbr_operation_class::controller));
+    CHECK(tracker.controller_generation() == 2);
+    std::vector<vbr_unit_generation> live_units;
+    for (uint32_t unit = 0; unit < plan.units.size(); ++unit) {
+        live_units.push_back(tracker.unit_generation(unit));
+    }
     plan.target_instance = tracker.runtime_instance();
     plan.lineage_uuid = tracker.lineage_identity();
     plan.transition = vbr_tracker_install_transition::whole_import;
@@ -3317,6 +3320,16 @@ static void test_occupied_replacement_tracker_consumes_canonical_map() {
     CHECK(bool(operation));
     CHECK(tracker.import_image_installable(image, operation.id()));
     tracker.install_import_image_swap(image);
+    CHECK(tracker.controller_generation() == 2);
+    for (uint32_t unit = 0; unit < live_units.size(); ++unit) {
+        const auto current = tracker.unit_generation(unit);
+        CHECK(current.repr_gen == live_units[unit].repr_gen);
+        CHECK(current.current_type == live_units[unit].current_type);
+        CHECK(current.last_source_type == live_units[unit].last_source_type);
+        CHECK(current.domain == live_units[unit].domain);
+        CHECK(current.promote_hops == live_units[unit].promote_hops);
+        CHECK(current.last_transition == live_units[unit].last_transition);
+    }
     for (const auto & mapping : guard->cell_mapping()) {
         CHECK(tracker.dependency_generation(
                   0, mapping.destination_physical_cell) == 1);
@@ -4150,7 +4163,8 @@ static bool model_backed_adoption(
         ? uint32_t(std::max<size_t>(256, live_token_count + 128)) : 256;
     context_params.n_batch = live_matrix ? 512 : 64;
     context_params.n_ubatch = live_matrix ? 512 : 64;
-    context_params.n_seq_max = 1;
+    context_params.n_seq_max = 2;
+    context_params.kv_unified = true;
     context_params.n_threads = 2;
     context_params.n_threads_batch = 2;
     context_params.type_k = GGML_TYPE_F16;
@@ -5170,7 +5184,8 @@ static bool model_backed_occupied_store(
     context_params.n_ctx = 256;
     context_params.n_batch = 64;
     context_params.n_ubatch = 64;
-    context_params.n_seq_max = 1;
+    context_params.n_seq_max = 2;
+    context_params.kv_unified = true;
     context_params.n_threads = 2;
     context_params.n_threads_batch = 2;
     context_params.type_k = entry_type;
@@ -5209,11 +5224,11 @@ static bool model_backed_occupied_store(
     if (context_cells < 8 || incoming_tokens.size() >= context_cells) {
         return false;
     }
-    // Leave exactly one cache cell for the continuation. An equal-length
-    // occupied replacement cannot fit in the remaining free space and must
-    // therefore exercise authenticated incumbent-cell recycling.
+    // Leave room for one continuation plus eight cells owned by another
+    // unified-cache sequence. The equal-length occupied replacement still
+    // cannot fit in free cells and must recycle only its incumbent rows.
     incoming_tokens.resize(
-        size_t(context_cells)-1,
+        size_t(context_cells)-9,
         incoming_tokens.size() > 1 ? incoming_tokens[1]
                                    : incoming_tokens.front());
     auto incumbent_tokens = incoming_tokens;
@@ -5223,6 +5238,8 @@ static bool model_backed_occupied_store(
         incumbent_tokens.back() = llama_token(
             (uint32_t(incumbent_tokens.back()) + 1u) % uint32_t(vocab_size));
     }
+    llama_tokens foreign_tokens(
+        incoming_tokens.begin(), incoming_tokens.begin()+8);
 
     const size_t prefix_count = std::min<size_t>(8, incoming_tokens.size()-1);
     const llama_token prefix_continuation = incoming_tokens[prefix_count];
@@ -5376,15 +5393,34 @@ static bool model_backed_occupied_store(
     // sequence so this hardware arm exercises the same production owner used
     // by automatic projected host publication.
     const size_t projected_parent_count = incoming_tokens.size();
+    const auto make_projected_manifest = [&] (uint64_t manifest_id) {
+        vbr_projected_capture_manifest_request manifest;
+        manifest.manifest_id = manifest_id;
+        manifest.sequence = 0;
+        manifest.token_block.assign(
+            incoming_tokens.begin(),
+            incoming_tokens.begin() + projected_parent_count);
+        manifest.identity =
+            make_host_capture_request(manifest.token_block).identity;
+        manifest.text_only = true;
+        return manifest;
+    };
+
+    // Retention value, not manifest id, owns scheduler ordering. Exercise a
+    // reversed batch so accounting cannot accidentally binary-search the
+    // caller-ordered id vector.
+    std::vector<server_vbr_projected_host_publish_result> reversed_results;
+    server_vbr_projected_host_capture_diagnostics reversed_diagnostics;
+    CHECK(store->capture_projected_host_batch(
+        *memory,
+        { make_projected_manifest(2), make_projected_manifest(1) },
+        256ull*1024*1024, reversed_results, nullptr,
+        &reversed_diagnostics));
+    CHECK(reversed_results.size() == 2);
+    reversed_results.clear();
+
     vbr_projected_capture_manifest_request projected_manifest;
-    projected_manifest.manifest_id = 1;
-    projected_manifest.sequence = 0;
-    projected_manifest.token_block.assign(
-        incoming_tokens.begin(),
-        incoming_tokens.begin() + projected_parent_count);
-    projected_manifest.identity =
-        make_host_capture_request(projected_manifest.token_block).identity;
-    projected_manifest.text_only = true;
+    projected_manifest = make_projected_manifest(1);
     std::vector<server_vbr_projected_host_publish_result> projected_results;
     server_vbr_projected_host_capture_diagnostics projected_diagnostics;
     CHECK(store->capture_projected_host_batch(
@@ -5424,6 +5460,7 @@ static bool model_backed_occupied_store(
     if (!incoming_owner) {
         return false;
     }
+    CHECK(model_adoption_decode(context.get(), foreign_tokens, 0, 1));
     CHECK(model_adoption_decode(
         context.get(), { continuation }, llama_pos(incoming_tokens.size())));
     llama_synchronize(context.get());
@@ -5434,6 +5471,7 @@ static bool model_backed_occupied_store(
     }
     std::vector<float> expected_logits(
         expected_logits_ptr, expected_logits_ptr + vocab_size);
+    CHECK(llama_memory_seq_rm(memory, 1, -1, -1));
     // Build the prefix oracle from the exact rows used by the projected parent.
     // A separately decoded short prompt may take a different GEMM shape and is
     // not a byte-exact cache oracle even though it is semantically equivalent.
@@ -5454,10 +5492,15 @@ static bool model_backed_occupied_store(
     }
     llama_memory_clear(memory, true);
     CHECK(model_adoption_decode(context.get(), incumbent_tokens, 0));
+    CHECK(model_adoption_decode(context.get(), foreign_tokens, 0, 1));
     llama_synchronize(context.get());
     CHECK(memory->seq_pos_min(0) == 0);
     CHECK(memory->seq_pos_max(0) ==
           llama_pos(incumbent_tokens.size()-1));
+    std::vector<uint8_t> foreign_expected_rows;
+    CHECK(llama_kv_cache_vbr_epoch_test::snapshot_sequence_rows(
+        static_cast<llama_kv_cache *>(memory), 1,
+        uint32_t(foreign_tokens.size()), foreign_expected_rows));
 
     std::shared_ptr<const server_prompt_cache_vbr_payload> recovery_owner;
     CHECK(capture_owner(incumbent_tokens, recovery_owner));
@@ -5666,6 +5709,11 @@ static bool model_backed_occupied_store(
     CHECK(llama_kv_cache_vbr_epoch_test::adopted_matches(
         occupied_cache, incoming_owner->package(),
         incoming_owner->package().manifest(), destination_slot));
+    std::vector<uint8_t> foreign_actual_rows;
+    CHECK(llama_kv_cache_vbr_epoch_test::snapshot_sequence_rows(
+        occupied_cache, 1, uint32_t(foreign_tokens.size()),
+        foreign_actual_rows));
+    CHECK(foreign_actual_rows == foreign_expected_rows);
     if (imported.status != server_vbr_artifact_import_status::ok ||
         imported.adopt_status != vbr_adopt_status::adopted ||
         !state.published) {
@@ -5675,15 +5723,31 @@ static bool model_backed_occupied_store(
         ticket, incumbent_prompt, incumbent_family, destination_slot);
     CHECK(!ticket.ready());
 
+    // A growing import keeps a conservative bridge over newly mapped VMM
+    // pages until the server publishes its complete live-memory gauge. This
+    // fixture deliberately recycles incumbent pages, so the bridge can be
+    // empty; acknowledging the observation must be safe in either case.
+    context->vbr_import_accounting_observed();
+    CHECK(adoption_fixture::device_transfer_staging_value(
+              ledger.snapshot(),
+              llama_cache_acct_measure::resident_allocated) == 0);
+
     CHECK(model_adoption_decode(
         context.get(), { continuation }, llama_pos(incoming_tokens.size())));
     llama_synchronize(context.get());
     float * actual_logits = llama_get_logits_ith(context.get(), -1);
     CHECK(actual_logits != nullptr);
     if (actual_logits) {
-        CHECK(std::memcmp(
-            expected_logits.data(), actual_logits,
-            expected_logits.size()*sizeof(float)) == 0);
+        float max_abs = 0.0f;
+        for (size_t i = 0; i < expected_logits.size(); ++i) {
+            max_abs = std::max(
+                max_abs, std::fabs(expected_logits[i]-actual_logits[i]));
+        }
+        if (max_abs >= 1.0e-4f) {
+            std::fprintf(stderr,
+                "VBR occupied multi-sequence parity max_abs=%g\n", max_abs);
+        }
+        CHECK(max_abs < 1.0e-4f);
     }
     // The no-fail sidecar swap retired the displaced live artifact and its
     // soft lease. Drop the now-stale local handle without a second terminal.

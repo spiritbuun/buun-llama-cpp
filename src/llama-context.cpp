@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "llama-vbr-codec.h"
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -13,6 +14,7 @@
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-hybrid-iswa.h"
+#include "llama-memory-tree.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -171,8 +173,9 @@ llama_context::llama_context(
     cparams.embeddings_layer_inp.resize(hparams.n_layer() + 1, false);
     embd_layer_inp.resize(hparams.n_layer() + 1);
 
-    cparams.ctx_type     = params.ctx_type;
-    cparams.pooling_type = params.pooling_type;
+    cparams.ctx_type          = params.ctx_type;
+    cparams.rope_scaling_type = params.rope_scaling_type;
+    cparams.pooling_type      = params.pooling_type;
 
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
@@ -214,17 +217,16 @@ llama_context::llama_context(
 
     cparams.dflash_n_slots = std::clamp(params.dflash_n_slots <= 0 ? 1 : params.dflash_n_slots,
                                         1, (int) LLAMA_DFLASH_MAX_SLOTS);
-    auto rope_scaling_type = params.rope_scaling_type;
-    if (rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {
-        rope_scaling_type = hparams.rope_scaling_type_train;
+    if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {
+        cparams.rope_scaling_type = hparams.rope_scaling_type_train;
     }
 
-    if (rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_NONE) {
+    if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_NONE) {
         cparams.rope_freq_scale = 1.0f; // never scale if scaling type is none
     }
 
     if (cparams.yarn_ext_factor < 0.0f) { // negative indicates 'not set'
-        cparams.yarn_ext_factor = rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_YARN ? 1.0f : 0.0f;
+        cparams.yarn_ext_factor = cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_YARN ? 1.0f : 0.0f;
     }
 
     if (cparams.yarn_ext_factor != 0) {
@@ -345,6 +347,7 @@ llama_context::llama_context(
     cparams.kv_unified = params.kv_unified;
     cparams.logits_all = params.logits_all;
     cparams.vbr_dynamic = params.vbr_dynamic;
+    cparams.vbr_codec = params.vbr_codec;
     cparams.vbr_min_bits = params.vbr_min_bits;
     cparams.vbr_vram_budget_bytes = params.vbr_vram_budget_bytes;
     cparams.vbr_growth_headroom_bytes = params.vbr_growth_headroom_bytes;
@@ -368,6 +371,7 @@ llama_context::llama_context(
                 "disarming the drafter's own VBR controller (shared layers follow the "
                 "target's tier flips; the drafter's own layers stay at their static types)\n", __func__);
         cparams.vbr_dynamic              = false;
+        cparams.vbr_codec                = LLAMA_VBR_CODEC_TURBO;
         cparams.vbr_min_bits             = 0.0;
         cparams.vbr_vram_budget_bytes    = 0;
         cparams.vbr_growth_headroom_bytes = 0;
@@ -427,9 +431,10 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: flash_attn            = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
     LLAMA_LOG_INFO("%s: kv_unified            = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
     if (cparams.vbr_dynamic || cparams.vbr_vram_budget_bytes > 0 || cparams.vbr_min_bits > 0.0) {
-        LLAMA_LOG_INFO("%s: vbr                    = %s, min_bits=%g, vram_budget=%" PRIu64 "\n",
+        LLAMA_LOG_INFO("%s: vbr                    = %s/%s, min_bits=%g, vram_budget=%" PRIu64 "\n",
                 __func__,
                 cparams.vbr_dynamic ? "dynamic" : "static",
+                llama_vbr_ladder(cparams.vbr_codec).name,
                 cparams.vbr_min_bits,
                 cparams.vbr_vram_budget_bytes);
     }
@@ -6071,17 +6076,28 @@ public:
             }
 
             if (mbuf_cur.n_tensors == mbuf.n_tensors) {
-                // same chunking: copy 1:1 by index
+                // an equal tensor count does not imply the same chunking, e.g. save ranges [2,1] vs restore runs [1,2]
+                bool same_chunking = true;
                 for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
-                    GGML_ASSERT(ggml_nbytes(mbuf_cur.cpy[i]) == ggml_nbytes(mbuf.org[i]));
-                    ggml_backend_tensor_copy(mbuf_cur.cpy[i], mbuf.org[i]);
+                    if (ggml_nbytes(mbuf_cur.cpy[i]) != ggml_nbytes(mbuf.org[i])) {
+                        same_chunking = false;
+                        break;
+                    }
                 }
-                continue;
+
+                if (same_chunking) {
+                    // same chunking: copy 1:1 by index
+                    for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
+                        ggml_backend_tensor_copy(mbuf_cur.cpy[i], mbuf.org[i]);
+                    }
+                    continue;
+                }
             }
 
             // different chunking: copy the write-side data (mbuf_cur.cpy) into the read-side targets (mbuf.org)
             // with a byte cursor. Write and read enumerate the same logical data in the same order but may chunk
-            // it differently, so copy across tensor boundaries rather than 1:1 by index.
+            // it differently (even with an equal number of tensors), so copy across tensor boundaries rather than
+            // 1:1 by index.
             const size_t total = mbuf_cur.total_size;
 
             ggml_init_params params_scratch = {
@@ -6811,17 +6827,32 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             GGML_ASSERT(mb.context_vbr_managed <= mb.context);
         }
     }
+    const auto add_compute = [&ret](
+            ggml_backend_buffer_type_t buft, size_t size) {
+        if (!ggml_backend_buft_is_meta(buft)) {
+            ret[buft].compute += size;
+            return;
+        }
+        // A Meta scheduler buffer mirrors its workspace allocation on every
+        // child backend. The outer size is therefore a per-device value.
+        const size_t n = ggml_backend_meta_buft_n_bufts(buft);
+        for (size_t i = 0; i < n; ++i) {
+            ret[ggml_backend_meta_buft_simple_buft(buft, i)].compute += size;
+        }
+    };
     if (model.hparams.no_alloc) {
         for (size_t i = 0; i < backends.size(); ++i) {
             ggml_backend_t             backend = backends[i].get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
+            // Fit owns the estimated Meta row as one logical model device.
+            // Physical expansion is only valid once child allocations exist.
             ret[buft].compute += backend_buf_exp_size[i];
         }
     } else {
         for (const auto & backend_ptr : backends) {
             ggml_backend_t             backend = backend_ptr.get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
-            ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend);
+            add_compute(buft, ggml_backend_sched_get_buffer_size(sched.get(), backend));
         }
     }
     return ret;
@@ -6883,6 +6914,21 @@ llama_live_memory_breakdown llama_context::live_memory_breakdown() const {
     }
 
     return ret;
+}
+
+void llama_context::vbr_import_accounting_observed() noexcept {
+    if (!memory) {
+        return;
+    }
+    std::vector<llama_memory_tree_child> tree;
+    if (!llama_memory_tree_collect(memory.get(), tree)) {
+        return;
+    }
+    for (const auto & child : tree) {
+        if (child.attention != nullptr) {
+            child.attention->vbr_import_accounting_observed();
+        }
+    }
 }
 
 //
@@ -7135,6 +7181,7 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.vbr_codec                   =*/ LLAMA_VBR_CODEC_TURBO,
         /*.vbr_min_bits                =*/ 0.0,
         /*.vbr_vram_budget_bytes       =*/ 0,
         /*.vbr_growth_headroom_bytes   =*/ 0,
@@ -7220,6 +7267,36 @@ llama_context * llama_init_from_model(
         }
     }
 
+    const bool vbr_active = params.vbr_dynamic ||
+        params.vbr_vram_budget_bytes > 0 || params.vbr_min_bits > 0.0;
+    if (vbr_active &&
+        params.vbr_codec != LLAMA_VBR_CODEC_TURBO &&
+        params.vbr_codec != LLAMA_VBR_CODEC_CLASSIC) {
+        LLAMA_LOG_ERROR("%s: invalid VBR codec %d\n", __func__, int(params.vbr_codec));
+        return nullptr;
+    }
+
+    if (params.vbr_dynamic && params.vbr_codec == LLAMA_VBR_CODEC_CLASSIC) {
+        // Classic live retiering is currently implemented and validated for the
+        // BailingMoE3/Ling coupled cache. DSV4 retains its separate q8_0-capped
+        // policy; ordinary DSA does not thread VBR into its child caches yet.
+        if (!model->supports_classic_vbr()) {
+            LLAMA_LOG_ERROR("%s: classic VBR currently supports BailingMoE3/Ling models only\n", __func__);
+            return nullptr;
+        }
+        if (!llama_vbr_codec_contains(params.vbr_codec, params.type_k) ||
+            !llama_vbr_codec_contains(params.vbr_codec, params.type_v)) {
+            LLAMA_LOG_ERROR("%s: classic VBR entry must be f16, q8_0 or q4_0\n", __func__);
+            return nullptr;
+        }
+    }
+
+    if (params.vbr_dynamic && params.vbr_codec == LLAMA_VBR_CODEC_TURBO &&
+            !model->supports_turbo_vbr()) {
+        LLAMA_LOG_ERROR("%s: model KV geometry does not support the complete Turbo VBR ladder\n", __func__);
+        return nullptr;
+    }
+
     if (llama_model_kv_cache_types_coupled(model) && params.type_k != params.type_v) {
         LLAMA_LOG_ERROR("%s: model does not support different K (%s) and V (%s) cache types\n", __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
         return nullptr;
@@ -7272,6 +7349,14 @@ llama_context * llama_init_from_model(
 
     try {
         auto * ctx = new llama_context(*model, params);
+        const auto & cparams = ctx->get_cparams();
+
+        if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_YARN && cparams.rope_freq_scale != model->hparams.rope_freq_scale_train) {
+            LLAMA_LOG_INFO("%s: custom YaRN scaling detected, re-adjusting n_ctx_train(%u)...\n", __func__, model->hparams.n_ctx_train);
+            model->hparams.n_ctx_train = cparams.n_ctx_orig_yarn / cparams.rope_freq_scale;
+            LLAMA_LOG_INFO("%s: n_ctx_train adjusted to %u\n", __func__, model->hparams.n_ctx_train);
+        }
+
         // co-tenancy: every planned alloc landed — a held demand (if any) flips to
         // phase=satisfied; the claim lives until the first real decode (claim-complete)
         llama_vram_demand_satisfied();

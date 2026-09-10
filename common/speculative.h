@@ -151,7 +151,7 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t
 
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
-void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
+bool common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
 
 enum class common_speculative_sequence_event : uint8_t {
     prompt_rewind = 0,          // retained draft prefix remains installed
@@ -185,6 +185,28 @@ public:
 private:
     bool ready = false;
 };
+
+// Host-checkpoint codec for the deferred MTP hidden row. A complete draft
+// sequence image is not usable without this carry at a nonzero frontier.
+bool common_speculative_mtp_carry_state_save(
+        const common_speculative_mtp_carry_lifecycle & lifecycle,
+        const std::vector<float> & pending_h,
+        std::vector<uint8_t> & data);
+bool common_speculative_mtp_carry_state_load(
+        common_speculative_mtp_carry_lifecycle & lifecycle,
+        std::vector<float> & pending_h,
+        const std::vector<uint8_t> & data);
+
+struct common_speculative_checkpoint_policy {
+    bool capture_draft = false;
+    bool require_complete_draft_and_state = false;
+};
+
+common_speculative_checkpoint_policy common_speculative_checkpoint_policy_resolve(
+        bool has_draft_context,
+        bool vbr_prompt_cache,
+        bool can_speculate,
+        bool mtp_primary) noexcept;
 
 enum class common_speculative_mtp_process_preflight {
     cold_or_retained,

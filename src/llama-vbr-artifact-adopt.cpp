@@ -1066,6 +1066,30 @@ class vbr_kv_import_session {
             std::vector<vbr_artifact_stream_placement> placements;
             if (replacement) {
                 auto & cells = final_cells_.front();
+                for (const auto & retained : replacement->preserved_cells()) {
+                    if (retained.stream_index != 0 ||
+                        retained.physical_cell >= cells.size() ||
+                        retained.logical_position < 0 ||
+                        retained.reference_count != 1 ||
+                        retained.owner_sequence < 0 ||
+                        retained.owner_sequence == destination_ ||
+                        retained.owns_destination ||
+                        !cells.is_empty(retained.physical_cell)) {
+                        return false;
+                    }
+                    cells.pos_set(
+                        retained.physical_cell, retained.logical_position);
+                    cells.ext_set(retained.physical_cell,
+                        { retained.ext_x, retained.ext_y, retained.token });
+                    cells.seq_add(
+                        retained.physical_cell, retained.owner_sequence);
+                    if (!final_ownership_->add_cell(
+                            0, retained.owner_sequence,
+                            retained.physical_cell,
+                            retained.logical_position)) {
+                        return false;
+                    }
+                }
                 for (const auto & mapping : replacement->cell_mapping()) {
                     if (mapping.source_stream != 0 ||
                         mapping.destination_physical_cell >= cells.size() ||

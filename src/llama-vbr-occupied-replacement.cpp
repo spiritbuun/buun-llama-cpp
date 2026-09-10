@@ -18,6 +18,7 @@ struct vbr_occupied_replacement_guard::map {
     uint64_t packed_rows_expanded = 0;
     uint64_t incoming_prefix_tokens = 0;
     std::vector<vbr_artifact_prefix_cell_run> incoming_prefix_runs;
+    std::vector<vbr_occupied_replacement_cell> preserved_cells;
 };
 
 namespace {
@@ -316,6 +317,8 @@ std::array<uint8_t, 32> occupied_currency_digest(
         writer.u64(uint64_t(cell.ext_y));
         writer.u64(uint64_t(cell.owner_sequence));
         writer.u64(cell.reference_count);
+        writer.u64(cell.owns_destination ? 1 : 0);
+        writer.u64(uint64_t(int64_t(cell.token)));
     }
     writer.u64(observation.unit_count);
     for (size_t i = 0; i < observation.unit_count; ++i) {
@@ -503,8 +506,7 @@ vbr_occupied_replacement_guard_status occupied_guard_validate(
             llama_pos(parent_incoming_tokens) ||
         recovery_placement.cells.size() != recovery_tokens ||
         incoming_placement.cells.size() != parent_incoming_tokens ||
-        incoming_tokens == 0 || incoming_tokens > parent_incoming_tokens ||
-        observation.cell_count != recovery_tokens) {
+        incoming_tokens == 0 || incoming_tokens > parent_incoming_tokens) {
         return vbr_occupied_replacement_guard_status::frontier_mismatch;
     }
     for (size_t logical = 0; logical < recovery_tokens; ++logical) {
@@ -519,6 +521,86 @@ vbr_occupied_replacement_guard_status occupied_guard_validate(
             return vbr_occupied_replacement_guard_status::unsupported_layout;
         }
     }
+    // A unified physical cache may contain several independent server slots.
+    // Authenticate every occupied cell, isolate the destination's exact
+    // recovery image, and retain the other slots as part of the guarded map.
+    // Shared cells involving the destination remain unsupported: recycling
+    // one would alter another sequence's prefix.
+    std::vector<uint8_t> destination_cells(recovery_tokens, 0);
+    if (build) {
+        build->preserved_cells.reserve(
+            observation.cell_count > recovery_tokens
+                ? observation.cell_count - recovery_tokens
+                : 0);
+    }
+    size_t preserved_index = 0;
+    uint32_t previous_observed_physical = 0;
+    for (size_t i = 0; i < observation.cell_count; ++i) {
+        const auto & live = observation.cells[i];
+        if (live.stream_index != 0 ||
+            live.physical_cell >= observation.cell_capacity ||
+            (i != 0 &&
+             live.physical_cell <= previous_observed_physical) ||
+            live.logical_position < 0 || live.reference_count != 1 ||
+            live.owner_sequence < 0) {
+            return vbr_occupied_replacement_guard_status::ownership_mismatch;
+        }
+        previous_observed_physical = live.physical_cell;
+        if (!live.owns_destination) {
+            if (live.owner_sequence == observation.destination) {
+                return vbr_occupied_replacement_guard_status::ownership_mismatch;
+            }
+            if (build) {
+                build->preserved_cells.push_back(live);
+            } else if (!expected ||
+                       preserved_index >= expected->preserved_cells.size()) {
+                return vbr_occupied_replacement_guard_status::currency_changed;
+            } else {
+                const auto & sealed = expected->preserved_cells[preserved_index++];
+                if (live.stream_index != sealed.stream_index ||
+                    live.physical_cell != sealed.physical_cell ||
+                    live.logical_position != sealed.logical_position ||
+                    live.ext_x != sealed.ext_x || live.ext_y != sealed.ext_y ||
+                    live.owner_sequence != sealed.owner_sequence ||
+                    live.reference_count != sealed.reference_count ||
+                    live.owns_destination != sealed.owns_destination ||
+                    live.token != sealed.token) {
+                    return vbr_occupied_replacement_guard_status::currency_changed;
+                }
+            }
+            continue;
+        }
+        if (live.reference_count != 1 ||
+            live.owner_sequence != observation.destination ||
+            uint64_t(live.logical_position) >= recovery_tokens) {
+            return vbr_occupied_replacement_guard_status::ownership_mismatch;
+        }
+        auto & logical = destination_cells[size_t(live.logical_position)];
+        if (logical != 0) {
+            return vbr_occupied_replacement_guard_status::ownership_mismatch;
+        }
+        const auto & sealed = recovery_placement.cells[
+            size_t(live.logical_position)];
+        if (sealed.physical_cell != live.physical_cell ||
+            sealed.ext_x != live.ext_x || sealed.ext_y != live.ext_y) {
+            return vbr_occupied_replacement_guard_status::ownership_mismatch;
+        }
+        logical = 1;
+    }
+    if (std::find(destination_cells.begin(), destination_cells.end(), uint8_t(0)) !=
+            destination_cells.end()) {
+        return vbr_occupied_replacement_guard_status::frontier_mismatch;
+    }
+    if (!build && (!expected ||
+                   preserved_index != expected->preserved_cells.size())) {
+        return vbr_occupied_replacement_guard_status::currency_changed;
+    }
+    if (incoming_transformed && observation.cell_count != recovery_tokens) {
+        // Retiering changes the representation of the whole physical cache;
+        // rows retained for another sequence would otherwise be reinterpreted.
+        return vbr_occupied_replacement_guard_status::unsupported_layout;
+    }
+
     const size_t free_cells = observation.cell_capacity-observation.cell_count;
     const auto strategy = incoming_tokens <= free_cells
         ? vbr_occupied_replacement_strategy::provisional_free_cells
@@ -576,26 +658,6 @@ vbr_occupied_replacement_guard_status occupied_guard_validate(
                        recovery, recovery_placement,
                        recovery_packed_rows)))) {
         return vbr_occupied_replacement_guard_status::unsupported_layout;
-    }
-    uint32_t previous_physical = 0;
-    for (size_t i = 0; i < observation.cell_count; ++i) {
-        const auto & live = observation.cells[i];
-        if (live.stream_index != 0 ||
-            live.physical_cell >= observation.cell_capacity ||
-            (i != 0 && live.physical_cell <= previous_physical) ||
-            live.reference_count != 1 ||
-            live.owner_sequence != observation.destination ||
-            live.logical_position < 0 ||
-            uint64_t(live.logical_position) >= recovery_tokens) {
-            return vbr_occupied_replacement_guard_status::ownership_mismatch;
-        }
-        previous_physical = live.physical_cell;
-        const auto & sealed = recovery_placement.cells[
-            size_t(live.logical_position)];
-        if (sealed.physical_cell != live.physical_cell ||
-            sealed.ext_x != live.ext_x || sealed.ext_y != live.ext_y) {
-            return vbr_occupied_replacement_guard_status::ownership_mismatch;
-        }
     }
     const auto append_run = [](
             std::vector<vbr_occupied_replacement_relocation_run> & runs,
@@ -800,6 +862,12 @@ const std::vector<vbr_occupied_replacement_relocation_run> &
 vbr_occupied_replacement_guard::recovery_runs() const noexcept {
     static const std::vector<vbr_occupied_replacement_relocation_run> empty;
     return map_ ? map_->recovery_runs : empty;
+}
+
+const std::vector<vbr_occupied_replacement_cell> &
+vbr_occupied_replacement_guard::preserved_cells() const noexcept {
+    static const std::vector<vbr_occupied_replacement_cell> empty;
+    return map_ ? map_->preserved_cells : empty;
 }
 
 const vbr_artifact_package_view &

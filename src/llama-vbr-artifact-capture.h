@@ -97,6 +97,8 @@ struct artifact_segment {
     uint64_t length = 0;
 };
 
+using vbr_capture_continue_fn = bool (*)(void * context) noexcept;
+
 // Immutable segmented pageable backing. Each append allocates at most one
 // capture chunk; source() supports arbitrary reads across segment boundaries
 // and never concatenates the complete artifact.
@@ -126,6 +128,10 @@ public:
     size_t segment_count() const noexcept;
     size_t max_segment_size() const noexcept;
     bool authenticated() const noexcept;
+    // A nonzero digest is available only after the immutable range tree has
+    // sealed the complete chain. Restore staging can reuse this capability
+    // instead of rereading a multi-GiB catalog payload.
+    std::array<uint8_t, 32> sealed_digest() const noexcept;
     bool read(uint64_t offset, uint8_t * destination, size_t size) const noexcept;
     vbr_artifact_byte_source source() const noexcept;
 
@@ -137,7 +143,10 @@ private:
     friend bool vbr_capture_range_seal(
         artifact_segment_chain &,
         uint64_t,
-        class vbr_capture_range_tree &) noexcept;
+        class vbr_capture_range_tree &,
+        void *,
+        vbr_capture_continue_fn,
+        bool *) noexcept;
     friend std::array<uint8_t, 32> vbr_capture_stream_digest(
         const artifact_segment_chain &) noexcept;
 };
@@ -164,9 +173,9 @@ enum class vbr_capture_range_restrict_status : uint8_t {
     _count,
 };
 
-// Immutable Merkle owner produced from the same append pass that creates the
-// pageable segment chain. The root binds total bytes, canonical chunking, and
-// the complete padded tree; no payload rescan is needed to seal it.
+// Immutable Merkle owner produced by parallel hashing after the complete
+// pageable segment chain has been captured. The root binds total bytes,
+// canonical chunking, and the complete padded tree.
 class vbr_capture_range_tree {
 public:
     vbr_capture_range_tree() noexcept = default;
@@ -187,7 +196,10 @@ private:
     friend bool vbr_capture_range_seal(
         artifact_segment_chain &,
         uint64_t,
-        vbr_capture_range_tree &) noexcept;
+        vbr_capture_range_tree &,
+        void *,
+        vbr_capture_continue_fn,
+        bool *) noexcept;
     friend bool vbr_capture_range_prove(
         const vbr_capture_range_tree &,
         const std::vector<vbr_capture_authenticated_range> &,
@@ -233,11 +245,15 @@ private:
 
 // Sealing is valid only for a chain constructed with authenticated chunking,
 // after all appends complete. All failures clear output and leave the chain
-// readable but permanently unsealed for publication.
+// readable but permanently unsealed for publication. Optional continuation
+// polling bounds cancellation while large chains are hashed.
 bool vbr_capture_range_seal(
     artifact_segment_chain & chain,
     uint64_t max_metadata_bytes,
-    vbr_capture_range_tree & output) noexcept;
+    vbr_capture_range_tree & output,
+    void * continue_context = nullptr,
+    vbr_capture_continue_fn continue_work = nullptr,
+    bool * was_cancelled = nullptr) noexcept;
 
 // Ranges must be sorted, nonempty, nonoverlapping, and within the sealed byte
 // extent. Proof construction and verification are transactional/fail-closed.

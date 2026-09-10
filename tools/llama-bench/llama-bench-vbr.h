@@ -17,6 +17,7 @@ struct llama_bench_vbr_plan {
     bool floor_explicit = false;
     uint64_t budget_bytes = 0;
     bool budget_explicit = false;
+    llama_vbr_codec codec = LLAMA_VBR_CODEC_TURBO;
 };
 
 inline llama_bench_vbr_plan llama_bench_vbr_make_plan(
@@ -27,20 +28,24 @@ inline llama_bench_vbr_plan llama_bench_vbr_make_plan(
         const std::string & vram,
         bool entry_explicit,
         bool floor_explicit,
-        bool vram_explicit) {
+        bool vram_explicit,
+        llama_vbr_codec codec = LLAMA_VBR_CODEC_TURBO,
+        bool codec_explicit = false) {
     llama_bench_vbr_plan plan;
-    plan.options_selected = entry_explicit || floor_explicit || vram_explicit;
+    plan.options_selected = codec_explicit || entry_explicit || floor_explicit || vram_explicit;
     plan.matrix_has_alias =
         std::any_of(types_k.begin(), types_k.end(), [](const auto & c) { return c.vbr; }) ||
         std::any_of(types_v.begin(), types_v.end(), [](const auto & c) { return c.vbr; });
     if (!plan.options_selected && !plan.matrix_has_alias) {
         return plan;
     }
-    plan.entry_type = common_vbr_entry_type(entry);
+    plan.codec = codec;
+    plan.entry_type = common_vbr_entry_type(entry, codec);
     plan.entry = ggml_type_name(plan.entry_type);
     plan.floor_explicit = floor_explicit;
-    plan.explicit_floor_bits = floor_explicit ? common_vbr_floor_bits(floor) : 0.0;
-    plan.implicit_option_floor_bits = common_vbr_floor_bits("t4");
+    plan.explicit_floor_bits = floor_explicit ? common_vbr_floor_bits(floor, codec) : 0.0;
+    plan.implicit_option_floor_bits = common_vbr_floor_bits(
+        codec == LLAMA_VBR_CODEC_CLASSIC ? "q4_0" : "t4", codec);
     plan.budget_bytes = common_vbr_vram_bytes(vram);
     plan.budget_explicit = vram_explicit;
     return plan;
@@ -57,6 +62,7 @@ struct llama_bench_vbr_row {
     bool floor_explicit = false;
     uint64_t budget_bytes = 0;
     bool budget_explicit = false;
+    llama_vbr_codec codec = LLAMA_VBR_CODEC_TURBO;
 };
 
 inline llama_bench_vbr_row llama_bench_vbr_resolve_row(
@@ -66,6 +72,7 @@ inline llama_bench_vbr_row llama_bench_vbr_resolve_row(
     llama_bench_vbr_row row;
     row.type_k = tk.type;
     row.type_v = tv.type;
+    row.codec = plan.codec;
     const bool alias_selected = tk.vbr || tv.vbr;
     const bool option_arms_row = plan.options_selected && !plan.matrix_has_alias;
     if (!alias_selected && !option_arms_row) {
@@ -104,6 +111,7 @@ inline void llama_bench_vbr_apply_row(const llama_bench_vbr_row & row, llama_con
     cparams.type_v = row.type_v;
     if (!row.active) return;
     cparams.vbr_dynamic = true;
+    cparams.vbr_codec = row.codec;
     cparams.vbr_pin_k = !row.k;
     cparams.vbr_pin_v = !row.v;
     cparams.vbr_min_bits = row.floor_bits;

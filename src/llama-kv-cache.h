@@ -36,6 +36,7 @@ struct llama_context;
 class vbr_unit_build;
 class vbr_pinned_chunk_ring;
 class vbr_kv_import_session;
+class llama_kv_cache_iswa;
 struct vbr_validated_child_plan;
 struct vbr_target_unit_snapshot;
 class vbr_import_receipt_group;
@@ -315,6 +316,9 @@ public:
     // iSWA attaches both children after their pools exist so ownership follows the
     // actually active controller and the last child in parent execution order is root.
     bool vbr_controller_active() const { return vbr_vmm_active(); }
+    void vbr_import_accounting_observed() noexcept {
+        vbr_import_receipts_release();
+    }
     void vbr_attach_ledger_tree(llama_kv_cache * root, llama_kv_cache * peer, double device_share);
     void vbr_finalize_ledger_tree();
     void vbr_finalize_failed_child(uint32_t n_tokens, bool root_ran);
@@ -744,6 +748,8 @@ private:
         size_t                used    = 0;        // high-water of placed extents (log-only)
         size_t                budget  = 0;         // current per-pool mapped-physical budget
         size_t                budget_base = 0;      // explicit arm or floor-layout share: re-derivation floor
+        size_t                entry_cost = 0;       // page-exact full-cache cost at resolved entry types
+        size_t                floor_cost = 0;       // page-exact full-cache cost at the configured floor
         // vbr_budget_eff memo: one live free-VRAM query per pool per boundary (the degrade loop
         // and promote hysteresis both consult it repeatedly within one boundary)
         mutable uint64_t      budget_eff_stamp = ~0ull;
@@ -878,26 +884,26 @@ private:
     vbr_operation_id vbr_import_operation_ = {};
     void vbr_import_receipts_release() noexcept;
     void vbr_import_receipts_release_if_empty() noexcept;
-    std::vector<vbr_degrade_step> vbr_degrade_order_; // global price order, F16->t8 band first
+    std::vector<vbr_degrade_step> vbr_degrade_order_; // global price order, first ladder band first
     size_t         vbr_degrade_cursor_ = 0;
     size_t         vbr_budget_bytes_   = 0;           // global mapped-physical budget; 0 = no trigger
     uint32_t       vbr_stash_rows_     = 0;           // sink-stash rows per (layer,side); 0 = off
     // --vbr-floor (env VBR_MIN_BITS): first order step the aggregate bits/value floor forbids;
     // the cursor never advances past it (default = order size, i.e. unclamped)
     size_t vbr_degrade_limit_ = (size_t) -1;
-    // co-tenancy: end of the leading f16->t8 band of the order (demand sheds stop here);
+    // co-tenancy: end of the leading entry-to-first-rung band (demand sheds stop here);
     // 0 = no band (custom VBR_DEGRADE_ORDER carries no band guarantee -> demand shed off)
-    size_t t8_band_end_ = 0;
+    size_t first_band_end_ = 0;
     // peer-yield consent bound (buun 2026-07-20, explicit-floor-as-consent): a TYPED
     // --vbr-floor (flag or VBR_MIN_BITS env) consents demand sheds down to the floor —
     // the ledger is per-uid, so the demander is the same human who typed it. A defaulted
     // floor keeps the conservative restorable band. 0 = demand shedding disabled.
     size_t vbr_demand_limit() const {
-        if (t8_band_end_ == 0) {
+        if (first_band_end_ == 0) {
             return 0;
         }
         return vbr_floor_typed_ ? vbr_degrade_limit_
-                                : std::min(vbr_degrade_limit_, t8_band_end_);
+                                : std::min(vbr_degrade_limit_, first_band_end_);
     }
     bool vbr_floor_typed_ = false;
     // ---- co-tenancy donor state ----
@@ -986,6 +992,13 @@ private:
     llama_kv_cache * vbr_ledger_root_ = nullptr;    // null means standalone/self
     llama_kv_cache * vbr_ledger_sibling_ = nullptr; // symmetric peer backlink in a composite
     double vbr_tree_device_share_ = 1.0;            // parent share before child normalization
+    // Root-owned topology and reusable scratch for one device-local budget refresh. Pool addresses
+    // are stable after construction; reserving here keeps dirty decode boundaries allocation-free.
+    std::vector<vbr_pool *> vbr_tree_pools_;
+    std::vector<vbr_pool *> vbr_tree_device_pools_scratch_;
+    std::vector<llama_memory_vbr_budget_cost> vbr_tree_budget_costs_scratch_;
+    std::vector<uint64_t> vbr_tree_budget_shares_scratch_;
+    uint64_t vbr_tree_budget_refresh_stamp_ = ~0ull;
     llama_kv_cache *       vbr_tree_root();
     const llama_kv_cache * vbr_tree_root() const;
     bool   vbr_tree_forced() const;
@@ -1224,6 +1237,7 @@ private:
     // 64 MiB-quantized. Shared by the init-time auto-budget arm (fit-less modes, e.g.
     // SPLIT_MODE_TENSOR) and the periodic re-derivation.
     size_t   vbr_pool_reach(const vbr_pool & p) const;
+    void     vbr_rederive_tree_budget();
     // Fast-path stability tracking: skip per-batch VBR bookkeeping when settled (avoids ~1ms/token)
     uint32_t vbr_last_used_        = 0;   // observed cell count last prepare() pass
     uint32_t vbr_last_wm_          = 0;   // predicted padded watermark of last successful boundary
@@ -1615,6 +1629,7 @@ private:
     // turbo8->turbo4 in-place-vs-separate identity, on a scoped CUDA backend. See definition.
     void vbr_transcode_anchor_test();
 
+    friend class llama_kv_cache_iswa;
     friend struct llama_kv_cache_vbr_epoch_test;
 
     // TurboQuant rotation matrices (128x128, row-major stored)

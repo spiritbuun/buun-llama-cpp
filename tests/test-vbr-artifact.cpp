@@ -92,6 +92,7 @@ static void test_vbr_prompt_cache_support_contract() {
           status::media_prompt_unsupported);
 
     for (const auto unsupported : {
+             status::codec_unsupported,
              status::draft_context_unsupported,
              status::speculative_slot_unsupported,
              status::media_prompt_unsupported,
@@ -6031,6 +6032,70 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
     };
     server_tokens extended(
         llama_tokens { 101, 102, 103 }, false);
+    {
+        server_prompt_cache_vbr_restore_candidate same_family;
+        CHECK(cache.prepare_vbr_restore(
+            extended,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            same_family, false, &logical->cache_family));
+        CHECK(same_family.cache_family() == logical->cache_family);
+    }
+    {
+        const common_cache_family_binding foreign_family {
+            common_cache_family_id { 43 }, common_cache_family_role::main,
+        };
+        server_prompt_cache_vbr_restore_candidate family_mismatch;
+        CHECK(!cache.prepare_vbr_restore(
+            extended,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            family_mismatch, false, &foreign_family));
+    }
+    {
+        // A globally preferred foreign-family row must not mask a useful row
+        // from the required family. Reuse the same immutable payload so only
+        // owner-side family filtering can distinguish the two candidates.
+        auto foreign = cache.states.insert(
+            std::next(logical), server_prompt_cache_state {});
+        foreign->prompt = logical->prompt.clone();
+        foreign->payload = payload;
+        foreign->adapter_config_key = logical->adapter_config_key;
+        foreign->vbr_execution_identity = logical->vbr_execution_identity;
+        foreign->cache_family = {
+            common_cache_family_id { 43 }, common_cache_family_role::main,
+        };
+        const auto foreign_key =
+            server_retention_instance_key::for_host_entry(&*foreign);
+        CHECK(retention.publish(
+            foreign_key, common_retention_pool::attention,
+            spans, true, foreign->prompt.n_tokens(),
+            foreign->prompt.n_tokens(), true));
+        CHECK(server_prompt_retention_publish_exact_prefix(
+            retention, foreign_key, foreign->prompt,
+            foreign->adapter_config_key,
+            foreign->prompt.n_tokens()));
+
+        server_prompt_cache_vbr_restore_candidate unfiltered;
+        CHECK(cache.prepare_vbr_restore(
+            extended,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            unfiltered, false));
+        CHECK(unfiltered.cache_family() == foreign->cache_family);
+
+        server_prompt_cache_vbr_restore_candidate filtered;
+        CHECK(cache.prepare_vbr_restore(
+            extended,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            filtered, false, &logical->cache_family));
+        CHECK(filtered.cache_family() == logical->cache_family);
+        filtered = {};
+        unfiltered = {};
+        retention.retire(foreign_key);
+        cache.states.erase(foreign);
+    }
     // Model multimodal capability is not media presence: text-only requests
     // on an MTMD-capable server remain eligible for this first restore slice.
     extended.has_mtmd = true;

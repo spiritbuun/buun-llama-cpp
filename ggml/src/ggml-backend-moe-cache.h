@@ -20,6 +20,8 @@ struct ggml_moe_cache_config {
     int32_t min_expert_explicit;
     int32_t max_batch;
     int32_t min_compute_capability;
+    // 1 preserves the provider's automatic admission and safety policy.
+    int32_t automatic;
     int32_t min_devices;
     // -1 selects the provider policy; 0..8 is a fixed total per node.
     int32_t overlap_cpu_rows;

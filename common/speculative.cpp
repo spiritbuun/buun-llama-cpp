@@ -98,6 +98,73 @@ void common_speculative_mtp_carry_lifecycle::sequence_transition(
     }
 }
 
+bool common_speculative_mtp_carry_state_save(
+        const common_speculative_mtp_carry_lifecycle & lifecycle,
+        const std::vector<float> & pending_h,
+        std::vector<uint8_t> & data) {
+    constexpr uint32_t magic       = 0x4d545043; // MTPC
+    constexpr uint32_t version     = 1;
+    constexpr size_t   header_size = 3*sizeof(uint32_t);
+
+    if (!lifecycle.draft_ready() || pending_h.empty() ||
+            pending_h.size() > UINT32_MAX) {
+        data.clear();
+        return false;
+    }
+
+    const uint32_t width = (uint32_t) pending_h.size();
+    data.resize(header_size + (size_t) width*sizeof(float));
+    std::memcpy(data.data() + 0*sizeof(uint32_t), &magic,   sizeof(uint32_t));
+    std::memcpy(data.data() + 1*sizeof(uint32_t), &version, sizeof(uint32_t));
+    std::memcpy(data.data() + 2*sizeof(uint32_t), &width,   sizeof(uint32_t));
+    std::memcpy(data.data() + header_size, pending_h.data(),
+                (size_t) width*sizeof(float));
+    return true;
+}
+
+bool common_speculative_mtp_carry_state_load(
+        common_speculative_mtp_carry_lifecycle & lifecycle,
+        std::vector<float> & pending_h,
+        const std::vector<uint8_t> & data) {
+    constexpr uint32_t magic       = 0x4d545043; // MTPC
+    constexpr uint32_t version     = 1;
+    constexpr size_t   header_size = 3*sizeof(uint32_t);
+
+    lifecycle.target_process_skipped();
+
+    uint32_t stored_magic = 0;
+    uint32_t stored_version = 0;
+    uint32_t width = 0;
+    if (data.size() < header_size) {
+        return false;
+    }
+    std::memcpy(&stored_magic,   data.data() + 0*sizeof(uint32_t), sizeof(uint32_t));
+    std::memcpy(&stored_version, data.data() + 1*sizeof(uint32_t), sizeof(uint32_t));
+    std::memcpy(&width,          data.data() + 2*sizeof(uint32_t), sizeof(uint32_t));
+    if (stored_magic != magic || stored_version != version ||
+            width != pending_h.size() ||
+            data.size() != header_size + (size_t) width*sizeof(float)) {
+        return false;
+    }
+
+    std::memcpy(pending_h.data(), data.data() + header_size,
+                (size_t) width*sizeof(float));
+    lifecycle.target_process_refreshed();
+    return true;
+}
+
+common_speculative_checkpoint_policy common_speculative_checkpoint_policy_resolve(
+        bool has_draft_context,
+        bool vbr_prompt_cache,
+        bool can_speculate,
+        bool mtp_primary) noexcept {
+    const bool require_mtp = has_draft_context && can_speculate && mtp_primary;
+    return {
+        has_draft_context && (vbr_prompt_cache || require_mtp),
+        require_mtp,
+    };
+}
+
 common_speculative_mtp_process_preflight
 common_speculative_mtp_process_preflight_resolve(
         const std::vector<common_speculative_mtp_carry_lifecycle> & lifecycles,
@@ -252,7 +319,7 @@ struct common_speculative_impl {
 
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
-    virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
+    virtual bool set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) { return false; }
     // Called after an external sequence lifecycle mutation. Most implementations
     // have no branch-local state beyond their serialized state and need no action.
     virtual void sequence_transition(
@@ -1004,15 +1071,15 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         return true;
     }
 
-    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+    bool set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
         if (!need_boundary_stash()) {
-            return;
+            return false;
         }
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
-            return;
+            return false;
         }
         if (data.size() != sizeof(llama_pos) + (size_t) n_embd_dec * sizeof(float)) {
-            return;
+            return false;
         }
 
         llama_pos pos = -1;
@@ -1021,6 +1088,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         pending_pos_last[seq_id] = pos;
         pending_g_last[seq_id].resize(n_embd_dec);
         std::memcpy(pending_g_last[seq_id].data(), data.data() + sizeof(llama_pos), (size_t) n_embd_dec * sizeof(float));
+        return true;
     }
 };
 
@@ -1155,7 +1223,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     uint32_t        target_layer_ids_n = 0;
     int32_t         target_layer_ids_buf[8] = {}; // backing store for fork-arch drafters
 
-    // scratch buffer for concatenated target features [n_tokens, n_embd_enc]
+    // Scratch storage for the unfused encoder path. The fused path gathers
+    // directly into the injection batch and does not use this allocation.
     std::vector<float> features_buf;
 
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
@@ -2032,44 +2101,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     continue;
                 }
 
-                // fuse extracted features through DFlash encoder
-                // M-RoPE drafts read 4 position rows per token from embd batches, so pass them explicitly
-                std::vector<llama_pos> enc_pos;
-                if (is_mrope) {
-                    enc_pos.resize((size_t) 4 * n_chunk);
-                    for (int32_t i = 0; i < n_chunk; ++i) {
-                        const llama_pos p = batch_in.pos[i_batch_beg[seq_id] + offset + i];
-                        enc_pos[0 * n_chunk + i] = p;
-                        enc_pos[1 * n_chunk + i] = p;
-                        enc_pos[2 * n_chunk + i] = p;
-                        enc_pos[3 * n_chunk + i] = 0;
-                    }
-                }
-
-                llama_batch enc_batch = {
-                    /*.n_tokens =*/ n_chunk,
-                    /*.token    =*/ nullptr,
-                    /*.embd     =*/ features_buf.data(),
-                    /*.pos      =*/ is_mrope ? enc_pos.data() : nullptr,
-                    /*.n_seq_id =*/ nullptr,
-                    /*.seq_id   =*/ nullptr,
-                    /*.logits   =*/ nullptr,
-                };
-
-                int32_t rc = llama_encode(ctx_dft, enc_batch);
-                if (rc != 0) {
-                    LOG_ERR("%s: llama_encode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
-                            __func__, rc, (int) n_chunk, (int) offset);
-                    return false;
-                }
-
-                const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
-                GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
-
-                // inject the DFlash decoder K/V cache at the tokens' target positions
-                batch_inject.n_tokens = n_chunk;
-                std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
-
                 for (int32_t i = 0; i < n_chunk; ++i) {
                     const llama_pos p = dft_pos0 + offset + i;
                     batch_inject.pos[i] = p;
@@ -2082,7 +2113,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     batch_inject.seq_id[i][0] = seq_id;
                     batch_inject.logits[i]    = false;
                 }
-                rc = llama_decode(ctx_dft, batch_inject);
+                const int32_t rc = llama_decode(ctx_dft, batch_inject);
                 if (rc != 0) {
                     LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                             __func__, rc, (int) n_chunk, (int) offset);
@@ -2771,19 +2802,35 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
 
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+
         // pending_h is an activation, not part of either serialized sequence
-        // image. A restored/rewound nonzero frontier therefore cannot safely
-        // catch the draft model up: the predecessor target-hidden row is
-        // unavailable. Stay target-only without touching the restored draft
-        // sequence. A true cold frontier has a defined zero predecessor and can
-        // start/re-arm normal MTP processing.
+        // image. A restored/rewound nonzero frontier therefore cannot replay
+        // this target batch into the draft model: the predecessor target-hidden
+        // row is unavailable. Use this verified target batch as a recovery
+        // boundary instead. Drop the stale draft sequence, retain the newest
+        // target-hidden row, and re-arm MTP for the next process/draft cycle.
+        // The draft context then refills incrementally while every proposal
+        // remains target-verified.
         if (!is_mem_shared) {
             const auto preflight = common_speculative_mtp_process_preflight_resolve(
                 pending_h_lifecycle, i_batch_beg, batch_in.pos);
             if (preflight == common_speculative_mtp_process_preflight::target_only) {
+                auto * mem_dft = llama_get_memory(ctx_dft);
                 for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                     if (i_batch_beg[seq_id] >= 0) {
-                        pending_h_lifecycle[seq_id].target_process_skipped();
+                        if (!mem_dft || !llama_memory_seq_rm(
+                                mem_dft, seq_id, -1, -1)) {
+                            return false;
+                        }
+                        const float * h_tgt = llama_get_embeddings_nextn_ith(
+                            ctx_tgt, i_batch_end[seq_id]);
+                        if (!h_tgt) {
+                            return false;
+                        }
+                        std::memcpy(
+                            pending_h[seq_id].data(), h_tgt, row_bytes);
+                        pending_h_lifecycle[seq_id].target_process_refreshed();
                         verify_h_rows[seq_id] = 0;
                     }
                 }
@@ -2800,8 +2847,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     batch_in.pos[i_batch_beg[seq_id]], -1);
             }
         }
-
-        const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
@@ -3094,6 +3139,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+    }
+
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return false;
+        }
+        return common_speculative_mtp_carry_state_save(
+            pending_h_lifecycle[seq_id], pending_h[seq_id], data);
+    }
+
+    bool set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return false;
+        }
+        return common_speculative_mtp_carry_state_load(
+            pending_h_lifecycle[seq_id], pending_h[seq_id], data);
     }
 
     void sequence_transition(
@@ -5562,10 +5623,10 @@ common_speculative_init_result::common_speculative_init_result(
         }
 
         if (external_mtp_sidecar) {
-            // The loader borrows exact pointers so the compact file can be
-            // constructed. Normalize them for the drafter scheduler now:
-            // same-device tensors stay shared; foreign/meta tensors become
-            // draft-owned gathered copies.
+            // Normalize tensors omitted or borrowed by compact sidecars for the
+            // drafter scheduler. Self-contained MTP models retain their own
+            // embedding/head. Same-device target tensors stay shared;
+            // foreign/meta tensors become draft-owned gathered copies.
             llama_model_share_tensors(model_dft, model_tgt);
         }
 
@@ -6063,14 +6124,16 @@ bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id
     return false;
 }
 
-void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data) {
+bool common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data) {
     if (spec == nullptr) {
-        return;
+        return false;
     }
 
+    bool restored = false;
     for (auto & impl : spec->impls) {
-        impl->set_state(seq_id, data);
+        restored = impl->set_state(seq_id, data) || restored;
     }
+    return restored;
 }
 
 void common_speculative_sequence_transition(
