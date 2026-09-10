@@ -635,6 +635,7 @@ ggml_cuda_ar_oneshot * ggml_cuda_ar_oneshot_init(const int * devices, size_t n_d
             GGML_LOG_INFO("%s: rank %zu slice block on NUMA node %d (%s)\n", __func__, r, node, st->slice_mmapped[r] ? "bound" : "unbound");
         }
     }
+    bool have_staging = true;
     for (size_t i = 0; i < n_devices; i++) {
         ggml_cuda_set_device(devices[i]);
         void * dptr = nullptr;
@@ -650,6 +651,7 @@ ggml_cuda_ar_oneshot * ggml_cuda_ar_oneshot_init(const int * devices, size_t n_d
         if (cudaMalloc((void **) &st->dev_stage[i], st->max_bytes / 2) != cudaSuccess) {
             (void) cudaGetLastError();
             st->dev_stage[i] = nullptr;
+            have_staging = false;
         }
         for (size_t r = 0; r < n_devices; r++) {
             void * sptr = nullptr;
@@ -659,6 +661,17 @@ ggml_cuda_ar_oneshot * ggml_cuda_ar_oneshot_init(const int * devices, size_t n_d
                 return nullptr;
             }
             st->dev_slices[i][r] = (char *) sptr;
+        }
+    }
+    // Every rank must publish and read the same payload format. If any staging
+    // allocation failed, release the others and use F32 on the whole communicator.
+    if (!have_staging) {
+        for (size_t i = 0; i < n_devices; i++) {
+            if (st->dev_stage[i] != nullptr) {
+                ggml_cuda_set_device(devices[i]);
+                (void) cudaFree(st->dev_stage[i]);
+                st->dev_stage[i] = nullptr;
+            }
         }
     }
     if (const char * tr = getenv("GGML_CUDA_AR1_TRACE")) {
