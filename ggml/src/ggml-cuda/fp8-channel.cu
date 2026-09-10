@@ -101,16 +101,14 @@ template<typename T>
 static void fp8_channel_pack_launch(const float * src, T * dst, float * scales,
         const int32_t * marker, int64_t k, int64_t m, int64_t padded_m,
         cudaStream_t stream, __nv_fp8_e4m3 * round_residual = nullptr, const float * up = nullptr) {
-    if constexpr (std::is_same<T, __nv_fp8_e4m3>::value) {
-        if (up) {
-            if (k == 5120) {
-                fp8_channel_pack<T, 20, true><<<padded_m, 256, 0, stream>>>(src, dst, scales, marker, k, m, nullptr, up);
-            } else {
-                GGML_ASSERT(k == 17408);
-                fp8_channel_pack<T, 68, true><<<padded_m, 256, 0, stream>>>(src, dst, scales, marker, k, m, nullptr, up);
-            }
-            return;
+    if (up) {
+        if (k == 5120) {
+            fp8_channel_pack<T, 20, true><<<padded_m, 256, 0, stream>>>(src, dst, scales, marker, k, m, nullptr, up);
+        } else {
+            GGML_ASSERT(k == 17408);
+            fp8_channel_pack<T, 68, true><<<padded_m, 256, 0, stream>>>(src, dst, scales, marker, k, m, nullptr, up);
         }
+        return;
     }
     // Retain a row across the reduction for these measured widths, avoiding
     // its second global read. Other widths keep the generic streaming loop.
@@ -149,6 +147,27 @@ static __global__ void fp8_channel_unpack_reference(
         const float value = float(src[i]);
         dst[i] = __float2bfloat16_rn(scales ? value * scales[i/k] : value);
     }
+}
+
+static __device__ uint16_t fp8_bf16_bits(uint8_t value) {
+    const unsigned magnitude = value & 127;
+    if (magnitude >= 8 && magnitude != 127) {
+        // E4M3 normals widen exactly: adjust exponent bias and mantissa width.
+        return uint16_t((unsigned(value & 128) << 8) | ((magnitude << 4) + 0x3c00));
+    }
+    // Preserve the existing signed-zero, subnormal and NaN conversion rules.
+    __nv_fp8_e4m3 x;
+    x.__x = value;
+    return __bfloat16_as_ushort(__float2bfloat16_rn(float(x)));
+}
+
+static __global__ void fp8_channel_unpack_vector(
+        const uint32_t * src, uint2 * dst, int64_t groups) {
+    const int64_t i = int64_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    if (i >= groups) return;
+    const uint32_t x = src[i];
+    dst[i] = make_uint2(uint32_t(fp8_bf16_bits(x)) | (uint32_t(fp8_bf16_bits(x >> 8)) << 16),
+                       uint32_t(fp8_bf16_bits(x >> 16)) | (uint32_t(fp8_bf16_bits(x >> 24)) << 16));
 }
 
 struct fp8_channel_lt_descriptors {
@@ -363,10 +382,14 @@ bool ggml_cuda_mul_mat_fp8_channel_lt(ggml_backend_cuda_context & ctx, ggml_tens
     const char * reference = getenv("GGML_CUDA_FP8_LT_REFERENCE");
     const bool bf16_reference = reference != nullptr;
     const bool fused_bf16 = reference && std::string(reference) == "fused-bf16";
+    const char * prep_env = getenv("BUUN_PRIVATE_BF16_PREP");
+    const int prep = fused_bf16 && prep_env ? atoi(prep_env) : 0;
+    const bool vector_weights = prep & 1;
+    const bool fuse_bf16_glu = prep & 2;
     const bool rounded_reference = fused_bf16 || (reference && std::string(reference) == "rounded-bf16");
     const bool round_correction = !bf16_reference && getenv("GGML_CUDA_FP8_LT_ROUND_CORRECTION");
     const bool wide_scale = getenv("GGML_CUDA_FP8_LT_WIDE_SCALE") != nullptr;
-    if (fuse_swiglu && (bf16_reference || round_correction || wide_scale ||
+    if (fuse_swiglu && ((bf16_reference && !fuse_bf16_glu) || round_correction || wide_scale ||
             getenv("GGML_CUDA_FP8_LT_CHECK_ALL") || getenv("GGML_CUDA_FP8_LT_CHECK") ||
             getenv("GGML_CUDA_FP8_LT_DUMP"))) return false;
     const auto * pack_src = static_cast<const float *>(fuse_swiglu ? x->src[0]->data : x->data);
@@ -429,14 +452,21 @@ bool ggml_cuda_mul_mat_fp8_channel_lt(ggml_backend_cuda_context & ctx, ggml_tens
     int count = 0;
     const auto status = cublasLtMatmulAlgoGetHeuristic(handle, plan.op, plan.a, plan.b,
         plan.c, plan.c, plan.preference, 1, &heuristic, &count);
-    if (status == CUBLAS_STATUS_NOT_SUPPORTED) {
-        return false;
-    }
+    if (status == CUBLAS_STATUS_NOT_SUPPORTED) return false;
     CUBLAS_CHECK(status);
-    if (count == 0) {
-        return false;
-    }
+    if (count == 0) return false;
     CUBLAS_CHECK(heuristic.state);
+    // Private measured-shape experiment; full-model exactness is gated separately.
+    if ((prep & 8) && k == 5120 && m == 2048 && (n == 6144 || n == 14336 || n == 17408)) {
+        cublasLtMatmulHeuristicResult_t choices[3]{};
+        int found = 0;
+        CUBLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(handle, plan.op, plan.a, plan.b,
+            plan.c, plan.c, plan.preference, 3, choices, &found));
+        const int index = n == 6144 ? 1 : 2;
+        if (found > index && choices[index].state == CUBLAS_STATUS_SUCCESS) {
+            heuristic = choices[index];
+        }
+    }
     ggml_cuda_pool_alloc<__nv_fp8_e4m3> packed(ctx.pool(), k * padded_m);
     ggml_cuda_pool_alloc<float> input_scales(ctx.pool(), padded_m);
     ggml_cuda_pool_alloc<float> unscaled(ctx.pool(), n * padded_m * split_k);
@@ -455,8 +485,8 @@ bool ggml_cuda_mul_mat_fp8_channel_lt(ggml_backend_cuda_context & ctx, ggml_tens
     }
     if (fused_bf16) {
         fp8_channel_pack_launch(
-            static_cast<const float *>(x->data), reference_x.get(), input_scales.get(),
-            static_cast<const int32_t *>(marker->data), k, m, padded_m, ctx.stream());
+            pack_src, reference_x.get(), input_scales.get(),
+            static_cast<const int32_t *>(marker->data), k, m, padded_m, ctx.stream(),nullptr,pack_up);
     } else {
         fp8_channel_pack_launch(
             pack_src, packed.get(), input_scales.get(),
@@ -466,8 +496,13 @@ bool ggml_cuda_mul_mat_fp8_channel_lt(ggml_backend_cuda_context & ctx, ggml_tens
     const void * gemm_w = w->data;
     const void * gemm_x = packed.get();
     if (bf16_reference) {
-        fp8_channel_unpack_reference<<<(n*k + 255)/256, 256, 0, ctx.stream()>>>(
-            static_cast<const __nv_fp8_e4m3 *>(w->data), reference_w.get(), n*k, nullptr, k);
+        if (vector_weights) {
+            fp8_channel_unpack_vector<<<(n*k/4+255)/256,256,0,ctx.stream()>>>(
+                static_cast<const uint32_t *>(w->data),reinterpret_cast<uint2 *>(reference_w.get()),n*k/4);
+        } else {
+            fp8_channel_unpack_reference<<<(n*k + 255)/256, 256, 0, ctx.stream()>>>(
+                static_cast<const __nv_fp8_e4m3 *>(w->data), reference_w.get(), n*k, nullptr, k);
+        }
         if (!fused_bf16) {
             fp8_channel_unpack_reference<<<(padded_m*k + 255)/256, 256, 0, ctx.stream()>>>(
                 packed.get(), reference_x.get(), padded_m*k, rounded_reference ? input_scales.get() : nullptr, k);

@@ -1247,9 +1247,34 @@ int main(int argc, char ** argv) {
         config["text_config"]["linear_value_head_dim"]                      = 1;
         config["quantization_config"]["config_groups"]["fp8"]["targets"][0] = channel_module;
         llama_safetensors_qwen35_importer channel_importer(channel_dir, config);
-        require(channel_importer.materialize("blk.0.ssm_out.scale", GGML_TYPE_BF16, 4) ==
-                    std::vector<uint8_t>({ 1, 2, 3, 4 }),
+        ggml_type channel_scale_type;
+        std::array<int64_t, GGML_MAX_DIMS> channel_scale_ne;
+        require(channel_importer.describe("blk.0.ssm_out.scale", channel_scale_type, channel_scale_ne) &&
+                    channel_scale_type == GGML_TYPE_F32 &&
+                    channel_scale_ne == std::array<int64_t, GGML_MAX_DIMS>{2, 1, 1, 1},
+                "BF16 FP8 channel scales did not select the shared FP32 scale contract");
+        require(channel_importer.materialize("blk.0.ssm_out.scale", channel_scale_type, 8) ==
+                    std::vector<uint8_t>({ 0, 0, 1, 2, 0, 0, 3, 4 }),
                 "Qwen output channel scale incorrectly followed the weight's column permutation");
+
+        // Widen BF16 scales exactly, for both published channel-scale shapes.
+        const auto channel_bf16_dir = dir.path / "channel-bf16-scales";
+        for (const auto & shape : { std::vector<uint64_t>{2}, std::vector<uint64_t>{2, 1} }) {
+            write_single_shard_model(channel_bf16_dir, {
+                { channel_module + ".weight", "F8_E4M3", {2, 2}, {0, 0, 0, 0} },
+                { channel_module + ".weight_scale", "BF16", shape, {0x80, 0x3f, 0x40, 0x3f} },
+            });
+            write_text(channel_bf16_dir / "generation_config.json", "{}");
+            write_text(channel_bf16_dir / "tokenizer.json", "{}");
+            llama_safetensors_qwen35_importer importer(channel_bf16_dir, config);
+            require(importer.describe("blk.0.ssm_out.scale", channel_scale_type, channel_scale_ne) &&
+                        channel_scale_type == GGML_TYPE_F32 &&
+                        channel_scale_ne == std::array<int64_t, GGML_MAX_DIMS>{2, 1, 1, 1},
+                    "BF16 FP8 channel scale descriptor is not canonical FP32");
+            require(importer.materialize("blk.0.ssm_out.scale", channel_scale_type, 8) ==
+                        std::vector<uint8_t>({0, 0, 0x80, 0x3f, 0, 0, 0x40, 0x3f}),
+                    "BF16 FP8 channel scales changed value during widening");
+        }
 
         // Preserve channel scales that are not exactly representable in BF16.
         const auto channel_f32_dir = dir.path / "channel-f32-scales";
@@ -1298,7 +1323,7 @@ int main(int argc, char ** argv) {
         require(qkv_importer.materialize("blk.0.attn_qkv.weight", qkv_type, 8) == std::vector<uint8_t>(8, 0x38),
                 "FP8 QKV fallback changed source weights");
         require(qkv_importer.describe("blk.0.attn_qkv.scale", qkv_type, qkv_ne) &&
-                    qkv_type == GGML_TYPE_BF16 && qkv_ne[0] == 4,
+                    qkv_type == GGML_TYPE_F32 && qkv_ne[0] == 4,
                 "FP8 QKV fallback lost its channel scales");
 
         // Full-attention FP8 Q|K|V must preserve both weight bytes and the
@@ -1366,7 +1391,7 @@ int main(int argc, char ** argv) {
             tensor.data.clear();
             for (uint64_t row = 0; row < tensor.shape[0]; ++row) {
                 tensor.data.insert(tensor.data.end(), {0x80, 0x3f});
-                bf16_joined_scales.insert(bf16_joined_scales.end(), {0x80, 0x3f});
+                bf16_joined_scales.insert(bf16_joined_scales.end(), {0, 0, 0x80, 0x3f});
             }
         }
         const auto bf16_qkv_dir = dir.path / "full-qkv-fp8-bf16-scale";
@@ -1374,19 +1399,26 @@ int main(int argc, char ** argv) {
         write_text(bf16_qkv_dir / "generation_config.json", "{}");
         write_text(bf16_qkv_dir / "tokenizer.json", "{}");
         llama_safetensors_qwen35_importer bf16_qkv_importer(bf16_qkv_dir, full_qkv_config);
-        require(bf16_qkv_importer.describe("blk.3.attn_qkv.scale", qkv_type, qkv_ne) && qkv_type == GGML_TYPE_BF16 &&
-                    bf16_qkv_importer.materialize("blk.3.attn_qkv.scale", qkv_type, 16) == bf16_joined_scales,
-                "FP8 QKV did not preserve BF16 scale bytes");
+        require(bf16_qkv_importer.describe("blk.3.attn_qkv.scale", qkv_type, qkv_ne) && qkv_type == GGML_TYPE_F32 &&
+                    bf16_qkv_importer.materialize("blk.3.attn_qkv.scale", qkv_type, 32) == bf16_joined_scales,
+                "FP8 QKV did not preserve widened BF16 scale values");
 
-        // Do not silently convert mixed scale precisions just to enable fusion.
+        // Mixed source precisions can share the canonical F32 contract without
+        // rounding the F32 values or changing the widened BF16 values.
         bf16_qkv_tensors[5] = full_qkv_tensors[5];
         const auto mixed_qkv_dir = dir.path / "full-qkv-fp8-mixed-scale";
         write_single_shard_model(mixed_qkv_dir, bf16_qkv_tensors);
         write_text(mixed_qkv_dir / "generation_config.json", "{}");
         write_text(mixed_qkv_dir / "tokenizer.json", "{}");
         llama_safetensors_qwen35_importer mixed_qkv_importer(mixed_qkv_dir, full_qkv_config);
-        require(!mixed_qkv_importer.describe("blk.3.attn_qkv.weight", qkv_type, qkv_ne),
-                "FP8 QKV silently combined mixed channel-scale precisions");
+        auto mixed_joined_scales = bf16_joined_scales;
+        const auto & last_scale_bytes = full_qkv_tensors[5].data;
+        std::copy(last_scale_bytes.begin(), last_scale_bytes.end(),
+                  mixed_joined_scales.end() - last_scale_bytes.size());
+        require(mixed_qkv_importer.describe("blk.3.attn_qkv.scale", qkv_type, qkv_ne) &&
+                    qkv_type == GGML_TYPE_F32 &&
+                    mixed_qkv_importer.materialize("blk.3.attn_qkv.scale", qkv_type, 32) == mixed_joined_scales,
+                "FP8 QKV changed mixed-precision channel-scale values");
 
         // Static input quantization is not qualified for this concatenation.
         auto static_qkv_config = full_qkv_config;
@@ -1874,7 +1906,7 @@ int main(int argc, char ** argv) {
         const auto complete_weight = complete.bind("module", llama_safetensors_quant_role::WEIGHT);
         const auto scale           = complete.bind("module", llama_safetensors_quant_role::WEIGHT_SCALE);
         const auto input           = complete.bind("module", llama_safetensors_quant_role::INPUT_SCALE);
-        require(complete_weight.has_value() && scale.has_value() && scale->target_type == GGML_TYPE_BF16 &&
+        require(complete_weight.has_value() && scale.has_value() && scale->target_type == GGML_TYPE_F32 &&
                     scale->target_shape == std::vector<int64_t>({ 2 }) &&
                     input.has_value() && input->target_type == GGML_TYPE_I32 &&
                     input->materialization == llama_safetensors_quant_materialization::DYNAMIC_FP8_MARKER,

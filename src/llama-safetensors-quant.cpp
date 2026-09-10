@@ -918,8 +918,11 @@ std::optional<llama_safetensors_quant_binding> llama_safetensors_quant_adapters:
         result.target_shape = { static_cast<int64_t>(weight.shape[0]) };
         result.materialization = llama_safetensors_quant_materialization::BROADCAST_BF16_SCALAR;
     } else if (group->format == llama_safetensors_quant_format::FP8_CHANNEL) {
-        result.target_type  = !group->modelopt && scale.dtype == llama_safetensors_dtype::F32 ?
-            GGML_TYPE_F32 : GGML_TYPE_BF16;
+        // The shared channel-scale matmul contract uses F32. Widen BF16
+        // source scales exactly at import instead of leaving a separate
+        // post-matmul multiply that bypasses native FP8 GEMM dispatch.
+        // Keep ModelOpt's existing rounded-scale materialization unchanged.
+        result.target_type = group->modelopt ? GGML_TYPE_BF16 : GGML_TYPE_F32;
         result.target_shape = { static_cast<int64_t>(scale.shape[0]) };
         if (group->modelopt) {
             result.materialization = llama_safetensors_quant_materialization::POSITIVE_F32_TO_BF16;
