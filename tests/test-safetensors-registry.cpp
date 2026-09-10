@@ -2913,12 +2913,13 @@ int main(int argc, char ** argv) {
         for (size_t col = 0; col < cols; ++col) {
             for (size_t row = 0; row < rows; ++row) {
                 weight[col * packed_rows + row / 8] |=
-                    uint32_t((3 * col + row) % 16) << shifts[row % 8];
+                    uint32_t((3 * col + row + 3 * (row / 32)) % 16) << shifts[row % 8];
             }
         }
         for (size_t row = 0; row < rows; ++row) {
-            zero[row / 8] |= uint32_t(1 + row % 8) << shifts[row % 8];
-            store_bf16(scales, row, 0.5f + 0.125f * (row % 8));
+            // Distinguish heads: a 32-row head permutation must change the bytes.
+            zero[row / 8] |= uint32_t(1 + (row + row / 32) % 8) << shifts[row % 8];
+            store_bf16(scales, row, 0.5f + 0.125f * ((row + row / 32) % 8));
         }
         const std::string module = "model.layers.0.linear_attn.in_proj_qkv";
         write_single_shard_model(path, {
@@ -2942,12 +2943,13 @@ int main(int argc, char ** argv) {
         llama_safetensors_qwen35_importer importer(path, config);
         ggml_type target_type;
         std::array<int64_t, GGML_MAX_DIMS> ne;
-        require(importer.describe("blk.0.attn_qkv.weight", target_type, ne) &&
+        // This fixture has no Z projection; test the unfused QKV transform.
+        require(importer.describe("blk.0.attn_qkv_part.weight", target_type, ne) &&
                     target_type == GGML_TYPE_Q4_1 && ne[0] == int64_t(cols) && ne[1] == int64_t(rows),
                 "Quark Qwen3.5 QKV transform has the wrong target contract");
         constexpr size_t block_size = 2 * sizeof(ggml_fp16_t) + 16;
         const std::vector<uint8_t> transformed = importer.materialize(
-            "blk.0.attn_qkv.weight", target_type, rows * (cols / 32) * block_size);
+            "blk.0.attn_qkv_part.weight", target_type, rows * (cols / 32) * block_size);
         for (size_t dst_row = 0; dst_row < rows; ++dst_row) {
             size_t src_row = dst_row;
             if (dst_row >= 128) {
@@ -2958,12 +2960,62 @@ int main(int argc, char ** argv) {
             for (size_t block = 0; block < cols / 32; ++block) {
                 std::array<uint8_t, 32> codes{};
                 for (size_t col = 0; col < codes.size(); ++col) {
-                    codes[col] = (3 * (block * 32 + col) + src_row) % 16;
+                    codes[col] = (3 * (block * 32 + col) + src_row + 3 * (src_row / 32)) % 16;
                 }
                 require_q4_1_block(
                     transformed.data() + (dst_row * (cols / 32) + block) * block_size,
-                    0.5f + 0.125f * (src_row % 8), 1 + src_row % 8, codes,
+                    0.5f + 0.125f * ((src_row + src_row / 32) % 8), 1 + (src_row + src_row / 32) % 8, codes,
                     "Quark Qwen3.5 QKV transform split a quant block or moved the wrong row");
+            }
+        }
+
+        // Complete checkpoint fragment: default fusion must append independently
+        // permuted Z rows without changing the already-verified QKV bytes.
+        constexpr size_t z_rows = 128;
+        std::vector<uint32_t> z_weight(cols * z_rows / 8);
+        std::vector<uint32_t> z_zero(z_rows / 8);
+        std::vector<uint8_t> z_scales(z_rows * sizeof(uint16_t));
+        for (size_t row = 0; row < z_rows; ++row) {
+            for (size_t col = 0; col < cols; ++col) {
+                z_weight[col * (z_rows / 8) + row / 8] |=
+                    uint32_t((5 * col + row + 7 * (row / 32)) % 16) << shifts[row % 8];
+            }
+            z_zero[row / 8] |= uint32_t(2 + row / 32) << shifts[row % 8];
+            store_bf16(z_scales, row, 1.5f + 0.25f * (row / 32));
+        }
+        const auto fused_path = dir.path / "quark-qwen35-qkvz-transform";
+        const std::string z_module = "model.layers.0.linear_attn.in_proj_z";
+        write_single_shard_model(fused_path, {
+            { module + ".weight",              "I32",  { cols, packed_rows }, i32_bytes(weight)   },
+            { module + ".weight_scale",        "BF16", { 1, rows },           scales              },
+            { module + ".weight_zero_point",   "I32",  { 1, packed_rows },    i32_bytes(zero)     },
+            { z_module + ".weight",            "I32",  { cols, z_rows / 8 },  i32_bytes(z_weight) },
+            { z_module + ".weight_scale",      "BF16", { 1, z_rows },         z_scales            },
+            { z_module + ".weight_zero_point", "I32",  { 1, z_rows / 8 },     i32_bytes(z_zero)   },
+        });
+        write_text(fused_path / "generation_config.json", "{}");
+        write_text(fused_path / "tokenizer.json", "{}");
+        llama_safetensors_qwen35_importer fused_importer(fused_path, config);
+        require(fused_importer.describe("blk.0.attn_qkv.weight", target_type, ne) &&
+                    target_type == GGML_TYPE_Q4_1 &&
+                    ne == std::array<int64_t, GGML_MAX_DIMS>{cols, rows + z_rows, 1, 1},
+                "Quark Qwen3.5 default QKV|Z fusion has the wrong target contract");
+        const auto fused = fused_importer.materialize(
+            "blk.0.attn_qkv.weight", target_type, (rows + z_rows) * (cols / 32) * block_size);
+        require(std::equal(transformed.begin(), transformed.end(), fused.begin()),
+                "Quark QKV|Z fusion changed the QKV prefix");
+        constexpr std::array<size_t, 4> z_head_order = { 0, 2, 1, 3 };
+        for (size_t dst_row = 0; dst_row < z_rows; ++dst_row) {
+            const size_t src_row = z_head_order[dst_row / 32] * 32 + dst_row % 32;
+            for (size_t block = 0; block < cols / 32; ++block) {
+                std::array<uint8_t, 32> codes{};
+                for (size_t col = 0; col < codes.size(); ++col) {
+                    codes[col] = (5 * (block * 32 + col) + src_row + 7 * (src_row / 32)) % 16;
+                }
+                require_q4_1_block(
+                    fused.data() + ((rows + dst_row) * (cols / 32) + block) * block_size,
+                    1.5f + 0.25f * (src_row / 32), 2 + src_row / 32, codes,
+                    "Quark QKV|Z fusion moved the wrong Z row or changed its quantization");
             }
         }
     }
@@ -4360,9 +4412,17 @@ int main(int argc, char ** argv) {
     {
         llama_safetensors_json config = llama_safetensors_json::parse(modelopt_w4a16_nvfp4_config);
         config["quantization_config"]["quant_algo"] = "NVFP4";
+        const auto parsed = llama_safetensors_quant_config::from_json(config);
+        const auto * group = parsed.match("module");
+        require(group != nullptr && group->format == llama_safetensors_quant_format::NVFP4_PACK &&
+                    group->modelopt && group->group_size == 16 && !group->input_quantized &&
+                    parsed.match("ignored") == nullptr,
+                "ModelOpt NVFP4 alias did not select the W4A16 weight/activation contract");
+        // Alias normalization must retain the original format validation.
+        config["quantization_config"]["group_size"] = 32;
         require_rejected([&] {
             (void) llama_safetensors_quant_config::from_json(config);
-        }, "ModelOpt W4A4 NVFP4 was accepted without an FP4 activation contract");
+        }, "ModelOpt NVFP4 alias accepted an unsupported group size");
     }
     {
         const auto path = dir.path / "modelopt-mixed";
