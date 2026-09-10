@@ -1792,7 +1792,8 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
     // F32 where NCCL rounds large tensors to BF16. GGML_CUDA_ALLREDUCE_ONESHOT=0 disables; the value sets
     // the byte limit, default 32 MiB (pinned memory: 5 slots x limit per rank), which keeps 2048-token
     // prompt ubatches of a 2560-wide model on this path (-ub 2048 is the fastest prefill setting).
-    {
+    // An explicit backend selection takes precedence over the automatic fast path.
+    if (env == nullptr) {
         const char * env_os = getenv("GGML_CUDA_ALLREDUCE_ONESHOT");
         const size_t limit = env_os == nullptr ? (size_t) 32 * 1024 * 1024 : (size_t) atoll(env_os);
         if (limit > 0 && n_backends >= 2) {
