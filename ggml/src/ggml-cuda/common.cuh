@@ -1751,6 +1751,11 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pool & pool() {
         return pool(device);
     }
+
+#if !defined(GGML_USE_HIP)
+    // EXL3 reductions can overlap across backend contexts and streams.
+    int * exl3_int8_counter_storage[GGML_CUDA_MAX_STREAMS] = {};
+#endif
 };
 
 struct ggml_cuda_mm_fusion_args_host {

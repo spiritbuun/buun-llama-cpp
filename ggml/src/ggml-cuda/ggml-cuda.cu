@@ -808,6 +808,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         }
     }
     for (int i = 0; i < GGML_CUDA_MAX_STREAMS; ++i) {
+        if (exl3_int8_counter_storage[i] != nullptr) {
+            CUDA_CHECK(cudaFree(exl3_int8_counter_storage[i]));
+        }
         auto & storage = humming_fp8_locks[i];
         if (storage.ptr != nullptr) {
             CUDA_CHECK(cudaFree(storage.ptr));

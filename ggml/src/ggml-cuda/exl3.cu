@@ -162,18 +162,18 @@ static bool exl3_int8_resid(int bits, bool head) {
     return head || (mode != 2 && bits >= 7);
 }
 
-// Self-cleaning per-device counter block (one int per 256-column group), zero at rest.
+// Self-cleaning context/stream counter block (one int per column group and pair), zero at rest.
 constexpr size_t EXL3_INT8_MAX_N = 262144;
 constexpr size_t EXL3_INT8_COUNTERS = 65536;   // column groups x (token, expert) pairs
 
-int * exl3_int8_counters(int device, cudaStream_t stream) {
-    static int * ws[GGML_CUDA_MAX_DEVICES] = {};
-    if (ws[device] == nullptr) {
-        ggml_cuda_set_device(device);
-        CUDA_CHECK(cudaMalloc(&ws[device], EXL3_INT8_COUNTERS * sizeof(int)));
-        CUDA_CHECK(cudaMemsetAsync(ws[device], 0, EXL3_INT8_COUNTERS * sizeof(int), stream));
+int * exl3_int8_counters(ggml_backend_cuda_context & ctx) {
+    int * & ws = ctx.exl3_int8_counter_storage[ctx.curr_stream_no];
+    if (ws == nullptr) {
+        ggml_cuda_set_device(ctx.device);
+        CUDA_CHECK(cudaMalloc(&ws, EXL3_INT8_COUNTERS * sizeof(int)));
+        CUDA_CHECK(cudaMemsetAsync(ws, 0, EXL3_INT8_COUNTERS * sizeof(int), ctx.stream()));
     }
-    return ws[device];
+    return ws;
 }
 
 // Dynamic shared-memory budget per device: the 96 KB design cap, or what the device leaves after the
@@ -223,7 +223,7 @@ void exl3_gemv_int8_launch(ggml_backend_cuda_context & ctx, const uint8_t * B, c
     int ksplit, nrows; size_t smem;
     exl3_int8_geometry(bits, nacc, M, k, colblocks, pairs, cap, ksplit, nrows, smem);
     ggml_cuda_pool_alloc<float> partials(ctx.pool(), size_t(ksplit) * M * pairs * n);
-    int * counters = exl3_int8_counters(ctx.device, stream);
+    int * counters = exl3_int8_counters(ctx);
     kernel<<<dim3(colblocks, ksplit, pairs), exl3_int8::THREADS, smem, stream>>>(
         B, x, suh, svh, y, partials.get(), counters, k, n, nrows, ga);
 }
