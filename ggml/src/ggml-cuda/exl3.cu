@@ -249,6 +249,14 @@ void exl3_int8_run(ggml_backend_cuda_context & ctx, const float * x, const half 
 template <int bits, int cb>
 void exl3_moe_run(ggml_backend_cuda_context & ctx, const float * x, const half * suh, const uint8_t * B, const half * svh,
         float * y, int k, int n, int pairs, exl3_int8::grouped_args ga, cudaStream_t stream) {
+    // The mul1 codebook uses int8 activations in both executors. Preserve the
+    // dense executor's residual policy when an expert takes the grouped path.
+    if constexpr (cb == 2) {
+        if (exl3_int8_resid(bits, false)) {
+            exl3_gemv_int8_launch<bits, cb, 1, true, true>(ctx, B, x, suh, svh, y, k, n, pairs, ga, stream);
+            return;
+        }
+    }
     exl3_gemv_int8_launch<bits, cb, 1, false, true>(ctx, B, x, suh, svh, y, k, n, pairs, ga, stream);
 }
 
