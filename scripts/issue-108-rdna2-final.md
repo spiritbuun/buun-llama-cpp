@@ -1,8 +1,10 @@
 # Issue 108 final RDNA2 campaign
 
-This branch contains the corrected gfx1030 WGP register accounting and uses a 256 KiB HIP
-VMM commit granularity. The campaign stops at the first failed preflight or benchmark and
-still creates an archive, rather than repeating the same failure across every arm.
+This branch contains the corrected gfx1030 WGP register accounting and uses a 256 KiB
+minimum HIP VMM commit granularity. A larger driver-mandated granularity remains
+authoritative; the campaign records the resolved value for each GPU in `vmm-policy.tsv`.
+The campaign stops at the first failed preflight or benchmark and still creates an archive,
+rather than repeating the same failure across every arm.
 
 Start from a clean checkout so the binary and source receipts cannot disagree:
 
@@ -40,8 +42,10 @@ scripts/issue-108-vmm-batching-campaign.sh \
 
 No diagnostic environment variables are needed; the script sets only the narrowly scoped
 ones needed for each child process. Detailed VMM timing is confined to the small preflight;
-the benchmark arms do not carry per-map instrumentation. Please attach both of these files
-to issue 108:
+the benchmark arms do not carry per-map instrumentation. The former 64 KiB arm is a
+request, so a driver that requires larger pages may resolve it to the same size as the
+default arm; the logs and summary retain both requested and observed sizes. Please attach
+both of these files to issue 108:
 
 ```text
 issue-108-rdna2-final-results.tar.gz

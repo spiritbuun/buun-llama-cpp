@@ -12,10 +12,11 @@ Runs the final issue #108 gfx1030 campaign. Before any timed matrix it:
   2. validates VMM accounting on GPU 0 and GPU 1; and
   3. runs a Q8 FlashAttention smoke test with the WGP correction receipt enabled.
 
-The timed arms compare static Q8, the production 256 KiB HIP VMM commit size, and the
-former 64 KiB policy in mirrored order. Every arm uses a fresh process. The first failure
-stops the campaign and still produces a summary/archive, so one defect cannot turn into a
-matrix of identical aborts.
+The timed arms compare static Q8, the production HIP VMM commit policy, and the former
+64 KiB request in mirrored order. The production policy has a 256 KiB minimum, but the
+resolved size can be larger when required by the driver. Every arm uses a fresh process.
+The first failure stops the campaign and still produces a summary/archive, so one defect
+cannot turn into a matrix of identical aborts.
 
 Default workload: pp1601, tg64, b32768, ub2048, t8, ngl99, Flash Attention on.
 
@@ -153,14 +154,28 @@ echo "[$(date --iso-8601=seconds)] policy preflight"
 grep -q '^PASS:' "$output_dir/policy-test.log" || \
     stop_campaign "RDNA2/VMM policy test did not report PASS"
 
+vmm_policy="$output_dir/vmm-policy.tsv"
+printf 'device\tobserved_commit_kb\n' > "$vmm_policy"
+
 for device in 0 1; do
     echo "[$(date --iso-8601=seconds)] VMM device $device preflight"
     GGML_VBR_VMM_DIAGNOSTICS=1 "$vmm_test" "$device" \
         > "$output_dir/vmm-device-$device.log" 2>&1 || \
         stop_campaign "VMM accounting failed on device $device"
-    grep -q "^PASS: device $device VMM range accounting (256 KiB pages)" \
-        "$output_dir/vmm-device-$device.log" || \
-        stop_campaign "device $device did not expose the production 256 KiB HIP VMM policy"
+
+    pass_line=$(grep -E "^PASS: device $device VMM range accounting \\([0-9]+ KiB pages\\)$" \
+        "$output_dir/vmm-device-$device.log" | tail -n 1 || true)
+    if [[ ! $pass_line =~ \(([0-9]+)[[:space:]]KiB[[:space:]]pages\)$ ]]; then
+        stop_campaign "device $device did not report its resolved HIP VMM commit granularity"
+    fi
+
+    observed_commit_kb=${BASH_REMATCH[1]}
+    if (( observed_commit_kb < 256 )); then
+        stop_campaign "device $device resolved a ${observed_commit_kb} KiB HIP VMM commit granularity below the production 256 KiB minimum"
+    fi
+
+    printf '%s\t%s\n' "$device" "$observed_commit_kb" >> "$vmm_policy"
+    echo "device $device production HIP VMM commit granularity: ${observed_commit_kb} KiB"
 done
 
 run_one() {
