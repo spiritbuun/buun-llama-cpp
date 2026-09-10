@@ -213,7 +213,8 @@ void exl3_gemv_int8_launch(ggml_backend_cuda_context & ctx, const uint8_t * B, c
         attr_set[ctx.device] = true;
     }
     const int colblocks = (n + exl3_int8::COLS - 1) / exl3_int8::COLS;
-    const int nacc = GROUPED ? (cb == 2 ? 1 : 0) : (RESID ? 2 : 1) * M;
+    // The kernel reserves the accumulator offset even for F16 codebooks.
+    const int nacc = (RESID ? 2 : 1) * M;
     // The grouped split is sized for the batch's pair count (deliberately batch-dependent): sizing it for
     // one token's expert set cost 3% of speculative throughput on Qwen3.8-Flash-Next (2800 verify blocks
     // instead of 800) and bought nothing, because that model's other batch-keyed kernels (F16 hyper-
