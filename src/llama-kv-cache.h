@@ -412,10 +412,6 @@ public:
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
 
-    // raise the floor of the n_kv read-extent padding (power of two >= 256; process-wide, never lowered):
-    // a multi-device tensor split uses it so its step graphs change shape less often
-    static void set_pad_floor(uint32_t cells);
-
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -1539,6 +1535,7 @@ private:
     // its side is not flag-pinned — every degrade/promote/sim walk must use this predicate
     bool vbr_unit_movable(ggml_type t, bool is_v) const;
     uint32_t vbr_watermark_cells(uint32_t extra_tokens) const; // shared by prepare() + ensure_mapped
+    uint32_t get_pad_floor() const; // model-scoped attention read padding, also used by scratch sizing
     enum class vbr_degrade_result {
         applied,
         exhausted,

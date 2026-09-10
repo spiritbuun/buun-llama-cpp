@@ -2697,14 +2697,9 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
 
-    // A tensor split (the meta backend presents its devices as one) records one step graph per KV-extent
-    // shape and pays ~1 s per new shape, so its attention READ extent is padded to 2048 cells instead of 256
-    // (LLAMA_KV_PAD can raise it further). Only the read-extent floor changes: the cache size itself keeps its
-    // own padding, so small contexts stay valid.
+    // Allocation padding is independent of the cache's model-scoped attention
+    // read padding, so small contexts remain valid under tensor splitting.
     const uint32_t attn_n_pad = 1;
-    if (split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
-        llama_kv_cache::set_pad_floor(2048);
-    }
 
     // TurboQuant dynamic-VBR inputs for the attention KV caches (no-op unless armed);
     // recurrent/DSA caches do not take them
