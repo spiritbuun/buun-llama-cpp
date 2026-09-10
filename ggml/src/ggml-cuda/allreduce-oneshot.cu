@@ -447,8 +447,6 @@ k_ar1_mb_reduce(float4 * __restrict__ dst, char * base, const ar1_bases bases, i
     }
 }
 
-static ggml_cuda_ar_oneshot * g_ar1_last = nullptr;
-
 // First-touch placement: fault the pages in from a thread pinned to the CPUs of `node` (sysfs cpulist), so the
 // default local-allocation policy puts them on that node. Returns false if the node's CPUs cannot be used.
 static bool ar1_first_touch_on_node(void * p, size_t bytes, int node) {
@@ -513,12 +511,9 @@ static int ar1_gpu_numa_node(int device) {
     return node;
 }
 
-// prints and clears the per-rank spin-timeout records (called from the backend synchronize under GGML_CUDA_AR1_DEBUG)
-void ggml_cuda_ar_oneshot_report_all() {
-    ggml_cuda_ar_oneshot * st = g_ar1_last;
-    if (st == nullptr) {
-        return;
-    }
+// Report only the communicator being submitted; backend contexts can outlive
+// other communicators in the same process.
+static void ggml_cuda_ar_oneshot_report(ggml_cuda_ar_oneshot * st) {
     if (st->host_trace != nullptr && !st->trace_printed) {
         bool ready = true;
         for (int i = 0; i < st->n_ranks && ready; i++) {
@@ -691,7 +686,6 @@ ggml_cuda_ar_oneshot * ggml_cuda_ar_oneshot_init(const int * devices, size_t n_d
         }
     }
     GGML_LOG_INFO("%s: one-shot host-memory AllReduce for %zu devices, up to %zu bytes per tensor\n", __func__, n_devices, st->max_bytes);
-    g_ar1_last = st;
     return st;
 }
 
@@ -722,6 +716,9 @@ void ggml_cuda_ar_oneshot_free(ggml_cuda_ar_oneshot * st) {
     }
     if (st->host_base != nullptr) {
         (void) cudaFreeHost(st->host_base);
+    }
+    if (st->host_trace != nullptr) {
+        (void) cudaFreeHost(st->host_trace);
     }
     delete st;
 }
@@ -757,7 +754,7 @@ bool ggml_cuda_ar_oneshot_allreduce_rank(ggml_cuda_ar_oneshot * st, ggml_backend
     static const size_t mb_from = getenv("GGML_CUDA_AR1_MB_FROM") != nullptr ? (size_t) atoll(getenv("GGML_CUDA_AR1_MB_FROM")) : (size_t) 256 * 1024;
     const int multi_block = ggml_nbytes(tensors[0]) > mb_from && n4 >= st->n_ranks * AR1_MB_BLOCKS;
     if (rank == 0) {
-        ggml_cuda_ar_oneshot_report_all();
+        ggml_cuda_ar_oneshot_report(st);
     }
     {
         const int i = rank;

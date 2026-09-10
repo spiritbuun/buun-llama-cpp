@@ -3992,10 +3992,6 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 }
 
 static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
-    static const bool ar1_debug = getenv("GGML_CUDA_AR1_DEBUG") != nullptr || getenv("GGML_CUDA_AR1_TRACE") != nullptr;
-    if (ar1_debug) {
-        ggml_cuda_ar_oneshot_report_all();
-    }
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
