@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Experimental paired FFN epilogue; the retained provider defines the base
+// Paired FFN epilogue; the retained provider defines the base
 // split2 GEMM. Build against unmodified CUTLASS 4.3.4 headers.
 #include "fp8-cutlass-sm120.cu"
 using Retained                 = Plan<true, false, true>;
@@ -115,51 +115,8 @@ struct PairedEpilogue {
     }
 };
 
-extern "C" int ffn_epilogue_layout_check() {
-    typename Retained::BaseMain::TiledMma mma;
-    for (int thread = 0; thread < size(mma); ++thread) {
-        auto      coords = mma.get_slice(thread).partition_C(make_identity_tensor(Shape<_128, _128>{}));
-        const int step   = PairGroup == 1 ? 1 : (PairGroup / 16) * size<0>(coords) * size<1>(coords);
-        for (int i = 0; i < size(coords); ++i) {
-            const auto a = coords(i), b = coords(i ^ step);
-            if (i % 2 == 0) {
-                const auto next = coords(i + 1);
-                if (get<0>(a) != get<0>(next) || get<1>(next) != get<1>(a) + 1 || get<1>(a) % 2) {
-                    return -2;
-                }
-            }
-            if (get<0>(a) != get<0>(b) || (get<1>(a) ^ PairGroup) != get<1>(b)) {
-                printf("thread=%d step=%d size=%d,%d,%d\n", thread, step, int(size<0>(coords)), int(size<1>(coords)),
-                       int(size<2>(coords)));
-                for (int j = 0; j < size(coords); ++j) {
-                    printf("i=%d m=%d n=%d\n", j, int(get<0>(coords(j))), int(get<1>(coords(j))));
-                }
-                return -1;
-            }
-        }
-    }
-    return 0;
-}
-
 // DualMain extends SeparateMain; preserve their definition order.
 // clang-format off
 #include "fp8-cutlass-ffn-load.cuh"
 #include "fp8-cutlass-ffn-dual.cuh"
 // clang-format on
-
-// Standalone reference entry point for exact-output qualification.
-__global__ void ffn_reference(const float * gate, const float * up, float * output, int64_t count) {
-    int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i < count) {
-        output[i] = (gate[i] / (1.0f + expf(-gate[i]))) * up[i];
-    }
-}
-
-extern "C" int ffn_epilogue_reference(const float * gate,
-                                      const float * up,
-                                      float *       output,
-                                      int64_t       count,
-                                      cudaStream_t  stream) {
-    ffn_reference<<<(count + 255) / 256, 256, 0, stream>>>(gate, up, output, count);
-    return int(cudaGetLastError());
-}

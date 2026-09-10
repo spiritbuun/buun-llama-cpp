@@ -5436,15 +5436,15 @@ struct test_mul_mat_quant_glu_chain : public test_case {
 
 struct test_mul_mat_dynamic_fp8 : public test_case {
     test_mul_mat_dynamic_fp8(bool channel_scale = false, float upper_bound = 0.0f, bool dynamic_input = true,
-            ggml_type scale_type = GGML_TYPE_BF16, int64_t k = 32, int64_t n = 4, int64_t m = 3) :
+            ggml_type scale_type = GGML_TYPE_BF16, int64_t k = 32, int64_t n = 4, int64_t m = 3, bool swiglu = false) :
         channel_scale(channel_scale), upper_bound(upper_bound), dynamic_input(dynamic_input),
-        scale_type(scale_type), k(k), n(n), m(m) {}
+        scale_type(scale_type), k(k), n(n), m(m), swiglu(swiglu) {}
 
     std::string vars() override {
         char buffer[192];
-        snprintf(buffer, sizeof(buffer), "k=%lld,n=%lld,m=%lld,channel_scale=%s,upper_bound=%.1f,dynamic_input=%s,scale_type=%s",
+        snprintf(buffer, sizeof(buffer), "k=%lld,n=%lld,m=%lld,channel_scale=%s,upper_bound=%.1f,dynamic_input=%s,scale_type=%s,swiglu=%s",
             (long long) k, (long long) n, (long long) m, channel_scale ? "true" : "false", upper_bound,
-            dynamic_input ? "true" : "false", ggml_type_name(scale_type));
+            dynamic_input ? "true" : "false", ggml_type_name(scale_type), swiglu ? "true" : "false");
         return buffer;
     }
     std::string op_desc(ggml_tensor *) override {
@@ -5458,6 +5458,11 @@ struct test_mul_mat_dynamic_fp8 : public test_case {
         ggml_set_name(weight, "dynamic_fp8_weight");
         ggml_set_name(input, "dynamic_fp8_input");
         ggml_set_name(marker, "dynamic_fp8_marker");
+        if (swiglu) {
+            ggml_tensor * up = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
+            ggml_set_name(up, "dynamic_fp8_up");
+            input = ggml_swiglu_split(ctx, input, up);
+        }
         ggml_tensor * out = ggml_mul_mat(ctx, weight, input);
         if (channel_scale) {
             ggml_tensor * scale = ggml_new_tensor_1d(ctx, scale_type, n);
@@ -5486,11 +5491,14 @@ struct test_mul_mat_dynamic_fp8 : public test_case {
                 std::vector<uint8_t> packed(k * n);
                 f8->from_float_ref(values.data(), packed.data(), values.size());
                 ggml_backend_tensor_set(tensor, packed.data(), 0, packed.size());
-            } else if (strcmp(tensor->name, "dynamic_fp8_input") == 0) {
+            } else if (strcmp(tensor->name, "dynamic_fp8_input") == 0 || strcmp(tensor->name, "dynamic_fp8_up") == 0) {
+                const bool is_up = strcmp(tensor->name, "dynamic_fp8_up") == 0;
                 std::vector<float> input(k * m);
                 for (int64_t row = 0; row < m; ++row) {
                     for (int64_t col = 0; col < k; ++col) {
-                        input[row * k + col] = (float((row + 2) * (col % 17) - 13) + 0.37f) / 7.0f;
+                        input[row * k + col] = m >= 32 && row % 17 == 0 ? 0.0f :
+                            is_up ? (float((row + 3) * (col % 13) - 19) - 0.21f) / 11.0f :
+                                    (float((row + 2) * (col % 17) - 13) + 0.37f) / 7.0f;
                     }
                 }
                 ggml_backend_tensor_set(tensor, input.data(), 0, input.size() * sizeof(float));
@@ -5525,6 +5533,7 @@ struct test_mul_mat_dynamic_fp8 : public test_case {
     bool  dynamic_input;
     ggml_type scale_type;
     int64_t k, n, m;
+    bool swiglu;
 };
 
 struct test_mul_mat_dynamic_mxfp4 : public test_case {
@@ -10605,6 +10614,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_dynamic_fp8());
     test_cases.emplace_back(new test_mul_mat_dynamic_fp8(true, 2.0f));
     test_cases.emplace_back(new test_mul_mat_dynamic_fp8(true, 0.0f, false));
+    for (ggml_type scale_type : {GGML_TYPE_BF16, GGML_TYPE_F32}) {
+        test_cases.emplace_back(new test_mul_mat_dynamic_fp8(true, 2.0f, true, scale_type, 5120, 128, 1025));
+        for (int64_t m : {31, 32, 33}) {
+            test_cases.emplace_back(new test_mul_mat_dynamic_fp8(true, 0.0f, true, scale_type, 32, 16, m));
+            test_cases.emplace_back(new test_mul_mat_dynamic_fp8(true, 2.0f, true, scale_type, 32, 16, m));
+        }
+        for (int64_t k : {5120, 17408}) {
+            test_cases.emplace_back(new test_mul_mat_dynamic_fp8(true, 0.0f, true, scale_type, k, 16, 33));
+            test_cases.emplace_back(new test_mul_mat_dynamic_fp8(true, 2.0f, true, scale_type, k, 16, 385, true));
+        }
+    }
     for (ggml_type scale_type : { GGML_TYPE_BF16, GGML_TYPE_F32 }) {
         for (bool dynamic_input : { false, true }) {
             for (int64_t m : { 1, 8, 129 }) {

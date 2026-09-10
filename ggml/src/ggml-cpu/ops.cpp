@@ -10905,9 +10905,6 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     // K (snapshot slot count) is an op param; state holds s0 only [S_v, S_v, H, n_seqs].
     const int64_t K = ggml_get_op_params_i32(dst, 0);
     GGML_ASSERT(K >= 1);
-    const int64_t prefix = dst->op == GGML_OP_GATED_DELTA_NET_PREFIX
-        ? ggml_get_op_params_i32(dst, 1) : 0;
-    GGML_ASSERT(prefix == 0 || (K == 2 && prefix > 0 && prefix < n_tokens));
     // per-seq stride in floats (seq s starts at state + s * seq_stride)
     const int64_t state_seq_stride = src_state->nb[3] / sizeof(float);
 
@@ -11007,9 +11004,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
             attn_data += S_v * H; // advance to next token
 
             if (K > 1) {
-                const int64_t target_slot = prefix > 0
-                    ? (t == n_tokens - 1 ? 0 : t == prefix - 1 ? 1 : -1)
-                    : n_tokens - 1 - t;
+                const int64_t target_slot = n_tokens - 1 - t;
                 if (target_slot >= 0 && target_slot < K) {
                     float * curr_state_o = state_out_base + target_slot * state_size_per_snap +
                                      (iv3 * H + iv1) * S_v * S_v;

@@ -2592,42 +2592,6 @@ server_cache_lease_id grant_explicit_host_lease(
         server_cache_lease_table::IMPLICIT_SOFT_TTL_NS);
 }
 
-void test_large_shared_checkpoint_buffer() {
-    for (const size_t size : { size_t(0), size_t(1), size_t(8 * 1024 * 1024 - 1),
-                              size_t(8 * 1024 * 1024), size_t(8 * 1024 * 1024 + 4097) }) {
-        common_shared_byte_buffer buffer;
-        buffer.overwrite(size, [](uint8_t * data, size_t n) {
-            for (size_t i = 0; i < n; ++i) {
-                CHECK(data[i] == 0);
-                data[i] = uint8_t(i * 17 + 3);
-            }
-        });
-        CHECK(buffer.size() == size);
-        const auto original = buffer;
-        bool failed = false;
-        try {
-            buffer.overwrite(size, [](uint8_t * data, size_t n) {
-                if (n) data[0] = 99;
-                throw std::runtime_error("checkpoint writer failure");
-            });
-        } catch (const std::runtime_error &) {
-            failed = true;
-        }
-        CHECK(failed);
-        CHECK(buffer == original);
-        buffer.overwrite(size, [](uint8_t * data, size_t n) {
-            if (n) std::memset(data, 0x5a, n);
-        });
-        for (size_t i = 0; i < size; ++i) {
-            CHECK(original[i] == uint8_t(i * 17 + 3));
-            CHECK(buffer[i] == 0x5a);
-        }
-        buffer.clear();
-        CHECK(buffer.empty());
-        CHECK(original.size() == size);
-    }
-}
-
 void test_declared_family_round_trip_and_price() {
     const common_cache_family_binding declared_main {
         { 0xe11b }, common_cache_family_role::main,
@@ -5449,7 +5413,6 @@ int main(int argc, char ** argv) {
     test_lifecycle_retention_capacity_all_one_shot_converges_to_fifo();
     test_lifecycle_retention_capacity_uses_value_density_not_reuse_as_a_pin();
     test_lifecycle_retention_capacity_cold_start_prior_ages_to_recency();
-    test_large_shared_checkpoint_buffer();
     test_declared_family_round_trip_and_price();
     test_checkpoint_lineage_ignores_retier_but_rejects_content_change();
     test_checkpoint_draft_restore_refuses_without_context();

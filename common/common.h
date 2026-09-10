@@ -1561,7 +1561,7 @@ struct common_computation_frontier {
 class common_shared_byte_buffer {
     struct storage {
         storage() = default;
-        explicit storage(size_t size);
+        explicit storage(size_t size) : bytes(size) {}
         explicit storage(const std::vector<uint8_t> & source)
             : bytes(source) {}
 

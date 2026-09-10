@@ -740,8 +740,6 @@ extern "C" {
 
         GGML_OP_GLU,
 
-        GGML_OP_GATED_DELTA_NET_PREFIX,
-
         GGML_OP_COUNT,
     };
 
@@ -2794,19 +2792,6 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             int64_t               K);
-
-    // Like gated_delta_net, but packs exactly two state snapshots after the
-    // attention output: final state, then state after prefix_tokens inputs.
-    // 0 < prefix_tokens < n_tokens. This is not the newest-K rollback layout.
-    GGML_API struct ggml_tensor * ggml_gated_delta_net_prefix(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * q,
-            struct ggml_tensor  * k,
-            struct ggml_tensor  * v,
-            struct ggml_tensor  * g,
-            struct ggml_tensor  * beta,
-            struct ggml_tensor  * state,
-            int32_t               prefix_tokens);
 
     // Tree-mode gated delta net: processes tokens with tree structure via parent_ids
     // persist_inter: [S_v, S_v, H, n_tokens, n_seqs] f16 buffer for intermediate states

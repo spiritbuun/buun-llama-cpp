@@ -20,7 +20,4 @@ void ggml_cuda_gdn_fla_ptx(
         bool rms_gate_bf16 = false,
         float * rms_output = nullptr, bool rms_output_bf16 = false,
         bool rms_output_int8 = false, float * rms_output_scale = nullptr,
-        float rms_eps = 0.0f,
-        // Optional SM120 prefix-state output, separate from the live final state.
-        // Both outputs must remain valid through stream completion and not overlap.
-        float * prefix_state_out = nullptr, int prefix_tokens = 0);
+        float rms_eps = 0.0f);

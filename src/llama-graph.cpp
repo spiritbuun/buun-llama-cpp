@@ -32,6 +32,14 @@
 #include <unordered_set>
 #include <vector>
 
+static bool is_dynamic_fp8_bf16_channel_scale(
+        const ggml_tensor * weight, const ggml_tensor * scale, const ggml_tensor * input_scale) {
+    return weight && scale && input_scale && weight->type == GGML_TYPE_F8_E4M3 &&
+        scale->type == GGML_TYPE_BF16 && scale->ne[0] == weight->ne[1] &&
+        ggml_nelements(scale) == weight->ne[1] && ggml_is_contiguous(scale) &&
+        input_scale->type == GGML_TYPE_I32 && ggml_nelements(input_scale) == 1;
+}
+
 // TurboQuant V-mean tap (TorQuant Prop 3.5). The CUDA encode path subtracts per-layer raw V
 // means (TURBO_VMEAN_SUB, PFH1 dump, V slab); attention weights sum to 1, so the weighted sum
 // of centered V reconstructions equals (output - mu_V) — ONE broadcast add after the graph's
@@ -1834,9 +1842,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
-    gf               (res->get_gf()),
-    prefix_snapshot  (params.prefix_snapshot),
-    prefix_tokens    (params.prefix_tokens) {
+    gf               (res->get_gf()) {
         res->set_params(params);
     }
 
@@ -1914,7 +1920,8 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         const bool exl3_scale = ggml_type_is_exl3(w->type) &&
             w_s->type == GGML_TYPE_F16 && ggml_nelements(w_s) == w->ne[1];
         if ((w->type == GGML_TYPE_F8_E4M3 &&
-             (w_s->type == GGML_TYPE_F32 || w_s->type == GGML_TYPE_I8 || fp8_group_scale)) ||
+             (w_s->type == GGML_TYPE_F32 || w_s->type == GGML_TYPE_I8 || fp8_group_scale ||
+              is_dynamic_fp8_bf16_channel_scale(w, w_s, in_s))) ||
             (w->type == GGML_TYPE_I8 &&
              (w_s->type == GGML_TYPE_F32 || w_s->type == GGML_TYPE_F16 || w_s->type == GGML_TYPE_BF16)) ||
             bnb_scale || gptq_ao_scale || quanto_w4a16 || w8a16_scale || exl3_scale) {
@@ -2152,10 +2159,13 @@ ggml_tensor * llm_graph_context::build_ffn(
     GGML_ASSERT(!gate_s || !gate || gate->type != GGML_TYPE_NVFP4 || !has_lora(gate));
     GGML_ASSERT(!down_s || !down || down->type != GGML_TYPE_NVFP4 || !has_lora(down));
 
-    const auto is_dot_product_scale = [](ggml_tensor * weight, ggml_tensor * scale) {
+    const auto is_dot_product_scale = [&has_lora](ggml_tensor * weight, ggml_tensor * scale,
+            ggml_tensor * input_scale, ggml_tensor * bias) {
         return weight && scale &&
             ((weight->type == GGML_TYPE_F8_E4M3 &&
-              (scale->type == GGML_TYPE_F32 || scale->type == GGML_TYPE_I8)) ||
+              (scale->type == GGML_TYPE_F32 || scale->type == GGML_TYPE_I8 ||
+               // Preserve the existing post-bias/adapter scale ordering.
+               (is_dynamic_fp8_bf16_channel_scale(weight, scale, input_scale) && !bias && !has_lora(weight)))) ||
              (weight->type == GGML_TYPE_I8 &&
               (scale->type == GGML_TYPE_F32 || scale->type == GGML_TYPE_F16 ||
                scale->type == GGML_TYPE_BF16 ||
@@ -2170,9 +2180,9 @@ ggml_tensor * llm_graph_context::build_ffn(
               ggml_nelements(scale) == 1));
     };
 
-    const bool up_dot_scale   = is_dot_product_scale(up, up_s);
-    const bool gate_dot_scale = is_dot_product_scale(gate, gate_s);
-    const bool down_dot_scale = is_dot_product_scale(down, down_s);
+    const bool up_dot_scale   = is_dot_product_scale(up, up_s, up_in_s, up_b);
+    const bool gate_dot_scale = is_dot_product_scale(gate, gate_s, gate_in_s, gate_b);
+    const bool down_dot_scale = is_dot_product_scale(down, down_s, down_in_s, down_b);
 
     ggml_tensor * tmp = up ? build_lora_mm(up, cur, up_dot_scale ? up_s : nullptr, up_in_s) : cur;
     cb(tmp, "ffn_up", il);

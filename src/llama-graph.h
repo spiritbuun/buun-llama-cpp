@@ -30,7 +30,6 @@ class llama_kv_cache_dsv4_raw_context;
 class llama_kv_cache_dsv4_context;
 class llama_kv_cache_iswa_context;
 class llama_memory_recurrent_context;
-class llama_memory_recurrent;
 class llama_memory_hybrid_context;
 class llama_memory_hybrid_iswa_context;
 
@@ -894,11 +893,6 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
-    // Optional prefix checkpoint outputs. Graph params own their backing so
-    // cached graphs cannot outlive the tensors referenced by their copies.
-    std::shared_ptr<llama_memory_recurrent> prefix_snapshot;
-    int32_t prefix_tokens = 0;
-
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -934,9 +928,6 @@ struct llm_graph_params {
         }
 
         if (n_outputs != other.n_outputs) {
-            return false;
-        }
-        if (prefix_snapshot != other.prefix_snapshot || prefix_tokens != other.prefix_tokens) {
             return false;
         }
 
@@ -1160,9 +1151,6 @@ struct llm_graph_context {
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
-
-    std::shared_ptr<llama_memory_recurrent> prefix_snapshot;
-    int32_t prefix_tokens = 0;
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;

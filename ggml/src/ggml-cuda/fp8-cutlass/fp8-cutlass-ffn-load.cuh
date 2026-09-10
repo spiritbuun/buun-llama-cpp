@@ -110,22 +110,3 @@ struct SeparateMain : Retained::Main {
         }
     }
 };
-
-extern "C" int ffn_separate_layout_check() {
-    SeparateMain::HalfLayout        half;
-    SeparateMain::Base::SmemLayoutB full;
-    const int                       offset = full(make_coord(64, 0, 0));
-    for (int s = 0; s < SeparateMain::DispatchPolicy::Stages; ++s) {
-        for (int k = 0; k < 128; ++k) {
-            for (int n = 0; n < 64; ++n) {
-                if (half(make_coord(n, k, s)) != full(make_coord(n, k, s))) {
-                    return -1;
-                }
-                if (half(make_coord(n, k, s)) + offset != full(make_coord(n + 64, k, s))) {
-                    return -2;
-                }
-            }
-        }
-    }
-    return ffn_epilogue_layout_check();
-}

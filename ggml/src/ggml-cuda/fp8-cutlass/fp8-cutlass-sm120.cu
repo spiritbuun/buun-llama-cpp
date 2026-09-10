@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Experimental integration using NVIDIA CUTLASS 4.3.4 (BSD-3-Clause).
+// Integration using NVIDIA CUTLASS 4.3.4 (BSD-3-Clause).
 // Configuration informed by vLLM v0.28.0 (Apache-2.0), commit2cf0a691:
 // csrc/libtorch_stable/quantization/w8a8/cutlass/c3x/scaled_mm{,_sm120_fp8_dispatch}.cuh
 // Unlike vLLM's wrapper, this has no Torch dependency, writes F32, scales in
@@ -154,10 +154,10 @@ extern "C" int buun_fp8_cutlass(const void *  w,
                                 size_t        capacity,
                                 size_t *      required,
                                 cudaStream_t  stream) {
-    if (m < 1 || n < 1 || k < 1 || (parts != 1 && parts != 2) || n % 16 || k % (16 * parts)) {
+    if (m < 1 || n < 1 || k < 1 || parts != 2 || n % 16 || k % 32) {
         return -1;
     }
-    if (parts == 2 && k % 256 == 0) {
+    if (k % 256 == 0) {
         const auto run_register = [&](auto small) {
             using Register = Plan<true, false, true, decltype(small)::value>;
             auto args = Register::args(w, x, ws, xs, nullptr, out, m, n, k, k, device, sms);
@@ -187,35 +187,25 @@ extern "C" int buun_fp8_cutlass(const void *  w,
             return status;
         }
     }
-    using Single               = Plan<true, false>;
     using First                = Plan<false, false>;
     using Last                 = Plan<true, true>;
-    const size_t partial_bytes = parts == 2 ? (size_t(m) * n * sizeof(float) + 255) / 256 * 256 : 0;
+    const size_t partial_bytes = (size_t(m) * n * sizeof(float) + 255) / 256 * 256;
     auto *       partial       = static_cast<float *>(workspace);
     void *       scratch       = workspace ? static_cast<char *>(workspace) + partial_bytes : nullptr;
-    auto         a             = Single::args(w, x, ws, xs, nullptr, out, m, n, k, k, device, sms);
     auto         f             = First::args(w, x, ws, xs, nullptr, partial, m, n, k / parts, k, device, sms);
     auto l = Last::args(static_cast<const char *>(w) + k / parts, static_cast<const char *>(x) + k / parts, ws, xs,
                         partial, out, m, n, k / parts, k, device, sms);
-    const auto supported =
-        parts == 1 ? Single::Op::can_implement(a) :
-                     (First::Op::can_implement(f) == cutlass::Status::kSuccess ? Last::Op::can_implement(l) :
-                                                                                 cutlass::Status::kErrorNotSupported);
+    const auto supported = First::Op::can_implement(f) == cutlass::Status::kSuccess ?
+        Last::Op::can_implement(l) : cutlass::Status::kErrorNotSupported;
     if (supported != cutlass::Status::kSuccess) {
         return int(supported);
     }
-    *required =
-        partial_bytes + (parts == 1 ? Single::Op::get_workspace_size(a) :
-                                      std::max(First::Op::get_workspace_size(f), Last::Op::get_workspace_size(l)));
+    *required = partial_bytes + std::max(First::Op::get_workspace_size(f), Last::Op::get_workspace_size(l));
     if (!workspace) {
         return 0;
     }
     if (capacity < *required) {
         return -2;
-    }
-    if (parts == 1) {
-        typename Single::Op op;
-        return int(op.run(a, scratch, stream));
     }
     typename First::Op first;
     auto               status = first.run(f, scratch, stream);

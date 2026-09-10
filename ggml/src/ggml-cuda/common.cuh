@@ -1565,8 +1565,6 @@ struct ggml_cuda_q8_activation_storage {
 
 #endif
 
-struct ggml_cuda_prefix_export;
-
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1582,12 +1580,6 @@ struct ggml_backend_cuda_context {
     // set while the meta backend records a whole tensor-parallel step on this context's stream:
     // graph_compute then launches plainly into that capture (no per-graph CUDA graph, no upload wait)
     bool external_capture = false;
-
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    // Stable while captured graphs reference its callbacks; drained and freed
-    // explicitly with the backend's other asynchronous workspaces.
-    ggml_cuda_prefix_export * prefix_export = nullptr;
-#endif
 
     // Persistent flash-attention scratch belongs to this backend context, not to the process or
     // physical device. Independent llama contexts therefore never alias Q/K/V work buffers.

@@ -27,7 +27,7 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-// Private dual-activation experiment. The shared-memory copy/MMA pipeline is
+// Dual-activation FFN. The shared-memory copy/MMA pipeline is
 // adapted from NVIDIA CUTLASS sm120_mma_tma.hpp (BSD-3-Clause); no vendor file
 // is changed. Preserve the retained two separate K accumulations.
 struct DualMain : SeparateMain {

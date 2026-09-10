@@ -167,7 +167,23 @@ if (CUDAToolkit_FOUND)
                             )
     target_include_directories(ggml-cuda PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/bsa_vendor")
 
-    # vLLM's exact-shape FLA kernels are shipped as SM80/SM86 cubins. On ELF
+    # The native F32-channel FP8 provider is compiled into the backend, not
+    # loaded from a benchmark directory. Its CUTLASS headers are isolated from
+    # the backend's other vendored versions and its device code is SM120-only.
+    if (CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8 AND
+            CMAKE_CUDA_ARCHITECTURES MATCHES "(^|;)120(a|f)?(-real|-virtual)?(;|$)")
+        add_library(ggml-cuda-fp8-cutlass OBJECT fp8-cutlass/fp8-cutlass-ffn-sm120.cu)
+        set_target_properties(ggml-cuda-fp8-cutlass PROPERTIES
+            CUDA_ARCHITECTURES "120a-real" CUDA_STANDARD 17 POSITION_INDEPENDENT_CODE ON)
+        target_include_directories(ggml-cuda-fp8-cutlass PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/fp8-cutlass/vendor/include")
+        target_compile_options(ggml-cuda-fp8-cutlass PRIVATE
+            -O3 -use_fast_math --expt-relaxed-constexpr -extended-lambda)
+        target_sources(ggml-cuda PRIVATE $<TARGET_OBJECTS:ggml-cuda-fp8-cutlass>)
+        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_FP8_CUTLASS)
+    endif()
+
+    # vLLM's exact-shape FLA kernels are shipped as SM80/SM86/SM120 cubins. On ELF
     # x86-64, wrap them in read-only relocatable objects so ggml-cuda remains
     # self-contained and needs no Triton/Python cache at runtime. Other host
     # platforms retain the portable GDN fallback.
@@ -182,11 +198,11 @@ if (CUDAToolkit_FOUND)
             chunk_gated_delta_rule_fwd_kernel_h_blockdim64
             chunk_fwd_kernel_o)
         set(GGML_CUDA_GDN_FLA_OBJECTS "")
-        foreach(GDN_ARCH IN ITEMS sm80 sm86)
-            if (GDN_ARCH STREQUAL "sm80")
-                set(GDN_CUBIN_PREFIX "sm80_")
-            else()
+        foreach(GDN_ARCH IN ITEMS sm80 sm86 sm120)
+            if (GDN_ARCH STREQUAL "sm86")
                 set(GDN_CUBIN_PREFIX "")
+            else()
+                set(GDN_CUBIN_PREFIX "${GDN_ARCH}_")
             endif()
             foreach(KERNEL IN LISTS GGML_CUDA_GDN_FLA_CUBINS)
                 set(CUBIN_FILE "${GDN_CUBIN_PREFIX}${KERNEL}.cubin")
