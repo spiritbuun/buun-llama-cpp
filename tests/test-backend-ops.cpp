@@ -7925,6 +7925,12 @@ struct test_moe_weighted_reduction : public test_case {
 
     bool run_whole_graph() override { return true; }
 
+    double max_nmse_err(ggml_backend_t backend) override {
+        const auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        // CUDA fusion must preserve the separate F32 MUL/ADD rounding boundaries.
+        return strcmp(ggml_backend_reg_name(reg), "CUDA") == 0 ? 0.0 : test_case::max_nmse_err(backend);
+    }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * experts;
         if (unaligned_experts) {
