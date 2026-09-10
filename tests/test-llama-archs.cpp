@@ -1014,6 +1014,9 @@ static void test_qwen4_qsa_layout_cpu(llama_model * model, size_t seed) {
 }
 
 static void test_qwen4_indexed_cache_admission(const size_t seed) {
+    // Keep model-level admission aligned with the implemented Meta split path.
+    // Otherwise the generic backend test below silently skips its tensor arm.
+    GGML_ASSERT(llm_arch_supports_sm_tensor(LLM_ARCH_QWEN4EXP));
     struct qsa_trace {
         size_t raw_key_nodes = 0;
         size_t score_nodes = 0;
