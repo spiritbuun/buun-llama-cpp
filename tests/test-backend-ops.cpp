@@ -4808,7 +4808,11 @@ struct test_gated_delta_net : public test_case {
     double max_nmse_err() override {
         // The production Qwen3.5 FLA kernel changes the reduction order across
         // a full 512-token tile. Its observed CPU-reference NMSE is ~9.7e-6.
-        if (head_count == 16 && head_size == 128 && n_seq_tokens >= 508 && n_seqs == 1 && v_repeat == 3) {
+        // The same kernels run on a head subset under a tensor split (head_count 2 or 4).
+        const bool full_heads = head_count == 16 && n_seq_tokens >= 508;
+        const bool split_heads = head_count > 0 && head_count <= 16 && head_count % 2 == 0 &&
+                                 n_seq_tokens >= 512 && n_seq_tokens % 64 == 0;
+        if (head_size == 128 && (full_heads || split_heads) && n_seqs == 1 && v_repeat == 3 && !kda) {
             return 2e-5;
         }
         return test_case::max_nmse_err();
@@ -5956,6 +5960,54 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
         }
     }
 }
+
+// GGML_OP_MUL_MAT_ID with an expert-parallel window: `as` holds n_local experts of an n_mats routing space
+// routed ids outside [lo, lo + n_local) must produce zero rows.
+struct test_mul_mat_id_window : public test_case {
+    const ggml_type type_a;
+    const int n_mats;
+    const int n_local;
+    const int lo;
+    const int n_used;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    std::string vars() override {
+        return VARS_TO_STR8(type_a, n_mats, n_local, lo, n_used, m, n, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_id_window(ggml_type type_a = GGML_TYPE_F32, int n_mats = 16, int n_local = 4, int lo = 4,
+            int n_used = 4, int64_t m = 64, int64_t n = 8, int64_t k = 256)
+        : type_a(type_a), n_mats(n_mats), n_local(n_local), lo(lo), n_used(n_used), m(m), n(n), k(k) {
+        GGML_ASSERT(n_used <= n_mats && lo + n_local <= n_mats);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_local);
+        ggml_set_name(as, "as");
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+        }
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_used, n);
+        ggml_set_name(b, "b");
+        ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
+        ggml_mul_mat_id_set_expert_window(out, lo, n_local);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+};
 
 // GGML_OP_MUL_MAT_ID
 struct test_mul_mat_id : public test_case {
@@ -10584,6 +10636,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
 #endif
+    // expert-parallel windows (live: these must run)
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
+        for (int64_t n : {1, 8, 64}) {
+            test_cases.emplace_back(new test_mul_mat_id_window(type_a, 16, 4, 4, 4, 64, n, 256)); // window in the middle
+            test_cases.emplace_back(new test_mul_mat_id_window(type_a, 16, 4, 0, 4, 64, n, 256)); // window at the start
+            test_cases.emplace_back(new test_mul_mat_id_window(type_a, 16, 4, 12, 4, 64, n, 256)); // window at the end
+        }
+    }
+    // Flash-Next expert shapes on one of 8 devices: 512 experts, 64 local, 10 used, 640 x 2560 experts
+    for (int64_t n : {8, 16, 64, 512}) {
+        test_cases.emplace_back(new test_mul_mat_id_window(GGML_TYPE_Q4_K, 512, 64, 0,   10, 640, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id_window(GGML_TYPE_Q4_0, 512, 64, 448, 10, 2560, n, 640)); // k=640 is not a Q4_K multiple
+    }
 
     // Channel-scaled F8 uses raw E4M3 storage with BF16 activations in MMVQ,
     // then BF16/F32 expansion for wider batches.
@@ -11660,6 +11725,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t n : {508, 513, 2044, 2048}) {
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n, 1, 3));
     }
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  2, 128,  512, 1, 3)); // same kernels on one device of an 8-way tensor split (head subset)
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  4, 128,  512, 1, 3)); // 4-way split
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,  2, 128, 1024, 1, 3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1, 1, true));
     // KDA (vector gate)

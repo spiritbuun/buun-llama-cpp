@@ -3768,6 +3768,14 @@ struct ggml_tensor * ggml_mul_mat_id(
     return result;
 }
 
+void ggml_mul_mat_id_set_expert_window(struct ggml_tensor * mmid, int32_t lo, int32_t n_local) {
+    GGML_ASSERT(mmid->op == GGML_OP_MUL_MAT_ID);
+    GGML_ASSERT(n_local >= 0 && lo >= 0);
+    GGML_ASSERT(n_local == 0 || mmid->src[0]->ne[2] == n_local);
+    ggml_set_op_params_i32(mmid, 2, lo);
+    ggml_set_op_params_i32(mmid, 3, n_local);
+}
+
 // ggml_out_prod
 
 static inline bool ggml_can_out_prod(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {

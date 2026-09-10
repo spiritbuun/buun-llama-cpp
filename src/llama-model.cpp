@@ -439,6 +439,21 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_ffn_down_weight   ("blk\\.\\d*\\.ffn_down(_exps)?.weight");
     static const std::regex pattern_ffn_down_bias         ("blk\\.\\d*\\.ffn_down.bias");
     static const std::regex pattern_ffn_down_exps_bias    ("blk\\.\\d*\\.ffn_down_exps.bias");
+    static const std::regex pattern_ffn_up_exps_any      ("blk\\.\\d*\\.ffn_up_exps\\.(weight|scale|input_scale)");
+    static const std::regex pattern_ffn_gate_exps_any    ("blk\\.\\d*\\.ffn_gate_exps\\.(weight|scale|input_scale)");
+    static const std::regex pattern_ffn_gate_up_exps_any ("blk\\.\\d*\\.ffn_gate_up_exps\\.(weight|scale|input_scale)");
+    static const std::regex pattern_ffn_down_exps_any    ("blk\\.\\d*\\.ffn_down_exps\\.(weight|scale|input_scale)");
+    // Expert parallelism needs every routed row to stay on one device between the up/gate projection and
+    // the down projection; per-expert biases (added on all devices as partial sums) would break that, so
+    // models with expert biases keep the sliced layout until the bias add learns the expert window.
+    static const bool expert_parallel_env = [] {
+        const char * env = std::getenv("LLAMA_SPLIT_EXPERTS");
+        return env == nullptr || std::string(env) != "slice";
+    }();
+    const bool expert_parallel = expert_parallel_env &&
+        ud->model->get_tensor("blk.0.ffn_down_exps.bias") == nullptr &&
+        ud->model->get_tensor("blk.0.ffn_up_exps.bias") == nullptr &&
+        ud->model->get_tensor("blk.0.ffn_gate_exps.bias") == nullptr;
     static const std::regex pattern_ffn_up_shexp_weight   ("blk\\.\\d*\\.ffn_up_shexp.weight");
     static const std::regex pattern_ffn_gate_shexp_weight ("blk\\.\\d*\\.ffn_gate_shexp.weight");
     static const std::regex pattern_ffn_down_shexp_weight ("blk\\.\\d*\\.ffn_down_shexp.weight");
@@ -510,6 +525,48 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_tensor_config = [&]() -> tensor_config {
+        // Localization aid: LLAMA_SPLIT_MIRROR is a comma list; "ssm" mirrors every tensor of the recurrent
+        // (GDN) layers and their caches, "attn" every tensor of the attention layers and the KV cache, any
+        // other item mirrors the tensors whose name contains it (e.g. "shexp", "output.weight"), so a
+        // quality deviation of the tensor split can be attributed to one component (costs VRAM and speed).
+        static const std::string mirror_env = std::getenv("LLAMA_SPLIT_MIRROR") != nullptr ? std::getenv("LLAMA_SPLIT_MIRROR") : "";
+        if (!mirror_env.empty()) {
+            bool mirror_ssm = false, mirror_attn = false;
+            for (size_t p = 0; p < mirror_env.size();) {
+                size_t q = mirror_env.find(',', p);
+                if (q == std::string::npos) q = mirror_env.size();
+                const std::string item = mirror_env.substr(p, q - p);
+                p = q + 1;
+                if (item == "ssm") {
+                    mirror_ssm = true;
+                } else if (item == "attn") {
+                    mirror_attn = true;
+                } else if (!item.empty() && tensor_name.find(item) != std::string::npos) {
+                    return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                }
+            }
+            int il = -1;
+            if (tensor_name.rfind("blk.", 0) == 0) {
+                il = std::atoi(tensor_name.c_str() + 4);
+            } else if (tensor_name.rfind("cache_", 0) == 0) {
+                const size_t l = tensor_name.rfind("_l");
+                if (l != std::string::npos) {
+                    il = std::atoi(tensor_name.c_str() + l + 2);
+                }
+            }
+            if (il >= 0 && il < (int) hparams.n_layer()) {
+                const bool recurrent = hparams.is_recr(il);
+                const bool layer_tensor = tensor_name.rfind("blk.", 0) == 0 &&
+                    (tensor_name.find(".attn_") != std::string::npos || tensor_name.find(".ssm_") != std::string::npos);
+                const bool cache_tensor = tensor_name.rfind("cache_", 0) == 0;
+                if (mirror_ssm && recurrent && (layer_tensor || cache_tensor)) {
+                    return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                }
+                if (mirror_attn && !recurrent && (layer_tensor || cache_tensor)) {
+                    return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                }
+            }
+        }
         if (is_dsv4) {
             if (std::regex_match(tensor_name, pattern_kv_cache) ||
                     std::regex_match(tensor_name, pattern_dsv4_state)) {
@@ -632,6 +689,15 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
 
         // FFN
+        // Stacked expert tensors: expert parallelism keeps whole experts per device (split on the expert
+        // axis) instead of slicing every expert across all devices; the MUL_MAT_ID nodes get a per-device
+        // expert window and the expert outputs are reduced once per layer. LLAMA_SPLIT_EXPERTS=slice restores
+        // the sliced layout.
+        if (expert_parallel && tensor->ne[2] > 1 &&
+                (std::regex_match(tensor_name, pattern_ffn_up_exps_any) || std::regex_match(tensor_name, pattern_ffn_gate_exps_any) ||
+                 std::regex_match(tensor_name, pattern_ffn_gate_up_exps_any) || std::regex_match(tensor_name, pattern_ffn_down_exps_any))) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2, "ffn_down_exps.weight");
+        }
         if (std::regex_match(tensor_name, pattern_ffn_up_weight) || std::regex_match(tensor_name, pattern_ffn_gate_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down.weight", "ffn_down_exps.weight");
         }
@@ -679,6 +745,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_split_segments = [&](int axis, uint32_t il) -> std::vector<std::pair<int64_t, uint32_t>> {
+        // expert parallelism: stacked expert tensors split on the expert axis move whole experts
+        if (axis == GGML_BACKEND_SPLIT_AXIS_2 && tensor->ne[2] > 1 &&
+                (std::regex_match(tensor_name, pattern_ffn_up_exps_any) || std::regex_match(tensor_name, pattern_ffn_gate_exps_any) ||
+                 std::regex_match(tensor_name, pattern_ffn_gate_up_exps_any) || std::regex_match(tensor_name, pattern_ffn_down_exps_any))) {
+            return {{tensor->ne[2], 1}};
+        }
         if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE ||
                 ud->model->arch == LLM_ARCH_QWEN4EXP) {
             const int64_t head_k_dim = hparams.ssm_d_state;
@@ -806,7 +878,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         return {{tensor->ne[axis], 1}};
     };
 
+    int split_axis_for_granularity = -1;
     auto get_split_granularity = [&](int64_t blck_size, uint32_t il, const std::vector<std::pair<int64_t, uint32_t>> & segments) -> std::vector<int64_t> {
+        if (split_axis_for_granularity == GGML_BACKEND_SPLIT_AXIS_2 && tensor->ne[2] > 1 &&
+                (std::regex_match(tensor_name, pattern_ffn_up_exps_any) || std::regex_match(tensor_name, pattern_ffn_gate_exps_any) ||
+                 std::regex_match(tensor_name, pattern_ffn_gate_up_exps_any) || std::regex_match(tensor_name, pattern_ffn_down_exps_any))) {
+            return std::vector<int64_t>(segments.size(), 1); // whole experts
+        }
         // for better performance it may make sense to round up blck_size to a higher power of 2 so that more efficient kernels can be used
         if (hparams.is_recr(il)) {
             // linear attention
@@ -951,6 +1029,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
         }
         const std::vector<std::pair<int64_t, uint32_t>> segments = get_split_segments(split_state.axis, tc.il);
+        split_axis_for_granularity = split_state.axis;
         const std::vector<int64_t> granularity = get_split_granularity(blck_size, tc.il, segments);
         for (size_t is = 0; is < segments.size(); is++) {
             const int64_t  ne_s = segments[is].first;
@@ -2618,6 +2697,15 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
 
+    // A tensor split (the meta backend presents its devices as one) records one step graph per KV-extent
+    // shape and pays ~1 s per new shape, so its attention READ extent is padded to 2048 cells instead of 256
+    // (LLAMA_KV_PAD can raise it further). Only the read-extent floor changes: the cache size itself keeps its
+    // own padding, so small contexts stay valid.
+    const uint32_t attn_n_pad = 1;
+    if (split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+        llama_kv_cache::set_pad_floor(2048);
+    }
+
     // TurboQuant dynamic-VBR inputs for the attention KV caches (no-op unless armed);
     // recurrent/DSA caches do not take them
     const llama_memory_vbr_params vbr = {
@@ -2659,7 +2747,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         cparams.kv_unified,
                         cparams.n_ctx_seq,
                         cparams.n_seq_max,
-                        1,
+                        attn_n_pad,
                         hparams.n_swa,
                         hparams.swa_type,
                         nullptr,
@@ -2691,7 +2779,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         cparams.kv_unified,
                         cparams.n_ctx_seq,
                         cparams.n_seq_max,
-                        1,
+                        attn_n_pad,
                         hparams.n_swa,
                         hparams.swa_type,
                         nullptr,
@@ -2718,7 +2806,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             cparams.kv_unified,
                             cparams.n_ctx_seq,
                             cparams.n_seq_max,
-                            1,
+                            attn_n_pad,
                             hparams.n_swa,
                             hparams.swa_type,
                             nullptr,
@@ -2743,7 +2831,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             cparams.kv_unified,
                             cparams.n_ctx_seq,
                             cparams.n_seq_max,
-                            1,
+                            attn_n_pad,
                             hparams.n_swa,
                             hparams.swa_type,
                             filter_mla,
@@ -2770,7 +2858,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             cparams.kv_unified,
                             cparams.n_ctx_seq,
                             cparams.n_seq_max,
-                            1,
+                            attn_n_pad,
                             hparams.n_swa,
                             hparams.swa_type,
                             nullptr,
@@ -2943,7 +3031,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_type_v       */ params.type_v,
                             /* attn_v_trans      */ !cparams.flash_attn,
                             /* attn_kv_size      */ cparams.n_ctx_seq,
-                            /* attn_n_pad        */ 1,
+                            /* attn_n_pad        */ attn_n_pad,
                             /* attn_n_swa        */ hparams.n_swa,
                             /* attn_swa_type     */ hparams.swa_type,
                             /* recurrent_type_k  */ GGML_TYPE_F32,
@@ -2967,7 +3055,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_swa_full     */ params.swa_full,
                             /* attn_kv_size      */ cparams.n_ctx_seq,
                             /* attn_n_ubatch     */ cparams.n_ubatch,
-                            /* attn_n_pad        */ 1,
+                            /* attn_n_pad        */ attn_n_pad,
                             /* recurrent_type_r  */ GGML_TYPE_F32,
                             /* recurrent_type_s  */ GGML_TYPE_F32,
                             /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
@@ -2985,7 +3073,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_type_v       */ params.type_v,
                             /* attn_v_trans      */ !cparams.flash_attn,
                             /* attn_kv_size      */ cparams.n_ctx_seq,
-                            /* attn_n_pad        */ 1,
+                            /* attn_n_pad        */ attn_n_pad,
                             /* attn_n_swa        */ hparams.n_swa,
                             /* attn_swa_type     */ hparams.swa_type,
                             /* recurrent_type_k  */ GGML_TYPE_F32,
@@ -3095,7 +3183,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 cparams.kv_unified,
                                 cparams.n_ctx_seq,
                                 cparams.n_seq_max,
-                                1,
+                                attn_n_pad,
                                 hparams.n_swa,
                                 hparams.swa_type,
                                 nullptr,

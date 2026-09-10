@@ -379,6 +379,8 @@ extern "C" {
 
         GGML_BACKEND_SPLIT_AXIS_MIRRORED = 10, // all values on all backends
         GGML_BACKEND_SPLIT_AXIS_PARTIAL  = 11, // each backend has a partial sum
+        GGML_BACKEND_SPLIT_AXIS_DISJOINT = 12, // partial sum whose every row is non-zero on exactly one backend
+                                               //   (expert-parallel expert outputs): element-wise ops may run on it
 
         // for internal bookkeeping only:
         GGML_BACKEND_SPLIT_AXIS_NONE    = 98,

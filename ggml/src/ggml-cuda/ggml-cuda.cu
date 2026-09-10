@@ -3,6 +3,7 @@
 #include "ggml-backend-impl.h"
 
 #include "ggml-cuda/allreduce.cuh"
+#include "ggml-cuda/allreduce-oneshot.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/moe-cache.cuh"
 #include "ggml-cuda/acc.cuh"
@@ -1505,6 +1506,8 @@ struct ggml_backend_cuda_comm_context {
     try_allreduce_fn            try_allreduce = nullptr;
 
     ggml_cuda_ar_pipeline *     ar_pipeline = nullptr;
+    // latency path for small F32 tensors (decode activations), any rank count, graph-capturable
+    ggml_cuda_ar_oneshot *      oneshot = nullptr;
 
 #ifdef GGML_USE_NCCL
     std::vector<ncclComm_t>     comms;
@@ -1517,6 +1520,7 @@ struct ggml_backend_cuda_comm_context {
         }
 #endif // GGML_USE_NCCL
         ggml_cuda_ar_pipeline_free(ar_pipeline);
+        ggml_cuda_ar_oneshot_free(oneshot);
     }
 };
 
@@ -1782,6 +1786,19 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
             ggml_backend_cuda_comm_init_none(ret);
         }
     }
+    // Reduce activations through pinned host memory in one shot: small decode messages are latency-bound
+    // (single-block kernel), prompt-chunk messages up to the window go through a copy-engine publish and a
+    // multi-block reduce-scatter, which beats a host-staged NCCL ring on boxes without PCIe P2P and sums in
+    // F32 where NCCL rounds large tensors to BF16. GGML_CUDA_ALLREDUCE_ONESHOT=0 disables; the value sets
+    // the byte limit, default 32 MiB (pinned memory: 5 slots x limit per rank), which keeps 2048-token
+    // prompt ubatches of a 2560-wide model on this path (-ub 2048 is the fastest prefill setting).
+    {
+        const char * env_os = getenv("GGML_CUDA_ALLREDUCE_ONESHOT");
+        const size_t limit = env_os == nullptr ? (size_t) 32 * 1024 * 1024 : (size_t) atoll(env_os);
+        if (limit > 0 && n_backends >= 2) {
+            ret->oneshot = ggml_cuda_ar_oneshot_init(ret->dev_ids.data(), n_backends, limit);
+        }
+    }
 
     return ret;
 }
@@ -1881,6 +1898,12 @@ static void * ggml_backend_cuda_step_capture_end(ggml_backend_t backend) {
         (void) cudaGraphDestroy(graph);
         return nullptr;
     }
+    // upload now so the first launch is as cheap as a replay: a lazy first-launch upload was observed to
+    // block the host until the previously launched device's stream drained, which serializes the devices
+    // and deadlocks in-graph collectives that need every rank in flight
+    if (cudaGraphUpload(instance, cuda_ctx->stream()) != cudaSuccess) {
+        (void) cudaGetLastError();
+    }
     ggml_cuda_step_graph * step = new ggml_cuda_step_graph;
     step->graph    = graph;
     step->instance = instance;
@@ -1934,7 +1957,23 @@ static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct gg
         return false;
     }
     auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    if (comm_ctx->oneshot != nullptr && ggml_cuda_ar_oneshot_eligible(comm_ctx->oneshot, tensors)) {
+        return ggml_cuda_ar_oneshot_allreduce(comm_ctx->oneshot, comm_ctx->backends.data(), tensors);
+    }
     return comm_ctx->try_allreduce(comm_ctx, tensors);
+}
+
+// Per-rank enqueue of the one-shot all-reduce for concurrent issuer threads; false when this message needs a
+// collective (NCCL fallback), which the caller then issues from one thread for all ranks.
+static bool ggml_backend_cuda_comm_allreduce_tensor_rank(void * comm_ctx_v, struct ggml_tensor ** tensors, int rank) {
+    if (comm_ctx_v == nullptr) {
+        return false;
+    }
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    if (comm_ctx->oneshot == nullptr || !ggml_cuda_ar_oneshot_eligible(comm_ctx->oneshot, tensors)) {
+        return false;
+    }
+    return ggml_cuda_ar_oneshot_allreduce_rank(comm_ctx->oneshot, comm_ctx->backends[rank], tensors, rank);
 }
 
 // host buffer type
@@ -2476,6 +2515,9 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
 
     const bool is_mul_mat     = ffn_up->op == GGML_OP_MUL_MAT     && ffn_gate->op == GGML_OP_MUL_MAT     && glu->op == GGML_OP_GLU;
     const bool is_mul_mat_id  = ffn_up->op == GGML_OP_MUL_MAT_ID  && ffn_gate->op == GGML_OP_MUL_MAT_ID  && glu->op == GGML_OP_GLU;
+    if (is_mul_mat_id && (ggml_mmid_window_n_local(ffn_up) != 0 || ggml_mmid_window_n_local(ffn_gate) != 0)) {
+        return false; // expert-parallel windows are applied by the per-node executor only
+    }
 
     GGML_ASSERT(ffn_up && ffn_gate && glu);
 
@@ -2567,6 +2609,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     const ggml_tensor * dst  = tensor;
 
     const bool is_mul_mat_id = tensor->op == GGML_OP_MUL_MAT_ID;
+    if (is_mul_mat_id && ggml_mmid_window_n_local(tensor) != 0) {
+        return false; // expert-parallel windows are applied by the per-node executor only
+    }
 
     if (!is_mul_mat_id && tensor->src[3] != nullptr) {
         return false;
@@ -3173,7 +3218,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     std::vector<int32_t> ids_to_sorted_host;
     ids_to_sorted_host.reserve(2*ne_get_rows);
-    std::vector<int32_t> ids_from_sorted_host(ne_get_rows);
+    std::vector<int32_t> ids_from_sorted_host(ne_get_rows, 0); // 0: rows of a foreign expert gather any row and are zeroed afterwards
 
     ggml_cuda_pool_alloc<int32_t> ids_buf_dev(ctx.pool(), 2*ne_get_rows);
 
@@ -3190,7 +3235,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
             for (int64_t iex = 0; iex < n_expert_used; ++iex) {
                 const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
-                assert(expert_to_use >= 0 && expert_to_use < ne02);
+                if (expert_to_use < 0) {
+                    continue; // expert-parallel window: routed to another device
+                }
+                assert(expert_to_use < ne02);
                 if (expert_to_use == i02) {
                     ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
                     ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
@@ -3200,7 +3248,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
         }
     }
-    GGML_ASSERT(ids_to_sorted_host.size() == size_t(ne_get_rows));
+    GGML_ASSERT(ids_to_sorted_host.size() <= size_t(ne_get_rows));
+    ids_to_sorted_host.resize(ne_get_rows, 0); // pad (foreign rows) so the buffer layout below stays fixed
 
     ids_to_sorted_host.insert(ids_to_sorted_host.end(), ids_from_sorted_host.begin(), ids_from_sorted_host.end());
 
@@ -3286,6 +3335,76 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         ne0, ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted,
         ne_get_rows, 1, 1, sizeof(int32_t), ne_get_rows*sizeof(int32_t), ne_get_rows*sizeof(int32_t),
         nb1, nb2, nb3, stream);
+}
+
+// expert-parallel window: rewrite the routed ids into the local expert space once, then run the
+// ordinary executors on a shadow node whose ids point at the remapped copy
+static __global__ void k_mmid_remap_ids(const int32_t * __restrict__ ids, int32_t * __restrict__ out,
+        const int64_t ne0, const int64_t ne1, const size_t nb1, const int32_t lo, const int32_t n_local) {
+    const int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x;
+    if (i >= ne0 * ne1) {
+        return;
+    }
+    const int64_t i1 = i / ne0;
+    const int64_t i0 = i - i1 * ne0;
+    const int32_t id    = *(const int32_t *) ((const char *) ids + i1 * nb1 + i0 * sizeof(int32_t));
+    const int32_t local = id - lo; // same mapping as ggml_mmid_expert_index (host-only inline)
+    out[i] = (local < 0 || local >= n_local) ? -1 : local;
+}
+
+// Rows routed to experts on other devices are skipped by every executor and zeroed here afterwards.
+static __global__ void k_mmid_zero_foreign_rows(const int32_t * __restrict__ ids, float * __restrict__ dst,
+        const int64_t ne0, const int64_t n_used, const int64_t n_tokens, const size_t ids_nb1,
+        const size_t dst_nb1, const size_t dst_nb2, const int32_t lo, const int32_t n_local) {
+    const int64_t row = blockIdx.x; // (token, slot)
+    const int64_t t = row / n_used;
+    const int64_t u = row - t * n_used;
+    if (t >= n_tokens) {
+        return;
+    }
+    const int32_t id = *(const int32_t *) ((const char *) ids + t * ids_nb1 + u * sizeof(int32_t));
+    const int32_t local = id - lo;
+    if (local >= 0 && local < n_local) {
+        return;
+    }
+    float * d = (float *) ((char *) dst + t * dst_nb2 + u * dst_nb1);
+    for (int64_t i = threadIdx.x; i < ne0; i += blockDim.x) {
+        d[i] = 0.0f;
+    }
+}
+
+static void ggml_cuda_mul_mat_id_windowed(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * ids = dst->src[2];
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->nb[0] == sizeof(int32_t));
+    const int64_t n = ids->ne[0] * ids->ne[1];
+    ggml_cuda_pool_alloc<int32_t> remapped(ctx.pool(), n);
+    k_mmid_remap_ids<<<(n + 255) / 256, 256, 0, ctx.stream()>>>(
+        (const int32_t *) ids->data, remapped.get(), ids->ne[0], ids->ne[1], ids->nb[1],
+        ggml_mmid_window_lo(dst), ggml_mmid_window_n_local(dst));
+    CUDA_CHECK(cudaGetLastError());
+    ggml_tensor ids_local = *ids;
+    ids_local.data  = remapped.get();
+    ids_local.nb[1] = ids->ne[0] * sizeof(int32_t);
+    ids_local.nb[2] = ids_local.nb[1] * ids->ne[1];
+    ids_local.nb[3] = ids_local.nb[2];
+    ids_local.view_src = nullptr;
+    GGML_ASSERT(!ggml_cuda_is_exl3(dst->src[0]->type) && "expert-parallel window: exl3 mul_mat_id not supported yet");
+    ggml_tensor shadow = *dst;
+    shadow.src[2] = &ids_local;
+    ggml_mul_mat_id_set_expert_window(&shadow, 0, 0);
+    static const bool debug_mmid = getenv("GGML_CUDA_DEBUG_MMID") != nullptr;
+    if (debug_mmid) {
+        fprintf(stderr, "[mmid] window lo=%d n_local=%d ne02=%lld ids=[%lld x %lld] nb1=%zu -> compact nb1=%zu\n",
+                ggml_mmid_window_lo(dst), ggml_mmid_window_n_local(dst), (long long) dst->src[0]->ne[2],
+                (long long) ids->ne[0], (long long) ids->ne[1], ids->nb[1], ids_local.nb[1]);
+    }
+    ggml_cuda_mul_mat_id(ctx, &shadow);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    const int64_t n_rows = ids->ne[0] * ids->ne[1];
+    k_mmid_zero_foreign_rows<<<n_rows, 256, 0, ctx.stream()>>>(
+        (const int32_t *) ids->data, (float *) dst->data, dst->ne[0], ids->ne[0], ids->ne[1], ids->nb[1],
+        dst->nb[1], dst->nb[2], ggml_mmid_window_lo(dst), ggml_mmid_window_n_local(dst));
+    CUDA_CHECK(cudaGetLastError());
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
@@ -3481,7 +3600,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_mul_mat(ctx, dst->src[0], dst->src[1], dst);
             break;
         case GGML_OP_MUL_MAT_ID:
-            ggml_cuda_mul_mat_id(ctx, dst);
+            if (ggml_mmid_window_n_local(dst) != 0) {
+                ggml_cuda_mul_mat_id_windowed(ctx, dst);
+            } else {
+                ggml_cuda_mul_mat_id(ctx, dst);
+            }
             break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
@@ -3869,6 +3992,10 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 }
 
 static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
+    static const bool ar1_debug = getenv("GGML_CUDA_AR1_DEBUG") != nullptr || getenv("GGML_CUDA_AR1_TRACE") != nullptr;
+    if (ar1_debug) {
+        ggml_cuda_ar_oneshot_report_all();
+    }
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
@@ -7493,6 +7620,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            // GGML_CUDA_OP_TRACE=<n>: host time per op type inside ggml_cuda_compute_forward and the loop's
+            // remaining overhead (fusion checks, dispatch), summed over n graph_compute calls per thread,
+            // then printed — where the uncaptured tensor-split issue time goes (no sampling profiler in containers)
+            static const int op_trace_every = getenv("GGML_CUDA_OP_TRACE") != nullptr ? atoi(getenv("GGML_CUDA_OP_TRACE")) : 0;
+            struct op_trace_acc { double loop_ns = 0, fwd_ns[GGML_OP_COUNT] = {}; int cnt[GGML_OP_COUNT] = {}; int calls = 0; };
+            thread_local op_trace_acc op_trace;
+            auto op_now = []() {
+                struct timespec ts;
+                clock_gettime(CLOCK_MONOTONIC, &ts);
+                return ts.tv_sec * 1e9 + ts.tv_nsec;
+            };
+            const double op_loop0 = op_trace_every ? op_now() : 0.0;
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -7564,7 +7704,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                const double op_t0 = op_trace_every ? op_now() : 0.0;
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                if (op_trace_every) {
+                    op_trace.fwd_ns[node->op] += op_now() - op_t0;
+                    op_trace.cnt[node->op]++;
+                }
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
@@ -7573,6 +7718,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
                }
+            }
+            if (op_trace_every) {
+                op_trace.loop_ns += op_now() - op_loop0;
+                if (++op_trace.calls >= op_trace_every) {
+                    double fwd_total = 0; int n_ops = 0;
+                    for (int op = 0; op < GGML_OP_COUNT; op++) { fwd_total += op_trace.fwd_ns[op]; n_ops += op_trace.cnt[op]; }
+                    fprintf(stderr, "ggml_cuda op trace dev %d: %d calls, %d ops, loop %.1f ms, in compute_forward %.1f ms, loop overhead %.1f ms;",
+                            cuda_ctx->device, op_trace.calls, n_ops, op_trace.loop_ns / 1e6, fwd_total / 1e6, (op_trace.loop_ns - fwd_total) / 1e6);
+                    for (int op = 0; op < GGML_OP_COUNT; op++) {
+                        if (op_trace.cnt[op] > 0 && op_trace.fwd_ns[op] >= 1e6) {
+                            fprintf(stderr, " %s %d×%.0fus", ggml_op_name((ggml_op) op), op_trace.cnt[op], op_trace.fwd_ns[op] / 1e3 / op_trace.cnt[op]);
+                        }
+                    }
+                    fprintf(stderr, "\n");
+                    op_trace = op_trace_acc{};
+                }
             }
         }
 
@@ -9293,6 +9454,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
+    }
+    if (strcmp(name, "ggml_backend_comm_allreduce_tensor_rank") == 0) {
+        return (void *)ggml_backend_cuda_comm_allreduce_tensor_rank;
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;

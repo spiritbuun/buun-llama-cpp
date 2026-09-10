@@ -2337,6 +2337,9 @@ static void ggml_compute_forward_mul_mat_id_impl(
     const int ith = params->ith;
     const int nth = params->nth;
 
+    const int32_t mmid_lo      = ggml_mmid_window_lo(dst);
+    const int32_t mmid_n_local = ggml_mmid_window_n_local(dst);
+
     const enum ggml_type type = src0->type;
 
     const bool src1_cont = ggml_is_contiguous(src1);
@@ -2434,7 +2437,7 @@ static void ggml_compute_forward_mul_mat_id_impl(
         if (allow_moe_cache &&
             ggml_moe_cache.begin && ggml_moe_cache.plan &&
             ggml_moe_cache.dispatch && ggml_moe_cache.collect && ggml_moe_cache.end &&
-            src0->op == GGML_OP_NONE && src0_buffer &&
+            src0->op == GGML_OP_NONE && src0_buffer && mmid_n_local == 0 &&
             ggml_backend_buffer_is_host(src0_buffer) &&
             ggml_backend_buffer_get_usage(src0_buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
             src1->type == GGML_TYPE_F32) {
@@ -2448,7 +2451,7 @@ static void ggml_compute_forward_mul_mat_id_impl(
                 int32_t expert_ids[MOE_CACHE_MAX_TOPK];
                 for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
                     for (int id = 0; id < n_ids; ++id) {
-                        expert_ids[iid1*n_ids + id] = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+                        expert_ids[iid1*n_ids + id] = ggml_mmid_expert_index(*(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]), mmid_lo, mmid_n_local);
                     }
                 }
                 ggml_moe_cache.plan(moe_cache_node, expert_ids, n_ids * ids->ne[1], moe_cache_slot_idx);
@@ -2468,7 +2471,12 @@ static void ggml_compute_forward_mul_mat_id_impl(
                         continue;
                     }
                 }
-                const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+                const int32_t i02 = ggml_mmid_expert_index(*(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]), mmid_lo, mmid_n_local);
+                if (i02 < 0) {
+                    // expert-parallel window: the expert lives on another device, the row is zero here
+                    memset((char *) dst->data + iid1*nb2 + id*nb1, 0, ne0*sizeof(float));
+                    continue;
+                }
 
                 assert(i02 >= 0 && i02 < n_as);
 

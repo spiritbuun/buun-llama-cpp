@@ -137,15 +137,29 @@ void exl3_reconstruct_launch(const uint8_t * data, half * dst, int k, int n0, in
         default: GGML_ABORT("invalid EXL3 codebook");         \
     }
 
-// ---- int8 activation path (4 bpw, m <= 4) ---------------------------------------------------
-// GGML_EXL3_INT8: 0 = off (fp16 tensor-core gemv), 1 = int8 + error-feedback residual, 2 = plain int8.
+// ---- int8 activation path (m <= MAX_M) ---------------------------------------------------
+// GGML_EXL3_INT8: 0 = off (fp16 tensor-core gemv), 1 = int8 + error-feedback residual everywhere,
+// 2 = plain int8 (residual only for the head), unset = per-tensor rule: plain for K <= 6, residual for K >= 7.
+// The activation rounding of plain int8 is invisible next to the weight error up to 6 bpw but becomes the
+// dominant error at 7-8 bpw (worst-token KLD vs exllamav3 0.07 at K7, 0.56 at K8; residual restores 0.001/0.0005
+// for 7% / 1% of decode speed on a 1.7B model).
 
 int exl3_int8_mode() {
     static const int mode = [] {
         const char * e = getenv("GGML_EXL3_INT8");
-        return e ? atoi(e) : 2;
+        return e ? atoi(e) : -1;
     }();
     return mode;
+}
+
+// whether the int8 path takes the error-feedback residual pass for a weight of this bit width
+static bool exl3_int8_resid(int bits, bool head) {
+    const int mode = exl3_int8_mode();
+    if (mode == 1) {
+        return true;
+    }
+    // The head (output.weight) feeds the logits directly and is DRAM-bound anyway, so it always takes it
+    return head || (mode != 2 && bits >= 7);
 }
 
 // Self-cleaning per-device counter block (one int per 256-column group), zero at rest.
@@ -162,43 +176,71 @@ int * exl3_int8_counters(int device, cudaStream_t stream) {
     return ws[device];
 }
 
-template <int bits, int cb, int M, bool RESID, bool GROUPED>
-void exl3_gemv_int8_launch(const uint8_t * B, const float * x, const half * suh, const half * svh, float * y, float * partials, int * counters,
-        int k, int n, int colblocks, int ksplit, int nrows, size_t smem, int pairs, exl3_int8::grouped_args ga, cudaStream_t stream) {
-    static bool attr_set = false;
-    if (!attr_set) {
-        CUDA_CHECK(cudaFuncSetAttribute(exl3_int8::gemv_int8_kernel<bits, cb, M, RESID, GROUPED>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024));
-        attr_set = true;
-    }
-    exl3_int8::gemv_int8_kernel<bits, cb, M, RESID, GROUPED><<<dim3(colblocks, ksplit, pairs), exl3_int8::THREADS, smem, stream>>>(
-        B, x, suh, svh, y, partials, counters, k, n, nrows, ga);
+// Dynamic shared-memory budget per device: the 96 KB design cap, or what the device leaves after the
+// largest instantiation's static smem (sh_y[MAX_M][COLS] + reductions; sm_86 opts in to 99 KB total).
+// One value for every instantiation so the k-split below does not depend on M.
+size_t exl3_int8_smem_cap(int device) {
+    constexpr size_t static_worst = size_t(exl3_int8::MAX_M) * exl3_int8::COLS * sizeof(float) + 4096;
+    return std::min<size_t>(96 * 1024, ggml_cuda_info().devices[device].smpbo - static_worst);
 }
 
-// k-split geometry: ~640 blocks in flight, 128-aligned slices, shared memory cap
-void exl3_int8_geometry(int bits, int nacc, int m, int k, int colblocks, int pairs, int & ksplit, int & nrows, size_t & smem) {
+// k-split geometry: ~640 blocks in flight, 128-aligned slices, rows bounded by the shared-memory cap
+// at the worst-case per-row cost (M = MAX_M with residual). For dense calls the split is therefore a
+// function of the shape alone: a token gets bit-identical partial sums whether it is decoded alone or
+// verified in a batch, which keeps greedy speculative decoding lossless on dense models.
+void exl3_int8_geometry(int bits, int nacc, int m, int k, int colblocks, int pairs, size_t cap, int & ksplit, int & nrows, size_t & smem) {
+    constexpr int worst_row_bytes = 2 * exl3_int8::MAX_M * 64 + exl3_int8::MAX_M * 32;
     const int kslices = k / 16;
     ksplit = std::max(1, (640 + colblocks * pairs - 1) / (colblocks * pairs));
     nrows  = std::max(8, ((kslices + ksplit - 1) / ksplit + 7) / 8 * 8);
-    nrows  = std::min(nrows, (96 * 1024 - exl3_int8::stage_bytes(bits)) / (nacc * 64 + m * 32) / 8 * 8);
+    nrows  = std::min(nrows, int(cap - exl3_int8::stage_bytes(bits)) / worst_row_bytes / 8 * 8);
+    GGML_ASSERT(nrows >= 8 && "EXL3 int8 gemv: device shared memory too small");
     ksplit = (kslices + nrows - 1) / nrows;
     smem   = size_t(nrows) * 16 * (size_t(nacc) * 4 + size_t(m) * 2) + exl3_int8::stage_bytes(bits);
+}
+
+// One launch = grid (n/256, ksplit, pairs); dense calls pass pairs = 1 with M tokens, the grouped
+// MoE path M = 1 with one (token, expert) pair per block-z.
+template <int bits, int cb, int M, bool RESID, bool GROUPED>
+void exl3_gemv_int8_launch(ggml_backend_cuda_context & ctx, const uint8_t * B, const float * x, const half * suh, const half * svh,
+        float * y, int k, int n, int pairs, exl3_int8::grouped_args ga, cudaStream_t stream) {
+    const auto kernel = exl3_int8::gemv_int8_kernel<bits, cb, M, RESID, GROUPED>;
+    const size_t cap = exl3_int8_smem_cap(ctx.device);
+    // function attributes are per device: opt this instantiation in once on each
+    static bool attr_set[GGML_CUDA_MAX_DEVICES] = {};
+    if (!attr_set[ctx.device]) {
+        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(cap)));
+        attr_set[ctx.device] = true;
+    }
+    const int colblocks = (n + exl3_int8::COLS - 1) / exl3_int8::COLS;
+    const int nacc = GROUPED ? (cb == 2 ? 1 : 0) : (RESID ? 2 : 1) * M;
+    // The grouped split is sized for the batch's pair count (deliberately batch-dependent): sizing it for
+    // one token's expert set cost 3% of speculative throughput on Qwen3.8-Flash-Next (2800 verify blocks
+    // instead of 800) and bought nothing, because that model's other batch-keyed kernels (F16 hyper-
+    // connection matmuls, attention) already change its numerics between batch sizes and MoE routing
+    // amplifies any such difference. Dense models get batch-independent results from the cap above.
+    int ksplit, nrows; size_t smem;
+    exl3_int8_geometry(bits, nacc, M, k, colblocks, pairs, cap, ksplit, nrows, smem);
+    ggml_cuda_pool_alloc<float> partials(ctx.pool(), size_t(ksplit) * M * pairs * n);
+    int * counters = exl3_int8_counters(ctx.device, stream);
+    kernel<<<dim3(colblocks, ksplit, pairs), exl3_int8::THREADS, smem, stream>>>(
+        B, x, suh, svh, y, partials.get(), counters, k, n, nrows, ga);
 }
 
 template <int bits, bool RESID>
 void exl3_int8_run(ggml_backend_cuda_context & ctx, const float * x, const half * suh, const uint8_t * B, const half * svh,
         float * y, int m, int k, int n, cudaStream_t stream) {
-    const int colblocks = (n + exl3_int8::COLS - 1) / exl3_int8::COLS;
-    const int nacc = (RESID ? 2 : 1) * m;
-    int ksplit, nrows; size_t smem;
-    exl3_int8_geometry(bits, nacc, m, k, colblocks, 1, ksplit, nrows, smem);
-    ggml_cuda_pool_alloc<float> partials(ctx.pool(), size_t(ksplit) * m * n);
-    int * counters = exl3_int8_counters(ctx.device, stream);
     const exl3_int8::grouped_args ga {};
     switch (m) {
-        case 1: exl3_gemv_int8_launch<bits, 2, 1, RESID, false>(B, x, suh, svh, y, partials.get(), counters, k, n, colblocks, ksplit, nrows, smem, 1, ga, stream); break;
-        case 2: exl3_gemv_int8_launch<bits, 2, 2, RESID, false>(B, x, suh, svh, y, partials.get(), counters, k, n, colblocks, ksplit, nrows, smem, 1, ga, stream); break;
-        case 3: exl3_gemv_int8_launch<bits, 2, 3, RESID, false>(B, x, suh, svh, y, partials.get(), counters, k, n, colblocks, ksplit, nrows, smem, 1, ga, stream); break;
-        default: exl3_gemv_int8_launch<bits, 2, 4, RESID, false>(B, x, suh, svh, y, partials.get(), counters, k, n, colblocks, ksplit, nrows, smem, 1, ga, stream); break;
+        case 1: exl3_gemv_int8_launch<bits, 2, 1, RESID, false>(ctx, B, x, suh, svh, y, k, n, 1, ga, stream); break;
+        case 2: exl3_gemv_int8_launch<bits, 2, 2, RESID, false>(ctx, B, x, suh, svh, y, k, n, 1, ga, stream); break;
+        case 3: exl3_gemv_int8_launch<bits, 2, 3, RESID, false>(ctx, B, x, suh, svh, y, k, n, 1, ga, stream); break;
+        case 4: exl3_gemv_int8_launch<bits, 2, 4, RESID, false>(ctx, B, x, suh, svh, y, k, n, 1, ga, stream); break;
+        case 5: exl3_gemv_int8_launch<bits, 2, 5, RESID, false>(ctx, B, x, suh, svh, y, k, n, 1, ga, stream); break;
+        case 6: exl3_gemv_int8_launch<bits, 2, 6, RESID, false>(ctx, B, x, suh, svh, y, k, n, 1, ga, stream); break;
+        case 7: exl3_gemv_int8_launch<bits, 2, 7, RESID, false>(ctx, B, x, suh, svh, y, k, n, 1, ga, stream); break;
+        case 8: exl3_gemv_int8_launch<bits, 2, 8, RESID, false>(ctx, B, x, suh, svh, y, k, n, 1, ga, stream); break;
+        default: GGML_ABORT("EXL3 int8 gemv: m = %d exceeds MAX_M", m);
     }
 }
 
@@ -206,23 +248,25 @@ void exl3_int8_run(ggml_backend_cuda_context & ctx, const float * x, const half 
 template <int bits, int cb>
 void exl3_moe_run(ggml_backend_cuda_context & ctx, const float * x, const half * suh, const uint8_t * B, const half * svh,
         float * y, int k, int n, int pairs, exl3_int8::grouped_args ga, cudaStream_t stream) {
-    constexpr bool INT8 = cb == 2;
-    const int colblocks = (n + exl3_int8::COLS - 1) / exl3_int8::COLS;
-    int ksplit, nrows; size_t smem;
-    exl3_int8_geometry(bits, INT8 ? 1 : 0, 1, k, colblocks, pairs, ksplit, nrows, smem);
-    ggml_cuda_pool_alloc<float> partials(ctx.pool(), size_t(ksplit) * pairs * n);
-    int * counters = exl3_int8_counters(ctx.device, stream);
-    exl3_gemv_int8_launch<bits, cb, 1, false, true>(B, x, suh, svh, y, partials.get(), counters, k, n, colblocks, ksplit, nrows, smem, pairs, ga, stream);
+    exl3_gemv_int8_launch<bits, cb, 1, false, true>(ctx, B, x, suh, svh, y, k, n, pairs, ga, stream);
 }
 
-// MoE decode shapes the grouped kernel takes: F32 in/out, contiguous dst, few pairs
+// (token, expert) pairs the grouped gemv takes before the per-expert fallback. The grouped kernel
+// reads an expert once per pair, the fallback reads each active expert once but pays a launch per
+// expert (Qwen3.8-Flash-Next: ~15k launches for a 32-token prompt). Measured crossover on 4x3090
+// (top-10 of 512 experts): 32-token prompts 2.2x faster grouped, 64-token 1.8x, 128-token 1.3x,
+// equal near 256 tokens (2560 pairs), fallback ahead at 512. Larger prompts want a sorted-token
+// tensor-core grouped GEMM instead of either.
+constexpr int EXL3_MOE_PAIRS_MAX = 2048;
+
+// MoE shapes the grouped kernel takes: F32 in/out, contiguous dst, pair count under the crossover
 bool exl3_mul_mat_id_fast_shape(const ggml_tensor * dst) {
     const ggml_tensor * w = dst->src[0], * x = dst->src[1], * ids = dst->src[2];
     const int64_t pairs = ids->ne[0] * ids->ne[1];
     return w->ne[0] % 128 == 0 && w->ne[1] % 128 == 0 && w->ne[1] <= int64_t(EXL3_INT8_MAX_N) &&
         x->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float) && dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst) &&
         ids->type == GGML_TYPE_I32 && ids->nb[0] == sizeof(int32_t) &&
-        pairs >= 1 && pairs <= 64 && size_t(pairs) * ((w->ne[1] + exl3_int8::COLS - 1) / exl3_int8::COLS) <= EXL3_INT8_COUNTERS &&
+        pairs >= 1 && pairs <= EXL3_MOE_PAIRS_MAX && size_t(pairs) * ((w->ne[1] + exl3_int8::COLS - 1) / exl3_int8::COLS) <= EXL3_INT8_COUNTERS &&
         dst->src[3] != nullptr && dst->src[4] != nullptr;
 }
 
@@ -277,9 +321,7 @@ void ggml_cuda_mul_mat_exl3(ggml_backend_cuda_context & ctx, const ggml_tensor *
         // int8 activation path: fused input transform, per-slice quantization, fused output transform
         const uint8_t * B = static_cast<const uint8_t *>(src0->data);
         const float * x = static_cast<const float *>(src1->data);
-        // The head (output.weight) feeds the logits directly and is DRAM-bound anyway, so it always
-        // takes the residual (error-feedback) pass; plain mode only drops it on the layer weights.
-        const bool resid = exl3_int8_mode() == 1 || strcmp(src0->name, "output.weight") == 0;
+        const bool resid = exl3_int8_resid(bits, strcmp(src0->name, "output.weight") == 0);
         switch (bits) {
 #define EXL3_INT8_CASE(K) case K: resid ? exl3_int8_run<K, true>(ctx, x, suh, B, svh, y, m, k, n, stream) \
                                        : exl3_int8_run<K, false>(ctx, x, suh, B, svh, y, m, k, n, stream); break;

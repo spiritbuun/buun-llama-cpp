@@ -3,6 +3,7 @@
 
 #if !defined(GGML_USE_HIP)
 
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <mutex>
@@ -128,29 +129,38 @@ static fla_modules & get_modules(int device, int cc) {
     return results[device][arch];
 }
 
+// The imported FLA kernels are compiled for the whole model's head layout (GDN_H v-heads, GDN_HK q/k-heads:
+// strides are constexpr) but each kernel block handles the single head named by its grid y index. A device
+// holding only H of the heads (tensor split: H = 3*HK, H <= GDN_H) therefore keeps the packed buffers in the
+// GDN_H/GDN_HK-strided layout, fills only heads < H (the rest is never read) and launches grid.y = H.
+// The FLA head order groups the three v-heads of one q/k-head; llama's native order is h_native = hk + HK*j.
+__device__ __forceinline__ int64_t gdn_h_native(int64_t h, int HK) {
+    return h / 3 + int64_t(HK) * (h % 3);
+}
+
 __global__ void pack_gdn_inputs_bf16(
         const float * q, const float * k, const float * v,
         nv_bfloat16 * qp, nv_bfloat16 * kp, nv_bfloat16 * vp,
-        int n_tokens,
+        int n_tokens, int H, int HK,
         int64_t sq1, int64_t sq2, int64_t sq3,
         int64_t sv1, int64_t sv2, int64_t sv3) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    const int64_t n_qk = int64_t(n_tokens) * GDN_HK * GDN_D;
-    const int64_t n_v  = int64_t(n_tokens) * GDN_H  * GDN_D;
+    const int64_t n_qk = int64_t(n_tokens) * HK * GDN_D;
+    const int64_t n_v  = int64_t(n_tokens) * H  * GDN_D;
     if (i < n_qk) {
         const int64_t d = i % GDN_D;
-        const int64_t h = (i / GDN_D) % GDN_HK;
-        const int64_t t = i / (GDN_D * GDN_HK);
+        const int64_t h = (i / GDN_D) % HK;
+        const int64_t t = i / (GDN_D * HK);
         const int64_t src = d + h * sq1 + t * sq2;
-        qp[i] = q[src];
-        kp[i] = k[src];
+        const int64_t pi  = (t * GDN_HK + h) * GDN_D + d;
+        qp[pi] = q[src];
+        kp[pi] = k[src];
     }
     if (i < n_v) {
         const int64_t d = i % GDN_D;
-        const int64_t h = (i / GDN_D) % GDN_H;
-        const int64_t t = i / (GDN_D * GDN_H);
-        const int64_t h_native = h / 3 + GDN_HK * (h % 3);
-        vp[i] = v[d + h_native * sv1 + t * sv2];
+        const int64_t h = (i / GDN_D) % H;
+        const int64_t t = i / (GDN_D * H);
+        vp[(t * GDN_H + h) * GDN_D + d] = v[d + gdn_h_native(h, HK) * sv1 + t * sv2];
     }
     GGML_UNUSED(sq3);
     GGML_UNUSED(sv3);
@@ -165,25 +175,25 @@ __global__ void pack_gdn_inputs_l2_bf16(
         const float * g, const float * beta, const float * state,
         nv_bfloat16 * qp, nv_bfloat16 * kp, nv_bfloat16 * vp,
         float * gp, float * betap, float * statep,
-        int n_tokens,
+        int n_tokens, int H, int HK,
         int64_t sq1, int64_t sq2, int64_t sq3,
         int64_t sv1, int64_t sv2, int64_t sv3, float eps) {
     constexpr int rows_per_block = 8;
-    const int n_qk_rows = 2 * n_tokens * GDN_HK;
+    const int n_qk_rows = 2 * n_tokens * HK;
     const int norm_blocks = n_qk_rows / rows_per_block;
 
     if (blockIdx.x < norm_blocks) {
         const int warp = threadIdx.x / WARP_SIZE;
         const int lane = threadIdx.x % WARP_SIZE;
         const int row = int(blockIdx.x) * rows_per_block + warp;
-        const bool is_k = row >= n_tokens * GDN_HK;
-        const int qk_row = row - (is_k ? n_tokens * GDN_HK : 0);
-        const int t = qk_row / GDN_HK;
-        const int h = qk_row % GDN_HK;
+        const bool is_k = row >= n_tokens * HK;
+        const int qk_row = row - (is_k ? n_tokens * HK : 0);
+        const int t = qk_row / HK;
+        const int h = qk_row % HK;
         const float * src = is_k ? k : q;
         nv_bfloat16 * dst = is_k ? kp : qp;
         src += h * sq1 + t * sq2;
-        dst += qk_row * GDN_D;
+        dst += (int64_t(t) * GDN_HK + h) * GDN_D;
 
         float values[GDN_D / WARP_SIZE];
         float sum = 0.0f;
@@ -200,33 +210,31 @@ __global__ void pack_gdn_inputs_l2_bf16(
         }
     } else {
         const int64_t i = (int64_t(blockIdx.x) - norm_blocks) * blockDim.x + threadIdx.x;
-        const int64_t n_v = int64_t(n_tokens) * GDN_H * GDN_D;
+        const int64_t n_v = int64_t(n_tokens) * H * GDN_D;
         const int64_t vi = 4 * i;
         if (vi < n_v) {
             const int64_t d = vi % GDN_D;
-            const int64_t h = (vi / GDN_D) % GDN_H;
-            const int64_t t = vi / (GDN_D * GDN_H);
-            const int64_t h_native = h / 3 + GDN_HK * (h % 3);
-            const float4 values = *reinterpret_cast<const float4 *>(v + d + h_native * sv1 + t * sv2);
-            nv_bfloat162 * dst = reinterpret_cast<nv_bfloat162 *>(vp + vi);
+            const int64_t h = (vi / GDN_D) % H;
+            const int64_t t = vi / (GDN_D * H);
+            const float4 values = *reinterpret_cast<const float4 *>(v + d + gdn_h_native(h, HK) * sv1 + t * sv2);
+            nv_bfloat162 * dst = reinterpret_cast<nv_bfloat162 *>(vp + (t * GDN_H + h) * GDN_D + d);
             dst[0] = __floats2bfloat162_rn(values.x, values.y);
             dst[1] = __floats2bfloat162_rn(values.z, values.w);
         }
-        const int64_t n_g = int64_t(n_tokens) * GDN_H;
+        const int64_t n_g = int64_t(n_tokens) * H;
         constexpr int64_t state_stride = int64_t(GDN_D) * GDN_D;
-        constexpr int64_t n_state = int64_t(GDN_H) * state_stride;
+        const int64_t n_state = int64_t(H) * state_stride;
         if (i < n_g) {
-            const int64_t h = i % GDN_H;
-            const int64_t t = i / GDN_H;
-            const int64_t h_native = h / 3 + GDN_HK * (h % 3);
-            gp[i]    = g[t * GDN_H + h_native];
-            betap[i] = beta[t * GDN_H + h_native];
+            const int64_t h = i % H;
+            const int64_t t = i / H;
+            const int64_t h_native = gdn_h_native(h, HK);
+            gp[t * GDN_H + h]    = g[t * H + h_native];
+            betap[t * GDN_H + h] = beta[t * H + h_native];
         }
         if (i < n_state) {
             const int64_t inner = i % state_stride;
             const int64_t h = i / state_stride;
-            const int64_t h_native = h / 3 + GDN_HK * (h % 3);
-            statep[i] = state[h_native * state_stride + inner];
+            statep[i] = state[gdn_h_native(h, HK) * state_stride + inner];
         }
     }
     GGML_UNUSED(sq3);
@@ -241,23 +249,23 @@ __global__ void pack_gdn_compact_conv_l2_bf16(
         const float * g, const float * beta, const float * state,
         nv_bfloat16 * qp, nv_bfloat16 * kp, nv_bfloat16 * vp,
         float * gp, float * betap, float * statep,
-        int n_tokens, float eps) {
+        int n_tokens, int H, int HK, float eps) {
     constexpr int rows_per_block = 8;
-    constexpr int qk_channels = GDN_HK * GDN_D;
-    constexpr int channels = 2 * qk_channels + GDN_H * GDN_D;
-    const int n_qk_rows = 2 * n_tokens * GDN_HK;
+    const int qk_channels = HK * GDN_D;
+    const int channels = 2 * qk_channels + H * GDN_D;
+    const int n_qk_rows = 2 * n_tokens * HK;
     const int norm_blocks = n_qk_rows / rows_per_block;
 
     if (blockIdx.x < norm_blocks) {
         const int warp = threadIdx.x / WARP_SIZE;
         const int lane = threadIdx.x % WARP_SIZE;
         const int row = int(blockIdx.x) * rows_per_block + warp;
-        const bool is_k = row >= n_tokens * GDN_HK;
-        const int qk_row = row - (is_k ? n_tokens * GDN_HK : 0);
-        const int t = qk_row / GDN_HK;
-        const int h = qk_row % GDN_HK;
+        const bool is_k = row >= n_tokens * HK;
+        const int qk_row = row - (is_k ? n_tokens * HK : 0);
+        const int t = qk_row / HK;
+        const int h = qk_row % HK;
         const nv_bfloat16 * src = conv + int64_t(t) * channels + h * GDN_D + (is_k ? qk_channels : 0);
-        nv_bfloat16 * dst = (is_k ? kp : qp) + qk_row * GDN_D;
+        nv_bfloat16 * dst = (is_k ? kp : qp) + (int64_t(t) * GDN_HK + h) * GDN_D;
 
         float values[GDN_D / WARP_SIZE];
         float sum = 0.0f;
@@ -274,103 +282,97 @@ __global__ void pack_gdn_compact_conv_l2_bf16(
         }
     } else {
         const int64_t i = (int64_t(blockIdx.x) - norm_blocks) * blockDim.x + threadIdx.x;
-        const int64_t n_v = int64_t(n_tokens) * GDN_H * GDN_D;
+        const int64_t n_v = int64_t(n_tokens) * H * GDN_D;
         const int64_t vi = 4 * i;
         if (vi < n_v) {
             const int64_t d = vi % GDN_D;
-            const int64_t h = (vi / GDN_D) % GDN_H;
-            const int64_t t = vi / (GDN_D * GDN_H);
-            const int64_t h_native = h / 3 + GDN_HK * (h % 3);
+            const int64_t h = (vi / GDN_D) % H;
+            const int64_t t = vi / (GDN_D * H);
             const nv_bfloat162 * src = reinterpret_cast<const nv_bfloat162 *>(
-                conv + t * channels + 2 * qk_channels + h_native * GDN_D + d);
-            nv_bfloat162 * dst = reinterpret_cast<nv_bfloat162 *>(vp + vi);
+                conv + t * channels + 2 * qk_channels + gdn_h_native(h, HK) * GDN_D + d);
+            nv_bfloat162 * dst = reinterpret_cast<nv_bfloat162 *>(vp + (t * GDN_H + h) * GDN_D + d);
             dst[0] = src[0];
             dst[1] = src[1];
         }
-        const int64_t n_g = int64_t(n_tokens) * GDN_H;
+        const int64_t n_g = int64_t(n_tokens) * H;
         constexpr int64_t state_stride = int64_t(GDN_D) * GDN_D;
-        constexpr int64_t n_state = int64_t(GDN_H) * state_stride;
+        const int64_t n_state = int64_t(H) * state_stride;
         if (i < n_g) {
-            const int64_t h = i % GDN_H;
-            const int64_t t = i / GDN_H;
-            const int64_t h_native = h / 3 + GDN_HK * (h % 3);
-            gp[i]    = g[t * GDN_H + h_native];
-            betap[i] = beta[t * GDN_H + h_native];
+            const int64_t h = i % H;
+            const int64_t t = i / H;
+            const int64_t h_native = gdn_h_native(h, HK);
+            gp[t * GDN_H + h]    = g[t * H + h_native];
+            betap[t * GDN_H + h] = beta[t * H + h_native];
         }
         if (i < n_state) {
             const int64_t inner = i % state_stride;
             const int64_t h = i / state_stride;
-            const int64_t h_native = h / 3 + GDN_HK * (h % 3);
-            statep[i] = state[h_native * state_stride + inner];
+            statep[i] = state[gdn_h_native(h, HK) * state_stride + inner];
         }
     }
 }
 
 __global__ void pack_gdn_heads_f32(
         const float * g, const float * beta, const float * state,
-        float * gp, float * betap, float * statep, int n_tokens) {
+        float * gp, float * betap, float * statep, int n_tokens, int H, int HK) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    const int64_t n_g = int64_t(n_tokens) * GDN_H;
+    const int64_t n_g = int64_t(n_tokens) * H;
     constexpr int64_t state_stride = int64_t(GDN_D) * GDN_D;
-    constexpr int64_t n_state = int64_t(GDN_H) * state_stride;
+    const int64_t n_state = int64_t(H) * state_stride;
     if (i < n_g) {
-        const int64_t h = i % GDN_H;
-        const int64_t t = i / GDN_H;
-        const int64_t h_native = h / 3 + GDN_HK * (h % 3);
-        gp[i]    = g[t * GDN_H + h_native];
-        betap[i] = beta[t * GDN_H + h_native];
+        const int64_t h = i % H;
+        const int64_t t = i / H;
+        const int64_t h_native = gdn_h_native(h, HK);
+        gp[t * GDN_H + h]    = g[t * H + h_native];
+        betap[t * GDN_H + h] = beta[t * H + h_native];
     }
     if (i < n_state) {
         const int64_t inner = i % state_stride;
         const int64_t h = i / state_stride;
-        const int64_t h_native = h / 3 + GDN_HK * (h % 3);
-        statep[i] = state[h_native * state_stride + inner];
+        statep[i] = state[gdn_h_native(h, HK) * state_stride + inner];
     }
 }
 
 __global__ void unpack_gdn_heads_f32(
         const nv_bfloat16 * src, const float * state_src,
-        float * dst, float * state_dst, int n_tokens) {
+        float * dst, float * state_dst, int n_tokens, int H, int HK) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    const int64_t n_v = int64_t(n_tokens) * GDN_H * GDN_D;
+    const int64_t n_v = int64_t(n_tokens) * H * GDN_D;
     constexpr int64_t state_stride = int64_t(GDN_D) * GDN_D;
-    constexpr int64_t n_state = int64_t(GDN_H) * state_stride;
+    const int64_t n_state = int64_t(H) * state_stride;
     if (i < n_v) {
         const int64_t d = i % GDN_D;
-        const int64_t h = (i / GDN_D) % GDN_H;
-        const int64_t t = i / (GDN_D * GDN_H);
-        const int64_t h_native = h / 3 + GDN_HK * (h % 3);
-        dst[(t * GDN_H + h_native) * GDN_D + d] = src[i];
+        const int64_t h = (i / GDN_D) % H;
+        const int64_t t = i / (GDN_D * H);
+        dst[(t * H + gdn_h_native(h, HK)) * GDN_D + d] = src[(t * GDN_H + h) * GDN_D + d];
     }
     if (i < n_state) {
         const int64_t inner = i % state_stride;
         const int64_t h = i / state_stride;
-        const int64_t h_native = h / 3 + GDN_HK * (h % 3);
-        state_dst[h_native * state_stride + inner] = state_src[i];
+        state_dst[gdn_h_native(h, HK) * state_stride + inner] = state_src[i];
     }
 }
 
-__global__ void unpack_gdn_state_f32(const float * src, float * dst) {
+__global__ void unpack_gdn_state_f32(const float * src, float * dst, int H, int HK) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     constexpr int64_t state_stride = int64_t(GDN_D) * GDN_D;
-    constexpr int64_t n_state = int64_t(GDN_H) * state_stride;
+    const int64_t n_state = int64_t(H) * state_stride;
     if (i < n_state) {
         const int64_t inner = i % state_stride;
         const int64_t h = i / state_stride;
-        const int64_t h_native = h / 3 + GDN_HK * (h % 3);
-        dst[h_native * state_stride + inner] = src[i];
+        dst[gdn_h_native(h, HK) * state_stride + inner] = src[i];
     }
 }
 
 template <bool fuse_gate, bool gate_bf16 = false, bool output_bf16 = false, int rows_per_block = 1>
 __global__ void unpack_gdn_rms_f32(
-        const nv_bfloat16 * src, const float * weight, const float * gate, float * dst, float eps) {
+        const nv_bfloat16 * src, const float * weight, const float * gate, float * dst, float eps, int H, int HK) {
     const int group = threadIdx.x / GDN_D;
     const int64_t row_native = int64_t(blockIdx.x) * rows_per_block + group;
     const int d = threadIdx.x % GDN_D;
-    const int64_t t = row_native / GDN_H;
-    const int64_t h_native = row_native % GDN_H;
-    const int64_t h = (h_native % GDN_HK) * 3 + h_native / GDN_HK;
+    const int64_t t = row_native / H;
+    const int64_t h_native = row_native % H;
+    const int64_t h = (h_native % HK) * 3 + h_native / HK;
     const float x = __bfloat162float(src[(t * GDN_H + h) * GDN_D + d]);
     const int64_t output_idx = row_native * GDN_D + d;
     float gain = 0.0f;
@@ -436,8 +438,9 @@ __device__ __forceinline__ int8_t gdn_float_to_i8_rn(float value) {
 template <bool gate_bf16>
 __global__ void unpack_gdn_rms_i8(
         const nv_bfloat16 * src, const float * weight, const float * gate,
-        int8_t * dst, float * scales, float eps) {
-    constexpr int warps = GDN_H / 2;
+        int8_t * dst, float * scales, float eps, int H, int HK) {
+    constexpr int warps_max = GDN_H / 2;
+    const int warps = H / 2;
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const int64_t t = blockIdx.x;
@@ -447,7 +450,7 @@ __global__ void unpack_gdn_rms_i8(
 #pragma unroll
     for (int head_pass = 0; head_pass < 2; ++head_pass) {
         const int h_native = warp + head_pass * warps;
-        const int h = (h_native % GDN_HK) * 3 + h_native / GDN_HK;
+        const int h = (h_native % HK) * 3 + h_native / HK;
         float x[4];
         float sum = 0.0f;
 #pragma unroll
@@ -465,7 +468,7 @@ __global__ void unpack_gdn_rms_i8(
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             const int d = lane * 4 + j;
-            const int64_t output_idx = (t * GDN_H + h_native) * GDN_D + d;
+            const int64_t output_idx = (t * H + h_native) * GDN_D + d;
             const float gate_value = gate_bf16
                 ? __bfloat162float(reinterpret_cast<const nv_bfloat16 *>(gate)[output_idx])
                 : gate[output_idx];
@@ -481,7 +484,7 @@ __global__ void unpack_gdn_rms_i8(
     for (int offset = 16; offset > 0; offset >>= 1) {
         local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, offset));
     }
-    __shared__ float warp_max[warps];
+    __shared__ float warp_max[warps_max];
     __shared__ float inverse;
     if (lane == 0) {
         warp_max[warp] = local_max;
@@ -508,7 +511,7 @@ __global__ void unpack_gdn_rms_i8(
         packed.y = gdn_float_to_i8_rn(__bfloat162float(values[head_pass * 4 + 1]) * inverse);
         packed.z = gdn_float_to_i8_rn(__bfloat162float(values[head_pass * 4 + 2]) * inverse);
         packed.w = gdn_float_to_i8_rn(__bfloat162float(values[head_pass * 4 + 3]) * inverse);
-        reinterpret_cast<char4 *>(dst + (t * GDN_H + h_native) * GDN_D)[lane] = packed;
+        reinterpret_cast<char4 *>(dst + (t * H + h_native) * GDN_D)[lane] = packed;
     }
 }
 
@@ -546,9 +549,12 @@ bool ggml_cuda_gdn_fla_ptx_supported(
     const bool supported_device = available && (cc == 800 || cc == 860 || cc == 1200);
     const bool supported_length = cc == 1200 ? n_tokens >= 508 :
                                   n_tokens >= 512 && n_tokens % GDN_BT == 0;
-    return supported_device &&
-           !kda && !keep_rs && S_v == GDN_D && H == GDN_H && H_k == GDN_HK &&
-           supported_length && n_seqs == 1;
+    // Keep SM120 on its validated full-head layout. Ampere also supports
+    // per-device subsets with the compiled 3:1 ratio and paired I8 heads.
+    const bool supported_heads = cc == 1200 ? H == GDN_H && H_k == GDN_HK :
+                                 H > 0 && H == 3 * H_k && H <= GDN_H && H % 2 == 0;
+    return supported_device && !kda && !keep_rs && S_v == GDN_D &&
+           supported_heads && supported_length && n_seqs == 1;
 }
 
 void ggml_cuda_gdn_fla_ptx(
@@ -556,7 +562,7 @@ void ggml_cuda_gdn_fla_ptx(
         const float * q, const float * k, const float * v,
         const float * g, const float * beta, const float * state_in,
         float * dst, float * state_out,
-        int64_t n_tokens,
+        int64_t n_tokens, int64_t H64, int64_t HK64,
         int64_t sq1, int64_t sq2, int64_t sq3,
         int64_t sv1, int64_t sv2, int64_t sv3,
         const void * compact_conv_bf16,
@@ -568,6 +574,9 @@ void ggml_cuda_gdn_fla_ptx(
     fla_modules & m = get_modules(ctx.device, cc);
 
     GGML_ASSERT(n_tokens > 0 && n_tokens <= INT_MAX);
+    GGML_ASSERT(H64 > 0 && H64 == 3 * HK64 && H64 <= GDN_H && H64 % 2 == 0);
+    const int H  = int(H64);
+    const int HK = int(HK64);
     const int n_chunks         = int((n_tokens + GDN_BT - 1) / GDN_BT);
     const int64_t n_qk         = n_tokens * GDN_HK * GDN_D;
     const int64_t n_v          = n_tokens * GDN_H  * GDN_D;
@@ -596,30 +605,34 @@ void ggml_cuda_gdn_fla_ptx(
     ggml_cuda_pool_alloc<int64_t>     chunk_offsets(ctx.pool(), 2);
 
     constexpr int threads = 256;
+    // element counts of this device's heads (the packed buffers above are sized for GDN_H)
+    const int64_t n_v_dev     = n_tokens * H * GDN_D;
+    const int64_t n_state_dev = int64_t(H) * GDN_D * GDN_D;
+    const int64_t n_g_dev     = n_tokens * H;
     if (compact_conv_bf16 != nullptr) {
         GGML_ASSERT(l2_eps >= 0.0f);
         constexpr int rows_per_block = 8;
-        const int norm_blocks = 2 * int(n_tokens) * GDN_HK / rows_per_block;
-        const int v_blocks = (std::max(n_v / 4, n_state) + threads - 1) / threads;
+        const int norm_blocks = 2 * int(n_tokens) * HK / rows_per_block;
+        const int v_blocks = (std::max(n_v_dev / 4, n_state_dev) + threads - 1) / threads;
         pack_gdn_compact_conv_l2_bf16<<<norm_blocks + v_blocks, threads, 0, stream>>>(
             static_cast<const nv_bfloat16 *>(compact_conv_bf16), g, beta, state_in,
             q_p.get(), k_p.get(), v_p.get(), g_p.get(), beta_p.get(), state_in_p.get(),
-            int(n_tokens), l2_eps);
+            int(n_tokens), H, HK, l2_eps);
     } else if (l2_eps >= 0.0f) {
         constexpr int rows_per_block = 8;
-        const int norm_blocks = 2 * int(n_tokens) * GDN_HK / rows_per_block;
-        const int v_blocks = (std::max(n_v / 4, n_state) + threads - 1) / threads;
+        const int norm_blocks = 2 * int(n_tokens) * HK / rows_per_block;
+        const int v_blocks = (std::max(n_v_dev / 4, n_state_dev) + threads - 1) / threads;
         pack_gdn_inputs_l2_bf16<<<norm_blocks + v_blocks, threads, 0, stream>>>(
             q, k, v, g, beta, state_in,
             q_p.get(), k_p.get(), v_p.get(), g_p.get(), beta_p.get(), state_in_p.get(),
-            int(n_tokens),
+            int(n_tokens), H, HK,
             sq1, sq2, sq3, sv1, sv2, sv3, l2_eps);
     } else {
-        pack_gdn_inputs_bf16<<<(n_v + threads - 1) / threads, threads, 0, stream>>>(
-            q, k, v, q_p.get(), k_p.get(), v_p.get(), int(n_tokens),
+        pack_gdn_inputs_bf16<<<(n_v_dev + threads - 1) / threads, threads, 0, stream>>>(
+            q, k, v, q_p.get(), k_p.get(), v_p.get(), int(n_tokens), H, HK,
             sq1, sq2, sq3, sv1, sv2, sv3);
-        pack_gdn_heads_f32<<<(std::max(n_state, n_g) + threads - 1) / threads, threads, 0, stream>>>(
-            g, beta, state_in, g_p.get(), beta_p.get(), state_in_p.get(), int(n_tokens));
+        pack_gdn_heads_f32<<<(std::max(n_state_dev, n_g_dev) + threads - 1) / threads, threads, 0, stream>>>(
+            g, beta, state_in, g_p.get(), beta_p.get(), state_in_p.get(), int(n_tokens), H, HK);
     }
     CUDA_CHECK(cudaGetLastError());
     init_gdn_varlen_metadata<<<1, 256, 0, stream>>>(
@@ -632,71 +645,72 @@ void ggml_cuda_gdn_fla_ptx(
 
     void * cumsum_args[] = { &g_p.ptr, &g_cum.ptr, &cu_seqlens.ptr, &chunk_indices.ptr, &T, &null_ptr, &null_ptr };
     const bool sm80 = cc == 800;
+    const unsigned Hu = (unsigned) H;
     const bool sm120 = cc == 1200;
-    launch(m.funcs[K_CUMSUM], {(unsigned) n_chunks, GDN_H, 1}, {sm120 ? 64u : sm80 ? 128u : 256u, 1, 1}, 8, cu_stream, cumsum_args);
+    launch(m.funcs[K_CUMSUM], {(unsigned) n_chunks, Hu, 1}, {sm120 ? 64u : sm80 ? 128u : 256u, 1, 1}, 8, cu_stream, cumsum_args);
     void * kkt_args[] = { &k_p.ptr, &beta_p.ptr, &g_cum.ptr, &A.ptr, &cu_seqlens.ptr, &chunk_indices.ptr, &T, &null_ptr, &null_ptr };
-    launch(m.funcs[K_KKT], {(unsigned) n_chunks, GDN_H, 1}, {sm80 || sm120 ? 128u : 256u, 1, 1}, sm80 ? 8192 : 16384, cu_stream, kkt_args);
+    launch(m.funcs[K_KKT], {(unsigned) n_chunks, Hu, 1}, {sm80 || sm120 ? 128u : 256u, 1, 1}, sm80 ? 8192 : 16384, cu_stream, kkt_args);
     CUDA_CHECK(cudaMemsetAsync(Ai.get(), 0, n_A * sizeof(nv_bfloat16), stream));
     void * solve_args[] = { &A.ptr, &Ai.ptr, &cu_seqlens.ptr, &chunk_indices.ptr, &T, &null_ptr, &null_ptr };
-    launch(m.funcs[K_SOLVE], {(unsigned) n_chunks, GDN_H, 1}, {sm80 || sm120 ? 64u : 128u, 1, 1}, 10240, cu_stream, solve_args);
+    launch(m.funcs[K_SOLVE], {(unsigned) n_chunks, Hu, 1}, {sm80 || sm120 ? 64u : 128u, 1, 1}, 10240, cu_stream, solve_args);
     void * recompute_args[] = { &k_p.ptr, &v_p.ptr, &beta_p.ptr, &w.ptr, &u.ptr, &Ai.ptr, &g_cum.ptr,
                                 &cu_seqlens.ptr, &chunk_indices.ptr, &T, &null_ptr, &null_ptr };
-    launch(m.funcs[K_RECOMPUTE], {(unsigned) n_chunks, GDN_H, 1}, {sm80 ? 64u : 128u, 1, 1}, sm120 ? 20480 : sm80 ? 36864 : 32768, cu_stream, recompute_args);
+    launch(m.funcs[K_RECOMPUTE], {(unsigned) n_chunks, Hu, 1}, {sm80 ? 64u : 128u, 1, 1}, sm120 ? 20480 : sm80 ? 36864 : 32768, cu_stream, recompute_args);
     void * state_args[] = { &k_p.ptr, &u.ptr, &w.ptr, &v_new.ptr, &g_cum.ptr, &h.ptr,
                             &state_in_p.ptr, &state_out_p.ptr, &cu_seqlens.ptr, &chunk_offsets.ptr, &T, &null_ptr, &null_ptr };
-    launch(m.funcs[K_STATE], {2, GDN_H, 1}, {128, 1, 1}, sm80 || sm120 ? 90632 : 49412, cu_stream, state_args);
+    launch(m.funcs[K_STATE], {2, Hu, 1}, {128, 1, 1}, sm80 || sm120 ? 90632 : 49412, cu_stream, state_args);
     void * output_args[] = { &q_p.ptr, &k_p.ptr, &v_new.ptr, &h.ptr, &g_cum.ptr, &out.ptr,
                              &cu_seqlens.ptr, &chunk_indices.ptr, &scale, &T, &null_ptr, &null_ptr };
-    launch(m.funcs[K_OUTPUT], {sm120 ? 2u : sm80 ? 1u : 4u, (unsigned) n_chunks, GDN_H}, {sm80 || sm120 ? 128u : 64u, 1, 1}, sm120 ? 24576 : sm80 ? 32768 : 20480, cu_stream, output_args);
+    launch(m.funcs[K_OUTPUT], {sm120 ? 2u : sm80 ? 1u : 4u, (unsigned) n_chunks, Hu}, {sm80 || sm120 ? 128u : 64u, 1, 1}, sm120 ? 24576 : sm80 ? 32768 : 20480, cu_stream, output_args);
     if (rms_output != nullptr) {
         GGML_ASSERT(rms_weight != nullptr);
         if (rms_output_int8) {
             GGML_ASSERT(rms_gate != nullptr && rms_output_scale != nullptr);
-            constexpr int block_size = (GDN_H / 2) * 32;
+            const int block_size = (H / 2) * 32;
             if (rms_gate_bf16) {
                 unpack_gdn_rms_i8<true><<<n_tokens, block_size, 0, stream>>>(
                     out.get(), rms_weight, rms_gate,
-                    reinterpret_cast<int8_t *>(rms_output), rms_output_scale, rms_eps);
+                    reinterpret_cast<int8_t *>(rms_output), rms_output_scale, rms_eps, H, HK);
             } else {
                 unpack_gdn_rms_i8<false><<<n_tokens, block_size, 0, stream>>>(
                     out.get(), rms_weight, rms_gate,
-                    reinterpret_cast<int8_t *>(rms_output), rms_output_scale, rms_eps);
+                    reinterpret_cast<int8_t *>(rms_output), rms_output_scale, rms_eps, H, HK);
             }
         } else if (rms_gate != nullptr) {
             if (rms_gate_bf16) {
                 if (rms_output_bf16) {
-                    unpack_gdn_rms_f32<true, true, true><<<n_tokens * GDN_H, GDN_D, 32 * sizeof(float), stream>>>(
-                        out.get(), rms_weight, rms_gate, rms_output, rms_eps);
+                    unpack_gdn_rms_f32<true, true, true><<<n_g_dev, GDN_D, 32 * sizeof(float), stream>>>(
+                        out.get(), rms_weight, rms_gate, rms_output, rms_eps, H, HK);
                 } else {
-                    unpack_gdn_rms_f32<true, true><<<n_tokens * GDN_H, GDN_D, 32 * sizeof(float), stream>>>(
-                        out.get(), rms_weight, rms_gate, rms_output, rms_eps);
+                    unpack_gdn_rms_f32<true, true><<<n_g_dev, GDN_D, 32 * sizeof(float), stream>>>(
+                        out.get(), rms_weight, rms_gate, rms_output, rms_eps, H, HK);
                 }
             } else {
                 if (rms_output_bf16) {
-                    unpack_gdn_rms_f32<true, false, true><<<n_tokens * GDN_H, GDN_D, 32 * sizeof(float), stream>>>(
-                        out.get(), rms_weight, rms_gate, rms_output, rms_eps);
+                    unpack_gdn_rms_f32<true, false, true><<<n_g_dev, GDN_D, 32 * sizeof(float), stream>>>(
+                        out.get(), rms_weight, rms_gate, rms_output, rms_eps, H, HK);
                 } else if (sm120) {
-                    unpack_gdn_rms_f32<true, false, false, 2><<<n_tokens * GDN_H / 2, 2 * GDN_D, 8 * sizeof(float), stream>>>(
-                        out.get(), rms_weight, rms_gate, rms_output, rms_eps);
+                    unpack_gdn_rms_f32<true, false, false, 2><<<n_g_dev / 2, 2 * GDN_D, 8 * sizeof(float), stream>>>(
+                        out.get(), rms_weight, rms_gate, rms_output, rms_eps, H, HK);
                 } else {
-                    unpack_gdn_rms_f32<true><<<n_tokens * GDN_H, GDN_D, 32 * sizeof(float), stream>>>(
-                        out.get(), rms_weight, rms_gate, rms_output, rms_eps);
+                    unpack_gdn_rms_f32<true><<<n_g_dev, GDN_D, 32 * sizeof(float), stream>>>(
+                        out.get(), rms_weight, rms_gate, rms_output, rms_eps, H, HK);
                 }
             }
         } else {
             if (rms_output_bf16) {
-                unpack_gdn_rms_f32<false, false, true><<<n_tokens * GDN_H, GDN_D, 32 * sizeof(float), stream>>>(
-                    out.get(), rms_weight, nullptr, rms_output, rms_eps);
+                unpack_gdn_rms_f32<false, false, true><<<n_g_dev, GDN_D, 32 * sizeof(float), stream>>>(
+                    out.get(), rms_weight, nullptr, rms_output, rms_eps, H, HK);
             } else {
-                unpack_gdn_rms_f32<false><<<n_tokens * GDN_H, GDN_D, 32 * sizeof(float), stream>>>(
-                    out.get(), rms_weight, nullptr, rms_output, rms_eps);
+                unpack_gdn_rms_f32<false><<<n_g_dev, GDN_D, 32 * sizeof(float), stream>>>(
+                    out.get(), rms_weight, nullptr, rms_output, rms_eps, H, HK);
             }
         }
-        unpack_gdn_state_f32<<<(n_state + threads - 1) / threads, threads, 0, stream>>>(
-            state_out_p.get(), state_out);
+        unpack_gdn_state_f32<<<(n_state_dev + threads - 1) / threads, threads, 0, stream>>>(
+            state_out_p.get(), state_out, H, HK);
     } else {
-        unpack_gdn_heads_f32<<<(n_v + threads - 1) / threads, threads, 0, stream>>>(
-            out.get(), state_out_p.get(), dst, state_out, int(n_tokens));
+        unpack_gdn_heads_f32<<<(std::max(n_v_dev, n_state_dev) + threads - 1) / threads, threads, 0, stream>>>(
+            out.get(), state_out_p.get(), dst, state_out, int(n_tokens), H, HK);
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -705,7 +719,7 @@ void ggml_cuda_gdn_fla_ptx(
 
 bool ggml_cuda_gdn_fla_ptx_supported(int, bool, bool, int64_t, int64_t, int64_t, int64_t, int64_t) { return false; }
 void ggml_cuda_gdn_fla_ptx(ggml_backend_cuda_context &, int, const float *, const float *, const float *,
-        const float *, const float *, const float *, float *, float *, int64_t, int64_t, int64_t,
+        const float *, const float *, const float *, float *, float *, int64_t, int64_t, int64_t, int64_t, int64_t,
         int64_t, int64_t, int64_t, int64_t, const void *, float, const float *, const float *, bool, float *, bool,
         bool, float *, float) { GGML_ABORT("FLA PTX is CUDA-only"); }
 

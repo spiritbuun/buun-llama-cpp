@@ -260,6 +260,7 @@ static __global__ void quantize_mmq_nvfp4(
 #pragma unroll
                 for (int slot = 0; slot < n_expert_used; ++slot) {
                     const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
+            if (i < 0) { continue; } // slot routed to another device (expert-parallel window)
                     scale[i] = warp_amax[0];
                 }
             } else {
@@ -386,6 +387,7 @@ static __global__ void quantize_mmq_nvfp4(
 #pragma unroll
             for (int slot = 0; slot < n_expert_used; ++slot) {
                 const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
+            if (i < 0) { continue; } // slot routed to another device (expert-parallel window)
                 block_fp4_mmq * yb = y + (k_block * ne1 + i);
                 uint32_t * yqs = reinterpret_cast<uint32_t *>(yb->qs);
                 yqs[2 * sub + 0] = q0;
@@ -504,6 +506,7 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
 #pragma unroll
         for (int slot = 0; slot < n_expert_used; ++slot) {
             const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
+            if (i < 0) { continue; } // slot routed to another device (expert-parallel window)
             block_fp4_mmq * yb = y + (k_block * ne1 + i);
             char2 * yqs2 = (char2 *) yb->qs;
             if (lane_in_group == 0) {
@@ -603,6 +606,7 @@ static __global__ void quantize_mmq_q8_1(
         int64_t ib;
         if constexpr (scatter) {
             const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
+            if (i < 0) { continue; } // slot routed to another device (expert-parallel window)
             ib = k_block*ne1 + i;
         } else {
             const int64_t ib0 = blockIdx.z*((int64_t)gridDim.x*gridDim.y*blockDim.x/QK8_1); // first block of channel
