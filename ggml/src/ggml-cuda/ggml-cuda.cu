@@ -2651,6 +2651,32 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
+static bool ggml_cuda_can_prepare_dynamic_fp8_mmv(
+        const ggml_backend_cuda_context & ctx, const ggml_tensor * mm) {
+#if defined(GGML_USE_HIP)
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(mm);
+    return false;
+#else
+    const ggml_tensor * w = mm->src[0];
+    const ggml_tensor * x = mm->src[1];
+    const ggml_tensor * marker = mm->src[3];
+    if (!w || !x || !marker || mm->op != GGML_OP_MUL_MAT ||
+            w->type != GGML_TYPE_F8_E4M3 || x->type != GGML_TYPE_F32 ||
+            marker->type != GGML_TYPE_I32 || ggml_nelements(marker) != 1 ||
+            !ggml_is_contiguous(marker) || !ggml_is_contiguous(x) || x->ne[1] != 1 ||
+            w->ne[2] != 1 || w->ne[3] != 1 || x->ne[2] != 1 || x->ne[3] != 1 ||
+            ggml_cuda_info().devices[ctx.device].cc != GGML_CUDA_CC_BLACKWELL ||
+            ggml_cuda_humming_fp8_is_repacked(w)) {
+        return false;
+    }
+    ggml_tensor ordinary = *mm;
+    ordinary.src[2] = nullptr;
+    ordinary.src[3] = nullptr;
+    return ggml_cuda_should_fuse_mul_mat_vec_q(&ordinary);
+#endif
+}
+
 __global__ void dequantize_quanto_q4_1_bf16(
         const block_q4_1 * weight, nv_bfloat16 * output, int64_t count) {
     const int64_t index = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -2733,7 +2759,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             return;
         }
 
-        ggml_cuda_pool_alloc<float> rounded_input(ctx.pool(), ggml_nelements(src1));
+        ggml_tensor ordinary = *dst;
+        ordinary.src[2] = nullptr;
+        ordinary.src[3] = nullptr;
+        const bool fused_fp8_prepare = ggml_cuda_can_prepare_dynamic_fp8_mmv(ctx, dst);
+        ggml_cuda_pool_alloc<float> rounded_input(ctx.pool());
+        if (!fused_fp8_prepare) {
+            rounded_input.alloc(ggml_nelements(src1));
+        }
         if (src0->type == GGML_TYPE_Q4_A32 && dst->src[2] == nullptr) {
             if (input_scale->type == GGML_TYPE_I16) {
                 ggml_cuda_fp8_dynamic_fake_quant(ctx, src1, input_scale, rounded_input.get());
@@ -2754,23 +2787,41 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
                 ggml_is_contiguous(weight_scale);
             GGML_ASSERT(src0->type == GGML_TYPE_F8_E4M3 &&
                 (dst->src[2] == nullptr || fp8_channel_scale));
-            if (input_scale->type == GGML_TYPE_I32) {
-                ggml_cuda_fp8_dynamic_fake_quant(ctx, src1, input_scale, rounded_input.get());
-            } else {
-                ggml_cuda_fp8_static_fake_quant(ctx, src1, input_scale, rounded_input.get());
+            if (!fused_fp8_prepare) {
+                if (input_scale->type == GGML_TYPE_I32) {
+                    ggml_cuda_fp8_dynamic_fake_quant(ctx, src1, input_scale, rounded_input.get());
+                } else {
+                    ggml_cuda_fp8_static_fake_quant(ctx, src1, input_scale, rounded_input.get());
+                }
             }
         }
 
         ggml_tensor rounded = *src1;
-        rounded.data = rounded_input.get();
-        ggml_tensor ordinary = *dst;
+        rounded.data = fused_fp8_prepare ? src1->data : rounded_input.get();
         ordinary.src[1] = &rounded;
-        ordinary.src[3] = nullptr;
+        ordinary.src[2] = dst->src[2];
+        const auto run_ordinary = [&] {
+            if (fused_fp8_prepare) {
+                ggml_cuda_mul_mat_vec_q(ctx, src0, &rounded, nullptr, &ordinary,
+                    nullptr, 1.0f, false, input_scale);
+            } else {
+                ggml_cuda_mul_mat(ctx, src0, &rounded, &ordinary);
+            }
+        };
         if (src0->type == GGML_TYPE_F8_E4M3 && dst->src[2] != nullptr) {
+            if (fused_fp8_prepare) {
+                // Apply the existing row scale at the final F32 writer, preserving
+                // the dot-product and scale-multiply rounding boundaries.
+                ggml_cuda_mm_fusion_args_host fusion{};
+                fusion.x_scale = dst->src[2];
+                ggml_cuda_mul_mat_vec_q(ctx, src0, &rounded, nullptr, dst,
+                    &fusion, 1.0f, false, input_scale);
+                return;
+            }
             ggml_cuda_pool_alloc<float> unscaled(ctx.pool(), ggml_nelements(dst));
             ordinary.data = unscaled.get();
             ordinary.src[2] = nullptr;
-            ggml_cuda_mul_mat(ctx, src0, &rounded, &ordinary);
+            run_ordinary();
 
             ggml_tensor unscaled_tensor = *dst;
             unscaled_tensor.data = unscaled.get();
@@ -2783,7 +2834,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             scaled.src[3] = nullptr;
             ggml_cuda_op_mul(ctx, &scaled);
         } else {
-            ggml_cuda_mul_mat(ctx, src0, &rounded, &ordinary);
+            run_ordinary();
         }
         return;
 #endif
@@ -5579,6 +5630,94 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // not. Keep these nodes on that path until an individual fusion consumes
     // the scale/marker explicitly.
     if (node->op == GGML_OP_MUL_MAT && node->src[3] != nullptr) {
+        if (ggml_cuda_can_prepare_dynamic_fp8_mmv(*cuda_ctx, node)) {
+            // One-token, one-sequence DConv4. The state-slot VIEW remains an
+            // output binding; the two actual writers are CPY and SiLU.
+            const ggml_op conv_ops[] = { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_TRANSPOSE,
+                GGML_OP_CONCAT, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY,
+                GGML_OP_SSM_CONV, GGML_OP_UNARY };
+            const int conv_outputs[] = { i + 5, i + 6, i + 8 };
+            if (node->src[0]->ne[0] >= 2048 && node->src[0]->ne[0] % 128 == 0 &&
+                    ggml_is_contiguous(node->src[0]) &&
+                    ggml_can_fuse_subgraph(cgraph, i, 9, conv_ops, conv_outputs, 3)) {
+                const ggml_tensor * reshape = cgraph->nodes[i + 1];
+                const ggml_tensor * body = cgraph->nodes[i + 2];
+                const ggml_tensor * concat = cgraph->nodes[i + 3];
+                const ggml_tensor * tail = cgraph->nodes[i + 4];
+                const ggml_tensor * state_view = cgraph->nodes[i + 5];
+                ggml_tensor * state = cgraph->nodes[i + 6];
+                const ggml_tensor * conv = cgraph->nodes[i + 7];
+                ggml_tensor * out = cgraph->nodes[i + 8];
+                const ggml_tensor * prefix = concat->src[0];
+                const ggml_tensor * cw = conv->src[1];
+                const ggml_tensor * scale = node->src[2];
+                const int64_t rows = node->ne[0];
+                if (reshape->src[0] == node && body->src[0] == reshape && concat->src[1] == body &&
+                        ggml_get_op_params_i32(concat, 0) == 0 &&
+                        prefix->type == GGML_TYPE_F32 && ggml_is_contiguous(prefix) &&
+                        prefix->ne[0] == 3 && prefix->ne[1] == rows && prefix->ne[2] == 1 && prefix->ne[3] == 1 &&
+                        body->ne[0] == 1 && body->ne[1] == rows && body->ne[2] == 1 && body->ne[3] == 1 &&
+                        concat->type == GGML_TYPE_F32 && ggml_is_contiguous(concat) &&
+                        concat->ne[0] == 4 && concat->ne[1] == rows && concat->ne[2] == 1 &&
+                        tail->view_src == concat && tail->view_offs == sizeof(float) &&
+                        ggml_are_same_shape(tail, prefix) && tail->nb[1] == concat->nb[1] &&
+                        tail->nb[2] == concat->nb[2] && state->src[0] == tail && state->src[1] == state_view &&
+                        state->type == GGML_TYPE_F32 && ggml_is_contiguous(state) &&
+                        ggml_nelements(state) == 3 * rows &&
+                        conv->src[0] == concat && cw->type == GGML_TYPE_F32 && ggml_is_contiguous(cw) &&
+                        cw->ne[0] == 4 && cw->ne[1] == rows && ggml_nelements(cw) == 4 * rows &&
+                        out->src[0] == conv && ggml_get_unary_op(out) == GGML_UNARY_OP_SILU &&
+                        out->type == GGML_TYPE_F32 && ggml_is_contiguous(out) && ggml_nelements(out) == rows &&
+                        scale && (scale->type == GGML_TYPE_F32 || scale->type == GGML_TYPE_BF16) &&
+                        ggml_is_contiguous(scale) && ggml_nelements(scale) == rows) {
+                    bool safe = !ggml_cuda_tensors_overlap(out, state) &&
+                        !ggml_cuda_tensors_overlap(out, prefix) &&
+                        (!ggml_cuda_tensors_overlap(state, prefix) || state->data == prefix->data);
+                    const ggml_tensor * inputs[] = { node->src[0], node->src[1], node->src[2], node->src[3], cw };
+                    for (const ggml_tensor * input : inputs) {
+                        safe = safe && !ggml_cuda_tensors_overlap(out, input) &&
+                            !ggml_cuda_tensors_overlap(state, input);
+                    }
+                    if (safe) {
+                        ggml_cuda_mul_mat_vec_q_conv(*cuda_ctx, node, prefix, cw, state, out);
+                        return 8;
+                    }
+                }
+            }
+            for (bool reshaped : { false, true }) {
+                const ggml_op direct_ops[] = { GGML_OP_MUL_MAT, GGML_OP_ADD };
+                const ggml_op reshape_ops[] = { GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_ADD };
+                const int count = reshaped ? 3 : 2;
+                const int output = i + count - 1;
+                if (!ggml_can_fuse_subgraph(cgraph, i, count,
+                        reshaped ? reshape_ops : direct_ops, &output, 1)) continue;
+                ggml_tensor * projected = cgraph->nodes[output - 1];
+                ggml_tensor * add = cgraph->nodes[output];
+                const ggml_tensor * residual = add->src[0] == projected ? add->src[1] :
+                    add->src[1] == projected ? add->src[0] : nullptr;
+                const ggml_tensor * scale = node->src[2];
+                if ((reshaped && projected->src[0] != node) || !residual || !scale ||
+                        (scale->type != GGML_TYPE_F32 && scale->type != GGML_TYPE_BF16) ||
+                        !ggml_is_contiguous(scale) || ggml_nelements(scale) != node->ne[0] ||
+                        residual->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 ||
+                        !ggml_is_contiguous(residual) || !ggml_is_contiguous(add) ||
+                        !ggml_are_same_shape(residual, add) || !ggml_are_same_shape(node, add)) continue;
+                // In-place residual addition is row-local. All matrix/activation
+                // inputs must remain disjoint from the output; elided intermediates
+                // were already checked for outside observers by the graph matcher.
+                bool safe = !ggml_cuda_tensors_overlap(add, residual) || add->data == residual->data;
+                for (int s = 0; s < 4; ++s) {
+                    if (node->src[s] && ggml_cuda_tensors_overlap(add, node->src[s])) safe = false;
+                }
+                if (!safe) continue;
+                ggml_cuda_mm_fusion_args_host fusion{};
+                fusion.x_scale = scale;
+                fusion.residual = residual;
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], nullptr,
+                    add, &fusion, 1.0f, false, node->src[3]);
+                return count - 1;
+            }
+        }
         const ggml_op ops[] = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU };
         const int output = i + 2;
         if (ggml_can_fuse_subgraph(cgraph, i, 3, ops, &output, 1) &&
@@ -5878,6 +6017,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                         continue;
                     }
                     ggml_tensor * next = j + 1 < cgraph->n_nodes ? cgraph->nodes[j + 1] : nullptr;
+                    // One-token in-place SiLU owns the same channel element it
+                    // loaded into its register window. No intervening operation
+                    // may still observe the original projected value.
+                    const bool inplace_body = next && n_t == 1 && body->ne[2] == 1 &&
+                        j == cpy_index + 1 && next->data == body->data &&
+                        !ggml_cuda_tensors_overlap(next, cand->src[1]);
                     if (next != nullptr && next->op == GGML_OP_UNARY && next->src[0] == cand &&
                             ggml_get_unary_op(next) == GGML_UNARY_OP_SILU &&
                             ggml_node_get_use_count(cgraph, j) == 1 &&
@@ -5886,7 +6031,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                             cand->src[1]->ne[1] == node->ne[1] && cand->src[1]->nb[0] == sizeof(float) &&
                             next->type == GGML_TYPE_F32 && ggml_is_contiguous(next) &&
                             next->ne[0] == node->ne[1] && next->ne[1] == n_t && next->ne[2] == node->ne[2] &&
-                            !ggml_cuda_tensors_overlap(next, prefix) && !ggml_cuda_tensors_overlap(next, body) &&
+                            !ggml_cuda_tensors_overlap(next, prefix) &&
+                            (!ggml_cuda_tensors_overlap(next, body) || inplace_body) &&
                             !ggml_cuda_tensors_overlap(next, node) && !ggml_cuda_tensors_overlap(next, cpy) &&
                             (!prefill_conv || (ggml_is_contiguous(cand->src[1]) &&
                                 cand->src[1]->op == GGML_OP_NONE))) {
@@ -6881,6 +7027,36 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 if (ggml_cuda_mul_mat_humming_fp8(*cuda_ctx, src0, src1, nullptr, norm_node, &fusion_data)) {
                     return n_ops - 1;
                 }
+            }
+        }
+    }
+
+    // Canonical NVFP4 decode can publish its scaled F32 result directly into
+    // the residual. Keep the scale rounding boundary inside the MMVQ epilogue.
+    if (node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_NVFP4 &&
+            ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_BLACKWELL &&
+            ggml_cuda_should_fuse_mul_mat_vec_q(node)) {
+        const ggml_op ops[] = { GGML_OP_MUL_MAT, GGML_OP_MUL, GGML_OP_ADD };
+        const int output = i + 2;
+        if (ggml_can_fuse_subgraph(cgraph, i, 3, ops, &output, 1)) {
+            ggml_tensor * scaled = cgraph->nodes[i + 1];
+            ggml_tensor * add = cgraph->nodes[output];
+            const ggml_tensor * scale = get_mul_mat_scale(scaled, node);
+            const ggml_tensor * residual = add->src[0] == scaled ? add->src[1] :
+                add->src[1] == scaled ? add->src[0] : nullptr;
+            if (scale && scale->type == GGML_TYPE_F32 && ggml_nelements(scale) == 1 &&
+                    residual && residual->type == GGML_TYPE_F32 && add->type == GGML_TYPE_F32 &&
+                    ggml_is_contiguous(residual) && ggml_is_contiguous(add) &&
+                    ggml_are_same_shape(residual, add) && ggml_are_same_shape(node, add) &&
+                    (!ggml_cuda_tensors_overlap(add, residual) || add->data == residual->data) &&
+                    !ggml_cuda_tensors_overlap(add, node->src[0]) &&
+                    !ggml_cuda_tensors_overlap(add, node->src[1]) &&
+                    !ggml_cuda_tensors_overlap(add, scale)) {
+                ggml_cuda_mm_fusion_args_host fusion{};
+                fusion.x_scale = scale;
+                fusion.residual = residual;
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], nullptr, add, &fusion);
+                return 2;
             }
         }
     }

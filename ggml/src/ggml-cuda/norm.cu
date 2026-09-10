@@ -220,7 +220,7 @@ static __global__ void rms_norm_f32(const float * x,
 // general rms_norm_f32 loses), and indexing mul[col] directly drops the per-element
 // fastmodulo. Reduction is the identical block_reduce<SUM> as the general kernel, so output
 // is bit-for-bit the same in this case.
-template <int block_size, typename dst_t = float>
+template <int block_size, typename dst_t = float, int cached_values = 0>
 static __global__ void rms_norm_mul_bcast_f32(const float * __restrict__ x,
                                               const float * __restrict__ mul,
                                               dst_t       * __restrict__ dst,
@@ -240,10 +240,22 @@ static __global__ void rms_norm_mul_bcast_f32(const float * __restrict__ x,
     x   += sample*stride_sample + channel*stride_channel + row*stride_row;
     dst += ((sample*nchannels + channel)*nrows + row)*ncols;
 
+    float values[cached_values ? cached_values : 1];
+    float gains[cached_values ? cached_values : 1];
     float tmp = 0.0f;
-    for (int col = tid; col < ncols; col += block_size) {
-        const float xi = x[col];
-        tmp += xi * xi;
+    if constexpr (cached_values > 0) {
+#pragma unroll
+        for (int i = 0; i < cached_values; ++i) {
+            const int col = tid + i*block_size;
+            values[i] = x[col];
+            gains[i] = mul[col];
+            tmp += values[i] * values[i];
+        }
+    } else {
+        for (int col = tid; col < ncols; col += block_size) {
+            const float xi = x[col];
+            tmp += xi * xi;
+        }
     }
 
     extern __shared__ float s_sum[];
@@ -252,8 +264,15 @@ static __global__ void rms_norm_mul_bcast_f32(const float * __restrict__ x,
     const float mean  = tmp / ncols;
     const float scale = rsqrtf(mean + eps);
 
-    for (int col = tid; col < ncols; col += block_size) {
-        dst[col] = scale * x[col] * mul[col];
+    if constexpr (cached_values > 0) {
+#pragma unroll
+        for (int i = 0; i < cached_values; ++i) {
+            dst[tid + i*block_size] = scale * values[i] * gains[i];
+        }
+    } else {
+        for (int col = tid; col < ncols; col += block_size) {
+            dst[col] = scale * x[col] * mul[col];
+        }
     }
 }
 
@@ -612,6 +631,14 @@ static void rms_norm_mul_f32_cuda(const float *  x,
         const int block_size = ncols <= 128 && use_d128_block ? 128 : ncols < 1024 ? 256 : 1024;
         const dim3 block_dims(block_size, 1, 1);
         const size_t nbytes_shared = block_size > WARP_SIZE ? 32 * sizeof(float) : 0;
+        // Decode: overlap gain loads with the unchanged sum-of-squares reduction.
+        // Limit register caching to the measured single-row geometry.
+        if (ncols == 5120 && nrows == 1 && nchannels == 1 && nsamples == 1 &&
+                ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_BLACKWELL) {
+            rms_norm_mul_bcast_f32<1024, float, 5><<<blocks_num, block_dims, nbytes_shared, stream>>>(
+                x, mul, dst, ncols, stride_row, stride_channel, stride_sample, eps);
+            return;
+        }
         if (block_size == 128) {
             rms_norm_mul_bcast_f32<128><<<blocks_num, block_dims, nbytes_shared, stream>>>(
                 x, mul, dst, ncols, stride_row, stride_channel, stride_sample, eps);
