@@ -376,6 +376,28 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
     const std::string tensor_name = tensor->name;
+    // EXL3 sign/scale vectors must follow the exact shard of their owning weight,
+    // including repeated segments and rank rotation. Expert vectors are [dim, expert]
+    // while the packed weights are [K, N, expert]. Other quant formats keep their
+    // existing scale-grid rules below.
+    const size_t suffix_pos = tensor_name.rfind('.');
+    const std::string suffix = suffix_pos == std::string::npos ? "" : tensor_name.substr(suffix_pos + 1);
+    if (suffix == "scale" || suffix == "input_scale") {
+        const ggml_tensor * weight = ud->model->get_tensor((tensor_name.substr(0, suffix_pos + 1) + "weight").c_str());
+        if (weight != nullptr && ggml_type_is_exl3(weight->type)) {
+            auto split = llama_meta_device_get_split_state(weight, userdata);
+            const int vector_axis = suffix == "input_scale" ? 0 : 1;
+            if (split.axis == vector_axis) {
+                split.axis = GGML_BACKEND_SPLIT_AXIS_0;
+                return split;
+            }
+            if (split.axis == GGML_BACKEND_SPLIT_AXIS_2) {
+                split.axis = GGML_BACKEND_SPLIT_AXIS_1;
+                return split;
+            }
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+        }
+    }
     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 ||
         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
 
@@ -1034,7 +1056,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         for (size_t is = 0; is < segments.size(); is++) {
             const int64_t  ne_s = segments[is].first;
             const uint32_t nr_s = segments[is].second;
-            const int64_t  g_s  = granularity[is];
+            // Keep complete 128-value Hadamard blocks on both matrix axes.
+            const int64_t g_s = ggml_type_is_exl3(tensor->type) && split_state.axis < GGML_BACKEND_SPLIT_AXIS_2 ?
+                std::lcm(granularity[is], int64_t(128)) : granularity[is];
             int64_t low = 0;
             size_t j = 0;
             for (; j < ud->n_devices - 1; j++) {
@@ -2299,14 +2323,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
-    ggml_tensor * tensor = ml.create_tensor(
+    return ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);
-    if (tensor != nullptr && ggml_type_is_exl3(tensor->type) &&
-            params.split_mode == LLAMA_SPLIT_MODE_TENSOR && get_split_state_ud.n_devices > 1) {
-        throw std::runtime_error("EXL3 weights do not support multi-device tensor splitting yet; use --split-mode layer");
-    }
-    return tensor;
 }
 
 std::string llama_model::arch_name() const {

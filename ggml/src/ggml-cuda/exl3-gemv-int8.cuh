@@ -252,6 +252,9 @@ __global__ void __launch_bounds__(THREADS) gemv_int8_kernel(const uint8_t * __re
         const int pair = blockIdx.z;
         const int t = pair / ga.n_expert_used, e = pair - t * ga.n_expert_used;
         const int expert = ga.ids[size_t(t) * ga.ids_nb1 + e];
+        // Expert windows use -1 for pairs owned by another device. The whole
+        // block skips them; the window dispatcher zeroes their output rows.
+        if (expert < 0) return;
         B   += size_t(expert) * ga.expert_stride;
         svh += size_t(expert) * n;
         suh += size_t(expert) * k;

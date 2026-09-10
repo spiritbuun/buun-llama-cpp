@@ -3,13 +3,20 @@
 Source of truth: exllamav3 (MIT, turboderp) `exllamav3_ext/quant/{codebook,exl3_dq,exl3_gemv_kernel,
 hadamard_inner,reconstruct,pack}.cu*` and `modules/quant/exl3_lib/quantize.py`; QTIP (arXiv 2406.11235).
 
-## Placement limitation
+## Placement
 
-Use one CUDA GPU or `--split-mode layer` across multiple GPUs. Multi-device
-`--split-mode tensor` is rejected during model loading: EXL3 projection sign/scale
-vectors and expert windows do not yet have a qualified tensor-sharding path.
-This applies to dense and MoE EXL3 models, not just Flash-Next. Whole-expert CUDA
-layer placement is distinct from the unsupported per-device expert windows.
+CUDA supports one GPU, multi-GPU `--split-mode layer`, and `--split-mode tensor`.
+Tensor splitting preserves whole 128-value Hadamard blocks and the corresponding
+input/output sign-scale vectors. Packed column transfers select complete 16x16
+tiles; expert parallelism keeps each expert's weights and vectors together and
+skips routed rows assigned to another GPU. No additional EXL3 enable flag is needed.
+
+Different GPU layouts can change floating-point reduction order and, consequently,
+quantized activations and MoE routing. Cross-layout logits are not promised to be
+identical. The CUDA tests check packed shard bytes, numerical operator agreement,
+and repeatability within each layout. Model qualification includes dense EXL3 and
+Flash-Next MoE, including multi-slot MTP serving.
+
 CPU execution of EXL3 weights is also unsupported; do not assume that another
 format's MoE CPU-cache/offload results establish EXL3 support.
 
@@ -34,7 +41,7 @@ Per linear module `M` (in features `k`, out features `n`, both multiples of 128)
   K per tensor = `trellis.shape[2] / 16` (layers K=4, lm_head K=6 here; SC variants mix K).
 
 ## ggml representation
-- Types `GGML_TYPE_EXL3_1 .. EXL3_8` (K = bits): `blck_size 256`, `type_size 32*K` bytes. Tensor
+- Types `GGML_TYPE_EXL3_1 .. EXL3_8` (K = bits): logical `blck_size 16`, `type_size 2*K` bytes. Tensor
   `[ne0 = k, ne1 = n]`; `row_size = k*K/8`. Data layout is the tile stream in **n-tile-major** order
   `[n/16][k/16][32*K bytes]` so a 16-row group is contiguous. Rows are not independently decodable
   (each weight's window overlaps its neighbours across the tile), so the CPU backend does not support

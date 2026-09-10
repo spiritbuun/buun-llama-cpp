@@ -3392,7 +3392,6 @@ static void ggml_cuda_mul_mat_id_windowed(ggml_backend_cuda_context & ctx, ggml_
     ids_local.nb[2] = ids_local.nb[1] * ids->ne[1];
     ids_local.nb[3] = ids_local.nb[2];
     ids_local.view_src = nullptr;
-    GGML_ASSERT(!ggml_cuda_is_exl3(dst->src[0]->type) && "expert-parallel window: exl3 mul_mat_id not supported yet");
     ggml_tensor shadow = *dst;
     shadow.src[2] = &ids_local;
     ggml_mul_mat_id_set_expert_window(&shadow, 0, 0);

@@ -1527,6 +1527,56 @@ static void ggml_backend_meta_buffer_memset_tensor(
     }
 }
 
+// EXL3 packs 16x16 tiles, not independent rows. Column shards select K tiles from
+// each 16-row stripe. Stage each device's selected bytes once; this also supports
+// native-loader chunks that start/end inside a tile, without GPU read-modify-write.
+static void ggml_backend_meta_exl3_columns(const ggml_tensor * tensor,
+        const ggml_backend_meta_split_state & split, size_t n_bufs,
+        const void * upload, void * download, size_t offset, size_t size) {
+    const size_t tile_bytes = 32 * ggml_exl3_bits(tensor->type);
+    const size_t stripe_bytes = tensor->ne[0] / 16 * tile_bytes;
+    const size_t n_stripes = ggml_nbytes(tensor) / stripe_bytes;
+    struct span { size_t full, local, size; };
+    for (size_t j = 0; j < n_bufs; ++j) {
+        ggml_tensor * shard = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+        const size_t local_stripe = shard->ne[0] / 16 * tile_bytes;
+        std::vector<span> spans;
+        size_t total = 0;
+        for (size_t row = offset / stripe_bytes; row < n_stripes && row * stripe_bytes < offset + size; ++row) {
+            size_t full = row * stripe_bytes, local = row * local_stripe;
+            for (size_t s = 0; s < split.n_segments; ++s) {
+                for (size_t r = 0; r < split.nr[s]; ++r) {
+                    for (size_t rank = 0; rank < n_bufs; ++rank) {
+                        GGML_ASSERT(split.ne[s*n_bufs + rank] % 16 == 0);
+                        const size_t bytes = split.ne[s*n_bufs + rank] / 16 * tile_bytes;
+                        if (rank == j) {
+                            const size_t lo = std::max(full, offset), hi = std::min(full + bytes, offset + size);
+                            if (hi > lo) {
+                                spans.push_back({lo, local + lo - full, hi - lo});
+                                total += hi - lo;
+                            }
+                            local += bytes;
+                        }
+                        full += bytes;
+                    }
+                }
+            }
+        }
+        if (spans.empty()) continue;
+        std::vector<uint8_t> staging(total);
+        const size_t start = spans.front().local;
+        if (download) ggml_backend_tensor_get(shard, staging.data(), start, total);
+        size_t pos = 0;
+        for (const auto & s : spans) {
+            GGML_ASSERT(s.local == start + pos);
+            if (download) memcpy(static_cast<uint8_t *>(download) + s.full - offset, staging.data() + pos, s.size);
+            else memcpy(staging.data() + pos, static_cast<const uint8_t *>(upload) + s.full - offset, s.size);
+            pos += s.size;
+        }
+        if (!download) ggml_backend_tensor_set(shard, staging.data(), start, total);
+    }
+}
+
 static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     static const bool upload_trace = getenv("GGML_META_DEBUG") != nullptr && atoi(getenv("GGML_META_DEBUG")) >= 2;
@@ -1535,6 +1585,10 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     }
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+    if (ggml_type_is_exl3(tensor->type) && split_state.axis == GGML_BACKEND_SPLIT_AXIS_0) {
+        ggml_backend_meta_exl3_columns(tensor, split_state, n_bufs, data, nullptr, offset, size);
+        return;
+    }
     // A whole-tensor upload is staged per device and handed to the simple buffer as ONE full set_tensor:
     // backends that repack weights at upload time (e.g. the CUDA Marlin paths) only do so for complete
     // tensors, and the strided per-segment copies below would leave every multi-segment or column-split
@@ -1714,6 +1768,10 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+    if (ggml_type_is_exl3(tensor->type) && split_state.axis == GGML_BACKEND_SPLIT_AXIS_0) {
+        ggml_backend_meta_exl3_columns(tensor, split_state, n_bufs, nullptr, data, offset, size);
+        return;
+    }
 
     if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
         GGML_ASSERT(split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS);
@@ -2209,6 +2267,14 @@ static void ggml_backend_meta_free(ggml_backend_t backend) {
 
 static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
+    const auto split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+    if (ggml_type_is_exl3(tensor->type) && split_state.axis == GGML_BACKEND_SPLIT_AXIS_0) {
+        // Packed columns require host staging. Complete the transfer before that
+        // temporary storage goes away; activation transfers keep the async path.
+        ggml_backend_synchronize(backend);
+        ggml_backend_tensor_set(tensor, data, offset, size);
+        return;
+    }
     GGML_ASSERT(offset == 0);
     GGML_ASSERT(ggml_is_contiguous(tensor));
     static const bool upload_trace = getenv("GGML_META_DEBUG") != nullptr && atoi(getenv("GGML_META_DEBUG")) >= 2;
@@ -2216,7 +2282,6 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
         fprintf(stderr, "ggml_backend_meta: upload(async) '%s' %zu bytes at %zu\n", tensor->name, size, offset);
     }
 
-    const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(split_state.n_segments == 1);
     GGML_ASSERT(split_state.nr[0]      == 1);
 
@@ -2258,10 +2323,15 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
 
 static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
+    const auto split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+    if (ggml_type_is_exl3(tensor->type) && split_state.axis == GGML_BACKEND_SPLIT_AXIS_0) {
+        ggml_backend_synchronize(backend);
+        ggml_backend_tensor_get(tensor, data, offset, size);
+        return;
+    }
     GGML_ASSERT(offset == 0);
     GGML_ASSERT(ggml_is_contiguous(tensor));
 
-    const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(split_state.n_segments == 1);
     GGML_ASSERT(split_state.nr[0]      == 1);
 
