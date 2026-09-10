@@ -624,11 +624,7 @@ static void rms_norm_mul_f32_cuda(const float *  x,
     // rows/channels/samples (the standard rms_norm weight), no add. Bit-identical to the
     // general kernel here but with far fewer params -> higher occupancy on the big block.
     if (add == nullptr && mul_nrows == 1 && mul_nchannels == 1 && mul_nsamples == 1 && mul_ncols == ncols) {
-        static const bool use_d128_block = [] {
-            const char * value = std::getenv("GGML_CUDA_RMS_D128_BLOCK");
-            return value == nullptr || std::atoi(value) != 0;
-        }();
-        const int block_size = ncols <= 128 && use_d128_block ? 128 : ncols < 1024 ? 256 : 1024;
+        const int block_size = ncols <= 128 ? 128 : ncols < 1024 ? 256 : 1024;
         const dim3 block_dims(block_size, 1, 1);
         const size_t nbytes_shared = block_size > WARP_SIZE ? 32 * sizeof(float) : 0;
         // Overlap gain loads with the unchanged sum-of-squares reduction.

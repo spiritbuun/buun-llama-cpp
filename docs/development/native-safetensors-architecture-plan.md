@@ -292,10 +292,9 @@ single sequence, and exact BF16 reference artifact for every native-engine
 comparison. External-engine rows must record their engine revision and cannot
 be mixed into the native timing table unless those execution conditions match.
 
-Current known exception: explicitly enabling the experimental Humming NVFP4
-path produced incoherent greedy output on the A6000 while the ordinary NVFP4
-path remained coherent. The experimental path stays opt-in and must not be
-treated as a correctness baseline until separately repaired and revalidated.
+The experimental Humming NVFP4 executor was removed after failing the A6000
+coherence gate. It is not a selectable execution path in this branch; the
+retained Humming FP8 executor is a separate implementation.
 
 Matrix receipts recorded on the A100-SXM4-80GB on 2026-09-02:
 

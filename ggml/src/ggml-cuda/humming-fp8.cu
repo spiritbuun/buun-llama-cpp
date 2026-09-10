@@ -659,31 +659,21 @@ void ggml_cuda_humming_residual_rms_prepare(
         int64_t nrows,
         float eps,
         cudaStream_t stream) {
-    static const int requested_block = [] {
-        const char * value = std::getenv("GGML_CUDA_HUMMING_RMS_BLOCK");
-        return value ? std::atoi(value) : 1024;
-    }();
     const bool pair_aligned = ((uintptr_t(src) | uintptr_t(norm_bf16)) % 4 == 0) &&
         ((uintptr_t(residual) | uintptr_t(norm_weight) | uintptr_t(residual_out) | uintptr_t(norm_out)) % 8 == 0);
-    if (requested_block == 1024 && nrows == 1 && ncols == 5120 && pair_aligned) {
+    if (nrows == 1 && ncols == 5120 && pair_aligned) {
         residual_rms_prepare_pairs_5120<<<1, 512, 32 * sizeof(float), stream>>>(
             reinterpret_cast<const nv_bfloat162 *>(src), reinterpret_cast<const float2 *>(residual),
             reinterpret_cast<const float2 *>(norm_weight), reinterpret_cast<float2 *>(residual_out),
             reinterpret_cast<float2 *>(norm_out), reinterpret_cast<nv_bfloat162 *>(norm_bf16), ncols, eps);
-    } else if (requested_block == 1024 && ncols == 5120) {
+    } else if (ncols == 5120) {
         residual_rms_prepare_cached<1024, 5><<<nrows, 1024, 32 * sizeof(float), stream>>>(
             src, residual, norm_weight, residual_out, norm_out, norm_bf16, ncols, eps);
-    } else if (requested_block == 1024 && ncols <= 8192) {
+    } else if (ncols <= 8192) {
         residual_rms_prepare_cached<1024, 8><<<nrows, 1024, 32 * sizeof(float), stream>>>(
             src, residual, norm_weight, residual_out, norm_out, norm_bf16, ncols, eps);
-    } else if (requested_block == 256) {
-        residual_rms_prepare<256><<<nrows, 256, 32 * sizeof(float), stream>>>(
-            src, residual, norm_weight, residual_out, norm_out, norm_bf16, ncols, eps);
-    } else if (requested_block == 1024) {
-        residual_rms_prepare<1024><<<nrows, 1024, 32 * sizeof(float), stream>>>(
-            src, residual, norm_weight, residual_out, norm_out, norm_bf16, ncols, eps);
     } else {
-        residual_rms_prepare<512><<<nrows, 512, 32 * sizeof(float), stream>>>(
+        residual_rms_prepare<1024><<<nrows, 1024, 32 * sizeof(float), stream>>>(
             src, residual, norm_weight, residual_out, norm_out, norm_bf16, ncols, eps);
     }
 }

@@ -221,15 +221,6 @@ bool ggml_cuda_mul_mat_marlin_q4_a32(
     // Unfused projections take the GEMM result as F32 directly; fused epilogues
     // consume the BF16 scratch exactly as they do after a Marlin launch.
     const bool direct_f32 = gate == nullptr && (fusion == nullptr || fusion->residual == nullptr);
-    static const bool debug = std::getenv("GGML_CUDA_MARLIN_DEBUG") != nullptr;
-    if (debug) {
-        static int budget = 64;
-        if (budget-- > 0) {
-            GGML_LOG_INFO("marlin-q4: %s n=%lld k=%lld m=%lld gate=%d pair=%d residual=%d retain=%d\n", src0->name,
-                (long long) n, (long long) k, (long long) m, gate != nullptr, pair_launch,
-                fusion != nullptr && fusion->residual != nullptr, fusion != nullptr && fusion->retain_bf16_output);
-        }
-    }
     if (pair_launch) {
         const bool retain_bf16 = fusion->retain_bf16_output;
         ggml_cuda_marlin_q4_a32_launch(
@@ -355,14 +346,6 @@ bool ggml_cuda_mul_mat_marlin_q8_g128(
     if (retain_bf16) {
         ctx.humming_bf16_activations.insert(dst);
     }
-    static const bool debug = std::getenv("GGML_CUDA_MARLIN_DEBUG") != nullptr;
-    if (debug) {
-        static int budget = 64;
-        if (budget-- > 0) {
-            GGML_LOG_INFO("marlin-q8: %s n=%lld k=%lld m=%lld gate=%d pair=%d retain=%d\n", src0->name,
-                (long long) n, (long long) k, (long long) m, gate != nullptr, pair_launch, retain_bf16);
-        }
-    }
     if (pair_launch) {
         ggml_cuda_marlin_q8_g128_launch(
             input, src0->data, scales_of(src0), gate->data, scales_of(gate), output, false, lock_storage.ptr,
@@ -442,14 +425,7 @@ static nv_bfloat16 * ggml_cuda_humming_get_input(
         const ggml_tensor * src,
         size_t count,
         cudaStream_t stream) {
-    static const bool debug = std::getenv("GGML_CUDA_MARLIN_DEBUG") != nullptr;
     const nv_bfloat16 * cached = ggml_cuda_get_cached_bf16_input(ctx, src, count);
-    if (debug) {
-        static int budget = 96;
-        if (budget-- > 0) {
-            GGML_LOG_INFO("marlin-input: %s (%s) %s\n", src->name, ggml_op_name(src->op), cached ? "cached" : "CONVERTED");
-        }
-    }
     if (cached != nullptr) {
         return const_cast<nv_bfloat16 *>(cached);
     }

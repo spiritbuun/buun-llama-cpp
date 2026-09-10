@@ -3048,8 +3048,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // A wide BF16 projection (an output head) at decode width streams faster
     // through the cuBLAS GEMM than through the vector kernels: A100 Qwen3.8-27B
     // head 1.40 ms vs 1.66 ms (mmvf) and 1.45 ms (mmf) per token.
-    static const bool head_mmvf = std::getenv("GGML_CUDA_HEAD_MMVF") != nullptr;
-    if (!head_mmvf && src0->type == GGML_TYPE_BF16 && ne01 >= 32768 && ne11 <= 4 &&
+    if (src0->type == GGML_TYPE_BF16 && ne01 >= 32768 && ne11 <= 4 &&
             GGML_CUDA_CC_IS_NVIDIA(cc) && ampere_mma_available(cc)) {
         ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
         return;
@@ -3158,18 +3157,6 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         return;
     }
 
-    // GGML_CUDA_DEBUG_MMID=1: report once per (type, n_tokens) which executor MUL_MAT_ID takes
-    static const bool debug_mmid = getenv("GGML_CUDA_DEBUG_MMID") != nullptr;
-    const auto mmid_trace = [&](const char * path) {
-        if (!debug_mmid) return;
-        static std::set<std::tuple<int, int64_t, int64_t>> seen;
-        if (seen.insert({ (int) src0->type, ne2, ids->ne[0] }).second) {
-            fprintf(stderr, "[mmid] %s type=%s n_tokens=%lld n_expert=%lld n_used=%lld ne00=%lld ne01=%lld srcs=%d%d\n", path,
-                    ggml_type_name(src0->type), (long long) ne2, (long long) ne02, (long long) ids->ne[0],
-                    (long long) ne00, (long long) ne01, dst->src[3] != nullptr, dst->src[4] != nullptr);
-        }
-    };
-
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && !ggml_cuda_is_exl3(src0->type)) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
@@ -3177,13 +3164,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             if (ggml_cuda_should_use_mmvq(src0->type, cc, ne2)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
-                    mmid_trace("mmvq");
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                     return;
                 }
             } else {
                 if (GGML_CUDA_CC_IS_AMD(cc)) {
-                    mmid_trace("mmvf");
                     ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
                     return;
                 }
@@ -3191,18 +3176,15 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
-            mmid_trace("mmq");
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }
 
         if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
-            mmid_trace("mmf");
             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
             return;
         }
     }
-    mmid_trace("sorted-fallback (stream sync)");
 
     // note: this path should not be reached when recording CUDA graphs, because it requires stream synchronization
     GGML_ASSERT(ggml_cuda_mul_mat_id_needs_sync(dst, cc));
@@ -3395,12 +3377,6 @@ static void ggml_cuda_mul_mat_id_windowed(ggml_backend_cuda_context & ctx, ggml_
     ggml_tensor shadow = *dst;
     shadow.src[2] = &ids_local;
     ggml_mul_mat_id_set_expert_window(&shadow, 0, 0);
-    static const bool debug_mmid = getenv("GGML_CUDA_DEBUG_MMID") != nullptr;
-    if (debug_mmid) {
-        fprintf(stderr, "[mmid] window lo=%d n_local=%d ne02=%lld ids=[%lld x %lld] nb1=%zu -> compact nb1=%zu\n",
-                ggml_mmid_window_lo(dst), ggml_mmid_window_n_local(dst), (long long) dst->src[0]->ne[2],
-                (long long) ids->ne[0], (long long) ids->ne[1], ids->nb[1], ids_local.nb[1]);
-    }
     ggml_cuda_mul_mat_id(ctx, &shadow);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
     const int64_t n_rows = ids->ne[0] * ids->ne[1];
@@ -5691,17 +5667,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
              ggml_cuda_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU }, {})) ||
             ggml_can_fuse_subgraph(cgraph, i, 4, residual_ops, residual_out, 2) ||
             ggml_can_fuse_subgraph(cgraph, i, 5, reshaped_ops, reshaped_out, 2);
-        static const bool debug = std::getenv("GGML_CUDA_MARLIN_DEBUG") != nullptr;
-        if (debug) {
-            static int budget = 24;
-            if (budget-- > 0) {
-                std::string chain;
-                for (int j = i; j < std::min(i + 6, cgraph->n_nodes); ++j) {
-                    chain += std::string(ggml_op_name(cgraph->nodes[j]->op)) + "(" + cgraph->nodes[j]->name + ") ";
-                }
-                GGML_LOG_INFO("marlin chain at %s: fusion=%d :: %s\n", node->src[0]->name, marlin_fusion, chain.c_str());
-            }
-        }
         if (!marlin_fusion) {
             return 0;
         }
@@ -7177,43 +7142,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    // Dense projection + scale + residual add. Keep the Humming BF16 result
-    // through the add instead of expanding it to F32 only to read it back.
-    {
-        constexpr int n_ops = 3;
-        const ggml_op ops[n_ops] = { GGML_OP_MUL_MAT, GGML_OP_MUL, GGML_OP_ADD };
-        const int out_nodes[] = { i + 2 };
-        static const bool humming_residual_add = [] {
-            const char * value = std::getenv("GGML_CUDA_HUMMING_RESIDUAL_ADD");
-            return value != nullptr && std::atoi(value) != 0;
-        }();
-        if (humming_residual_add &&
-                ggml_can_fuse_subgraph(cgraph, i, n_ops, ops, out_nodes, 1)) {
-            ggml_tensor * mm_node    = cgraph->nodes[i];
-            ggml_tensor * scale_node = cgraph->nodes[i + 1];
-            ggml_tensor * add_node   = cgraph->nodes[i + 2];
-            const ggml_tensor * scale = get_mul_mat_scale(scale_node, mm_node);
-            const ggml_tensor * residual = add_node->src[0] == scale_node ? add_node->src[1] :
-                                           add_node->src[1] == scale_node ? add_node->src[0] : nullptr;
-            if (scale != nullptr && residual != nullptr && residual->type == GGML_TYPE_F32 &&
-                    ggml_is_contiguous(residual) && ggml_are_same_shape(scale_node, add_node)) {
-                ggml_cuda_mm_fusion_args_host fusion_data{};
-                fusion_data.x_scale  = scale;
-                fusion_data.residual = residual;
-                const ggml_tensor * src0 = mm_node->src[0];
-                const ggml_tensor * src1 = mm_node->src[1];
-                if (ggml_cuda_mul_mat_humming_fp8(*cuda_ctx, src0, src1, nullptr, add_node, &fusion_data)) {
-                    return n_ops - 1;
-                }
-                if (src0->type == GGML_TYPE_NVFP4 &&
-                        ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
-                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, nullptr, add_node, &fusion_data);
-                    return n_ops - 1;
-                }
-            }
-        }
-    }
-
     // mul_mat + scale + optional bias
     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
@@ -7382,10 +7310,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // Gated RMS normalization: preserve the original per-row reduction and
     // F32 roundings, but avoid materializing the two intermediate products.
     if (node->op == GGML_OP_RMS_NORM && i + 3 < cgraph->n_nodes) {
-        static const bool d128_block = [] {
-            const char * value = std::getenv("GGML_CUDA_RMS_D128_BLOCK");
-            return value == nullptr || std::atoi(value) != 0;
-        }();
         int unary_idx = i + 2;
         while (unary_idx < cgraph->n_nodes &&
                 (cgraph->nodes[unary_idx]->op == GGML_OP_VIEW ||
@@ -7406,7 +7330,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     ggml_get_unary_op(unary) == GGML_UNARY_OP_SILU &&
                     x->type == GGML_TYPE_F32 && gamma->type == GGML_TYPE_F32 &&
                     gate->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
-                    (x->ne[0] == 256 || (x->ne[0] == 128 && d128_block)) &&
+                    (x->ne[0] == 256 || x->ne[0] == 128) &&
                     x->ne[2] == 1 && x->ne[3] == 1 &&
                     ggml_are_same_shape(x, gate) && ggml_are_same_shape(x, dst) &&
                     ggml_is_contiguous(x) && ggml_is_contiguous(dst) &&
@@ -7619,19 +7543,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
-            // GGML_CUDA_OP_TRACE=<n>: host time per op type inside ggml_cuda_compute_forward and the loop's
-            // remaining overhead (fusion checks, dispatch), summed over n graph_compute calls per thread,
-            // then printed — where the uncaptured tensor-split issue time goes (no sampling profiler in containers)
-            static const int op_trace_every = getenv("GGML_CUDA_OP_TRACE") != nullptr ? atoi(getenv("GGML_CUDA_OP_TRACE")) : 0;
-            struct op_trace_acc { double loop_ns = 0, fwd_ns[GGML_OP_COUNT] = {}; int cnt[GGML_OP_COUNT] = {}; int calls = 0; };
-            thread_local op_trace_acc op_trace;
-            auto op_now = []() {
-                struct timespec ts;
-                clock_gettime(CLOCK_MONOTONIC, &ts);
-                return ts.tv_sec * 1e9 + ts.tv_nsec;
-            };
-            const double op_loop0 = op_trace_every ? op_now() : 0.0;
-
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -7703,12 +7614,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
-                const double op_t0 = op_trace_every ? op_now() : 0.0;
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
-                if (op_trace_every) {
-                    op_trace.fwd_ns[node->op] += op_now() - op_t0;
-                    op_trace.cnt[node->op]++;
-                }
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
@@ -7717,22 +7623,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
                }
-            }
-            if (op_trace_every) {
-                op_trace.loop_ns += op_now() - op_loop0;
-                if (++op_trace.calls >= op_trace_every) {
-                    double fwd_total = 0; int n_ops = 0;
-                    for (int op = 0; op < GGML_OP_COUNT; op++) { fwd_total += op_trace.fwd_ns[op]; n_ops += op_trace.cnt[op]; }
-                    fprintf(stderr, "ggml_cuda op trace dev %d: %d calls, %d ops, loop %.1f ms, in compute_forward %.1f ms, loop overhead %.1f ms;",
-                            cuda_ctx->device, op_trace.calls, n_ops, op_trace.loop_ns / 1e6, fwd_total / 1e6, (op_trace.loop_ns - fwd_total) / 1e6);
-                    for (int op = 0; op < GGML_OP_COUNT; op++) {
-                        if (op_trace.cnt[op] > 0 && op_trace.fwd_ns[op] >= 1e6) {
-                            fprintf(stderr, " %s %d×%.0fus", ggml_op_name((ggml_op) op), op_trace.cnt[op], op_trace.fwd_ns[op] / 1e3 / op_trace.cnt[op]);
-                        }
-                    }
-                    fprintf(stderr, "\n");
-                    op_trace = op_trace_acc{};
-                }
             }
         }
 
