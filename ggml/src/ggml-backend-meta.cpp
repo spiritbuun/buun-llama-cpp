@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <charconv>
 #include <cinttypes>
 #include <cmath>
 #include <cstddef>
@@ -2103,6 +2104,35 @@ struct ggml_backend_meta_context {
         step_records.clear();
     }
 
+    void step_record_add(step_record rec) {
+        // Bound successful and failed captures alike. Invalid overrides keep
+        // the default; zero must not try to evict from an empty cache.
+        static const size_t max_records = []() -> size_t {
+            if (const char * value = getenv("GGML_META_STEP_RECORDS")) {
+                size_t parsed = 0;
+                const char * end = value + strlen(value);
+                const auto result = std::from_chars(value, end, parsed);
+                if (result.ec == std::errc{} && result.ptr == end && parsed > 0) {
+                    return parsed;
+                }
+                GGML_LOG_WARN("invalid GGML_META_STEP_RECORDS value '%s'; using 16\n", value);
+            }
+            return 16;
+        }();
+        if (step_records.size() >= max_records) {
+            auto oldest = std::min_element(step_records.begin(), step_records.end(),
+                    [](const step_record & a, const step_record & b) { return a.last_used < b.last_used; });
+            for (size_t j = 0; j < oldest->steps.size(); j++) {
+                if (oldest->steps[j] != nullptr) {
+                    step_free(backend_configs[j].backend, oldest->steps[j]);
+                }
+            }
+            step_records.erase(oldest);
+        }
+        rec.last_used = ggml_time_us();
+        step_records.push_back(std::move(rec));
+    }
+
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
         n_reduce_steps = std::ceil(std::log2(n_devs));
@@ -2151,9 +2181,7 @@ struct ggml_backend_meta_context {
     }
 
     ~ggml_backend_meta_context() {
-        if (step_graphs) {
-            step_records_free();
-        }
+        step_records_free();
         if (comm_ctx != nullptr) {
             ggml_backend_comm_free_t comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
                 ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_configs[0].backend)), "ggml_backend_comm_free");
@@ -3275,6 +3303,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     fprintf(stderr, "ggml_backend_meta: capture ended on %zu devices (ok=%d), launching\n", n_began, (int) capture_ok);
                 }
                 if (status != GGML_STATUS_SUCCESS) {
+                    for (size_t j = 0; j < n_backends; j++) {
+                        if (steps[j] != nullptr) {
+                            backend_ctx->step_free(backend_ctx->backend_configs[j].backend, steps[j]);
+                        }
+                    }
                     return status;
                 }
                 if (capture_ok) {
@@ -3282,23 +3315,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     // missing all alternate in a server); evict the least recently used
                     // GGML_META_STEP_RECORDS raises the cap: a busy server with many slot-occupancy /
                     // KV-extent shape variants churns 16 (each re-record = a slow uncaptured step + capture)
-                    static const size_t max_records = getenv("GGML_META_STEP_RECORDS") != nullptr ?
-                        (size_t) atoi(getenv("GGML_META_STEP_RECORDS")) : 16;
-                    if (backend_ctx->step_records.size() >= max_records) {
-                        size_t oldest = 0;
-                        for (size_t r = 1; r < backend_ctx->step_records.size(); r++) {
-                            if (backend_ctx->step_records[r].last_used < backend_ctx->step_records[oldest].last_used) {
-                                oldest = r;
-                            }
-                        }
-                        auto & rec = backend_ctx->step_records[oldest];
-                        for (size_t j = 0; j < rec.steps.size(); j++) {
-                            if (rec.steps[j] != nullptr) {
-                                backend_ctx->step_free(backend_ctx->backend_configs[j].backend, rec.steps[j]);
-                            }
-                        }
-                        backend_ctx->step_records.erase(backend_ctx->step_records.begin() + oldest);
-                    }
                     ggml_backend_meta_context::step_record rec;
                     rec.sig   = step_sig;
                     rec.valid = true;
@@ -3307,8 +3323,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     for (size_t j = 0; j < n_backends; j++) {
                         rec.epochs[j] = backend_ctx->step_epoch(backend_ctx->backend_configs[j].backend);
                     }
-                    rec.last_used = ggml_time_us();
-                    backend_ctx->step_records.push_back(std::move(rec));
+                    backend_ctx->step_record_add(std::move(rec));
                     if (getenv("GGML_META_DEBUG") != nullptr) {
                         fprintf(stderr, "ggml_backend_meta: recorded step graph for signature %016" PRIx64 " (%zu subgraphs x %zu devices, %zu records)\n",
                                 step_sig, backend_ctx->n_subgraphs, n_backends, backend_ctx->step_records.size());
@@ -3334,7 +3349,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     bad.valid = false;
                     bad.steps.assign(n_backends, nullptr);
                     bad.epochs.assign(n_backends, 0);
-                    backend_ctx->step_records.push_back(std::move(bad));
+                    backend_ctx->step_record_add(std::move(bad));
                     if (getenv("GGML_META_DEBUG") != nullptr) {
                         fprintf(stderr, "ggml_backend_meta: step capture unavailable for signature %016" PRIx64 " (fallback all-reduce or capture error)\n", step_sig);
                     }
