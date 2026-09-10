@@ -2389,49 +2389,38 @@ static uint64_t ggml_backend_meta_graph_signature(const ggml_cgraph * cgraph) {
             h = (h ^ b[i]) * 1099511628211ULL;
         }
     };
-    // A meta tensor's data is an offset from a fake base: the real addresses live in the per-device buffers,
-    // which the scheduler replaces when a larger graph needs more room. Fold the device base addresses in, so a
-    // recording made against the old buffers is not replayed after a reallocation.
-    std::map<ggml_backend_buffer_t, uint64_t> buffer_ids;
-    auto mix_buffer = [&](ggml_backend_buffer_t buf) {
-        uint64_t id = 0;
-        if (buf != nullptr) {
-            auto it = buffer_ids.find(buf);
-            if (it == buffer_ids.end()) {
-                if (ggml_backend_buffer_is_meta(buf)) {
-                    const ggml_backend_meta_buffer_context * buf_ctx = (const ggml_backend_meta_buffer_context *) buf->context;
-                    for (const ggml_backend_buffer_ptr & simple : buf_ctx->bufs) {
-                        const uintptr_t base = simple ? (uintptr_t) ggml_backend_buffer_get_base(simple.get()) : 0;
-                        id = (id ^ (uint64_t) base) * 1099511628211ULL;
-                    }
-                } else {
-                    id = (uintptr_t) ggml_backend_buffer_get_base(buf);
-                }
-                it = buffer_ids.emplace(buf, id).first;
+    // Static meta tensors share a placeholder data address, even within the
+    // same buffer. Hash their actual shard addresses: buffer bases alone let
+    // identical-shaped graphs from different layers replay the wrong weights.
+    // This also distinguishes views and scheduler buffer reallocations.
+    auto mix_storage = [&](const ggml_tensor * t) {
+        if (t != nullptr && ggml_backend_buffer_is_meta(t->buffer)) {
+            auto * buf_ctx = (ggml_backend_meta_buffer_context *) t->buffer->context;
+            const auto & stc = buf_ctx->get_simple_tensor_container(t);
+            auto it = stc.simple_tensors.find(t);
+            GGML_ASSERT(it != stc.simple_tensors.end());
+            for (const ggml_tensor * shard : it->second) {
+                mix(&shard->data, sizeof(shard->data));
             }
-            id = it->second;
+        } else {
+            const void * data = t != nullptr ? t->data : nullptr;
+            mix(&data, sizeof(data));
         }
-        mix(&id, sizeof(id));
     };
     auto mix_tensor = [&](const ggml_tensor * t) {
-        const void *  data = t->data;
         const int32_t type = t->type;
         const int32_t op   = t->op;
-        mix_buffer(t->buffer);
-        mix(&data, sizeof(data));
+        mix_storage(t);
         mix(&type, sizeof(type));
         mix(&op, sizeof(op));
         mix(t->ne, sizeof(t->ne));
         mix(t->nb, sizeof(t->nb));
         mix(t->op_params, sizeof(t->op_params));
         mix(&t->flags, sizeof(t->flags));
-        const void * vdata = t->view_src != nullptr ? t->view_src->data : nullptr;
-        mix(&vdata, sizeof(vdata));
+        mix_storage(t->view_src);
         mix(&t->view_offs, sizeof(t->view_offs));
         for (int k = 0; k < GGML_MAX_SRC; k++) {
-            const void * sdata = t->src[k] != nullptr ? t->src[k]->data : nullptr;
-            mix(&sdata, sizeof(sdata));
-            mix_buffer(t->src[k] != nullptr ? t->src[k]->buffer : nullptr);
+            mix_storage(t->src[k]);
         }
     };
     mix(&cgraph->n_nodes, sizeof(cgraph->n_nodes));

@@ -779,6 +779,8 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
 
     # Needs non-public ggml{,-backend}-impl.h
     llama_build_and_test(test-alloc.cpp)
+    llama_build_and_test(test-backend-meta-replay.cpp)
+    set_tests_properties(test-backend-meta-replay PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 llama_build(test-export-graph-ops.cpp)
