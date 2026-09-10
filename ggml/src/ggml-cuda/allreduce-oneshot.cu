@@ -2,7 +2,6 @@
 
 #include <cuda_bf16.h>
 
-#include <time.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -18,8 +17,7 @@
 // Pinned host memory layout:
 //   one slice block per rank, [n_slots][max_bytes], bound to the NUMA node of that rank's GPU (a rank writes
 //   its slice locally; every rank reads all slices, half of them across the socket interconnect)
-//   flag block: [n_slots][n_ranks][3] x 128 bytes (published / done / chunk reduced) + one line per rank of
-//   spin-timeout diagnostics
+//   flag block: [n_slots + 1][n_ranks][3] x 128 bytes (published / done / chunk reduced)
 static constexpr int    GGML_CUDA_AR1_MAX_RANKS = GGML_CUDA_MAX_DEVICES;
 static constexpr int    GGML_CUDA_AR1_SLOTS     = 4;
 static constexpr size_t GGML_CUDA_AR1_LINE      = 128;
@@ -45,23 +43,7 @@ struct ggml_cuda_ar_oneshot {
     // device-side per-rank state: [0] launch counter (token x blocks), [1..3] large-message phase counters,
     // [4] current large token, [5] previous large token, [6 + slot] last token that used each small slot
     int  * dev_state[GGML_CUDA_AR1_MAX_RANKS] = {};
-
-    // GGML_CUDA_AR1_TRACE=lo:hi — per-rank ring of kernel timelines (token, entry, arrived, peers seen, end) in
-    // device globaltimer ns; clock_offset[i] = device time - host CLOCK_MONOTONIC at init, so ranks compare
-    unsigned long long * host_trace = nullptr;
-    unsigned long long * dev_trace[GGML_CUDA_AR1_MAX_RANKS] = {};
-    long long clock_offset[GGML_CUDA_AR1_MAX_RANKS] = {};
-    int trace_lo = -1, trace_hi = -1, trace_printed = 0;
 };
-static constexpr int AR1_TRACE_N = 256;
-static constexpr int AR1_TRACE_W = 5;
-
-static __global__ void k_ar1_clock(unsigned long long * out) {
-    unsigned long long t;
-    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
-    *out = t;
-}
-
 // flags live in mapped host memory: system-scope acquire loads and release stores, with a system fence after
 // each store so the flag is pushed out while the same thread keeps polling
 static __device__ __forceinline__ int ar1_load_flag(const int * p) {
@@ -80,46 +62,13 @@ static constexpr int AR1_FLAGS_PER_RANK = 3;
 static __device__ __forceinline__ int * ar1_flag(char * base, size_t data_bytes, int n_ranks, int slot, int rank, int which) {
     return (int *) (base + data_bytes + ((size_t) (slot * n_ranks + rank) * AR1_FLAGS_PER_RANK + which) * GGML_CUDA_AR1_LINE);
 }
-// diagnostics: rank's timeout word lives after all slot flags
-static __device__ __forceinline__ int * ar1_timeout(char * base, size_t data_bytes, int n_ranks, int rank) {
-    return (int *) (base + data_bytes + ((size_t) (GGML_CUDA_AR1_SLOTS + 1) * n_ranks * AR1_FLAGS_PER_RANK + rank) * GGML_CUDA_AR1_LINE);
-}
-static __device__ __forceinline__ unsigned int ar1_now_us() {
-    unsigned long long t;
-    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
-    return (unsigned int) (t / 1000);
-}
-
-// Polls a peer flag until *f >= value. After ~0.4 s (400k host reads) it records a diagnostic entry (up to 4
-// per rank: code, token, peer flag, n4, entry/spin/timeout times) and keeps waiting: a stuck collective must
-// fail loudly rather than reduce garbage. Only in diagnostic mode (give_up, GGML_CUDA_AR1_DEBUG) does it
-// return false so the run completes and the records get printed.
-static __device__ __forceinline__ bool ar1_spin(const int * f, int value, int * timeout_word, int code, int token, int n4,
-        unsigned int t_entry, int give_up) {
-    const unsigned int t_spin = ar1_now_us();
-    for (long it = 0; ar1_load_flag(f) < value; it++) {
-        if (it > 400000L) {
-            const int k = ar1_load_flag(timeout_word);
-            if (k < 4) {
-                int * e = timeout_word + 1 + 7 * k;
-                ar1_store_flag(e + 0, code);
-                ar1_store_flag(e + 1, token);
-                ar1_store_flag(e + 2, ar1_load_flag(f));
-                ar1_store_flag(e + 3, n4);
-                ar1_store_flag(e + 4, (int) t_entry);
-                ar1_store_flag(e + 5, (int) t_spin);
-                ar1_store_flag(e + 6, (int) ar1_now_us());
-                ar1_store_flag(timeout_word, k + 1);
-            }
-            if (give_up) {
-                return false;
-            }
-            it = 0;
-        }
+// Wait for the peer before using its slice. Never continue with incomplete data.
+static __device__ __forceinline__ void ar1_spin(const int * f, int value) {
+    while (ar1_load_flag(f) < value) {
         __nanosleep(100);
     }
-    return true;
 }
+
 // the slice blocks as this device sees them
 struct ar1_bases {
     char * p[GGML_CUDA_AR1_MAX_RANKS];
@@ -140,12 +89,9 @@ static constexpr int AR1_MB_BLOCKS = 16;
 static __global__ void __launch_bounds__(AR1_THREADS)
 k_ar1_allreduce(float4 * __restrict__ dst, char * base, const ar1_bases bases, int * state,
         const size_t data_bytes, const size_t max_bytes,
-        const int n_ranks, const int rank, const int n4, const int active, unsigned long long * trace, const int give_up,
+        const int n_ranks, const int rank, const int n4, const int active,
         const int scatter) {
     __shared__ int s_token;
-    const unsigned int t_entry = ar1_now_us();
-    unsigned long long t_ns[4];
-    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_ns[0]));
     if (threadIdx.x == 0) {
         s_token = atomicAdd(&state[0], AR1_MB_BLOCKS) / AR1_MB_BLOCKS + 1;
     }
@@ -162,9 +108,7 @@ k_ar1_allreduce(float4 * __restrict__ dst, char * base, const ar1_bases bases, i
         for (int r = 0; need > 0 && r < n_ranks; r++) {
             if (r == rank) continue;
             const int * f = ar1_flag(base, data_bytes, n_ranks, slot, r, 1);
-            if (!ar1_spin(f, need, ar1_timeout(base, data_bytes, n_ranks, rank), 1000000 + slot * 1000 + r, token, n4, t_entry, give_up)) {
-                break;
-            }
+            ar1_spin(f, need);
         }
     }
     __syncthreads();
@@ -178,16 +122,12 @@ k_ar1_allreduce(float4 * __restrict__ dst, char * base, const ar1_bases bases, i
     __syncthreads();
     if (threadIdx.x == 0) {
         ar1_store_flag(ar1_flag(base, data_bytes, n_ranks, slot, rank, 0), token);
-        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_ns[1]));
         // phase 2: wait for every peer's slice
         for (int r = 0; r < n_ranks; r++) {
             if (r == rank) continue;
             const int * f = ar1_flag(base, data_bytes, n_ranks, slot, r, 0);
-            if (!ar1_spin(f, token, ar1_timeout(base, data_bytes, n_ranks, rank), 2000000 + slot * 1000 + r, token, n4, t_entry, give_up)) {
-                break;
-            }
+            ar1_spin(f, token);
         }
-        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_ns[2]));
         __threadfence();
     }
     __syncthreads();
@@ -214,9 +154,7 @@ k_ar1_allreduce(float4 * __restrict__ dst, char * base, const ar1_bases bases, i
             for (int r = 0; r < n_ranks; r++) {
                 if (r == rank) continue;
                 const int * f = ar1_flag(base, data_bytes, n_ranks, slot, r, 2);
-                if (!ar1_spin(f, token, ar1_timeout(base, data_bytes, n_ranks, rank), 3000000 + slot * 1000 + r, token, n4, t_entry, give_up)) {
-                    break;
-                }
+                ar1_spin(f, token);
             }
             __threadfence();
         }
@@ -239,11 +177,6 @@ k_ar1_allreduce(float4 * __restrict__ dst, char * base, const ar1_bases bases, i
     if (threadIdx.x == 0) {
         __threadfence_system();
         ar1_store_flag(ar1_flag(base, data_bytes, n_ranks, slot, rank, 1), token);
-        if (trace != nullptr) {
-            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_ns[3]));
-            unsigned long long * e = trace + ((size_t) rank * AR1_TRACE_N + (token % AR1_TRACE_N)) * AR1_TRACE_W;
-            e[0] = token; e[1] = t_ns[0]; e[2] = t_ns[1]; e[3] = t_ns[2]; e[4] = t_ns[3];
-        }
     }
 }
 
@@ -260,11 +193,10 @@ k_ar1_allreduce(float4 * __restrict__ dst, char * base, const ar1_bases bases, i
 static constexpr int AR1_MB_SLOT = GGML_CUDA_AR1_SLOTS;
 
 static __global__ void k_ar1_mb_begin(char * base, int * state, const size_t data_bytes,
-        const int n_ranks, const int rank, const int n4, const int give_up) {
+        const int n_ranks, const int rank) {
     if (threadIdx.x != 0) {
         return;
     }
-    const unsigned int t_entry = ar1_now_us();
     const int token = atomicAdd(&state[0], AR1_MB_BLOCKS) / AR1_MB_BLOCKS + 1;
     state[4] = token;
     const int prev = state[5]; // this rank's previous large-message token; every rank runs the same sequence
@@ -272,10 +204,7 @@ static __global__ void k_ar1_mb_begin(char * base, int * state, const size_t dat
     if (prev > 0) {
         for (int r = 0; r < n_ranks; r++) {
             if (r == rank) continue;
-            if (!ar1_spin(ar1_flag(base, data_bytes, n_ranks, AR1_MB_SLOT, r, 1), prev, ar1_timeout(base, data_bytes, n_ranks, rank),
-                    1000000 + AR1_MB_SLOT * 1000 + r, token, n4, t_entry, give_up)) {
-                break;
-            }
+            ar1_spin(ar1_flag(base, data_bytes, n_ranks, AR1_MB_SLOT, r, 1), prev);
         }
     }
 }
@@ -306,8 +235,7 @@ static __global__ void k_ar1_f32_to_bf16(const float4 * __restrict__ src, uint2 
 static __global__ void __launch_bounds__(AR1_THREADS)
 k_ar1_mb_reduce_bf16(float4 * __restrict__ dst, char * base, const ar1_bases bases, int * state,
         const size_t data_bytes, const size_t max_bytes,
-        const int n_ranks, const int rank, const int n4, const int give_up) {
-    const unsigned int t_entry = ar1_now_us();
+        const int n_ranks, const int rank, const int n4) {
     const int token = state[4];
     const int slot  = AR1_MB_SLOT;
     const int nb    = gridDim.x;
@@ -318,10 +246,7 @@ k_ar1_mb_reduce_bf16(float4 * __restrict__ dst, char * base, const ar1_bases bas
             ar1_store_flag(ar1_flag(base, data_bytes, n_ranks, slot, rank, 0), token);
         }
         for (int r = 0; r < n_ranks; r++) {
-            if (!ar1_spin(ar1_flag(base, data_bytes, n_ranks, slot, r, 0), token, ar1_timeout(base, data_bytes, n_ranks, rank),
-                    2000000 + slot * 1000 + r, token, n4, t_entry, give_up)) {
-                break;
-            }
+            ar1_spin(ar1_flag(base, data_bytes, n_ranks, slot, r, 0), token);
         }
         __threadfence();
     }
@@ -346,10 +271,7 @@ k_ar1_mb_reduce_bf16(float4 * __restrict__ dst, char * base, const ar1_bases bas
             ar1_store_flag(ar1_flag(base, data_bytes, n_ranks, slot, rank, 2), token);
         }
         for (int r = 0; r < n_ranks; r++) {
-            if (!ar1_spin(ar1_flag(base, data_bytes, n_ranks, slot, r, 2), token, ar1_timeout(base, data_bytes, n_ranks, rank),
-                    3000000 + slot * 1000 + r, token, n4, t_entry, give_up)) {
-                break;
-            }
+            ar1_spin(ar1_flag(base, data_bytes, n_ranks, slot, r, 2), token);
         }
         __threadfence();
     }
@@ -370,11 +292,7 @@ k_ar1_mb_reduce_bf16(float4 * __restrict__ dst, char * base, const ar1_bases bas
 static __global__ void __launch_bounds__(AR1_THREADS)
 k_ar1_mb_reduce(float4 * __restrict__ dst, char * base, const ar1_bases bases, int * state,
         const size_t data_bytes, const size_t max_bytes,
-        const int n_ranks, const int rank, const int n4, const int give_up, unsigned long long * trace) {
-    const unsigned int t_entry = ar1_now_us();
-    unsigned long long t_ns[4];
-    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_ns[0]));
-    t_ns[1] = t_ns[2] = t_ns[0];
+        const int n_ranks, const int rank, const int n4) {
     const int token = state[4];
     const int slot  = AR1_MB_SLOT;
     const int nb    = gridDim.x;
@@ -385,14 +303,9 @@ k_ar1_mb_reduce(float4 * __restrict__ dst, char * base, const ar1_bases bases, i
         if (b == 0) {
             ar1_store_flag(ar1_flag(base, data_bytes, n_ranks, slot, rank, 0), token);
         }
-        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_ns[1]));
         for (int r = 0; r < n_ranks; r++) {
-            if (!ar1_spin(ar1_flag(base, data_bytes, n_ranks, slot, r, 0), token, ar1_timeout(base, data_bytes, n_ranks, rank),
-                    2000000 + slot * 1000 + r, token, n4, t_entry, give_up)) {
-                break;
-            }
+            ar1_spin(ar1_flag(base, data_bytes, n_ranks, slot, r, 0), token);
         }
-        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_ns[2]));
         __threadfence();
     }
     __syncthreads();
@@ -419,10 +332,7 @@ k_ar1_mb_reduce(float4 * __restrict__ dst, char * base, const ar1_bases bases, i
             ar1_store_flag(ar1_flag(base, data_bytes, n_ranks, slot, rank, 2), token);
         }
         for (int r = 0; r < n_ranks; r++) {
-            if (!ar1_spin(ar1_flag(base, data_bytes, n_ranks, slot, r, 2), token, ar1_timeout(base, data_bytes, n_ranks, rank),
-                    3000000 + slot * 1000 + r, token, n4, t_entry, give_up)) {
-                break;
-            }
+            ar1_spin(ar1_flag(base, data_bytes, n_ranks, slot, r, 2), token);
         }
         __threadfence();
     }
@@ -437,12 +347,6 @@ k_ar1_mb_reduce(float4 * __restrict__ dst, char * base, const ar1_bases bases, i
         __threadfence_system();
         if (atomicAdd(&state[3], 1) % nb == nb - 1) {
             ar1_store_flag(ar1_flag(base, data_bytes, n_ranks, slot, rank, 1), token);
-        }
-        if (trace != nullptr && b == 0) {
-            // block 0's view: entry, slice published, peers seen, end (the memcpy phase precedes the kernel)
-            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t_ns[3]));
-            unsigned long long * e = trace + ((size_t) rank * AR1_TRACE_N + (token % AR1_TRACE_N)) * AR1_TRACE_W;
-            e[0] = token; e[1] = t_ns[0]; e[2] = t_ns[1]; e[3] = t_ns[2]; e[4] = t_ns[3];
         }
     }
 }
@@ -511,57 +415,6 @@ static int ar1_gpu_numa_node(int device) {
     return node;
 }
 
-// Report only the communicator being submitted; backend contexts can outlive
-// other communicators in the same process.
-static void ggml_cuda_ar_oneshot_report(ggml_cuda_ar_oneshot * st) {
-    if (st->host_trace != nullptr && !st->trace_printed) {
-        bool ready = true;
-        for (int i = 0; i < st->n_ranks && ready; i++) {
-            volatile unsigned long long * e = st->host_trace + ((size_t) i * AR1_TRACE_N + (st->trace_hi % AR1_TRACE_N)) * AR1_TRACE_W;
-            ready = e[0] == (unsigned long long) st->trace_hi;
-        }
-        if (ready) {
-            st->trace_printed = 1;
-            // host-aligned ms relative to the earliest entry of trace_lo
-            long long t0 = 0;
-            for (int i = 0; i < st->n_ranks; i++) {
-                volatile unsigned long long * e = st->host_trace + ((size_t) i * AR1_TRACE_N + (st->trace_lo % AR1_TRACE_N)) * AR1_TRACE_W;
-                const long long t = (long long) e[1] - st->clock_offset[i];
-                if (i == 0 || t < t0) t0 = t;
-            }
-            GGML_LOG_ERROR("ar1 trace t0 = %.3f host ms\n", t0 / 1e6);
-            for (int tok = st->trace_lo; tok <= st->trace_hi; tok++) {
-                for (int i = 0; i < st->n_ranks; i++) {
-                    volatile unsigned long long * e = st->host_trace + ((size_t) i * AR1_TRACE_N + (tok % AR1_TRACE_N)) * AR1_TRACE_W;
-                    if (e[0] != (unsigned long long) tok) {
-                        GGML_LOG_ERROR("ar1 trace tok %d rank %d: missing (has %llu)\n", tok, i, e[0]);
-                        continue;
-                    }
-                    GGML_LOG_ERROR("ar1 trace tok %d rank %d: entry %.3f arrived %.3f peers %.3f end %.3f ms\n", tok, i,
-                        ((long long) e[1] - st->clock_offset[i] - t0) / 1e6, ((long long) e[2] - st->clock_offset[i] - t0) / 1e6,
-                        ((long long) e[3] - st->clock_offset[i] - t0) / 1e6, ((long long) e[4] - st->clock_offset[i] - t0) / 1e6);
-                }
-            }
-        }
-    }
-    const char * host_flags = (const char *) st->host_base + st->data_bytes + (size_t) (GGML_CUDA_AR1_SLOTS + 1) * st->n_ranks * AR1_FLAGS_PER_RANK * GGML_CUDA_AR1_LINE;
-    for (int i = 0; i < st->n_ranks; i++) {
-        volatile int * w = (volatile int *) (host_flags + (size_t) i * GGML_CUDA_AR1_LINE);
-        const int n = w[0];
-        for (int k = 0; k < n && k < 4; k++) {
-            const volatile int * e = w + 1 + 7 * k;
-            GGML_LOG_ERROR("one-shot allreduce: rank %d timed out (phase %d slot %d peer %d) at token %d, peer flag held %d, %d bytes, entry %u us, spin %u us, out %u us\n",
-                           i, e[0] / 1000000, (e[0] / 1000) % 1000, e[0] % 1000, e[1], e[2], e[3] * 16,
-                           (unsigned) e[4], (unsigned) e[5], (unsigned) e[6]);
-        }
-        if (n > 0) {
-            for (int k = 0; k < 29; k++) {
-                w[k] = 0;
-            }
-        }
-    }
-}
-
 ggml_cuda_ar_oneshot * ggml_cuda_ar_oneshot_init(const int * devices, size_t n_devices, size_t max_bytes) {
     if (n_devices < 2 || n_devices > (size_t) GGML_CUDA_AR1_MAX_RANKS) {
         return nullptr;
@@ -578,7 +431,7 @@ ggml_cuda_ar_oneshot * ggml_cuda_ar_oneshot_init(const int * devices, size_t n_d
         st->devices[i] = devices[i];
     }
     st->data_bytes = 0;
-    st->flag_bytes = (size_t) (GGML_CUDA_AR1_SLOTS + 1) * n_devices * AR1_FLAGS_PER_RANK * GGML_CUDA_AR1_LINE + n_devices * GGML_CUDA_AR1_LINE;
+    st->flag_bytes = (size_t) (GGML_CUDA_AR1_SLOTS + 1) * n_devices * AR1_FLAGS_PER_RANK * GGML_CUDA_AR1_LINE;
     if (cudaHostAlloc(&st->host_base, st->flag_bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
         (void) cudaGetLastError();
         delete st;
@@ -674,30 +527,6 @@ ggml_cuda_ar_oneshot * ggml_cuda_ar_oneshot_init(const int * devices, size_t n_d
             }
         }
     }
-    if (const char * tr = getenv("GGML_CUDA_AR1_TRACE")) {
-        if (sscanf(tr, "%d:%d", &st->trace_lo, &st->trace_hi) == 2 &&
-                cudaHostAlloc((void **) &st->host_trace, (size_t) n_devices * AR1_TRACE_N * AR1_TRACE_W * sizeof(unsigned long long),
-                              cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess) {
-            memset(st->host_trace, 0, (size_t) n_devices * AR1_TRACE_N * AR1_TRACE_W * sizeof(unsigned long long));
-            for (size_t i = 0; i < n_devices; i++) {
-                ggml_cuda_set_device(devices[i]);
-                void * dptr = nullptr;
-                CUDA_CHECK(cudaHostGetDevicePointer(&dptr, st->host_trace, 0));
-                st->dev_trace[i] = (unsigned long long *) dptr;
-                // align this device's globaltimer with the host clock
-                unsigned long long * clk = st->host_trace; // scratch: entry 0 of rank 0 is rewritten by the trace later
-                for (int rep = 0; rep < 3; rep++) {
-                    k_ar1_clock<<<1, 1>>>(st->dev_trace[i]);
-                    CUDA_CHECK(cudaDeviceSynchronize());
-                    struct timespec ts;
-                    clock_gettime(CLOCK_MONOTONIC, &ts);
-                    st->clock_offset[i] = (long long) *clk - ((long long) ts.tv_sec * 1000000000LL + ts.tv_nsec);
-                }
-                *clk = 0;
-            }
-            GGML_LOG_INFO("%s: tracing one-shot kernels for tokens %d..%d\n", __func__, st->trace_lo, st->trace_hi);
-        }
-    }
     GGML_LOG_INFO("%s: one-shot host-memory AllReduce for %zu devices, up to %zu bytes per tensor\n", __func__, n_devices, st->max_bytes);
     return st;
 }
@@ -730,9 +559,6 @@ void ggml_cuda_ar_oneshot_free(ggml_cuda_ar_oneshot * st) {
     if (st->host_base != nullptr) {
         (void) cudaFreeHost(st->host_base);
     }
-    if (st->host_trace != nullptr) {
-        (void) cudaFreeHost(st->host_trace);
-    }
     delete st;
 }
 
@@ -757,7 +583,6 @@ bool ggml_cuda_ar_oneshot_eligible(const ggml_cuda_ar_oneshot * st, ggml_tensor 
 // the ranks can be enqueued independently (one issuer thread per device); the kernels synchronize on-device.
 bool ggml_cuda_ar_oneshot_allreduce_rank(ggml_cuda_ar_oneshot * st, ggml_backend_t backend, ggml_tensor ** tensors, int rank) {
     const int n4 = (int) (ggml_nbytes(tensors[0]) / 16);
-    static const int give_up = getenv("GGML_CUDA_AR1_DEBUG") != nullptr;
     // reduce-scatter mode from this message size on (GGML_CUDA_AR1_SCATTER=<bytes>, 0 = never)
     static const size_t scatter_from = getenv("GGML_CUDA_AR1_SCATTER") != nullptr ? (size_t) atoll(getenv("GGML_CUDA_AR1_SCATTER")) : (size_t) 32 * 1024;
     const int scatter = scatter_from != 0 && ggml_nbytes(tensors[0]) >= scatter_from && n4 >= st->n_ranks;
@@ -766,9 +591,6 @@ bool ggml_cuda_ar_oneshot_allreduce_rank(ggml_cuda_ar_oneshot * st, ggml_backend
     // multi-block one advances by its block count, so the two must not interleave: the host serializes them)
     static const size_t mb_from = getenv("GGML_CUDA_AR1_MB_FROM") != nullptr ? (size_t) atoll(getenv("GGML_CUDA_AR1_MB_FROM")) : (size_t) 256 * 1024;
     const int multi_block = ggml_nbytes(tensors[0]) > mb_from && n4 >= st->n_ranks * AR1_MB_BLOCKS;
-    if (rank == 0) {
-        ggml_cuda_ar_oneshot_report(st);
-    }
     {
         const int i = rank;
         auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
@@ -784,7 +606,7 @@ bool ggml_cuda_ar_oneshot_allreduce_rank(ggml_cuda_ar_oneshot * st, ggml_backend
             // BF16 payload by default (GGML_CUDA_AR1_BF16=0 keeps F32): halves the host traffic of every
             // multi-MB reduce; the NCCL path rounded these tensors to BF16 as well
             static const bool bf16 = getenv("GGML_CUDA_AR1_BF16") == nullptr || atoi(getenv("GGML_CUDA_AR1_BF16")) != 0;
-            k_ar1_mb_begin<<<1, 32, 0, stream>>>(st->dev_base[i], st->dev_state[i], st->data_bytes, st->n_ranks, i, n4, give_up);
+            k_ar1_mb_begin<<<1, 32, 0, stream>>>(st->dev_base[i], st->dev_state[i], st->data_bytes, st->n_ranks, i);
             // host address of the own slice (UVA resolves the direction); the memset uses the device alias
             char * slice_host = (char *) st->host_slices[i] + (size_t) AR1_MB_SLOT * st->max_bytes;
             char * slice_dev  = st->dev_slices[i][i] + (size_t) AR1_MB_SLOT * st->max_bytes;
@@ -797,7 +619,7 @@ bool ggml_cuda_ar_oneshot_allreduce_rank(ggml_cuda_ar_oneshot * st, ggml_backend
                 }
                 k_ar1_mb_reduce_bf16<<<AR1_MB_BLOCKS, AR1_THREADS, 0, stream>>>(
                     (float4 *) tensors[i]->data, st->dev_base[i], bases, st->dev_state[i],
-                    st->data_bytes, st->max_bytes, st->n_ranks, i, n4, give_up);
+                    st->data_bytes, st->max_bytes, st->n_ranks, i, n4);
             } else {
                 if (active) {
                     CUDA_CHECK(cudaMemcpyAsync(slice_host, tensors[i]->data, (size_t) n4 * 16, cudaMemcpyDefault, stream));
@@ -806,12 +628,12 @@ bool ggml_cuda_ar_oneshot_allreduce_rank(ggml_cuda_ar_oneshot * st, ggml_backend
                 }
                 k_ar1_mb_reduce<<<AR1_MB_BLOCKS, AR1_THREADS, 0, stream>>>(
                     (float4 *) tensors[i]->data, st->dev_base[i], bases, st->dev_state[i],
-                    st->data_bytes, st->max_bytes, st->n_ranks, i, n4, give_up, st->dev_trace[i]);
+                    st->data_bytes, st->max_bytes, st->n_ranks, i, n4);
             }
         } else {
             k_ar1_allreduce<<<1, AR1_THREADS, 0, stream>>>(
                 (float4 *) tensors[i]->data, st->dev_base[i], bases, st->dev_state[i],
-                st->data_bytes, st->max_bytes, st->n_ranks, i, n4, active, st->dev_trace[i], give_up, scatter);
+                st->data_bytes, st->max_bytes, st->n_ranks, i, n4, active, scatter);
         }
         CUDA_CHECK(cudaGetLastError());
     }

@@ -547,48 +547,6 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_tensor_config = [&]() -> tensor_config {
-        // Localization aid: LLAMA_SPLIT_MIRROR is a comma list; "ssm" mirrors every tensor of the recurrent
-        // (GDN) layers and their caches, "attn" every tensor of the attention layers and the KV cache, any
-        // other item mirrors the tensors whose name contains it (e.g. "shexp", "output.weight"), so a
-        // quality deviation of the tensor split can be attributed to one component (costs VRAM and speed).
-        static const std::string mirror_env = std::getenv("LLAMA_SPLIT_MIRROR") != nullptr ? std::getenv("LLAMA_SPLIT_MIRROR") : "";
-        if (!mirror_env.empty()) {
-            bool mirror_ssm = false, mirror_attn = false;
-            for (size_t p = 0; p < mirror_env.size();) {
-                size_t q = mirror_env.find(',', p);
-                if (q == std::string::npos) q = mirror_env.size();
-                const std::string item = mirror_env.substr(p, q - p);
-                p = q + 1;
-                if (item == "ssm") {
-                    mirror_ssm = true;
-                } else if (item == "attn") {
-                    mirror_attn = true;
-                } else if (!item.empty() && tensor_name.find(item) != std::string::npos) {
-                    return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
-                }
-            }
-            int il = -1;
-            if (tensor_name.rfind("blk.", 0) == 0) {
-                il = std::atoi(tensor_name.c_str() + 4);
-            } else if (tensor_name.rfind("cache_", 0) == 0) {
-                const size_t l = tensor_name.rfind("_l");
-                if (l != std::string::npos) {
-                    il = std::atoi(tensor_name.c_str() + l + 2);
-                }
-            }
-            if (il >= 0 && il < (int) hparams.n_layer()) {
-                const bool recurrent = hparams.is_recr(il);
-                const bool layer_tensor = tensor_name.rfind("blk.", 0) == 0 &&
-                    (tensor_name.find(".attn_") != std::string::npos || tensor_name.find(".ssm_") != std::string::npos);
-                const bool cache_tensor = tensor_name.rfind("cache_", 0) == 0;
-                if (mirror_ssm && recurrent && (layer_tensor || cache_tensor)) {
-                    return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
-                }
-                if (mirror_attn && !recurrent && (layer_tensor || cache_tensor)) {
-                    return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
-                }
-            }
-        }
         if (is_dsv4) {
             if (std::regex_match(tensor_name, pattern_kv_cache) ||
                     std::regex_match(tensor_name, pattern_dsv4_state)) {
