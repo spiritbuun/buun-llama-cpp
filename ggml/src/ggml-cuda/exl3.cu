@@ -140,9 +140,8 @@ void exl3_reconstruct_launch(const uint8_t * data, half * dst, int k, int n0, in
 // ---- int8 activation path (m <= MAX_M) ---------------------------------------------------
 // GGML_EXL3_INT8: 0 = off (fp16 tensor-core gemv), 1 = int8 + error-feedback residual everywhere,
 // 2 = plain int8 (residual only for the head), unset = per-tensor rule: plain for K <= 6, residual for K >= 7.
-// The activation rounding of plain int8 is invisible next to the weight error up to 6 bpw but becomes the
-// dominant error at 7-8 bpw (worst-token KLD vs exllamav3 0.07 at K7, 0.56 at K8; residual restores 0.001/0.0005
-// for 7% / 1% of decode speed on a 1.7B model).
+// The residual limits additional activation error for high-bit weights. Plain activations at lower
+// bit widths are a precision/performance policy, not exact agreement with the F16-activation executor.
 
 int exl3_int8_mode() {
     static const int mode = [] {
@@ -185,9 +184,9 @@ size_t exl3_int8_smem_cap(int device) {
 }
 
 // k-split geometry: ~640 blocks in flight, 128-aligned slices, rows bounded by the shared-memory cap
-// at the worst-case per-row cost (M = MAX_M with residual). For dense calls the split is therefore a
-// function of the shape alone: a token gets bit-identical partial sums whether it is decoded alone or
-// verified in a batch, which keeps greedy speculative decoding lossless on dense models.
+// at the worst-case per-row cost (M = MAX_M with residual). Dense cb2 calls pass pairs = 1, so fixed
+// K/N and device give the same slices at M = 1..MAX_M. This keeps activation scales and partial-sum
+// order stable within this path; it does not establish whole-model speculative trajectory equality.
 void exl3_int8_geometry(int bits, int nacc, int m, int k, int colblocks, int pairs, size_t cap, int & ksplit, int & nrows, size_t & smem) {
     constexpr int worst_row_bytes = 2 * exl3_int8::MAX_M * 64 + exl3_int8::MAX_M * 32;
     const int kslices = k / 16;
@@ -215,11 +214,8 @@ void exl3_gemv_int8_launch(ggml_backend_cuda_context & ctx, const uint8_t * B, c
     const int colblocks = (n + exl3_int8::COLS - 1) / exl3_int8::COLS;
     // The kernel reserves the accumulator offset even for F16 codebooks.
     const int nacc = (RESID ? 2 : 1) * M;
-    // The grouped split is sized for the batch's pair count (deliberately batch-dependent): sizing it for
-    // one token's expert set cost 3% of speculative throughput on Qwen3.8-Flash-Next (2800 verify blocks
-    // instead of 800) and bought nothing, because that model's other batch-keyed kernels (F16 hyper-
-    // connection matmuls, attention) already change its numerics between batch sizes and MoE routing
-    // amplifies any such difference. Dense models get batch-independent results from the cap above.
+    // Grouped launches size the split by pair count for occupancy; their activation scales can
+    // therefore differ across batches. The fixed dense geometry does not apply to this grouped path.
     int ksplit, nrows; size_t smem;
     exl3_int8_geometry(bits, nacc, M, k, colblocks, pairs, cap, ksplit, nrows, smem);
     ggml_cuda_pool_alloc<float> partials(ctx.pool(), size_t(ksplit) * M * pairs * n);
