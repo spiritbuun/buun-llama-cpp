@@ -2385,6 +2385,12 @@ static uint64_t ggml_backend_meta_graph_signature(const ggml_cgraph * cgraph) {
 }
 
 static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+    // A CPU split can leave metadata-only views in this graph, including views
+    // of computed embeddings. They have no per-device shards or GPU work.
+    const auto is_host_view = [](const ggml_tensor * node) {
+        return node->view_src != nullptr && ggml_op_is_empty(node->op) &&
+            ggml_backend_buffer_is_host(node->buffer);
+    };
     GGML_ASSERT(cgraph->grads == nullptr);
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
@@ -2560,9 +2566,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-                if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(node->view_src->buffer)) {
-                    // FIXME s_copy_main is on the CPU and its view seems to be incorrectly added to the graph nodes.
-                    // For regular usage this doesn't matter since it's a noop but trying to call ggml_backend_meta_buffer_simple_tensor results in a crash.
+                if (is_host_view(node)) {
                     bcj.nodes[i] = node;
                     continue;
                 }
@@ -2584,7 +2588,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 auto skip_unrelated = [&]() {
                     while (id + 1 < cgraph->n_nodes) {
                         ggml_tensor * next = cgraph->nodes[id+1];
-                        if (ggml_backend_meta_get_split_state(next, false).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                        if (!is_host_view(next) &&
+                                ggml_backend_meta_get_split_state(next, false).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
                             break;
                         }
                         bool safe = true;
@@ -2693,7 +2698,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         }
                     }
 
-                    if (next->view_src != nullptr && next->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(next->view_src->buffer)) {
+                    if (is_host_view(next)) {
                         continue;
                     }
                     if (ggml_backend_meta_get_split_state(next, false).axis != GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
@@ -2732,7 +2737,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             int i_start = 0;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-                if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(node->view_src->buffer)) {
+                if (is_host_view(node)) {
                     continue;
                 }
                 const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(node, /*assume_sync =*/ false);
@@ -2775,6 +2780,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
                 n_subgraphs++;
                 i_start = i + 1;
+            }
+            // Trailing host views still belong to the final graph range.
+            if (i_start < cgraph->n_nodes) {
+                for (size_t j = 0; j < n_backends; j++) {
+                    backend_ctx->backend_configs[j].cgraphs[n_subgraphs].offset = i_start;
+                }
+                n_subgraphs++;
+                i_start = cgraph->n_nodes;
             }
             GGML_ASSERT(i_start == cgraph->n_nodes);
         }
