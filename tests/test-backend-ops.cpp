@@ -6073,6 +6073,33 @@ struct test_mul_mat_id_window : public test_case {
     }
 };
 
+// A post-op must not bypass the window's expert-ID mapping and zero fill.
+struct test_mul_mat_id_window_bias : public test_mul_mat_id_window {
+    test_mul_mat_id_window_bias(ggml_type type_a, int64_t n)
+        : test_mul_mat_id_window(type_a, 16, 4, 4, 4, 64, n, 256) {}
+
+    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_ID_WINDOW_BIAS"; }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_mul_mat_id_window::build_graph(ctx);
+        ggml_tensor * bias = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, n_mats);
+        return ggml_add_id(ctx, out, bias, out->src[2]);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_mul_mat_id_window::initialize_tensors(ctx);
+        ggml_tensor * ids = ggml_get_tensor(ctx, "ids");
+        std::vector<int32_t> routes(n_mats * n, 0);
+        for (int64_t t = 0; t < n; ++t) {
+            // Two local experts and one on either side of this device's range.
+            const int32_t row[] = {lo - 1, lo, lo + n_local - 1, lo + n_local};
+            std::copy(std::begin(row), std::end(row), routes.begin() + t * n_mats);
+        }
+        ggml_backend_tensor_set(ids, routes.data(), 0, ggml_nbytes(ids));
+    }
+};
+
 // GGML_OP_MUL_MAT_ID
 struct test_mul_mat_id : public test_case {
     const ggml_type type_a;
@@ -10867,6 +10894,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
 #endif
     // expert-parallel windows (live: these must run)
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
+        for (int64_t n : {1, 2}) {
+            test_cases.emplace_back(new test_mul_mat_id_window_bias(type_a, n));
+        }
+    }
     for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
         for (int64_t n : {1, 8, 64}) {
             test_cases.emplace_back(new test_mul_mat_id_window(type_a, 16, 4, 4, 4, 64, n, 256)); // window in the middle
