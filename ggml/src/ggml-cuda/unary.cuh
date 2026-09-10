@@ -142,6 +142,10 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
 
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
 
+void ggml_cuda_scaled_swiglu(ggml_backend_cuda_context & ctx,
+    const float * gate, const float * up, const float * gate_scale, const float * up_scale,
+    float * dst, int64_t n);
+
 __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {
     return x / (1.0f + expf(-x));
 }

@@ -365,24 +365,50 @@ __global__ void unpack_gdn_state_f32(const float * src, float * dst) {
     }
 }
 
-template <bool fuse_gate, bool gate_bf16 = false, bool output_bf16 = false>
+template <bool fuse_gate, bool gate_bf16 = false, bool output_bf16 = false, int rows_per_block = 1>
 __global__ void unpack_gdn_rms_f32(
         const nv_bfloat16 * src, const float * weight, const float * gate, float * dst, float eps) {
-    const int64_t row_native = blockIdx.x;
-    const int d = threadIdx.x;
+    const int group = threadIdx.x / GDN_D;
+    const int64_t row_native = int64_t(blockIdx.x) * rows_per_block + group;
+    const int d = threadIdx.x % GDN_D;
     const int64_t t = row_native / GDN_H;
     const int64_t h_native = row_native % GDN_H;
     const int64_t h = (h_native % GDN_HK) * 3 + h_native / GDN_HK;
     const float x = __bfloat162float(src[(t * GDN_H + h) * GDN_D + d]);
+    const int64_t output_idx = row_native * GDN_D + d;
+    float gain = 0.0f;
+    float prefetched_gate = 0.0f;
+    if constexpr (rows_per_block > 1) {
+        gain = weight[d];
+        if constexpr (fuse_gate) {
+            prefetched_gate = gate_bf16
+                ? __bfloat162float(reinterpret_cast<const nv_bfloat16 *>(gate)[output_idx])
+                : gate[output_idx];
+        }
+    }
 
     float sum = x * x;
     extern __shared__ float s_sum[];
-    sum = block_reduce<block_reduce_method::SUM, GDN_D>(sum, s_sum);
+    if constexpr (rows_per_block == 1) {
+        sum = block_reduce<block_reduce_method::SUM, GDN_D>(sum, s_sum);
+    } else {
+        // Keep the original four-warp reduction order separately for each row.
+        sum = warp_reduce_sum(sum);
+        const int lane = d % WARP_SIZE;
+        if (lane == 0) {
+            s_sum[group * (GDN_D / WARP_SIZE) + d / WARP_SIZE] = sum;
+        }
+        __syncthreads();
+        sum = warp_reduce_sum(lane < GDN_D / WARP_SIZE
+            ? s_sum[group * (GDN_D / WARP_SIZE) + lane] : 0.0f);
+    }
     const float scale = rsqrtf(sum / GDN_D + eps);
-    const int64_t output_idx = row_native * GDN_D + d;
-    const float normalized = scale * x * weight[d];
+    if constexpr (rows_per_block == 1) {
+        gain = weight[d];
+    }
+    const float normalized = scale * x * gain;
     if constexpr (fuse_gate) {
-        const float gate_value = gate_bf16
+        const float gate_value = rows_per_block > 1 ? prefetched_gate : gate_bf16
             ? __bfloat162float(reinterpret_cast<const nv_bfloat16 *>(gate)[output_idx])
             : gate[output_idx];
         const float result = ggml_cuda_op_silu_single(gate_value) * normalized;
@@ -675,6 +701,9 @@ void ggml_cuda_gdn_fla_ptx(
             } else {
                 if (rms_output_bf16) {
                     unpack_gdn_rms_f32<true, false, true><<<n_tokens * GDN_H, GDN_D, 32 * sizeof(float), stream>>>(
+                        out.get(), rms_weight, rms_gate, rms_output, rms_eps);
+                } else if (sm120) {
+                    unpack_gdn_rms_f32<true, false, false, 2><<<n_tokens * GDN_H / 2, 2 * GDN_D, 8 * sizeof(float), stream>>>(
                         out.get(), rms_weight, rms_gate, rms_output, rms_eps);
                 } else {
                     unpack_gdn_rms_f32<true><<<n_tokens * GDN_H, GDN_D, 32 * sizeof(float), stream>>>(

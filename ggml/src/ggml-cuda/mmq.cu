@@ -2,6 +2,7 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
+#include "mmq-nvfp4-tma.cuh"
 
 #include <cstdint>
 

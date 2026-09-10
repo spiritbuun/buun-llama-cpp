@@ -5590,6 +5590,31 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+    const ggml_op scale_add_ops[] = { GGML_OP_MUL, GGML_OP_ADD };
+    const int scale_add_output = i + 1;
+    if (node->op == GGML_OP_MUL &&
+            ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_BLACKWELL &&
+            ggml_can_fuse_subgraph(cgraph, i, 2, scale_add_ops, &scale_add_output, 1)) {
+        const ggml_tensor * x = node->src[0];
+        const ggml_tensor * scale = node->src[1];
+        ggml_tensor * add = cgraph->nodes[i + 1];
+        const ggml_tensor * residual = add->src[1];
+        if (add->src[0] == node && x->op == GGML_OP_MUL_MAT &&
+                x->src[0]->type == GGML_TYPE_NVFP4 && x->ne[1] >= 128 &&
+                x->type == GGML_TYPE_F32 && scale->type == GGML_TYPE_F32 &&
+                node->type == GGML_TYPE_F32 && residual->type == GGML_TYPE_F32 &&
+                add->type == GGML_TYPE_F32 && ggml_nelements(scale) == 1 &&
+                ggml_are_same_shape(x, node) && ggml_are_same_shape(x, add) &&
+                ggml_are_same_shape(residual, add) &&
+                ggml_is_contiguous(x) && ggml_is_contiguous(scale) &&
+                ggml_is_contiguous(node) && ggml_is_contiguous(residual) && ggml_is_contiguous(add) &&
+                !ggml_cuda_tensors_overlap(add, scale) &&
+                (!ggml_cuda_tensors_overlap(add, x) || add->data == x->data) &&
+                (!ggml_cuda_tensors_overlap(add, residual) || add->data == residual->data)) {
+            ggml_cuda_scale_add(*cuda_ctx, x, scale, residual, add);
+            return 1;
+        }
+    }
     // EXL3 projections have their own executor (Hadamard + trellis gemv); no matcher applies.
     if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) &&
             node->src[0] != nullptr && ggml_cuda_is_exl3(node->src[0]->type)) {
@@ -6525,6 +6550,39 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
                     fused_mul_mat_vec = true;
                     fused_node_count  = n_ops;
+                    break;
+                }
+
+                // Keep the PP contractions unchanged, but combine their scalar
+                // scales with SwiGLU instead of materializing two scaled arrays.
+                if (!with_bias && src0->type == GGML_TYPE_NVFP4 &&
+                        ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_BLACKWELL &&
+                        up_n->ne[1] >= 128 && up_n->ne[2] == 1 && up_n->ne[3] == 1 &&
+                        ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
+                        gate_n->type == GGML_TYPE_F32 && up_n->type == GGML_TYPE_F32 &&
+                        glu->type == GGML_TYPE_F32 &&
+                        ggml_is_contiguous(gate_n) && ggml_is_contiguous(up_n) &&
+                        ggml_is_contiguous(gate_scale_n) && ggml_is_contiguous(up_scale_n) &&
+                        ggml_is_contiguous(glu) &&
+                        !ggml_cuda_tensors_overlap(gate_scale_n, up_scale_n) &&
+                        !ggml_cuda_tensors_overlap(gate_scale_n, src1) &&
+                        !ggml_cuda_tensors_overlap(up_scale_n, src1) &&
+                        (!ggml_cuda_tensors_overlap(glu, gate_scale_n) || glu->data == gate_scale_n->data) &&
+                        (!ggml_cuda_tensors_overlap(glu, up_scale_n) || glu->data == up_scale_n->data)) {
+                    // The raw MM destinations may already be reusable by the
+                    // other contraction. Use the scaled tensors' live storage.
+                    ggml_tensor gate_tmp = *gate_n;
+                    ggml_tensor up_tmp = *up_n;
+                    gate_tmp.data = gate_scale_n->data;
+                    up_tmp.data = up_scale_n->data;
+                    ggml_cuda_mul_mat(*cuda_ctx, gate_tmp.src[0], src1, &gate_tmp);
+                    ggml_cuda_mul_mat(*cuda_ctx, src0, src1, &up_tmp);
+                    ggml_cuda_scaled_swiglu(*cuda_ctx,
+                        static_cast<const float *>(gate_tmp.data), static_cast<const float *>(up_tmp.data),
+                        static_cast<const float *>(gate_scale->data), static_cast<const float *>(up_scale->data),
+                        static_cast<float *>(cgraph->nodes[glu_idx]->data), ggml_nelements(glu));
+                    fused_mul_mat_vec = true;
+                    fused_node_count = n_ops;
                     break;
                 }
             }

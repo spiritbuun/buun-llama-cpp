@@ -631,9 +631,9 @@ static void rms_norm_mul_f32_cuda(const float *  x,
         const int block_size = ncols <= 128 && use_d128_block ? 128 : ncols < 1024 ? 256 : 1024;
         const dim3 block_dims(block_size, 1, 1);
         const size_t nbytes_shared = block_size > WARP_SIZE ? 32 * sizeof(float) : 0;
-        // Decode: overlap gain loads with the unchanged sum-of-squares reduction.
-        // Limit register caching to the measured single-row geometry.
-        if (ncols == 5120 && nrows == 1 && nchannels == 1 && nsamples == 1 &&
+        // Overlap gain loads with the unchanged sum-of-squares reduction.
+        // This fixed-width cache also pays off across measured prefill grids.
+        if (ncols == 5120 && nchannels == 1 && nsamples == 1 &&
                 ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_BLACKWELL) {
             rms_norm_mul_bcast_f32<1024, float, 5><<<blocks_num, block_dims, nbytes_shared, stream>>>(
                 x, mul, dst, ncols, stride_row, stride_channel, stride_sample, eps);

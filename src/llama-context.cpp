@@ -927,7 +927,7 @@ uint32_t llama_context::effective_reserve_n_seqs(const llama_memory_context_i * 
 }
 
 void llama_context::sched_reserve() {
-    if (!sched_need_reserve) {
+    if (!sched_need_reserve && !sched_need_sampler_reserve) {
         return;
     }
 
@@ -958,9 +958,6 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
-    gf_res_prev.reset(new llm_graph_result(max_nodes));
-    gf_res_reserve.reset(new llm_graph_result(max_nodes));
-
     const bool moe_cache_eligible = llama_model_has_cacheable_moe_weights(
             model, (llama_moe_cache_mode)cparams.moe_cache_mode,
             cparams.moe_cache_budget_mib, backend_ptrs);
@@ -977,7 +974,26 @@ void llama_context::sched_reserve() {
             __func__, moe_cache_requested,
             moe_cache_eligible ? moe_cache_requested : "off");
 
-    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    // A sampler-only change rebuilds the graph, but can keep sufficient allocation
+    // capacity. Other reservation reasons retain their original allocation lifecycle.
+    const bool reuse_sched = !sched_need_reserve && sched &&
+        !moe_cache_eligible && !cparams.pipeline_parallel &&
+        ggml_backend_sched_get_n_copies(sched.get()) == 1 && sched_max_nodes >= max_nodes;
+    if (reuse_sched && gf_res_prev && gf_res_reserve &&
+        gf_res_prev->get_max_nodes() == (int64_t) max_nodes &&
+        gf_res_reserve->get_max_nodes() == (int64_t) max_nodes) {
+        gf_res_prev->reset();
+        gf_res_reserve->reset();
+    } else {
+        gf_res_prev.reset(new llm_graph_result(max_nodes));
+        gf_res_reserve.reset(new llm_graph_result(max_nodes));
+    }
+    if (reuse_sched) {
+        ggml_backend_sched_reset(sched.get());
+    } else {
+        sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+        sched_max_nodes = max_nodes;
+    }
     ggml_backend_sched_set_moe_cache(
             sched.get(), moe_cache_mode,
             cparams.moe_cache_budget_mib,
@@ -1043,6 +1059,7 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                sched_max_nodes = max_nodes;
                 ggml_backend_sched_set_moe_cache(
                         sched.get(), moe_cache_mode,
                         cparams.moe_cache_budget_mib,
@@ -1121,6 +1138,7 @@ void llama_context::sched_reserve() {
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
     dflash_cross_reserved_bucket = cross.n_enc;
     sched_need_reserve = false;
+    sched_need_sampler_reserve = false;
 }
 
 void llama_context::synchronize() {
@@ -3944,7 +3962,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
             warned = true;
         }
         if (sampling.samplers.count(seq_id) > 0) {
-            sched_need_reserve = true;
+            sched_need_sampler_reserve = true;
         }
         sampling.samplers.erase(seq_id);
         return false;
@@ -3969,7 +3987,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
             LLAMA_LOG_WARN("%s: sampler '%s' for seq_id = %d has no supported backend prefix\n",
                     __func__, llama_sampler_name(sampler), seq_id);
             if (sampling.samplers.count(seq_id) > 0) {
-                sched_need_reserve = true;
+                sched_need_sampler_reserve = true;
             }
             sampling.samplers.erase(seq_id);
             return false;
@@ -3977,7 +3995,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
         sampling.samplers[seq_id] = sampler;
 
-        sched_need_reserve = true;
+        sched_need_sampler_reserve = true;
 
         return true;
     }
@@ -3986,7 +4004,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         LLAMA_LOG_WARN("%s: sampler '%s' for seq_id = %d, cannot be offloaded to the backend\n", __func__, llama_sampler_name(sampler), seq_id);
 
         if (sampling.samplers.count(seq_id) > 0) {
-            sched_need_reserve = true;
+            sched_need_sampler_reserve = true;
         }
 
         sampling.samplers.erase(seq_id);
@@ -3996,7 +4014,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
     sampling.samplers.erase(seq_id);
 
-    sched_need_reserve = true;
+    sched_need_sampler_reserve = true;
 
     return true;
 }

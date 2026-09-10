@@ -913,6 +913,24 @@ void ggml_cuda_op_softplus(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 /* gated ops */
 
+static __global__ void scaled_swiglu_f32(
+        const float * gate, const float * up, const float * gate_scale, const float * up_scale,
+        float * dst, int64_t n) {
+    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) {
+        const float g = gate[i] * gate_scale[0];
+        const float u = up[i] * up_scale[0];
+        dst[i] = op_silu(g) * u;
+    }
+}
+
+void ggml_cuda_scaled_swiglu(ggml_backend_cuda_context & ctx,
+        const float * gate, const float * up, const float * gate_scale, const float * up_scale,
+        float * dst, int64_t n) {
+    scaled_swiglu_f32<<<(n + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE,
+        CUDA_GLU_BLOCK_SIZE, 0, ctx.stream()>>>(gate, up, gate_scale, up_scale, dst, n);
+}
+
 template <float (*op)(float), typename T>
 static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1) {
     ggml_cuda_pdl_lc();

@@ -101,9 +101,14 @@ static __global__ void quantize_q8_1(
 }
 
 #if !defined(GGML_USE_HIP)
+template<bool pdl = false>
 static __global__ void quantize_fp8_q8_1(
         const float * x, const int32_t * marker, block_q8_1 * y,
         int64_t width, int64_t padded_width) {
+    if constexpr (pdl) {
+        ggml_cuda_pdl_lc();
+        ggml_cuda_pdl_sync();
+    }
     x += blockIdx.y * width;
     y += blockIdx.y * (padded_width / QK8_1);
 
@@ -156,9 +161,18 @@ void quantize_row_fp8_q8_1_cuda(
         int64_t width, int64_t padded_width, int64_t rows, cudaStream_t stream) {
     GGML_ASSERT(width > 0 && padded_width >= width && padded_width % QK8_1 == 0);
     const dim3 grid((padded_width + 255) / 256, rows);
-    quantize_fp8_q8_1<<<grid, 256, 0, stream>>>(
-        x, marker, static_cast<block_q8_1 *>(vy), width, padded_width);
-    CUDA_CHECK(cudaGetLastError());
+    // Let the one-token consumer prepare its weight/LUT data while packing runs.
+    // Other architectures retain their existing launch path.
+    const bool pdl = ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_BLACKWELL;
+    if (pdl) {
+        ggml_cuda_kernel_launch(quantize_fp8_q8_1<true>,
+            ggml_cuda_kernel_launch_params(grid, dim3(256), 0, stream),
+            x, marker, static_cast<block_q8_1 *>(vy), width, padded_width);
+    } else {
+        quantize_fp8_q8_1<false><<<grid, 256, 0, stream>>>(
+            x, marker, static_cast<block_q8_1 *>(vy), width, padded_width);
+        CUDA_CHECK(cudaGetLastError());
+    }
 }
 #endif
 

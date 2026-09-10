@@ -25,6 +25,7 @@ struct ggml_cuda_mmvq_fusion_args_device : ggml_cuda_mm_fusion_args_device {
     const float * conv_prefix = nullptr;
     const float * conv_weight = nullptr;
     float * conv_state = nullptr;
+    bool prefetch_weights = false; // immutable dense weights only
 };
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
@@ -1554,6 +1555,16 @@ static __global__ void mul_mat_vec_q(
     uint32_t channel_y;
     uint32_t sample_dst;
 
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    if constexpr (type == GGML_TYPE_F8_E4M3 && ncols_dst == 1) {
+        if (fusion.prefetch_weights) {
+            const char * row = static_cast<const char *>(vx) + size_t(row0)*stride_row_x*QK8_1;
+            for (int offset = tid*128; offset < int(ncols_x); offset += nwarps*warp_size*128) {
+                asm volatile("prefetch.global.L2 [%0];" :: "l"(row + offset));
+            }
+        }
+    }
+#endif
     ggml_cuda_pdl_sync();
     if constexpr (has_post_conv) {
         if (tid == 0) {
@@ -2576,6 +2587,11 @@ static void ggml_cuda_mul_mat_vec_q_impl(
     }
     fusion_local.post_scale = post_scale;
     fusion_local.post_silu  = post_silu;
+    fusion_local.prefetch_weights = ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_BLACKWELL &&
+        src0->type == GGML_TYPE_F8_E4M3 && fp8_marker && !ids &&
+        ne02 == 1 && ne03 == 1 && ne11 == 1 && ne12 == 1 && ne13 == 1 &&
+        ggml_is_contiguous(src0) &&
+        ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
     fusion_local.round_scale = fp8_marker != nullptr ||
         (src0->type == GGML_TYPE_NVFP4 && fusion && fusion->residual &&
             ggml_cuda_info().devices[ctx.device].cc == GGML_CUDA_CC_BLACKWELL);
