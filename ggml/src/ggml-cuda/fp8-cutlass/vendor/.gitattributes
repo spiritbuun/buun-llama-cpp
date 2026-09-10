@@ -1,0 +1,2 @@
+# Preserve the vendored header snapshot, including upstream whitespace.
+include/** -whitespace
