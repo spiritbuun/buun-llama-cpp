@@ -251,14 +251,22 @@ void exl3_moe_run(ggml_backend_cuda_context & ctx, const float * x, const half *
     exl3_gemv_int8_launch<bits, cb, 1, false, true>(ctx, B, x, suh, svh, y, k, n, pairs, ga, stream);
 }
 
-// MoE decode shapes the grouped kernel takes: F32 in/out, contiguous dst, few pairs
+// (token, expert) pairs the grouped gemv takes before the per-expert fallback. The grouped kernel
+// reads an expert once per pair, the fallback reads each active expert once but pays a launch per
+// expert (Qwen3.8-Flash-Next: ~15k launches for a 32-token prompt). Measured crossover on 4x3090
+// (top-10 of 512 experts): 32-token prompts 2.2x faster grouped, 64-token 1.8x, 128-token 1.3x,
+// equal near 256 tokens (2560 pairs), fallback ahead at 512. Larger prompts want a sorted-token
+// tensor-core grouped GEMM instead of either.
+constexpr int EXL3_MOE_PAIRS_MAX = 2048;
+
+// MoE shapes the grouped kernel takes: F32 in/out, contiguous dst, pair count under the crossover
 bool exl3_mul_mat_id_fast_shape(const ggml_tensor * dst) {
     const ggml_tensor * w = dst->src[0], * x = dst->src[1], * ids = dst->src[2];
     const int64_t pairs = ids->ne[0] * ids->ne[1];
     return w->ne[0] % 128 == 0 && w->ne[1] % 128 == 0 && w->ne[1] <= int64_t(EXL3_INT8_MAX_N) &&
         x->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float) && dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst) &&
         ids->type == GGML_TYPE_I32 && ids->nb[0] == sizeof(int32_t) &&
-        pairs >= 1 && pairs <= 64 && size_t(pairs) * ((w->ne[1] + exl3_int8::COLS - 1) / exl3_int8::COLS) <= EXL3_INT8_COUNTERS &&
+        pairs >= 1 && pairs <= EXL3_MOE_PAIRS_MAX && size_t(pairs) * ((w->ne[1] + exl3_int8::COLS - 1) / exl3_int8::COLS) <= EXL3_INT8_COUNTERS &&
         dst->src[3] != nullptr && dst->src[4] != nullptr;
 }
 
