@@ -4020,6 +4020,13 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                         llama_model_saver ms = llama_model_saver(model_and_ctx_dev.first.get());
                         ms.add_kv_from_model();
                         ms.add_tensors_from_model();
+                        for (const ggml_tensor * tensor : {
+                                model_and_ctx_dev.first->per_layer_tok_embd_scale,
+                                model_and_ctx_dev.first->per_layer_tok_embd_bias }) {
+                            if (tensor) {
+                                GGML_ASSERT(gguf_find_tensor(ms.gguf_ctx, tensor->name) >= 0);
+                            }
+                        }
                         ms.save(file.get());
                         rewind(file.get());
 
