@@ -2405,11 +2405,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 launch_one(j);
             }
         }
-        bool launched = true;
+        size_t n_launched = 0;
         for (size_t j = 0; j < n_backends; j++) {
-            launched = launched && launched_j[j];
+            n_launched += launched_j[j] != 0;
         }
-        return launched;
+        if (n_launched != 0 && n_launched != n_backends) {
+            // Submitted graphs may already have updated recurrent state or be
+            // waiting for peers. Neither retrying nor synchronizing is safe.
+            GGML_ABORT("meta step graph launch failed after %zu/%zu devices submitted; cannot retry", n_launched, n_backends);
+        }
+        return n_launched == n_backends;
     };
 
     // The meta buffers double-buffer the per-graph shard tensors: the scheduler's allocation of the next graph
