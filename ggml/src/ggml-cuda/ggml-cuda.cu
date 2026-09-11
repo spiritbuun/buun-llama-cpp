@@ -2826,7 +2826,8 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         }
         if (src0->type == GGML_TYPE_Q4_A32 && dst->src[2] == nullptr) {
             if (input_scale->type == GGML_TYPE_I16) {
-                ggml_cuda_fp8_dynamic_fake_quant(ctx, src1, input_scale, rounded_input.get());
+                // I16 selects dynamic FP8; it carries no I32 upper-bound payload.
+                ggml_cuda_fp8_dynamic_fake_quant(ctx, src1, nullptr, rounded_input.get());
             } else if (input_scale->type == GGML_TYPE_I32) {
                 ggml_cuda_int8_dynamic_fake_quant(ctx, src1, rounded_input.get());
             } else {
@@ -8763,7 +8764,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     }
                     const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
                     const bool i8_channel = a->type == GGML_TYPE_I8 && b->type == GGML_TYPE_F32 &&
-                        op->type == GGML_TYPE_F32 && cc >= GGML_CUDA_CC_TURING &&
+                        op->type == GGML_TYPE_F32 && cc >= GGML_CUDA_CC_VOLTA &&
                         ggml_is_contiguous(a) && ggml_is_contiguous(b) &&
                         ggml_is_contiguous(scale) && ggml_is_contiguous(op) &&
                         a->ne[0] % 4 == 0 && a->ne[1] % 4 == 0 &&
@@ -8775,9 +8776,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     if (i8_channel) {
                         return true;
                     }
+                    // Generic scale-aware fallbacks also work on Volta, without native FP8 MMA.
                     const bool f8_channel = a->type == GGML_TYPE_F8_E4M3 &&
                         b->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
-                        cc >= GGML_CUDA_CC_AMPERE && ggml_is_contiguous(a) &&
+                        cc >= GGML_CUDA_CC_VOLTA && ggml_is_contiguous(a) &&
                         ggml_is_contiguous(b) && ggml_is_contiguous(scale) &&
                         ggml_is_contiguous(op) && (scale->type == GGML_TYPE_BF16 || scale->type == GGML_TYPE_F32) &&
                         scale->ne[0] == a->ne[1] && scale->ne[1] == 1 &&
@@ -8795,7 +8797,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                            scale->ne[1] == a->ne[0] / 128 && scale->ne[2] == 1 && scale->ne[3] == 1 &&
                            b->ne[0] == a->ne[0] && op->ne[0] == a->ne[1] && op->ne[1] == b->ne[1] &&
                            a->ne[3] == 1 && b->ne[2] == a->ne[2] && b->ne[3] == 1 &&
-                           cc >= GGML_CUDA_CC_AMPERE;
+                           cc >= GGML_CUDA_CC_VOLTA;
 #endif
                 }
                 // Model placement probes MUL_MAT before the graph attaches the

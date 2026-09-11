@@ -527,6 +527,12 @@ llama_build_and_test(test-cuda-q8-mmv-selector.cpp)
 llama_build_and_test(test-cuda-graph-key.cpp)
 llama_build_and_test(test-cuda-rdna2-vmm-policy.cpp)
 if (TARGET ggml-cuda AND NOT GGML_BACKEND_DL)
+    # Small scale-aware cases exercise generic fallbacks without the expensive
+    # CPU reference of production-sized dynamic FP8 GEMMs.
+    llama_test(test-backend-ops NAME test-cuda-native-quant-fallbacks
+        ARGS test -b CUDA0
+        -o MUL_MAT_STATIC_I8,MUL_MAT_DYNAMIC_I4,MUL_MAT_DYNAMIC_W4A8_FP8,MUL_MAT_STATIC_FP8,MUL_MAT_CHANNEL_FP8,MUL_MAT_BLOCK_FP8
+        -p "^k=(32|128|256),n=[0-9]+(,m=(1|3|8)(,|$)|,scale=)")
     llama_build(test-exl3-dense-batch.cpp)
     target_link_libraries(test-exl3-dense-batch PRIVATE ggml-cuda)
     foreach(mode -1 1 2)

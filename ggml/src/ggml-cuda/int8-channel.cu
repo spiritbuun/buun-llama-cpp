@@ -599,11 +599,12 @@ bool ggml_cuda_int8_channel_supports(
         const ggml_tensor * scale,
         const ggml_tensor * output,
         int cc) {
+    // Volta uses the cuBLAS integer fallback; specialized MMA paths gate themselves below.
     return weight != nullptr && input != nullptr && scale != nullptr && output != nullptr &&
         weight->type == GGML_TYPE_I8 && input->type == GGML_TYPE_F32 &&
         output->type == GGML_TYPE_F32 &&
         (scale->type == GGML_TYPE_F32 || scale->type == GGML_TYPE_F16 || scale->type == GGML_TYPE_BF16) &&
-        cc >= GGML_CUDA_CC_TURING &&
+        cc >= GGML_CUDA_CC_VOLTA &&
         ggml_is_contiguous(weight) && ggml_is_contiguous(input) &&
         ggml_is_contiguous(output) && ggml_is_contiguous(scale) &&
         weight->ne[2] == 1 && weight->ne[3] == 1 &&
