@@ -48,6 +48,12 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
     uint32_t top_k,
     bool use_int64_expert_layout) {
 
+#if defined(HUMMING_MIN_CUDA_ARCH) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ < HUMMING_MIN_CUDA_ARCH
+  // Keep older targets in mixed-architecture builds without instantiating an
+  // unsupported MMA pipeline. The wrapper's host admission must reject it.
+  __trap();
+#else
+
   uint64_t debug_start_clock = debug_kernel_timer_start();
   constexpr uint32_t kNumThreads = TuningConfig::kNumThreads;
   constexpr uint32_t kNumStages = TuningConfig::kNumStages;
@@ -158,4 +164,5 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
     asm volatile("barrier.cluster.arrive;\n");
     asm volatile("barrier.cluster.wait;\n");
   }
+#endif
 };

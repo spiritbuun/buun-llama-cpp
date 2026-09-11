@@ -19,6 +19,7 @@ using exl3::FragC_h;
 // ---- decode gemv (m <= 8): warps split k, one m16n8k16 MMA pair per tile ------------------
 
 __device__ __forceinline__ void exl3_mma_ab_h(const FragB & a01, const FragB & a23, const FragB & b, FragC_h & c) {
+#if __CUDA_ARCH__ >= 800
     const uint32_t * a0 = reinterpret_cast<const uint32_t *>(&a01);
     const uint32_t * a1 = reinterpret_cast<const uint32_t *>(&a23);
     const uint32_t * bb = reinterpret_cast<const uint32_t *>(&b);
@@ -27,6 +28,11 @@ __device__ __forceinline__ void exl3_mma_ab_h(const FragB & a01, const FragB & a
         "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
         : "+r"(cc[0]), "+r"(cc[1])
         : "r"(a0[0]), "r"(a0[1]), "r"(a1[0]), "r"(a1[1]), "r"(bb[0]), "r"(bb[1]));
+#else
+    // The dispatcher uses reconstruction + cuBLAS below SM80.
+    (void) a01; (void) a23; (void) b; (void) c;
+    __trap();
+#endif
 }
 
 // mul1 codebook pair decode via dp4a byte sum (bit-identical to the vabsdiff4 form)

@@ -4,7 +4,7 @@
 
 
 CUDA_INLINE uint32_t warp_reduce_add(uint32_t local_count) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
   local_count += __shfl_down_sync(0xFFFFFFFF, local_count, 16);
   local_count += __shfl_down_sync(0xFFFFFFFF, local_count, 8);
   local_count += __shfl_down_sync(0xFFFFFFFF, local_count, 4);

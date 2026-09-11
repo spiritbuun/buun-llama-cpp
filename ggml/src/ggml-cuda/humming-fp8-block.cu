@@ -2,6 +2,8 @@
 
 #if !defined(GGML_USE_HIP)
 
+#define HUMMING_MIN_CUDA_ARCH 800
+
 #define HUMMING_INPUT_SCALE_GROUP_SIZE 0
 #define HUMMING_WEIGHT_SCALE_GROUP_SIZE 128
 #define HUMMING_WEIGHT_SCALE_GROUP_SIZE_N 128
@@ -181,7 +183,8 @@ void launch_fp8_block(
 } // namespace
 
 bool ggml_cuda_humming_fp8_block_supports_shape(int64_t n, int64_t k, int64_t m, int cc) {
-    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_AMPERE || cc >= GGML_CUDA_CC_ADA_LOVELACE) {
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_AMPERE ||
+            cc >= GGML_CUDA_CC_ADA_LOVELACE) {
         return false;
     }
     const bool retained = (n == 17408 && k == 5120) ||

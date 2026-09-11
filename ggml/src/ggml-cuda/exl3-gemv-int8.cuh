@@ -30,12 +30,26 @@ constexpr int COLS    = 256;   // columns per block: 8 warps x 2 tiles
 constexpr int MAX_M   = 8;     // covers speculative verify batches (draft-max 3 default, up to 7)
 
 __device__ __forceinline__ void cp_async16(void * smem, const void * glob) {
+#if __CUDA_ARCH__ >= 800
     const unsigned s = unsigned(__cvta_generic_to_shared(smem));
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(s), "l"(glob));
+#else
+    // Volta/Turing use synchronous copies into the same warp-private ring.
+    // The consumer's __syncwarp() orders these stores before cross-lane reads.
+    *static_cast<uint4 *>(smem) = *static_cast<const uint4 *>(glob);
+#endif
 }
-__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+__device__ __forceinline__ void cp_async_commit() {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
 template <int N>
-__device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" :: "n"(N)); }
+__device__ __forceinline__ void cp_async_wait() {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+#endif
+}
 
 // pair-row staging depth (rows in flight per warp) for the smem unit (K = 5..8)
 constexpr int STAGE_D = 4;
