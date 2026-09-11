@@ -2551,7 +2551,7 @@ bool llama_memory_recurrent_context::states_are_contiguous_identity(uint32_t n_s
         return false;
     }
     // rs_z >= 0 means a cell in range is a fresh/reset sequence that build_rs zeroes via
-    // ggml_scale_inplace(state_zero, 0). A direct view would skip that zeroing and leak the
+    // ggml_fill_inplace(state_zero, 0). A direct view would skip that zeroing and leak the
     // previous occupant's state into the new sequence, so fall back to the gather path.
     if (mem->rs_z != -1) {
         return false;

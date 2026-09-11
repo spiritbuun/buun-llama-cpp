@@ -126,8 +126,8 @@ static bool seq_state_payload_equal(
         std::equal(lhs.begin() + envelope_size, lhs.end(), rhs.begin() + envelope_size);
 }
 
-static std::vector<float> copy_logits(llama_context * ctx, int n_vocab) {
-    const float * logits = llama_get_logits_ith(ctx, 0);
+static std::vector<float> copy_logits(llama_context * ctx, int n_vocab, int index = 0) {
+    const float * logits = llama_get_logits_ith(ctx, index);
     return logits == nullptr ? std::vector<float>() : std::vector<float>(logits, logits + n_vocab);
 }
 
@@ -141,12 +141,51 @@ static bool logits_equal(
         return false;
     }
     for (size_t i = 0; i < lhs.size(); ++i) {
-        if (std::fabs(lhs[i] - rhs[i]) > eps) {
+        if (!std::isfinite(lhs[i]) || !std::isfinite(rhs[i]) || std::fabs(lhs[i] - rhs[i]) > eps) {
             fprintf(stderr, "%s : logits mismatch at token %zu (%g != %g)\n",
                     label, i, (double) lhs[i], (double) rhs[i]);
             return false;
         }
     }
+    return true;
+}
+
+static bool test_nonfinite_reset(llama_context * ctx, const std::vector<llama_token> & tokens, int n_vocab) {
+    auto * recurrent = get_recurrent(ctx);
+    if (recurrent == nullptr) {
+        return false;
+    }
+    auto mem = llama_get_memory(ctx);
+    for (uint32_t count : { 1u, 4u }) {
+        llama_memory_clear(mem, true);
+        if (!decode_range(ctx, tokens, 0, count)) {
+            return false;
+        }
+        const auto reference = copy_logits(ctx, n_vocab, -1);
+        llama_synchronize(ctx);
+        // A reset must overwrite old state, not multiply it by zero: NaN and infinity
+        // otherwise survive, poisoning every later request until the context is recreated.
+        for (const auto * planes : { &recurrent->r_l, &recurrent->s_l, &recurrent->p_l }) {
+            for (auto * tensor : *planes) {
+                if (tensor == nullptr) {
+                    continue;
+                }
+                GGML_ASSERT(tensor->type == GGML_TYPE_F32);
+                std::vector<float> poison(tensor->ne[0]);
+                for (size_t i = 0; i < poison.size(); ++i) {
+                    poison[i] = i % 3 == 0 ? std::numeric_limits<float>::quiet_NaN() :
+                                i % 3 == 1 ? std::numeric_limits<float>::infinity() :
+                                             -std::numeric_limits<float>::infinity();
+                }
+                ggml_backend_tensor_set(tensor, poison.data(), 0, poison.size() * sizeof(float));
+            }
+        }
+        if (!llama_memory_seq_rm(mem, 0, 0, -1) || !decode_range(ctx, tokens, 0, count) ||
+            !logits_equal(reference, copy_logits(ctx, n_vocab, -1), "nonfinite recurrent reset")) {
+            return false;
+        }
+    }
+    llama_memory_clear(mem, true);
     return true;
 }
 
@@ -436,6 +475,11 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "%s : failed to init contexts\n", __func__);
         return 1;
     }
+    if (!test_nonfinite_reset(ctx_test.get(), tokens, n_vocab)) {
+        fprintf(stderr, "%s : nonfinite recurrent reset failed\n", __func__);
+        return 1;
+    }
+    fprintf(stderr, "%s : nonfinite recurrent reset checks passed\n", __func__);
 
     // A unified attention cache owns one physical stream while remaining logically
     // capable of the configured sequence count. Composite lowering may narrow that

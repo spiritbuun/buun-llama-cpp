@@ -25,6 +25,90 @@ static bool expect_epoch(const char * label, uint64_t actual, uint64_t expected)
     return false;
 }
 
+static bool test_remap_contents(const ggml_vbr_backend_iface * be, int device) {
+    // Sparse fixed-VA slots model KV tensors. No ordinary GPU allocations are made
+    // between resets: those can accidentally hide missing VMM TLB invalidation.
+    constexpr size_t slots = 32;
+    const size_t g = be->vmm_granularity(device);
+    const size_t pages = std::max(size_t(1), std::min(size_t(64), (4 * 1024 * 1024) / g));
+    const size_t live_bytes = pages * g;
+    const size_t stride = live_bytes * 16;
+    const size_t words = live_bytes / sizeof(float);
+    ggml_backend_t backend = be->backend_init(device);
+    ggml_vbr_vmm_pool * pool = be->vmm_pool_init(device, slots * stride);
+    ggml_backend_buffer_t input_buf = ggml_backend_buft_alloc_buffer(be->buffer_type(device), slots * live_bytes);
+    if (!backend || !pool || !input_buf) {
+        if (input_buf) ggml_backend_buffer_free(input_buf);
+        if (pool) be->vmm_pool_free(pool);
+        if (backend) ggml_backend_free(backend);
+        std::fprintf(stderr, "remap contents: allocation failed\n");
+        return false;
+    }
+    ggml_backend_buffer_t output_buf = be->buffer_from_ptr(device, be->vmm_pool_base(pool), slots * stride);
+    ggml_init_params ip = { (3 * slots + 2) * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, slots * words);
+    input->data = ggml_backend_buffer_get_base(input_buf);
+    input->buffer = input_buf;
+    // Advance the input generation on the GPU, without a host upload or graph mutation
+    // that could incidentally refresh mappings and hide stale prior-generation data.
+    ggml_tensor * next_input = ggml_scale_inplace(ctx, input, 2.0f);
+    next_input->buffer = input_buf;
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    std::array<ggml_tensor *, slots> outputs;
+    for (size_t s = 0; s < slots; ++s) {
+        ggml_tensor * view = ggml_view_1d(ctx, next_input, words, s * live_bytes);
+        outputs[s] = ggml_scale(ctx, view, 2.0f);
+        outputs[s]->data = (char *) be->vmm_pool_base(pool) + s * stride;
+        outputs[s]->buffer = output_buf;
+        ggml_build_forward_expand(graph, outputs[s]);
+    }
+    std::vector<uint32_t> source(slots * words), result(words);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = 0x3e800000u + ((uint32_t(i) * 2654435761u) & 0x01ffffffu);
+    }
+    // Upload only before the reset loop: pageable-host transfers may register/map
+    // memory internally and incidentally flush the very translations under test.
+    ggml_backend_tensor_set(input, source.data(), 0, slots * live_bytes);
+    bool ok = true;
+    for (unsigned round = 0; round < 12 && ok; ++round) {
+        be->sync_device(device);
+        be->vmm_pool_unmap(pool, 0, slots * stride);
+        // Permute physical allocation order without changing any tensor pointer.
+        for (size_t i = 0; i < slots * pages; ++i) {
+            const size_t p = (i * 2053 + round * 17) % (slots * pages);
+            if (!be->vmm_pool_map(pool, (p / pages) * stride + (p % pages) * g, g)) {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok) break;
+        ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+        ggml_backend_synchronize(backend);
+        for (size_t s = 0; s < slots && ok; ++s) {
+            ggml_backend_tensor_get(outputs[s], result.data(), 0, live_bytes);
+            for (size_t i = 0; i < words; ++i) {
+                // Initial values span [0.25,4), unique across the 128 MiB fixture. Each
+                // exact doubling increments the exponent; all 12 rounds remain finite.
+                const uint32_t expected = source[s * words + i] + (round + 2) * 0x00800000u;
+                if (result[i] != expected) {
+                    std::fprintf(stderr, "remap contents: round=%u slot=%zu word=%zu got=%08x expected=%08x\n",
+                            round, s, i, result[i], expected);
+                    ok = false;
+                    break;
+                }
+            }
+        }
+    }
+    ggml_free(ctx);
+    ggml_backend_buffer_free(output_buf);
+    ggml_backend_buffer_free(input_buf);
+    be->vmm_pool_free(pool);
+    ggml_backend_free(backend);
+    if (ok) std::printf("PASS: fixed-VA remap contents (12 rounds, %zu pages)\n", slots * pages);
+    return ok;
+}
+
 static bool test_classic_transcode(const ggml_vbr_backend_iface * be, int device) {
     constexpr int64_t ne0 = 576; // Ling's physical coupled-MLA K width
     constexpr int64_t n   = 257; // one complete 256-row tile plus a tail
@@ -237,6 +321,7 @@ int main(int argc, char ** argv) {
     }
 
     bool ok = true;
+    ok = test_remap_contents(be, device) && ok;
     ok = test_classic_transcode(be, device) && ok;
     auto range = [&](size_t first_page, size_t n_pages) {
         return be->vmm_pool_mapped_in_range(pool, first_page * g, n_pages * g);

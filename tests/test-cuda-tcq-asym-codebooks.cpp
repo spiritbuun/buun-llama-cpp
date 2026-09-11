@@ -33,13 +33,14 @@ static void set_tcq_data(ggml_tensor * tensor, uint8_t salt) {
     ggml_backend_tensor_set(tensor, bytes.data(), 0, bytes.size());
 }
 
-static int test_pair(ggml_backend_t backend, ggml_type type_k, ggml_type type_v) {
+static int test_pair(ggml_backend_t backend, ggml_type type_k, ggml_type type_v, int64_t gqa) {
     constexpr int64_t d = 256;
-    constexpr int64_t kv = 113;
-    constexpr int64_t n_head_kv = 2;
-    constexpr int64_t gqa = 16;
+    // Match the production Qwen decode geometry on RDNA. A ragged, unmasked fixture selects an
+    // unsupported ncols2=1 specialization there instead of the fused path this test targets.
+    constexpr int64_t kv = 256;
+    constexpr int64_t n_head_kv = 4;
     // Deliberately above the <=4 fused-decode cutoff: this is the materialized reference arm.
-    constexpr int64_t n_prefill = 5;
+    constexpr int64_t n_prefill = 8;
 
     const ggml_init_params params = { 16*1024*1024, nullptr, true };
     ggml_context * ctx = ggml_init(params);
@@ -50,12 +51,14 @@ static int test_pair(ggml_backend_t backend, ggml_type type_k, ggml_type type_v)
     ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, 1, n_head_kv*gqa, 1);
     ggml_tensor * k = ggml_new_tensor_4d(ctx, type_k, d, kv, n_head_kv, 1);
     ggml_tensor * v = ggml_new_tensor_4d(ctx, type_v, d, kv, n_head_kv, 1);
+    ggml_tensor * mask_decode = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kv, 1);
 
-    ggml_tensor * out_decode = ggml_flash_attn_ext(ctx, q, k, v, nullptr, 1.0f/std::sqrt((float) d), 0.0f, 0.0f);
+    ggml_tensor * out_decode = ggml_flash_attn_ext(ctx, q, k, v, mask_decode, 1.0f/std::sqrt((float) d), 0.0f, 0.0f);
     ggml_flash_attn_ext_set_prec(out_decode, GGML_PREC_F32);
 
     ggml_tensor * q_prefill = ggml_repeat_4d(ctx, q, d, n_prefill, n_head_kv*gqa, 1);
-    ggml_tensor * out_prefill = ggml_flash_attn_ext(ctx, q_prefill, k, v, nullptr, 1.0f/std::sqrt((float) d), 0.0f, 0.0f);
+    ggml_tensor * mask_prefill = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kv, n_prefill);
+    ggml_tensor * out_prefill = ggml_flash_attn_ext(ctx, q_prefill, k, v, mask_prefill, 1.0f/std::sqrt((float) d), 0.0f, 0.0f);
     ggml_flash_attn_ext_set_prec(out_prefill, GGML_PREC_F32);
     ggml_tensor * out_prefill_first = ggml_view_4d(ctx, out_prefill,
         out_decode->ne[0], out_decode->ne[1], 1, 1,
@@ -84,6 +87,9 @@ static int test_pair(ggml_backend_t backend, ggml_type type_k, ggml_type type_v)
     ggml_backend_tensor_set(q, q_data.data(), 0, q_data.size()*sizeof(q_data[0]));
     set_tcq_data(k, 11);
     set_tcq_data(v, 73);
+    std::vector<ggml_fp16_t> mask_data((size_t) ggml_nelements(mask_prefill), ggml_fp32_to_fp16(0.0f));
+    ggml_backend_tensor_set(mask_decode, mask_data.data(), 0, ggml_nbytes(mask_decode));
+    ggml_backend_tensor_set(mask_prefill, mask_data.data(), 0, ggml_nbytes(mask_prefill));
 
     const ggml_status status = ggml_backend_graph_compute(backend, graph);
     std::vector<float> result((size_t) ggml_nelements(difference));
@@ -146,10 +152,14 @@ int main() {
         { GGML_TYPE_TURBO1_TCQ, GGML_TYPE_TURBO2_TCQ },
     };
     int result = EXIT_SUCCESS;
-    for (const auto & pair : pairs) {
-        const int pair_result = test_pair(backend, pair[0], pair[1]);
-        if (pair_result != EXIT_SUCCESS) {
-            result = EXIT_FAILURE;
+    // Cover both non-power-of-two and power-of-two query-head groups.
+    for (int64_t gqa : { 6, 16 }) {
+        for (const auto & pair : pairs) {
+            const int pair_result = test_pair(backend, pair[0], pair[1], gqa);
+            if (pair_result != EXIT_SUCCESS) {
+                std::fprintf(stderr, "failed with GQA ratio %lld\n", (long long) gqa);
+                result = EXIT_FAILURE;
+            }
         }
     }
 
