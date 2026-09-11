@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <regex>
@@ -725,6 +726,129 @@ static void list_available_gguf_files(const hf_cache::hf_files & files) {
     }
 }
 
+// Like vLLM's HF loader, prefer the index's exact shard set over a broad
+// *.safetensors download: repositories can contain duplicate weight exports.
+static common_download_hf_plan safetensors_plan(
+        const hf_cache::hf_files & all, const std::string & requested, const common_download_opts & opts) {
+    namespace fs = std::filesystem;
+    common_download_hf_plan plan;
+    std::map<std::string, hf_cache::hf_file> files;
+    for (const auto & file : all) {
+        files.emplace(file.path, file);
+    }
+
+    std::vector<std::string> configs;
+    if (!requested.empty()) {
+        configs.push_back((fs::path(requested).parent_path() / "config.json").generic_string());
+    } else {
+        for (const auto & file : files) {
+            if (fs::path(file.first).filename() != "config.json") {
+                continue;
+            }
+            const auto dir = fs::path(file.first).parent_path();
+            for (const auto & weight : files) {
+                if (fs::path(weight.first).parent_path() == dir &&
+                        (fs::path(weight.first).extension() == ".safetensors" ||
+                         fs::path(weight.first).filename() == "model.safetensors.index.json")) {
+                    configs.push_back(file.first);
+                    break;
+                }
+            }
+        }
+        if (std::find(configs.begin(), configs.end(), "config.json") != configs.end()) {
+            configs = {"config.json"};
+        }
+    }
+    if (configs.empty()) {
+        return plan;
+    }
+    if (configs.size() != 1) {
+        throw std::runtime_error("multiple safetensors directories; select one with --hf-file <directory>/config.json");
+    }
+    const auto config = files.find(configs.front());
+    if (config == files.end()) {
+        throw std::runtime_error("safetensors directory is missing " + configs.front());
+    }
+    plan.primary = config->second;
+    plan.model_dir = fs::path(plan.primary.final_path).parent_path().string();
+    const auto dir = fs::path(configs.front()).parent_path();
+    std::unordered_set<std::string> selected;
+    auto select = [&](const std::string & name) {
+        const std::string path = (dir / name).generic_string();
+        if (!files.count(path)) {
+            throw std::runtime_error("safetensors repository/cache is missing required file: " + path);
+        }
+        selected.insert(path);
+    };
+    const auto index = files.find((dir / "model.safetensors.index.json").generic_string());
+    if (index != files.end()) {
+        // Fetch only the small manifest before scheduling the large weights.
+        common_download_run_tasks({common_download_task(index->second, opts)});
+        const std::string index_path = hf_cache::finalize_file(index->second);
+        std::ifstream input(index_path);
+        if (!input) {
+            throw std::runtime_error("cannot read safetensors index: " + index_path);
+        }
+        const auto manifest = common_json::parse(std::string(std::istreambuf_iterator<char>(input), {}));
+        if (!manifest.contains("weight_map") || !manifest.at("weight_map").is_object() ||
+                manifest.at("weight_map").empty()) {
+            throw std::runtime_error("safetensors index requires a non-empty object-valued weight_map");
+        }
+        for (const auto & entry : manifest.at("weight_map").items()) {
+            if (!entry.value().is_string()) {
+                throw std::runtime_error("safetensors index contains a non-string shard name");
+            }
+            const std::string name = entry.value().get<std::string>();
+            const fs::path path(name);
+            if (path.is_absolute() || name.find_first_of("\\:") != std::string::npos ||
+                    path.extension() != ".safetensors") {
+                throw std::runtime_error("invalid safetensors shard path: " + name);
+            }
+            for (const auto & part : path) {
+                if (part == ".." || part == "." || part.empty()) {
+                    throw std::runtime_error("invalid safetensors shard path: " + name);
+                }
+            }
+            select(name);
+        }
+        select("model.safetensors.index.json");
+    } else if (files.count((dir / "model.safetensors").generic_string())) {
+        select("model.safetensors");
+    } else {
+        // Unindexed exports (including EXL3) store one or more weight files
+        // directly in the model directory. Do not recurse into other exports.
+        for (const auto & file : files) {
+            const fs::path path(file.first);
+            if (path.parent_path() == dir && path.extension() == ".safetensors") {
+                selected.insert(file.first);
+            }
+        }
+        if (selected.empty()) {
+            throw std::runtime_error("no safetensors weights in selected model directory");
+        }
+    }
+    // Metadata consumed by native importers; no Python code or alternate .bin
+    // weights. EXL3's ngram embedding can be a separate, unindexed side tensor.
+    static const std::unordered_set<std::string> companions = {
+        "config.json", "generation_config.json", "tokenizer.json", "tokenizer_config.json",
+        "special_tokens_map.json", "added_tokens.json", "tokenizer.model", "vocab.json", "merges.txt",
+        "chat_template.jinja", "chat_template.json", "quantization_config.json", "hf_quant_config.json",
+        "quanto_qmap.json", "ngram_embedding.safetensors",
+    };
+    for (const auto & file : files) {
+        const fs::path path(file.first);
+        if (path.parent_path() == dir && companions.count(path.filename().string())) {
+            selected.insert(file.first);
+        }
+    }
+    for (const auto & file : files) {
+        if (selected.count(file.first)) {
+            plan.model_files.push_back(file.second);
+        }
+    }
+    return plan;
+}
+
 common_download_hf_plan common_download_get_hf_plan(const common_params_model & model, const common_download_opts & opts) {
     common_download_hf_plan plan;
     hf_cache::hf_files all;
@@ -763,8 +887,18 @@ common_download_hf_plan common_download_get_hf_plan(const common_params_model & 
             list_available_gguf_files(all);
             return plan;
         }
+        const std::filesystem::path path(primary.path);
+        if (path.filename() == "config.json" || path.filename() == "model.safetensors.index.json" ||
+                path.extension() == ".safetensors") {
+            plan = safetensors_plan(all, primary.path, opts);
+            primary = plan.primary;
+        }
     } else {
         primary = find_best_model(all, tag);
+        if (primary.path.empty() && tag.empty()) {
+            plan = safetensors_plan(all, "", opts);
+            primary = plan.primary;
+        }
         // a requested sidecar can resolve on its own, without a full model of the same tag
         if (primary.path.empty() && !opts.download_mtp && !opts.download_dflash && !opts.download_eagle3 && !opts.download_dspark) {
             LOG_ERR("%s: no GGUF files found in repository %s\n", __func__, repo.c_str());
@@ -775,7 +909,9 @@ common_download_hf_plan common_download_get_hf_plan(const common_params_model & 
 
     if (!primary.path.empty()) {
         plan.primary = primary;
-        plan.model_files = get_split_files(all, primary);
+        if (plan.model_dir.empty()) {
+            plan.model_files = get_split_files(all, primary);
+        }
     }
 
     if (opts.download_mmproj && !primary.path.empty()) {
@@ -991,6 +1127,25 @@ std::string common_download_resolve_path(const std::string & hf_repo_with_tag, c
     auto files = hf_cache::get_cached_files(repo);
     if (files.empty()) {
         return "";
+    }
+
+    if (!hf_file.empty() && std::none_of(files.begin(), files.end(), [&](const hf_cache::hf_file & file) {
+            return file.path == hf_file;
+        })) {
+        return "";
+    }
+    const std::filesystem::path requested(hf_file);
+    const bool native_requested = requested.filename() == "config.json" ||
+        requested.filename() == "model.safetensors.index.json" || requested.extension() == ".safetensors";
+    if (native_requested || (hf_file.empty() && tag.empty() && find_best_model(files, tag).path.empty())) {
+        common_download_opts opts;
+        opts.offline = true;
+        try {
+            return safetensors_plan(files, hf_file, opts).model_dir;
+        } catch (const std::exception &) {
+            // This lookup is a cache probe; incomplete snapshots are not usable.
+            return "";
+        }
     }
 
     if (!hf_file.empty()) {

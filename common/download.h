@@ -111,6 +111,7 @@ bool common_download_remove(const std::string & hf_repo_with_tag);
 struct common_download_hf_plan {
     hf_cache::hf_file primary;
     hf_cache::hf_files model_files;
+    std::string model_dir; // native safetensors: snapshot directory, not a GGUF file
     hf_cache::hf_file mmproj;
     hf_cache::hf_file mtp;
     hf_cache::hf_file eagle3;

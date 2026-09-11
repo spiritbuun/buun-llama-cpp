@@ -47,12 +47,21 @@ static std::string g_context;
 //
 
 static std::map<std::string, std::vector<std::string>> g_repos;
+static std::map<std::string, std::string> g_contents;
 
 static const char * COMMIT = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 // the server lives in main, so its destructor runs before the static teardown
 // tears down the winsock state httplib brings in
 static void serve_repos(httplib::Server & server) {
+    server.Get(R"(/([^/]+/[^/]+)/resolve/[^/]+/(.+))", [](const httplib::Request & req, httplib::Response & res) {
+        const auto file = g_contents.find(req.matches[1].str() + "/" + req.matches[2].str());
+        if (file == g_contents.end()) {
+            res.status = 404;
+        } else {
+            res.set_content(file->second, "application/octet-stream");
+        }
+    });
     server.Get(R"(/api/models/(.+)/refs)", [](const httplib::Request & req, httplib::Response & res) {
         if (g_repos.count(req.matches[1])) {
             res.set_content(common_json{{"branches", common_json::array({ common_json{{"name", "main"}, {"targetCommit", COMMIT}} })}}.dump(),
@@ -344,7 +353,7 @@ static void test_plan_resolution() {
 // loopback, downloads skipped by flipping offline before apply
 //
 
-static void assemble(std::vector<std::string> argv, common_params & params) {
+static void assemble(std::vector<std::string> argv, common_params & params, bool skip_download = true) {
     std::vector<char *> cargv;
     g_context.clear();
     for (auto & a : argv) {
@@ -357,7 +366,9 @@ static void assemble(std::vector<std::string> argv, common_params & params) {
     auto handler = common_models_handler_init(params, LLAMA_EXAMPLE_SERVER);
 
     // skip the network execution, on_done still wires the params
-    params.offline = true;
+    if (skip_download) {
+        params.offline = true;
+    }
     common_models_handler_apply(handler, params);
 }
 
@@ -468,6 +479,144 @@ static void test_task_assembly() {
     g_repos.clear();
 }
 
+static void test_safetensors() {
+    printf("test-model-resolution: native safetensors downloads and offline reuse\n");
+    auto fixture = [](const std::string & repo, const std::map<std::string, std::string> & contents) {
+        for (const auto & file : contents) {
+            g_repos[repo].push_back(file.first);
+            g_contents[repo + "/" + file.first] = file.second;
+        }
+    };
+    auto names = [](const common_download_hf_plan & plan) {
+        std::vector<std::string> result;
+        for (const auto & file : plan.model_files) {
+            result.push_back(file.path);
+        }
+        std::sort(result.begin(), result.end());
+        return result;
+    };
+    const std::string index = R"({"weight_map":{"a":"model-1.safetensors","b":"model-2.safetensors","c":"model-1.safetensors"}})";
+    fixture("test/native", {
+        {"config.json", "{}"}, {"tokenizer.json", "{}"}, {"tokenizer_config.json", "{}"},
+        {"generation_config.json", "{}"}, {"hf_quant_config.json", "{}"}, {"chat_template.jinja", "template"},
+        {"model.safetensors.index.json", index}, {"model-1.safetensors", "one"}, {"model-2.safetensors", "two"},
+        {"model.safetensors", "duplicate"}, {"pytorch_model.bin", "duplicate"},
+        {"optimizer.pt", "training"}, {"modeling.py", "unused"},
+        {"other/model.safetensors", "other export"},
+    });
+    g_context = "indexed native plan";
+    const auto plan = common_download_get_hf_plan(model_ref("test/native"), {});
+    const std::vector<std::string> expected = {
+        "chat_template.jinja", "config.json", "generation_config.json", "hf_quant_config.json",
+        "model-1.safetensors", "model-2.safetensors", "model.safetensors.index.json",
+        "tokenizer.json", "tokenizer_config.json",
+    };
+    REQUIRE(names(plan) == expected);
+    const auto model_dir = std::filesystem::path(cached("test/native", "config.json")).parent_path().string();
+    REQUIRE_EQ(plan.model_dir, model_dir);
+    {
+        common_params params;
+        assemble({"server", "-hf", "test/native"}, params, false);
+        REQUIRE_EQ(params.model.path, model_dir);
+        for (const auto & name : expected) {
+            REQUIRE(std::filesystem::is_regular_file(cached("test/native", name)));
+        }
+        REQUIRE(!std::filesystem::exists(cached("test/native", "model.safetensors")));
+        REQUIRE(!std::filesystem::exists(cached("test/native", "pytorch_model.bin")));
+        REQUIRE(!std::filesystem::exists(cached("test/native", "other/model.safetensors")));
+        REQUIRE_EQ(common_download_resolve_path("test/native"), model_dir);
+        REQUIRE_EQ(common_download_resolve_path("test/native", "config.json"), model_dir);
+        REQUIRE(common_download_resolve_path("test/native", "missing.safetensors").empty());
+    }
+    {
+        common_params params;
+        assemble({"server", "--offline", "-hf", "test/native"}, params, false);
+        REQUIRE_EQ(params.model.path, model_dir);
+    }
+    g_context = "incomplete indexed cache";
+    std::filesystem::remove(cached("test/native", "model-2.safetensors"));
+    REQUIRE(common_download_resolve_path("test/native").empty());
+    bool failed = false;
+    try {
+        common_download_opts offline;
+        offline.offline = true;
+        common_download_get_hf_plan(model_ref("test/native"), offline);
+    } catch (const std::exception &) {
+        failed = true;
+    }
+    REQUIRE(failed);
+
+    fixture("test/single-native", {{"config.json", "{}"}, {"tokenizer.json", "{}"},
+        {"model.safetensors", "single"}, {"model-old.safetensors", "duplicate"}});
+    g_context = "single-file safetensors precedence";
+    REQUIRE(names(common_download_get_hf_plan(model_ref("test/single-native"), {})) ==
+            std::vector<std::string>({"config.json", "model.safetensors", "tokenizer.json"}));
+    REQUIRE(common_download_get_hf_plan(model_ref("test/single-native:Q4_K_M"), {}).model_dir.empty());
+    {
+        common_params params;
+        assemble({"server", "-hf", "test/single-native", "-hfd", "test/single-native"}, params, false);
+        REQUIRE_EQ(params.speculative.draft.mparams.path, params.model.path);
+        REQUIRE(std::filesystem::is_directory(params.model.path));
+    }
+
+    fixture("test/nested-native", {{"q4/config.json", "{}"}, {"q4/model.safetensors", "q4"},
+        {"q4/tokenizer.json", "{}"}, {"q8/config.json", "{}"}, {"q8/model.safetensors", "q8"}});
+    g_context = "ambiguous native directories";
+    failed = false;
+    try {
+        common_download_get_hf_plan(model_ref("test/nested-native"), {});
+    } catch (const std::exception &) {
+        failed = true;
+    }
+    REQUIRE(failed);
+    {
+        common_params params;
+        assemble({"server", "-hf", "test/nested-native", "-hff", "q4/config.json"}, params, false);
+        REQUIRE_EQ(params.model.path, std::filesystem::path(cached("test/nested-native", "q4/config.json")).parent_path().string());
+    }
+    fixture("test/mixed-native", {{"config.json", "{}"}, {"model.safetensors", "weights"},
+        {"model-Q4_K_M.gguf", "gguf"}});
+    g_context = "GGUF remains preferred in mixed repos";
+    REQUIRE_EQ(common_download_get_hf_plan(model_ref("test/mixed-native"), {}).primary.path, "model-Q4_K_M.gguf");
+    REQUIRE(!common_download_get_hf_plan(model_ref("test/mixed-native", "config.json"), {}).model_dir.empty());
+
+    fixture("test/exl3-native", {{"config.json", "{}"}, {"layer-0.safetensors", "zero"},
+        {"layer-1.safetensors", "one"}, {"ngram_embedding.safetensors", "embedding"}});
+    g_context = "unindexed layer export";
+    REQUIRE(common_download_get_hf_plan(model_ref("test/exl3-native"), {}).model_files.size() == 4);
+
+    fixture("test/native-sidecars", {{"config.json", "{}"}, {"model.safetensors", "weights"},
+        {"mmproj-F16.gguf", "projector"}, {"mtp-BF16.gguf", "draft"}});
+    g_context = "native model with GGUF sidecars";
+    common_download_opts sidecars;
+    sidecars.download_mmproj = true;
+    sidecars.download_mtp = true;
+    const auto with_sidecars = common_download_get_hf_plan(model_ref("test/native-sidecars"), sidecars);
+    REQUIRE(!with_sidecars.model_dir.empty());
+    REQUIRE_EQ(with_sidecars.mmproj.path, "mmproj-F16.gguf");
+    REQUIRE_EQ(with_sidecars.mtp.path, "mtp-BF16.gguf");
+
+    const std::vector<std::string> invalid = {
+        "not json", "{}", R"({"weight_map":{}})", R"({"weight_map":{"x":42}})",
+        R"({"weight_map":{"x":"missing.safetensors"}})",
+        R"({"weight_map":{"x":"../outside.safetensors"}})",
+        R"({"weight_map":{"x":"/absolute.safetensors"}})",
+        R"({"weight_map":{"x":"C:\\model.safetensors"}})",
+    };
+    for (size_t i = 0; i < invalid.size(); ++i) {
+        const std::string repo = "test/invalid-native-" + std::to_string(i);
+        g_context = repo;
+        fixture(repo, {{"config.json", "{}"}, {"model.safetensors.index.json", invalid[i]}});
+        failed = false;
+        try {
+            common_download_get_hf_plan(model_ref(repo), {});
+        } catch (const std::exception &) {
+            failed = true;
+        }
+        REQUIRE(failed);
+    }
+}
+
 int main(void) {
     // unbuffered, so a crash cannot swallow the reports already printed
     setvbuf(stdout, nullptr, _IONBF, 0);
@@ -496,6 +645,7 @@ int main(void) {
 
     test_plan_resolution();
     test_task_assembly();
+    test_safetensors();
 
     server.stop();
     server_thread.join();

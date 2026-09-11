@@ -1397,8 +1397,10 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
     }
 
     // handle plan_spec (e.g. --spec-draft-hf)
+    bool native_spec_selected = false;
     if (!plan_spec.model_files.empty() && !had_spec_url && !spec_sidecar_found) {
         add_tasks(plan_spec.model_files, plan_spec.primary, params.speculative.draft.mparams);
+        native_spec_selected = !plan_spec.model_dir.empty();
         had_spec_url = true;
     }
 
@@ -1482,6 +1484,23 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
         if (task.on_done) {
             task.on_done();
         }
+    }
+    // A native loader takes the complete snapshot directory. Unlike the GGUF
+    // path, handing it config.json (or a single shard) is not sufficient.
+    auto resolve_native = [](const common_download_hf_plan & native, common_params_model & model) {
+        if (native.model_dir.empty()) {
+            return;
+        }
+        for (const auto & file : native.model_files) {
+            if (!std::filesystem::is_regular_file(file.final_path)) {
+                throw std::runtime_error("incomplete safetensors download/cache: " + file.final_path);
+            }
+        }
+        model.path = native.model_dir;
+    };
+    resolve_native(plan, params.model);
+    if (native_spec_selected) {
+        resolve_native(plan_spec, params.speculative.draft.mparams);
     }
 }
 
@@ -4128,7 +4147,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_DOWNLOAD, LLAMA_EXAMPLE_TOKENIZE}).set_env("LLAMA_ARG_DOCKER_REPO"));
     add_opt(common_arg(
         {"-hf", "-hfr", "--hf-repo"}, "<user>/<model>[:quant]",
-        "Hugging Face model repository; quant is optional, case-insensitive, default to Q4_K_M, or falls back to the first file in the repo if Q4_K_M doesn't exist.\n"
+        "Hugging Face model repository. GGUF: optional case-insensitive quant, prefers Q4_K_M then Q8_0.\n"
+        "Without GGUF files, downloads the native safetensors weights and metadata (omit :quant).\n"
         "mmproj is also downloaded automatically if available. to disable, add --no-mmproj\n"
         "example: ggml-org/GLM-4.7-Flash-GGUF:Q4_K_M\n"
         "(default: unused)",
@@ -4138,7 +4158,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_DOWNLOAD, LLAMA_EXAMPLE_TOKENIZE}).set_env("LLAMA_ARG_HF_REPO"));
     add_opt(common_arg(
         {"-hff", "--hf-file"}, "FILE",
-        "Hugging Face model file. If specified, it will override the quant in --hf-repo (default: unused)",
+        "Hugging Face model file; overrides the quant in --hf-repo. For a safetensors subdirectory, select <directory>/config.json (default: unused)",
         [](common_params & params, const std::string & value) {
             params.model.hf_file = value;
         }
