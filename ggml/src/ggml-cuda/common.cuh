@@ -1891,6 +1891,9 @@ static bool ggml_cuda_kernel_can_use_pdl(const void * kernel) {
 
 template<typename Kernel, typename... Args>
 static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_kernel_launch_params & launch_params, Args&&... args) {
+#if defined(GGML_USE_HIP)
+    CUDA_CHECK(ggml_hip_prepare_kernel(reinterpret_cast<const void *>(kernel)));
+#endif
 #if defined(GGML_CUDA_USE_PDL)
 
     static const bool env_pdl_enabled = []() {

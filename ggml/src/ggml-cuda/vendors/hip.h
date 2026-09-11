@@ -8,6 +8,7 @@
 #include <hipblas/hipblas.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_bf16.h>
+#include "hip-runtime.h"
 
 #if defined(GGML_HIP_ROCWMMA_FATTN)
 #include <rocwmma/rocwmma-version.hpp>
@@ -95,8 +96,8 @@
 #define cudaMallocHost(ptr, size) hipHostMalloc(ptr, size, hipHostMallocDefault)
 #define cudaMallocManaged hipMallocManaged
 #define cudaMemAdvise hipMemAdvise
-#define cudaMemcpy hipMemcpy
-#define cudaMemcpyAsync hipMemcpyAsync
+#define cudaMemcpy ggml_hip_memcpy
+#define cudaMemcpyAsync ggml_hip_memcpy_async
 #define cudaMemcpyPeerAsync hipMemcpyPeerAsync
 #define cudaMemoryTypeDevice hipMemoryTypeDevice
 #define cudaPointerAttributes hipPointerAttribute_t
