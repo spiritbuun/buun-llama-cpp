@@ -577,7 +577,7 @@ if (TARGET ggml-cuda AND NOT GGML_BACKEND_DL)
     endforeach()
 
 endif()
-if ((TARGET ggml-cuda OR TARGET ggml-hip) AND NOT GGML_BACKEND_DL)
+if ((TARGET ggml-hip OR (TARGET ggml-cuda AND GGML_CUDA_TURBO_FA)) AND NOT GGML_BACKEND_DL)
     llama_build(test-cuda-tcq-asym-codebooks.cpp)
     llama_test(test-cuda-tcq-asym-codebooks LABEL "main;backend")
     set_tests_properties(test-cuda-tcq-asym-codebooks PROPERTIES
