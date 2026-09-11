@@ -218,7 +218,7 @@ then evicts the minimum expert footprint needed to form cache pools.
 ### Choose the KV/VBR entry tier
 
 For these bandwidth-heavy models, start with `--vbr-entry t8`. This starts the dynamic VBR cache at
-Turbo8 instead of F16, then retains VBR's ability to degrade colder or older regions as its VRAM
+Turbo8 instead of F16, then retains VBR's ability to quantize KV layers as its VRAM
 budget fills. Use `--vbr-entry t4` when cache capacity and bandwidth matter more than the additional
 quality loss. Omit the option (F16 entry) when maximum KV quality is more important than decode
 speed. Static `-ctk t8 -ctv t8` and `-ctk t4 -ctv t4` remain useful for fixed-tier comparisons, but

@@ -2375,8 +2375,6 @@ static inline void turbo1_tcq_load_kv_encode() {
     if (do_k && kp && load_file(kp, buf)) { cudaMemcpyToSymbol(d_turbo1_tcq_codebook,   buf, 256*sizeof(float)); mk[dev] = nk; }
     if (do_v && vp && load_file(vp, buf)) { cudaMemcpyToSymbol(d_turbo1_tcq_codebook_v, buf, 256*sizeof(float)); mv[dev] = nv; }
     init[dev] = true;
-    if (first)
-        fprintf(stderr, "TCQ1 encode: K/V codebooks (K=%s V=%s) hotswap=%d\n", kp?kp:"baked-in", vp?vp:"baked-in", hot);
 }
 
 // 1-bit TCQ SET_ROWS encode: Viterbi optimal path with right-shift trellis (k=1, L=8).

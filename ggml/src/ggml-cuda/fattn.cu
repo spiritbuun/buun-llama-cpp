@@ -963,8 +963,6 @@ static void turbo1_tcq_load_cb_fattn() {
     if (do_k && kp && load_file(kp, buf)) { cudaMemcpyToSymbol(d_turbo1_tcq_cb_fattn,   buf, 256*sizeof(float)); mk[dev] = nk; }
     if (do_v && vp && load_file(vp, buf)) { cudaMemcpyToSymbol(d_turbo1_tcq_cb_v_fattn, buf, 256*sizeof(float)); mv[dev] = nv; }
     init[dev] = true;
-    if (first)
-        fprintf(stderr, "TCQ1 decode: K/V codebooks (K=%s V=%s) hotswap=%d\n", kp?kp:"baked-in", vp?vp:"baked-in", hot);
 }
 
 // turbo1_tcq dequant: trellis-state decode of rotated coords, then per-row inverse FWHT → original
