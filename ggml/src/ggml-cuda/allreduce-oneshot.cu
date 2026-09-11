@@ -1,5 +1,7 @@
 #include "allreduce-oneshot.cuh"
 
+#if defined(__linux__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
 #include <cuda_bf16.h>
 
 #include <sys/mman.h>
@@ -646,3 +648,15 @@ bool ggml_cuda_ar_oneshot_allreduce(ggml_cuda_ar_oneshot * st, ggml_backend_t * 
     }
     return true;
 }
+
+#else
+
+// This implementation requires CUDA PTX and Linux NUMA allocation APIs.
+// Leave the communicator's existing collective fallback in use elsewhere.
+ggml_cuda_ar_oneshot * ggml_cuda_ar_oneshot_init(const int *, size_t, size_t) { return nullptr; }
+void ggml_cuda_ar_oneshot_free(ggml_cuda_ar_oneshot *) {}
+bool ggml_cuda_ar_oneshot_eligible(const ggml_cuda_ar_oneshot *, ggml_tensor **) { return false; }
+bool ggml_cuda_ar_oneshot_allreduce(ggml_cuda_ar_oneshot *, ggml_backend_t *, ggml_tensor **) { return false; }
+bool ggml_cuda_ar_oneshot_allreduce_rank(ggml_cuda_ar_oneshot *, ggml_backend_t, ggml_tensor **, int) { return false; }
+
+#endif

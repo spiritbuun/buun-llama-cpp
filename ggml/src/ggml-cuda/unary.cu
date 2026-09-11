@@ -1113,6 +1113,7 @@ void ggml_cuda_op_geglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 
 void ggml_cuda_op_swiglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+#if !defined(GGML_USE_HIP)
     if (ctx.bf16_glu_outputs.erase(dst) != 0) {
         const ggml_tensor * src0 = dst->src[0];
         const ggml_tensor * src1 = dst->src[1];
@@ -1129,6 +1130,7 @@ void ggml_cuda_op_swiglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         ctx.humming_bf16_activations.insert(dst);
         return;
     }
+#endif
     ggml_cuda_op_unary_gated<op_silu>(ctx, dst);
 }
 
@@ -1567,6 +1569,7 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
                 GGML_CUDA_UNARY_MUL_STRIDED_ARGS(other_src));
         }
     } else {
+#if !defined(GGML_USE_HIP)
         // In-place F32 writes are element-wise; compact BF16 writes can instead
         // overwrite another block's unread F32 input. Keep overlapping output
         // in F32 and let the projection perform its normal BF16 conversion.
@@ -1602,7 +1605,11 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
                     GGML_CUDA_UNARY_MUL_STRIDED_ARGS(other_src));
             }
             ctx.humming_bf16_activations.insert(bf16_activation);
-        } else {
+        } else
+#else
+        GGML_ASSERT(bf16_activation == nullptr);
+#endif
+        {
             if (simple_rows) {
                 unary_gated_cuda<op>((const float *) unary_src->data, (const float *) other_src->data,
                                      (float *) mul_node->data, k, nc,

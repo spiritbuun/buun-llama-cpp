@@ -1566,6 +1566,8 @@ struct ggml_cuda_q8_activation_storage {
 #endif
 
 struct ggml_backend_cuda_context {
+    // Conv-state fusion is shared by CUDA and HIP; reset for each graph evaluation.
+    std::unordered_set<const ggml_tensor *> precomputed_ssm_convs;
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
@@ -1613,9 +1615,6 @@ struct ggml_backend_cuda_context {
     std::unordered_set<const void *> gdn_deferred_l2;
     std::unordered_map<const ggml_tensor *, ggml_cuda_humming_prepared_activation> humming_prepared_activations;
     std::unordered_set<const ggml_tensor *> humming_prepared_active;
-    // SSM_CONV nodes whose convolution (and SiLU) the conv-state fusion already
-    // computed for this graph evaluation; the node loop skips them.
-    std::unordered_set<const ggml_tensor *> precomputed_ssm_convs;
 
     bool consume_bf16_activation(const ggml_tensor * tensor) {
         auto it = humming_bf16_activation_uses.find(tensor);

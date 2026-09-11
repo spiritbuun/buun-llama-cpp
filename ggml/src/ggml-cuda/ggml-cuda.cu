@@ -1050,6 +1050,10 @@ static void ggml_cuda_canonicalize_unserved_marlin_weights(
         ggml_cuda_set_device(cuda_ctx->device);
     }
 }
+#else
+bool ggml_cuda_marlin_q8_g128_is_repacked(const ggml_tensor *) {
+    return false;
+}
 #endif
 
 static void * ggml_backend_cuda_buffer_get_base(ggml_backend_buffer_t buffer) {
@@ -2678,7 +2682,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     bool use_mul_mat_vec_q = (ggml_is_quantized(src0->type) || src0->type == GGML_TYPE_F8_E4M3) &&
                              ggml_cuda_f8_mmvq_layout_supported(src0) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
+#if !defined(GGML_USE_HIP)
                              !ggml_cuda_marlin_owner_is_repacked(src0) &&
+#endif
                              dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE &&
                              ggml_cuda_should_use_mmvq(src0->type, cc, src1->ne[1]);
 
@@ -2724,6 +2730,7 @@ static bool ggml_cuda_can_prepare_dynamic_fp8_mmv(
 #endif
 }
 
+#if !defined(GGML_USE_HIP)
 __global__ void dequantize_quanto_q4_1_bf16(
         const block_q4_1 * weight, nv_bfloat16 * output, int64_t count) {
     const int64_t index = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -2766,6 +2773,8 @@ __global__ void dequantize_quanto_f8_bf16(
     output[index] = __float2bfloat16_rn(
         ggml_cuda_e4m3_to_fp32(weight[index]) * __bfloat162float(scale[index / cols]));
 }
+
+#endif
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
@@ -4376,6 +4385,7 @@ static int ggml_cuda_try_gdn_cache_fusion(
             }
         }
     }
+#if !defined(GGML_USE_HIP)
     const ggml_tensor * int8_projection_input =
             rms_result != nullptr && fused_state_cpy.rms_gate != nullptr ?
         ggml_cuda_find_int8_projection_input(cgraph, rms_result, cc) : nullptr;
@@ -4394,6 +4404,7 @@ static int ggml_cuda_try_gdn_cache_fusion(
         fused_state_cpy.rms_output_bf16 = true;
         cuda_ctx->humming_bf16_activations.insert(projection_input);
     }
+#endif
     return skip;
 }
 
@@ -5585,6 +5596,12 @@ static bool ggml_cuda_all_consumers_use_cached_bf16(
 
 static bool ggml_cuda_can_retain_glu_bf16(
         const ggml_cgraph * cgraph, const ggml_tensor * activation, int cc) {
+#if defined(GGML_USE_HIP)
+    GGML_UNUSED(cgraph);
+    GGML_UNUSED(activation);
+    GGML_UNUSED(cc);
+    return false;
+#else
     if ((activation->flags & GGML_TENSOR_FLAG_OUTPUT) || activation->type != GGML_TYPE_F32 ||
             !ggml_is_contiguous(activation)) {
         return false;
@@ -5634,6 +5651,7 @@ static bool ggml_cuda_can_retain_glu_bf16(
             ggml_cuda_marlin_q8_g128_accepts_mul_mat(weight, activation, consumer->src[2], consumer, cc);
     }
     return false;
+#endif
 }
 
 static const ggml_tensor * ggml_cuda_find_bf16_projection_input(
@@ -5807,6 +5825,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             node->src[0] != nullptr && ggml_cuda_is_exl3(node->src[0]->type)) {
         return 0;
     }
+#if !defined(GGML_USE_HIP)
     // No matcher below may read a private Marlin layout as canonical blocks;
     // only the gate/up/GLU and residual + RMS-norm matchers, which dispatch
     // to the Marlin executors, may see a repacked weight.
@@ -5826,6 +5845,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+#endif
     // Input-quantized projections carry their activation contract in src[3].
     // The ordinary MUL_MAT executor implements it; legacy graph fusions do
     // not. Keep these nodes on that path until an individual fusion consumes
@@ -5954,7 +5974,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // the group-32 asymmetric contract is never reinterpreted by a fusion.
     if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) &&
             node->src[0] != nullptr && node->src[0]->type == GGML_TYPE_Q4_A32 &&
+#if !defined(GGML_USE_HIP)
             !ggml_cuda_marlin_owner_is_repacked(node->src[0])) {
+#else
+            true) {
+#endif
         return 0;
     }
 
@@ -6044,11 +6068,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 #else
                     const bool standard = false;
 #endif
+#if !defined(GGML_USE_HIP)
                     if (supported || standard) {
                         cuda_ctx->gdn_deferred_l2.insert(node->data);
                         cuda_ctx->gdn_deferred_l2.insert(k_norm->data);
                         return 2;
                     }
+#endif
                     break;
                 }
             }
@@ -6729,12 +6755,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.retain_bf16_output = ggml_cuda_can_retain_glu_bf16(
                     cgraph, glu, ggml_cuda_info().devices[cuda_ctx->device].cc);
 
+#if !defined(GGML_USE_HIP)
                 if (ggml_cuda_mul_mat_humming_fp8(*cuda_ctx, src0, src1, ids,
                         cgraph->nodes[glu_idx], &fusion_data)) {
                     fused_mul_mat_vec = true;
                     fused_node_count  = n_ops;
                     break;
                 }
+#endif
 
                 if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
                     ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
@@ -6964,10 +6992,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
             const bool retain_bf16_output = ggml_cuda_can_retain_glu_bf16(
                 cgraph, glu, ggml_cuda_info().devices[cuda_ctx->device].cc);
+#if !defined(GGML_USE_HIP)
             if (retain_bf16_output && up->src[0]->type == GGML_TYPE_BF16 &&
                     gate->src[0]->type == GGML_TYPE_BF16) {
                 cuda_ctx->bf16_glu_outputs.insert(glu);
             }
+#endif
             if (ggml_cuda_mul_mat_int8_channel_swiglu(
                     *cuda_ctx, up, gate, src1, glu, retain_bf16_output)) {
                 fused_mul_mat_vec = true;
@@ -6981,6 +7011,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (!ggml_cuda_can_fuse(cgraph, i, { op, op, GGML_OP_GLU }, {})) {
                 continue;
             }
+#if !defined(GGML_USE_HIP)
             if (ggml_cuda_mul_mat_humming_fp8_block_swiglu(
                     *cuda_ctx, up, gate, src1, glu, retain_bf16_output)) {
                 fused_mul_mat_vec = true;
@@ -6999,6 +7030,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
+#endif
             if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate->src[0];
@@ -7047,6 +7079,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     fused_mul_mat_vec = false;
     fused_node_count  = 0;
 
+#if !defined(GGML_USE_HIP)
     // Block-scaled FP8 stores its weight-scale grid directly on MUL_MAT, so
     // there is no post-matmul MUL node to match. Retain the Humming BF16
     // projection through the recurrent reshape and residual/RMS boundary.
@@ -7314,6 +7347,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+#endif
     // mul_mat + scale + optional bias
     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
@@ -7386,11 +7420,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             fusion_data.x_bias  = bias;
             fusion_data.x_scale = scale;
 
+#if !defined(GGML_USE_HIP)
             if (ggml_cuda_mul_mat_humming_fp8(*cuda_ctx, src0, src1, ids, out_node, &fusion_data)) {
                 fused_mul_mat_vec = true;
                 fused_node_count  = n_ops;
                 break;
             }
+#endif
 
             if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, out_node, &fusion_data);
@@ -7882,10 +7918,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     cuda_ctx->int8_channel_activations.clear();
     cuda_ctx->bf16_glu_outputs.clear();
     cuda_ctx->humming_prepared_active.clear();
-    cuda_ctx->precomputed_ssm_convs.clear();
 
     ggml_cuda_canonicalize_unserved_marlin_weights(cuda_ctx, cgraph);
 #endif
+    cuda_ctx->precomputed_ssm_convs.clear();
 
     // VBR S5: if a KV degrade wave is in flight on the side stream, GPU-wait on it here (before
     // any capture/launch) so this graph reads the flipped tensors post-transcode. Host never blocks.

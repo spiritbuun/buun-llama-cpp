@@ -3,13 +3,14 @@
 // The tile decode and the gemv structure follow exllamav3 (MIT, Copyright (c) 2025 Turboderp):
 // exllamav3_ext/quant/{exl3_gemv_kernel,hadamard_inner,reconstruct}.cu*.
 #include "exl3.cuh"
+
+#if !defined(GGML_USE_HIP)
+
 #include <cstring>
 #include "exl3-dq.cuh"
 #include "exl3-had.cuh"
 #include "exl3-gemv.cuh"
 #include "exl3-gemv-int8.cuh"
-
-#if !defined(GGML_USE_HIP)
 
 namespace {
 
