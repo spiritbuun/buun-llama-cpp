@@ -1549,6 +1549,7 @@ private:
     // its side is not flag-pinned — every degrade/promote/sim walk must use this predicate
     bool vbr_unit_movable(ggml_type t, bool is_v) const;
     uint32_t vbr_watermark_cells(uint32_t extra_tokens) const; // shared by prepare() + ensure_mapped
+    uint32_t get_pad_floor() const; // model-scoped attention read padding, also used by scratch sizing
     enum class vbr_degrade_result {
         applied,
         exhausted,

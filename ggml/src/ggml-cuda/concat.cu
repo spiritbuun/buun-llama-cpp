@@ -139,6 +139,55 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
     }
 }
 
+// Concatenate a short contiguous prefix with a transposed contiguous matrix
+// along dim 0. This is the recurrent-convolution prefill layout:
+//   prefix [P, C], body view [T, C] with strides [C, 1], dst [P + T, C].
+// The generic non-contiguous kernel assigns one block to each channel, making
+// a warp read the body with a C-element stride. A padded shared tile coalesces
+// both the body read and the transposed destination write.
+template <typename T>
+static __global__ void concat_prefix_transpose(
+        const T * __restrict__ prefix,
+        const T * __restrict__ body,
+        T * __restrict__ dst,
+        int prefix_cols,
+        int body_cols,
+        int channels) {
+    constexpr int tile_dim  = 32;
+    constexpr int block_rows = 8;
+    __shared__ T tile[tile_dim][tile_dim + 1];
+
+    const int channel_base = blockIdx.x * tile_dim;
+    const int body_base    = blockIdx.y * tile_dim;
+
+    // body is physically [body_cols, channels], even though its tensor view
+    // presents [body_cols, channels] with the first dimension strided.
+    for (int j = 0; j < tile_dim; j += block_rows) {
+        const int body_col = body_base + threadIdx.y + j;
+        const int channel  = channel_base + threadIdx.x;
+        if (body_col < body_cols && channel < channels) {
+            tile[threadIdx.y + j][threadIdx.x] = body[body_col * channels + channel];
+        }
+    }
+    __syncthreads();
+
+    const int dst_width = prefix_cols + body_cols;
+    for (int j = 0; j < tile_dim; j += block_rows) {
+        const int channel = channel_base + threadIdx.y + j;
+        const int body_col = body_base + threadIdx.x;
+        if (channel < channels && body_col < body_cols) {
+            dst[channel * dst_width + prefix_cols + body_col] = tile[threadIdx.x][threadIdx.y + j];
+        }
+
+        // Only the first body tile copies the short prefix. Threads along X
+        // cover prefix columns, while Y/J cover the same channel rows as the
+        // transposed store above.
+        if (blockIdx.y == 0 && channel < channels && threadIdx.x < prefix_cols) {
+            dst[channel * dst_width + threadIdx.x] = prefix[channel * prefix_cols + threadIdx.x];
+        }
+    }
+}
+
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
     if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
@@ -160,6 +209,22 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
 
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data,         src0->data, size0, cudaMemcpyDeviceToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + size0, src1->data, size1, cudaMemcpyDeviceToDevice, stream));
+    } else if (dim == 0 && src0->ne[2] == 1 && src0->ne[3] == 1 &&
+               src1->ne[2] == 1 && src1->ne[3] == 1 &&
+               dst->ne[2] == 1 && dst->ne[3] == 1 &&
+               src0->ne[1] == src1->ne[1] && dst->ne[1] == src0->ne[1] &&
+               dst->ne[0] == src0->ne[0] + src1->ne[0] &&
+               ggml_is_contiguous(src0) && ggml_is_contiguous(dst) &&
+               src1->nb[1] == sizeof(T) &&
+               src1->nb[0] == size_t(src1->ne[1]) * sizeof(T) &&
+               src0->ne[0] <= 32) {
+        constexpr int tile_dim = 32;
+        constexpr int block_rows = 8;
+        const dim3 blocks((src1->ne[1] + tile_dim - 1) / tile_dim,
+                          (src1->ne[0] + tile_dim - 1) / tile_dim, 1);
+        concat_prefix_transpose<T><<<blocks, dim3(tile_dim, block_rows, 1), 0, stream>>>(
+            static_cast<const T *>(src0->data), static_cast<const T *>(src1->data),
+            static_cast<T *>(dst->data), src0->ne[0], src1->ne[0], src1->ne[1]);
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
 

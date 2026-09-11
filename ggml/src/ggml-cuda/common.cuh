@@ -41,8 +41,13 @@
 #include <cstdio>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
+
+#if !defined(GGML_USE_HIP)
+bool ggml_cuda_humming_fp8_is_repacked(const ggml_tensor * tensor);
+#endif
 
 #if defined(GGML_USE_HIP)
 #include "vendors/hip.h"
@@ -878,6 +883,19 @@ static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32(uint8_t x) {
 #endif // defined(GGML_USE_HIP) && defined(CDNA3) && defined(FP8_AVAILABLE) && HIP_VERSION >= 60200000
 }
 
+static __device__ __forceinline__ float ggml_cuda_e4m3_to_fp32(uint8_t x) {
+    const int sign = x >> 7;
+    const int exp  = (x >> 3) & 0x0f;
+    const int man  = x & 0x07;
+    if (exp == 0x0f && man == 0x07) {
+        return NAN;
+    }
+    const float value = exp == 0
+        ? ldexpf((float) man, -9)
+        : ldexpf(1.0f + (float) man / 8.0f, exp - 7);
+    return sign ? -value : value;
+}
+
 static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_ue4m3(float x) {
 #if defined(BLACKWELL_MMA_AVAILABLE) // This is used for NVFP4 subblock scale quantizations only
     if (!(x > 0.0f)) {
@@ -1019,6 +1037,14 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q4_1> {
 };
 
 template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q4_A32> {
+    static constexpr int qk = QK4_A32;
+    static constexpr int qr = QR4_A32;
+    // One lane computes one complete affine group of 32 values.
+    static constexpr int qi = QK4_A32 / QG4_A32;
+};
+
+template<>
 struct ggml_cuda_type_traits<GGML_TYPE_Q5_0> {
     static constexpr int qk = QK5_0;
     static constexpr int qr = QR5_0;
@@ -1037,6 +1063,14 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q8_0> {
     static constexpr int qk = QK8_0;
     static constexpr int qr = QR8_0;
     static constexpr int qi = QI8_0;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q8_0_G128> {
+    static constexpr int qk = QK8_0_G128;
+    static constexpr int qr = QR8_0_G128;
+    // One lane computes one 32-value quarter of the group-128 block.
+    static constexpr int qi = QK8_0_G128 / QK8_1;
 };
 
 template<>
@@ -1477,7 +1511,63 @@ struct ggml_cuda_vbr_transcode_workspace {
     size_t              vmm_hw = 0;
 };
 
+#if !defined(GGML_USE_HIP)
+struct ggml_cuda_humming_fp8_cache_entry {
+    void * scale  = nullptr;
+    const void * source_scale = nullptr;
+    size_t scale_size  = 0;
+};
+
+struct ggml_cuda_marlin_q4_a32_layout {
+    void * weight = nullptr;
+    void * scale  = nullptr;
+    void * zero   = nullptr;
+    size_t weight_size = 0;
+    size_t scale_size  = 0;
+    size_t zero_size   = 0;
+};
+
+struct ggml_cuda_humming_fp8_lock_storage {
+    int32_t * ptr = nullptr;
+    size_t count = 0;
+    // A captured CUDA graph may retain an older address after a wider batch
+    // grows this workspace. Keep those small allocations alive with the
+    // backend context rather than invalidating an existing graph.
+    std::vector<int32_t *> retired;
+};
+
+struct ggml_cuda_humming_input_storage {
+    nv_bfloat16 * ptr = nullptr;
+    size_t count = 0;
+    const ggml_tensor * source = nullptr;
+    size_t source_count = 0;
+    // CUDA graphs retain workspace addresses. Growth is rare (only when a
+    // wider graph is first seen), so preserve older allocations until the
+    // backend context is destroyed.
+    std::vector<nv_bfloat16 *> retired;
+};
+
+struct ggml_cuda_humming_prepared_activation {
+    nv_bfloat16 * ptr = nullptr;
+    size_t count = 0;
+    // A graph captured at a smaller microbatch retains the old address when a
+    // later graph grows this workspace. Preserve it until context teardown.
+    std::vector<nv_bfloat16 *> retired;
+};
+
+struct ggml_cuda_q8_activation_storage {
+    char * ptr = nullptr;
+    size_t bytes = 0;
+    const ggml_tensor * source = nullptr;
+    size_t source_count = 0;
+    std::vector<char *> retired;
+};
+
+#endif
+
 struct ggml_backend_cuda_context {
+    // Conv-state fusion is shared by CUDA and HIP; reset for each graph evaluation.
+    std::unordered_set<const ggml_tensor *> precomputed_ssm_convs;
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
@@ -1489,6 +1579,10 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+    // set while the meta backend records a whole tensor-parallel step on this context's stream:
+    // graph_compute then launches plainly into that capture (no per-graph CUDA graph, no upload wait)
+    bool external_capture = false;
+
     // Persistent flash-attention scratch belongs to this backend context, not to the process or
     // physical device. Independent llama contexts therefore never alias Q/K/V work buffers.
     ggml_cuda_fattn_scratch fattn_scratch;
@@ -1497,6 +1591,47 @@ struct ggml_backend_cuda_context {
     // planes can therefore reuse one context-owned, grow-only physical workspace without using
     // the generic pool (whose growth is fatal and cannot be projected by the KV controller).
     ggml_cuda_vbr_transcode_workspace vbr_transcode_workspace;
+
+#if !defined(GGML_USE_HIP)
+    // Context-owned workspaces and derived channel-FP8 scales. Marlin weights
+    // use buffer-owned in-place repacks instead.
+    std::unordered_map<const void *, ggml_cuda_humming_fp8_cache_entry> humming_fp8_cache;
+    ggml_cuda_humming_fp8_lock_storage humming_fp8_locks[GGML_CUDA_MAX_STREAMS];
+    ggml_cuda_humming_input_storage humming_inputs[GGML_CUDA_MAX_STREAMS];
+    ggml_cuda_humming_input_storage humming_outputs[GGML_CUDA_MAX_STREAMS];
+    ggml_cuda_q8_activation_storage mmq_q8_activations[GGML_CUDA_MAX_STREAMS];
+    std::unordered_map<const ggml_tensor *, int> mmq_q8_reuse_requests;
+    std::unordered_set<const ggml_tensor *> humming_bf16_activations;
+    std::unordered_map<const ggml_tensor *, int> humming_bf16_activation_uses;
+    // Graph-proven single-consumer recurrent outputs may be normalized,
+    // gated, and row-quantized directly into their F32-sized allocation.
+    std::unordered_set<const ggml_tensor *> int8_channel_activations;
+    // Graph-proven single-consumer GLU outputs may be written as BF16 directly
+    // into their F32-sized allocation and consumed by the following BF16 GEMM.
+    std::unordered_set<const ggml_tensor *> bf16_glu_outputs;
+    // Qwen recurrent prefill can defer its paired L2 outputs to the FLA input
+    // packer, which applies the same reduction while writing BF16 directly.
+    // Entries are produced and consumed within one graph evaluation.
+    std::unordered_set<const void *> gdn_deferred_l2;
+    std::unordered_map<const ggml_tensor *, ggml_cuda_humming_prepared_activation> humming_prepared_activations;
+    std::unordered_set<const ggml_tensor *> humming_prepared_active;
+
+    bool consume_bf16_activation(const ggml_tensor * tensor) {
+        auto it = humming_bf16_activation_uses.find(tensor);
+        if (it != humming_bf16_activation_uses.end()) {
+            GGML_ASSERT(it->second > 0);
+            if (--it->second == 0) {
+                humming_bf16_activation_uses.erase(it);
+            }
+            return true;
+        }
+        return humming_bf16_activations.erase(tensor) != 0;
+    }
+
+    bool consume_int8_channel_activation(const ggml_tensor * tensor) {
+        return int8_channel_activations.erase(tensor) != 0;
+    }
+#endif
 
 #ifdef USE_CUDA_GRAPH
     // One entry per split and shape. Speculative verification alternates batch
@@ -1615,6 +1750,11 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pool & pool() {
         return pool(device);
     }
+
+#if !defined(GGML_USE_HIP)
+    // EXL3 reductions can overlap across backend contexts and streams.
+    int * exl3_int8_counter_storage[GGML_CUDA_MAX_STREAMS] = {};
+#endif
 };
 
 struct ggml_cuda_mm_fusion_args_host {
@@ -1623,6 +1763,14 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gate_bias = nullptr;
     const ggml_tensor * x_scale = nullptr;
     const ggml_tensor * gate_scale = nullptr;
+    // F32 activation multiplied by silu(projection output). This is distinct
+    // from gate, which denotes a second projection weight matrix.
+    const ggml_tensor * residual = nullptr;
+    ggml_tensor * residual_out = nullptr;
+    const ggml_tensor * rms_weight = nullptr;
+    bool materialize_rms_output = true;
+    bool retain_bf16_output = false;
+    float rms_eps = 0.0f;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
 };
@@ -1632,6 +1780,7 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate_bias = nullptr;
     const void * x_scale = nullptr;
     const void * gate_scale = nullptr;
+    const float * residual = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
 };

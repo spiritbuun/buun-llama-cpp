@@ -97,7 +97,11 @@ static __global__ void k_get_rows_float(
         const src0_t * GGML_CUDA_RESTRICT src0_row = (const src0_t *)((const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03);
 
         for (int64_t i00 = blockIdx.y*blockDim.x + threadIdx.x; i00 < ne00; i00 += gridDim.y*blockDim.x) {
-            dst_row[i00] = ggml_cuda_cast<dst_t>(src0_row[i00]);
+            if constexpr (std::is_same<src0_t, uint8_t>::value) {
+                dst_row[i00] = ggml_cuda_cast<dst_t>(ggml_cuda_e4m3_to_fp32(src0_row[i00]));
+            } else {
+                dst_row[i00] = ggml_cuda_cast<dst_t>(src0_row[i00]);
+            }
         }
     }
 }
@@ -315,6 +319,10 @@ static void ggml_cuda_get_rows_switch_src0_type(
             break;
         case GGML_TYPE_BF16:
             get_rows_cuda_float((const nv_bfloat16 *) src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
+        case GGML_TYPE_F8_E4M3:
+            get_rows_cuda_float((const uint8_t *) src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_Q1_0:

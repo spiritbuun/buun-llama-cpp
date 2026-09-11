@@ -22,6 +22,12 @@ and finally the `--kl-divergence` argument to indicate that the program should c
 This is a measure of how similar the FP16 and the quantized logit distributions are with a value of 0 indicating that the distribution are the same.
 The uncertainty on the mean KL divergence is calculated by assuming the KL divergence per token follows a Gaussian distribution.
 
+The default reference format stores quantized 16-bit log-probabilities to keep
+the artifact smaller. Set `LLAMA_KLD_EXACT_BASE=1` while creating the reference
+to store the scored FP32 logits instead. The reader accepts both formats. The
+exact format is substantially larger, but permits an independent
+reference-versus-reference run to produce a bitwise-zero KLD anchor.
+
 In addition to the KL divergence the following statistics are calculated with `--kl-divergence`:
 
 * Ratio of mean FP16 PPL and quantized PPL. Uncertainty is estimated on logits, then propagated. The logarithm of this metric is also calculated and printed, it is 0 if the logit distributions are the same.

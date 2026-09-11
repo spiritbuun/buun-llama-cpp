@@ -622,8 +622,10 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+    size_t sched_max_nodes = 0;
 
     bool sched_need_reserve = true;
+    bool sched_need_sampler_reserve = false;
     // Largest DFlash cross-attention bucket covered by the current scheduler
     // allocation. Smaller graph shapes can reuse that allocation without
     // rebuilding the scheduler and replacing its host staging buffer.

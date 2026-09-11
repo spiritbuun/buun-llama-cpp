@@ -454,6 +454,24 @@ void ggml_cuda_op_mul(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_mul>>(dst->src[0], dst->src[1], dst, dst->src[0]->data, dst->src[1]->data, dst->data, ctx.stream());
 }
 
+static __global__ void scale_add_f32(const float * x, const float * scale,
+        const float * residual, float * dst, int64_t n) {
+    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) {
+        // Preserve the materialized MUL's rounding; this is not an FMA.
+        dst[i] = __fadd_rn(__fmul_rn(x[i], scale[0]), residual[i]);
+    }
+}
+
+void ggml_cuda_scale_add(ggml_backend_cuda_context & ctx, const ggml_tensor * x,
+        const ggml_tensor * scale, const ggml_tensor * residual, ggml_tensor * dst) {
+    const int64_t n = ggml_nelements(dst);
+    scale_add_f32<<<(n + 255) / 256, 256, 0, ctx.stream()>>>(
+        (const float *) x->data, (const float *) scale->data,
+        (const float *) residual->data, (float *) dst->data, n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void ggml_cuda_op_div(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_div>>(dst->src[0], dst->src[1], dst, dst->src[0]->data, dst->src[1]->data, dst->data, ctx.stream());
 }

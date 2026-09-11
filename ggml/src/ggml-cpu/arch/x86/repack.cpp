@@ -14,6 +14,7 @@
 #include <cassert>
 #include <cstdlib> // for qsort
 #include <cstdio>  // for GGML_ASSERT
+#include <vector>
 
 #define GGML_CPU_CLANG_WORKAROUND
 #include "../../repack.h"
@@ -522,6 +523,7 @@ template<typename block_tx8>
 static void gemv_q4_b32_8x8_q8_0_lut_avx(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc, __m256i signextendlut) {
     static_assert(
             std::is_same_v<block_tx8, block_q4_0x8> ||
+            std::is_same_v<block_tx8, block_q4_1x8> ||
             std::is_same_v<block_tx8, block_iq4_nlx8> ||
             std::is_same_v<block_tx8, block_mxfp4x8>,
             "Unsupported block type");
@@ -578,6 +580,7 @@ static void gemv_q4_b32_8x8_q8_0_lut_avx(int n, float * GGML_RESTRICT s, size_t 
                 __m256 col_scale_f32;
                 if constexpr (
                         std::is_same_v<block_tx8, block_q4_0x8> ||
+            std::is_same_v<block_tx8, block_q4_1x8> ||
                         std::is_same_v<block_tx8, block_iq4_nlx8>) {
                     const __m128i changemask = _mm_set_epi8(15, 14, 7, 6, 13, 12, 5, 4, 11, 10, 3, 2, 9, 8, 1, 0);
                     col_scale_f32 = GGML_F32Cx8_REARRANGE_LOAD(b_ptr[b].d, changemask);
@@ -641,6 +644,7 @@ template<typename block_tx8>
 static void gemm_q4_b32_8x8_q8_0_lut_avx(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc, __m256i signextendlut) {
     static_assert(
             std::is_same_v<block_tx8, block_q4_0x8> ||
+            std::is_same_v<block_tx8, block_q4_1x8> ||
             std::is_same_v<block_tx8, block_iq4_nlx8> ||
             std::is_same_v<block_tx8, block_mxfp4x8>,
             "Unsupported block type");
@@ -761,6 +765,7 @@ static void gemm_q4_b32_8x8_q8_0_lut_avx(int n, float * GGML_RESTRICT s, size_t 
                 __m512 col_scale_f32;
                 if constexpr (
                         std::is_same_v<block_tx8, block_q4_0x8> ||
+            std::is_same_v<block_tx8, block_q4_1x8> ||
                         std::is_same_v<block_tx8, block_iq4_nlx8>) {
                     col_scale_f32 = GGML_F32Cx8x2_LOAD(b_ptr_0[b].d, b_ptr_1[b].d);
                 } else if constexpr (std::is_same_v<block_tx8, block_mxfp4x8>) {
@@ -972,6 +977,7 @@ static void gemm_q4_b32_8x8_q8_0_lut_avx(int n, float * GGML_RESTRICT s, size_t 
                 __m512 col_scale_f32;
                 if constexpr (
                         std::is_same_v<block_tx8, block_q4_0x8> ||
+            std::is_same_v<block_tx8, block_q4_1x8> ||
                         std::is_same_v<block_tx8, block_iq4_nlx8>) {
                     col_scale_f32 = GGML_F32Cx8x2_LOAD(b_ptr_0[b].d, b_ptr_1[b].d);
                 } else if constexpr (std::is_same_v<block_tx8, block_mxfp4x8>) {
@@ -1173,6 +1179,7 @@ static void gemm_q4_b32_8x8_q8_0_lut_avx(int n, float * GGML_RESTRICT s, size_t 
                 __m256 col_scale_f32;
                 if constexpr (
                         std::is_same_v<block_tx8, block_q4_0x8> ||
+            std::is_same_v<block_tx8, block_q4_1x8> ||
                         std::is_same_v<block_tx8, block_iq4_nlx8>) {
                     col_scale_f32 = GGML_F32Cx8_LOAD(b_ptr[b].d);
                 } else if constexpr (std::is_same_v<block_tx8, block_mxfp4x8>) {
@@ -1343,6 +1350,7 @@ static void gemm_q4_b32_8x8_q8_0_lut_avx(int n, float * GGML_RESTRICT s, size_t 
                 __m256 col_scale_f32;
                 if constexpr (
                         std::is_same_v<block_tx8, block_q4_0x8> ||
+            std::is_same_v<block_tx8, block_q4_1x8> ||
                         std::is_same_v<block_tx8, block_iq4_nlx8>) {
                     col_scale_f32 = GGML_F32Cx8_LOAD(b_ptr[b].d);
                 } else if constexpr (std::is_same_v<block_tx8, block_mxfp4x8>) {
@@ -1459,6 +1467,56 @@ void ggml_gemv_q4_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
 #endif
 
     ggml_gemv_q4_0_8x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+}
+
+#if defined(__AVX2__) || defined(__AVX512F__)
+// sum of the 32 int8 activations of one q8_0 block
+static inline int32_t q8_0_block_sum_avx(const int8_t * qs) {
+    const __m256i v   = _mm256_xor_si256(_mm256_loadu_si256((const __m256i *) qs), _mm256_set1_epi8((char) 0x80));
+    const __m256i sad = _mm256_sad_epu8(v, _mm256_setzero_si256());
+    const __m128i lo  = _mm256_castsi256_si128(sad);
+    const __m128i hi  = _mm256_extracti128_si256(sad, 1);
+    const __m128i sum = _mm_add_epi64(lo, hi);
+    return (int32_t) (_mm_cvtsi128_si64(sum) + _mm_extract_epi64(sum, 1)) - 32 * 128;
+}
+
+// (m + 8d) for the 8 interleaved columns of a block_q4_1x8, in natural column order
+static inline __m256 q4_1x8_min_term_avx(const block_q4_1x8 & b) {
+    const __m256 d = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *) b.d));
+    const __m256 m = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *) b.m));
+    return _mm256_fmadd_ps(d, _mm256_set1_ps(8.0f), m);
+}
+#endif
+
+void ggml_gemv_q4_1_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+#if defined(__AVX2__) || defined(__AVX512F__)
+    {
+        __m256i signextendlut = _mm256_castsi128_si256(_mm_set_epi8(-1, -2, -3, -4, -5, -6, -7, -8, 7, 6, 5, 4, 3, 2, 1, 0));
+        signextendlut = _mm256_permute2f128_si256(signextendlut, signextendlut, 0);
+
+        // d * (q - 8) part with the q4_0 kernel (nibbles are stored XOR 0x88)
+        gemv_q4_b32_8x8_q8_0_lut_avx<block_q4_1x8>(n, s, bs, vx, vy, nr, nc, signextendlut);
+
+        // + (m + 8d) * d_x * sum(x) per block (nr == 1 for gemv)
+        const int nb = n / QK8_0;
+        const block_q8_0 * a_ptr = (const block_q8_0 *) vy;
+        std::vector<float> sx(nb);
+        for (int b = 0; b < nb; b++) {
+            sx[b] = GGML_CPU_FP16_TO_FP32(a_ptr[b].d) * (float) q8_0_block_sum_avx(a_ptr[b].qs);
+        }
+        for (int x = 0; x < nc / 8; x++) {
+            const block_q4_1x8 * b_ptr = (const block_q4_1x8 *) vx + (x * nb);
+            __m256 acc = _mm256_loadu_ps(s + x * 8);
+            for (int b = 0; b < nb; b++) {
+                acc = _mm256_fmadd_ps(q4_1x8_min_term_avx(b_ptr[b]), _mm256_set1_ps(sx[b]), acc);
+            }
+            _mm256_storeu_ps(s + x * 8, acc);
+        }
+        return;
+    }
+#endif
+
+    ggml_gemv_q4_1_8x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
 }
 
 void ggml_gemv_q4_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
@@ -2037,6 +2095,61 @@ void ggml_gemm_q4_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
 #endif // defined(__AVX2__) || defined(__AVX512F__)
 
     ggml_gemm_q4_0_8x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+}
+
+void ggml_gemm_q4_1_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+#if defined(__AVX2__) || defined(__AVX512F__)
+    {
+        __m256i signextendlut = _mm256_castsi128_si256(_mm_set_epi8(-1, -2, -3, -4, -5, -6, -7, -8, 7, 6, 5, 4, 3, 2, 1, 0));
+        signextendlut = _mm256_permute2f128_si256(signextendlut, signextendlut, 0);
+
+        gemm_q4_b32_8x8_q8_0_lut_avx<block_q4_1x8>(n, s, bs, vx, vy, nr, nc, signextendlut);
+
+        // + (m + 8d) * d_x * sum(x): block_q8_0x4 interleaves 4 rows in 8-byte groups, so one
+        // sad_epu8 per 32-byte vector yields the four per-row partial sums in its 64-bit lanes.
+        const int nb = n / QK8_0;
+        const __m256i x80  = _mm256_set1_epi8((char) 0x80);
+        const __m256i zero = _mm256_setzero_si256();
+        std::vector<float> sx(4 * nb);
+        for (int y = 0; y < nr / 4; y++) {
+            const block_q8_0x4 * a_ptr = (const block_q8_0x4 *) vy + (y * nb);
+            for (int b = 0; b < nb; b++) {
+                __m256i acc = zero;
+                for (int k = 0; k < 4; k++) {
+                    const __m256i v = _mm256_xor_si256(_mm256_loadu_si256((const __m256i *) (a_ptr[b].qs + 32 * k)), x80);
+                    acc = _mm256_add_epi64(acc, _mm256_sad_epu8(v, zero));
+                }
+                int64_t lanes[4];
+                _mm256_storeu_si256((__m256i *) lanes, acc);
+                for (int m = 0; m < 4; m++) {
+                    sx[4 * b + m] = GGML_CPU_FP16_TO_FP32(a_ptr[b].d[m]) * (float) (lanes[m] - 32 * 128);
+                }
+            }
+            for (int x = 0; x < nc / 8; x++) {
+                const block_q4_1x8 * b_ptr = (const block_q4_1x8 *) vx + (x * nb);
+                __m256 acc0 = _mm256_setzero_ps(), acc1 = acc0, acc2 = acc0, acc3 = acc0;
+                for (int b = 0; b < nb; b++) {
+                    const __m256 c = q4_1x8_min_term_avx(b_ptr[b]);
+                    acc0 = _mm256_fmadd_ps(c, _mm256_set1_ps(sx[4 * b + 0]), acc0);
+                    acc1 = _mm256_fmadd_ps(c, _mm256_set1_ps(sx[4 * b + 1]), acc1);
+                    acc2 = _mm256_fmadd_ps(c, _mm256_set1_ps(sx[4 * b + 2]), acc2);
+                    acc3 = _mm256_fmadd_ps(c, _mm256_set1_ps(sx[4 * b + 3]), acc3);
+                }
+                float * s0 = s + (y * 4 + 0) * bs + x * 8;
+                float * s1 = s + (y * 4 + 1) * bs + x * 8;
+                float * s2 = s + (y * 4 + 2) * bs + x * 8;
+                float * s3 = s + (y * 4 + 3) * bs + x * 8;
+                _mm256_storeu_ps(s0, _mm256_add_ps(_mm256_loadu_ps(s0), acc0));
+                _mm256_storeu_ps(s1, _mm256_add_ps(_mm256_loadu_ps(s1), acc1));
+                _mm256_storeu_ps(s2, _mm256_add_ps(_mm256_loadu_ps(s2), acc2));
+                _mm256_storeu_ps(s3, _mm256_add_ps(_mm256_loadu_ps(s3), acc3));
+            }
+        }
+        return;
+    }
+#endif
+
+    ggml_gemm_q4_1_8x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
 }
 
 void ggml_gemm_q4_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {

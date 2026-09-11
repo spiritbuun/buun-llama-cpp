@@ -100,6 +100,82 @@ static __global__ void quantize_q8_1(
     y[ib].ds = make_half2(d, sum);
 }
 
+#if !defined(GGML_USE_HIP)
+template<bool pdl = false>
+static __global__ void quantize_fp8_q8_1(
+        const float * x, const int32_t * marker, block_q8_1 * y,
+        int64_t width, int64_t padded_width) {
+    if constexpr (pdl) {
+        ggml_cuda_pdl_lc();
+        ggml_cuda_pdl_sync();
+    }
+    x += blockIdx.y * width;
+    y += blockIdx.y * (padded_width / QK8_1);
+
+    // Same reduction and scale operations as fp8_dynamic_fake_quant_kernel.
+    float local_max = 0.0f;
+    for (int64_t col = threadIdx.x; col < width; col += blockDim.x) {
+        local_max = fmaxf(local_max, fabsf(x[col]));
+    }
+    __shared__ float maxima[256];
+    maxima[threadIdx.x] = local_max;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (threadIdx.x < stride) {
+            maxima[threadIdx.x] = fmaxf(maxima[threadIdx.x], maxima[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    float absmax = maxima[0];
+    if (marker != nullptr) {
+        const float upper_bound = __int_as_float(marker[0]);
+        if (upper_bound > 0.0f) {
+            absmax = fminf(absmax, upper_bound);
+        }
+    }
+    const float fp8_d = absmax / 448.0f;
+    const float inverse = absmax == 0.0f ? 0.0f : 1.0f / fp8_d;
+    // Replicate the maximum reduction so each CTA can pack a short independent
+    // tile instead of serializing all block32 reductions on a single CTA.
+    const int64_t col = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (col < padded_width) {
+        float xi = 0.0f;
+        if (col < width) {
+            const __nv_fp8_e4m3 q(x[col] * inverse);
+            xi = float(q) * fp8_d;
+        }
+        // Keep the existing Q8_1 warp reduction and rounding order.
+        const float amax = warp_reduce_max<QK8_1>(fabsf(xi));
+        const float sum = warp_reduce_sum<QK8_1>(xi);
+        const float d = amax / 127.0f;
+        const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+        y[col / QK8_1].qs[col % QK8_1] = q;
+        if (col % QK8_1 == 0) {
+            y[col / QK8_1].ds = make_half2(d, sum);
+        }
+    }
+}
+
+void quantize_row_fp8_q8_1_cuda(
+        const float * x, const int32_t * marker, void * vy,
+        int64_t width, int64_t padded_width, int64_t rows, cudaStream_t stream) {
+    GGML_ASSERT(width > 0 && padded_width >= width && padded_width % QK8_1 == 0);
+    const dim3 grid((padded_width + 255) / 256, rows);
+    // Let the one-token consumer prepare its weight/LUT data while packing runs.
+    // Other architectures retain their existing launch path.
+    const bool pdl = ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_BLACKWELL;
+    if (pdl) {
+        ggml_cuda_kernel_launch(quantize_fp8_q8_1<true>,
+            ggml_cuda_kernel_launch_params(grid, dim3(256), 0, stream),
+            x, marker, static_cast<block_q8_1 *>(vy), width, padded_width);
+    } else {
+        quantize_fp8_q8_1<false><<<grid, 256, 0, stream>>>(
+            x, marker, static_cast<block_q8_1 *>(vy), width, padded_width);
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+#endif
+
 __device__ __forceinline__ uint8_t compute_e8m0_scale(float amax) {
     if (!(amax > 0.0f)) {
         return 0;
@@ -184,6 +260,7 @@ static __global__ void quantize_mmq_nvfp4(
 #pragma unroll
                 for (int slot = 0; slot < n_expert_used; ++slot) {
                     const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
+            if (i < 0) { continue; } // slot routed to another device (expert-parallel window)
                     scale[i] = warp_amax[0];
                 }
             } else {
@@ -310,6 +387,7 @@ static __global__ void quantize_mmq_nvfp4(
 #pragma unroll
             for (int slot = 0; slot < n_expert_used; ++slot) {
                 const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
+            if (i < 0) { continue; } // slot routed to another device (expert-parallel window)
                 block_fp4_mmq * yb = y + (k_block * ne1 + i);
                 uint32_t * yqs = reinterpret_cast<uint32_t *>(yb->qs);
                 yqs[2 * sub + 0] = q0;
@@ -428,6 +506,7 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
 #pragma unroll
         for (int slot = 0; slot < n_expert_used; ++slot) {
             const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
+            if (i < 0) { continue; } // slot routed to another device (expert-parallel window)
             block_fp4_mmq * yb = y + (k_block * ne1 + i);
             char2 * yqs2 = (char2 *) yb->qs;
             if (lane_in_group == 0) {
@@ -527,6 +606,7 @@ static __global__ void quantize_mmq_q8_1(
         int64_t ib;
         if constexpr (scatter) {
             const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
+            if (i < 0) { continue; } // slot routed to another device (expert-parallel window)
             ib = k_block*ne1 + i;
         } else {
             const int64_t ib0 = blockIdx.z*((int64_t)gridDim.x*gridDim.y*blockDim.x/QK8_1); // first block of channel

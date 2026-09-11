@@ -117,9 +117,21 @@ if (CUDAToolkit_FOUND)
 
     file(GLOB   GGML_SOURCES_CUDA "*.cu")
     list(FILTER GGML_SOURCES_CUDA EXCLUDE REGEX "bsa_.*\\.cu$")
+    set_source_files_properties(marlin-q4-a32.cu marlin-q8-g128.cu PROPERTIES
+        COMPILE_OPTIONS "--expt-relaxed-constexpr")
+    set_source_files_properties(int8-channel.cu PROPERTIES
+        COMPILE_OPTIONS "--expt-relaxed-constexpr")
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
+    option(GGML_CUDA_TURBO_FA "Build Turbo flash-attention template instances" ON)
+    if (GGML_CUDA_TURBO_FA)
+        add_compile_definitions(GGML_CUDA_TURBO_FA)
+    endif()
+
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")
+    if (NOT GGML_CUDA_TURBO_FA)
+        list(FILTER SRCS EXCLUDE REGEX "/fattn-mma-turbo.*\\.cu$")
+    endif()
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/mmq*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
@@ -139,18 +151,85 @@ if (CUDAToolkit_FOUND)
         list(APPEND GGML_SOURCES_CUDA ${SRCS})
         file(GLOB   SRCS "template-instances/fattn-vec*bf16-bf16.cu")
         list(APPEND GGML_SOURCES_CUDA ${SRCS})
-        file(GLOB   SRCS "template-instances/fattn-vec*turbo2_0*.cu")
-        list(APPEND GGML_SOURCES_CUDA ${SRCS})
-        file(GLOB   SRCS "template-instances/fattn-vec*turbo3_0*.cu")
-        list(APPEND GGML_SOURCES_CUDA ${SRCS})
-        file(GLOB   SRCS "template-instances/fattn-vec*turbo4_0*.cu")
-        list(APPEND GGML_SOURCES_CUDA ${SRCS})
+        if (GGML_CUDA_TURBO_FA)
+            file(GLOB   SRCS "template-instances/fattn-vec*turbo2_0*.cu")
+            list(APPEND GGML_SOURCES_CUDA ${SRCS})
+            file(GLOB   SRCS "template-instances/fattn-vec*turbo3_0*.cu")
+            list(APPEND GGML_SOURCES_CUDA ${SRCS})
+            file(GLOB   SRCS "template-instances/fattn-vec*turbo4_0*.cu")
+            list(APPEND GGML_SOURCES_CUDA ${SRCS})
+        endif()
     endif()
 
     ggml_add_backend_library(ggml-cuda
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}
                             )
+    target_include_directories(ggml-cuda PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/bsa_vendor")
+
+    # The native F32-channel FP8 provider is compiled into the backend, not
+    # loaded from a benchmark directory. Its CUTLASS headers are isolated from
+    # the backend's other vendored versions and its device code is SM120-only.
+    if (CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8 AND
+            CMAKE_CUDA_ARCHITECTURES MATCHES "(^|;)120(a|f)?(-real|-virtual)?(;|$)")
+        add_library(ggml-cuda-fp8-cutlass OBJECT fp8-cutlass/fp8-cutlass-ffn-sm120.cu)
+        set_target_properties(ggml-cuda-fp8-cutlass PROPERTIES
+            CUDA_ARCHITECTURES "120a-real" CUDA_STANDARD 17 POSITION_INDEPENDENT_CODE ON)
+        target_include_directories(ggml-cuda-fp8-cutlass PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/fp8-cutlass/vendor/include")
+        target_compile_options(ggml-cuda-fp8-cutlass PRIVATE
+            -O3 -use_fast_math --expt-relaxed-constexpr -extended-lambda)
+        target_sources(ggml-cuda PRIVATE $<TARGET_OBJECTS:ggml-cuda-fp8-cutlass>)
+        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_FP8_CUTLASS)
+    endif()
+
+    # vLLM's exact-shape FLA kernels are shipped as SM80/SM86/SM120 cubins. On ELF
+    # x86-64, wrap them in read-only relocatable objects so ggml-cuda remains
+    # self-contained and needs no Triton/Python cache at runtime. Other host
+    # platforms retain the portable GDN fallback.
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+            CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$" AND
+            CMAKE_LINKER AND CMAKE_OBJCOPY)
+        set(GGML_CUDA_GDN_FLA_CUBINS
+            chunk_local_cumsum_scalar_kernel
+            chunk_scaled_dot_kkt_fwd_kernel
+            merge_16x16_to_64x64_inverse_kernel
+            recompute_w_u_fwd_kernel
+            chunk_gated_delta_rule_fwd_kernel_h_blockdim64
+            chunk_fwd_kernel_o)
+        set(GGML_CUDA_GDN_FLA_OBJECTS "")
+        foreach(GDN_ARCH IN ITEMS sm80 sm86 sm120)
+            if (GDN_ARCH STREQUAL "sm86")
+                set(GDN_CUBIN_PREFIX "")
+            else()
+                set(GDN_CUBIN_PREFIX "${GDN_ARCH}_")
+            endif()
+            foreach(KERNEL IN LISTS GGML_CUDA_GDN_FLA_CUBINS)
+                set(CUBIN_FILE "${GDN_CUBIN_PREFIX}${KERNEL}.cubin")
+                set(CUBIN_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/gdn-fla-${GDN_ARCH}/${CUBIN_FILE}")
+                set(CUBIN_OBJECT "${CMAKE_CURRENT_BINARY_DIR}/${CUBIN_FILE}.o")
+                add_custom_command(
+                    OUTPUT "${CUBIN_OBJECT}"
+                    COMMAND "${CMAKE_LINKER}" -r -b binary -o "${CUBIN_OBJECT}" "${CUBIN_FILE}"
+                    COMMAND "${CMAKE_OBJCOPY}" --rename-section
+                            .data=.rodata,alloc,load,readonly,data,contents "${CUBIN_OBJECT}"
+                    COMMAND "${CMAKE_OBJCOPY}" --add-section .note.GNU-stack=/dev/null
+                            --set-section-flags .note.GNU-stack=noload,readonly "${CUBIN_OBJECT}"
+                    DEPENDS "${CUBIN_SOURCE}"
+                    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/gdn-fla-${GDN_ARCH}"
+                    VERBATIM)
+                set_source_files_properties("${CUBIN_OBJECT}" PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+                list(APPEND GGML_CUDA_GDN_FLA_OBJECTS "${CUBIN_OBJECT}")
+            endforeach()
+        endforeach()
+        target_sources(ggml-cuda PRIVATE ${GGML_CUDA_GDN_FLA_OBJECTS})
+        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_GDN_FLA_EMBEDDED)
+    endif()
+
+    set_source_files_properties(humming-fp8.cu humming-fp8-block.cu PROPERTIES
+        CUDA_ARCHITECTURES "80-virtual;86-real"
+        COMPILE_OPTIONS "--expt-relaxed-constexpr"
+        INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/humming-vendor/include")
 
     if (GGML_CUDA_Q8_MMV_TEST_INSTRUMENTATION)
         target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_Q8_MMV_TEST_INSTRUMENTATION)
@@ -200,7 +279,7 @@ if (CUDAToolkit_FOUND)
     if (GGML_STATIC)
         if (WIN32)
             # As of 12.3.1 CUDA Toolkit for Windows does not offer a static cublas library
-            target_link_libraries(ggml-cuda PRIVATE CUDA::cudart_static CUDA::cublas)
+            target_link_libraries(ggml-cuda PRIVATE CUDA::cudart_static CUDA::cublas CUDA::cublasLt)
         else ()
             if (GGML_CUDA_CUB_3DOT2)
                 target_link_libraries(ggml-cuda PRIVATE  CCCL::CCCL)
@@ -215,7 +294,7 @@ if (CUDAToolkit_FOUND)
         if (GGML_CUDA_CUB_3DOT2)
             target_link_libraries(ggml-cuda PRIVATE  CCCL::CCCL)
         endif()
-        target_link_libraries(ggml-cuda PRIVATE CUDA::cudart CUDA::cublas)
+        target_link_libraries(ggml-cuda PRIVATE CUDA::cudart CUDA::cublas CUDA::cublasLt)
     endif()
 
     if (GGML_CUDA_NO_VMM)

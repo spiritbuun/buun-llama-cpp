@@ -482,6 +482,8 @@ void llama_model_saver::add_tensors_from_model() {
     add_tensor(model->hc_head_base);
     add_tensor(model->hc_head_scale);
     add_tensor(model->per_layer_tok_embd);
+    add_tensor(model->per_layer_tok_embd_scale);
+    add_tensor(model->per_layer_tok_embd_bias);
     add_tensor(model->hc_head_norm);
     add_tensor(model->hc_head_down);
     add_tensor(model->hc_head_up);

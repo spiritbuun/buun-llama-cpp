@@ -443,7 +443,136 @@ extern "C" {
         GGML_TYPE_TURBO1_CQ = 51, // RESERVED (codec removed 2026-07-05)
         GGML_TYPE_TURBO1_TCQ = 52, // turbo1 Trellis-Coded: FWHT + k=1/L=8 trellis, separate K/V 256-state codebooks (1.25 bpw)
         GGML_TYPE_Q2_0_G128 = 53, // 2-bit ternary weight quant, group-128 (PrismML Bonsai; on-disk type-42 remapped here at load)
-        GGML_TYPE_COUNT   = 54,
+        GGML_TYPE_F8_E4M3 = 54, // raw signed E4M3FN weights; external per-channel scale is a separate tensor
+        GGML_TYPE_Q4_A32 = 55, // asymmetric 4-bit weights, BF16 scale + packed zero point per group-32 (4.625 bpw)
+        GGML_TYPE_Q8_0_G128 = 56, // symmetric 8-bit weights, one BF16 scale per group-128 (8.125 bpw)
+        // BitsAndBytes weights keep the checkpoint's packed nibbles. Their
+        // block scales/codebooks are attached as a separate MUL_MAT source.
+        GGML_TYPE_BNB_NF4 = 57,
+        GGML_TYPE_BNB_FP4 = 58,
+        // Native GPTQ act-order weights retain the checkpoint's packed I4
+        // matrix. Per-column group indices/scales/zeros are an attached
+        // MUL_MAT auxiliary rather than being flattened into Q4_1.
+        GGML_TYPE_GPTQ_AO = 59,
+        // EXL3 (exllamav3) trellis-coded weights: 16x16 tiles of 256 weights, K bits per
+        // weight through a procedural codebook; per-tensor Hadamard sign/scale vectors are
+        // attached as MUL_MAT sources. Rows are not independently decodable (GPU only).
+        GGML_TYPE_EXL3_1  = 60,
+        GGML_TYPE_EXL3_2  = 61,
+        GGML_TYPE_EXL3_3  = 62,
+        GGML_TYPE_EXL3_4  = 63,
+        GGML_TYPE_EXL3_5  = 64,
+        GGML_TYPE_EXL3_6  = 65,
+        GGML_TYPE_EXL3_7  = 66,
+        GGML_TYPE_EXL3_8  = 67,
+        // same tiles with the "mcg" codebook (exllamav3 < 0.0.x checkpoints) ...
+        GGML_TYPE_EXL3M_1 = 68,
+        GGML_TYPE_EXL3M_2 = 69,
+        GGML_TYPE_EXL3M_3 = 70,
+        GGML_TYPE_EXL3M_4 = 71,
+        GGML_TYPE_EXL3M_5 = 72,
+        GGML_TYPE_EXL3M_6 = 73,
+        GGML_TYPE_EXL3M_7 = 74,
+        GGML_TYPE_EXL3M_8 = 75,
+        // ... and the original "3inst" codebook
+        GGML_TYPE_EXL3T_1 = 76,
+        GGML_TYPE_EXL3T_2 = 77,
+        GGML_TYPE_EXL3T_3 = 78,
+        GGML_TYPE_EXL3T_4 = 79,
+        GGML_TYPE_EXL3T_5 = 80,
+        GGML_TYPE_EXL3T_6 = 81,
+        GGML_TYPE_EXL3T_7 = 82,
+        GGML_TYPE_EXL3T_8 = 83,
+        // exllamav3 n-gram embedding rows (exl3_ngram_trellis): 160-element rows, K bits each,
+        // fp16 row scale in word 0 (rows are independent, so the CPU can gather them)
+        GGML_TYPE_EXL3N_2 = 84,
+        GGML_TYPE_EXL3N_3 = 85,
+        GGML_TYPE_EXL3N_4 = 86,
+        GGML_TYPE_EXL3N_5 = 87,
+        GGML_TYPE_EXL3N_6 = 88,
+        GGML_TYPE_EXL3N_7 = 89,
+        GGML_TYPE_EXL3N_8 = 90,
+        GGML_TYPE_COUNT   = 91,
+    };
+
+    // EXL3 helpers: the type encodes the bit width and the codebook.
+    // GGML_TYPE_EXL3_* = mul1 (codebook 2), EXL3M_* = mcg (1), EXL3T_* = 3inst (0)
+    static inline bool ggml_type_is_exl3(enum ggml_type type) {
+        return type >= GGML_TYPE_EXL3_1 && type <= GGML_TYPE_EXL3T_8;
+    }
+    static inline int ggml_exl3_bits(enum ggml_type type) {
+        return ((int) type - (int) GGML_TYPE_EXL3_1) % 8 + 1;
+    }
+    static inline int ggml_exl3_codebook(enum ggml_type type) {
+        const int family = ((int) type - (int) GGML_TYPE_EXL3_1) / 8;
+        return family == 0 ? 2 : family == 1 ? 1 : 0;
+    }
+    static inline bool ggml_type_is_exl3_ngram(enum ggml_type type) {
+        return type >= GGML_TYPE_EXL3N_2 && type <= GGML_TYPE_EXL3N_8;
+    }
+    static inline int ggml_exl3_ngram_bits(enum ggml_type type) {
+        return (int) type - (int) GGML_TYPE_EXL3N_2 + 2;
+    }
+    static inline enum ggml_type ggml_exl3_type(int bits, int codebook) {
+        const int family = codebook == 2 ? 0 : codebook == 1 ? 1 : 2;
+        return (enum ggml_type) ((int) GGML_TYPE_EXL3_1 + family * 8 + bits - 1);
+    }
+
+    // Serialized auxiliary for GGML_TYPE_BNB_{NF4,FP4}. Offsets are from the
+    // beginning of this header and keep the checkpoint's optional nested
+    // (double-quantized) absmax representation intact.
+    #define GGML_BNB_SCALE_MAGIC 0x53424e42u // "BNBS"
+    #define GGML_BNB_SCALE_LAYOUT_NONE 0u
+    #define GGML_BNB_SCALE_LAYOUT_ROWS 1u
+    #define GGML_BNB_SCALE_LAYOUT_COLUMNS 2u
+    struct ggml_bnb_scale_header {
+        uint32_t magic;
+        uint32_t version;
+        uint32_t n_blocks;
+        uint32_t block_size;
+        uint32_t nested_block_size;
+        float    nested_offset;
+        uint32_t absmax_offset;
+        uint32_t nested_absmax_offset;
+        uint32_t quant_map_offset;
+        uint32_t nested_quant_map_offset;
+        uint32_t total_size;
+        // Optional logical-layout mapping for architecture adapters that
+        // permute packed weights without rewriting nested scale groups.
+        uint32_t layout;
+        uint32_t layout_rows;
+        uint32_t layout_cols;
+        uint32_t layout_prefix;
+        uint32_t layout_n_key_heads;
+        uint32_t layout_values_per_key;
+        uint32_t layout_head_span;
+    };
+
+    #define GGML_GPTQ_AO_MAGIC 0x4f415147u // "GQAO"
+    struct ggml_gptq_ao_header {
+        uint32_t magic;
+        uint32_t version;
+        uint32_t cols;
+        uint32_t rows;
+        uint32_t groups;
+        uint32_t group_size;
+        uint32_t scale_type; // 0 = F16, 1 = BF16
+        uint32_t zeros_offset;
+        uint32_t scales_offset;
+        uint32_t g_idx_offset;
+        uint32_t total_size;
+    };
+
+    // Serialized per-output-channel BF16 scale for weight-only INT8
+    // checkpoints. The I8 payload remains the canonical weight tensor; this
+    // sidecar distinguishes W8A16 from the dynamic/static W8A8 contracts.
+    #define GGML_W8A16_SCALE_MAGIC 0x36314157u // "WA16"
+    struct ggml_w8a16_scale_header {
+        uint32_t magic;
+        uint32_t version;
+        uint32_t n_channels;
+        uint32_t values_offset;
+        uint32_t total_size;
     };
 
     // precision
@@ -675,6 +804,9 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
+        // ...uses an E4M3 weight with a 128x128 block-scale tensor. Backends
+        // may use this to select a block-FP8-specific storage layout.
+        GGML_TENSOR_FLAG_BLOCK_FP8 = 32,
     };
 
     enum ggml_tri_type {
@@ -1499,6 +1631,11 @@ extern "C" {
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
+
+    // expert-parallel window: `as` holds only experts [lo, lo + n_local) of the routed expert space at local
+    // indices 0..n_local-1. Routed ids outside the window are skipped and their output rows are zero;
+    // n_local == 0 disables the window.
+    GGML_API void ggml_mul_mat_id_set_expert_window(struct ggml_tensor * mmid, int32_t lo, int32_t n_local);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

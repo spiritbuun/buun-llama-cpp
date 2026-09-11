@@ -217,6 +217,20 @@ bool llama_kv_cache::vbr_hard_seal_step_blocked(
     return verdict == vbr_hard_seal_guard_result::hard_lease_blocked;
 }
 
+// Tensor-split step graphs benefit from fewer read-extent shape changes. Scope
+// that policy to this cache's model; creating another model must not change it.
+uint32_t llama_kv_cache::get_pad_floor() const {
+    static const uint32_t env_cells = [] {
+        const char * env = getenv("LLAMA_KV_PAD");
+        uint32_t v = env != nullptr ? (uint32_t) atoi(env) : 256u;
+        if (v < 256u || (v & (v - 1)) != 0) {
+            v = 256u;
+        }
+        return v;
+    }();
+    return std::max(env_cells, model.split_mode() == LLAMA_SPLIT_MODE_TENSOR ? 2048u : 256u);
+}
+
 // Resolve a ladder step to its codec-owned representation type. Movability is defined by
 // membership in the selected ladder; a concrete type outside it (for example bf16, or q8_0
 // under the Turbo codec) is pinned and must never be passed to the transcode path.
@@ -3242,7 +3256,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
                 used_max_p1[s] = v_cells[s].used_max_p1();
             }
             scratch_cells = 0;
-            const uint32_t n_pad_cur = std::max(n_pad, 256u);
+            const uint32_t n_pad_cur = std::max(n_pad, get_pad_floor());
             for (const auto & sinfo : sinfos) {
                 uint32_t n_kv = 0;
                 for (size_t s = 0; s < sinfo.n_stream(); ++s) {
@@ -3970,7 +3984,7 @@ void llama_kv_cache::vbr_commit_submitted() {
 // floor), optionally projected forward by an incoming batch's tokens. prepare()'s predictive
 // budget check and ensure_mapped's backing MUST agree on this formula — keep it in one place.
 uint32_t llama_kv_cache::vbr_watermark_cells(uint32_t extra_tokens) const {
-    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+    const uint32_t n_pad_cur = std::max(n_pad, get_pad_floor());
     uint32_t wm = 0;
     for (uint32_t s = 0; s < n_stream; ++s) {
         const auto & cells = v_cells[s];
@@ -11924,7 +11938,7 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
-    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+    const uint32_t n_pad_cur = std::max(n_pad, get_pad_floor());
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];

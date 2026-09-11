@@ -492,6 +492,21 @@ llama cli -hf ggml-org/Qwen3.5-0.8B-GGUF
 llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
 ```
 
+For supported native safetensors models, `-hf` downloads the weights and metadata
+into the Hugging Face cache and loads that directory directly—no GGUF conversion:
+
+```sh
+llama-server -hf unsloth/Qwen3.6-27B-NVFP4
+```
+
+Omit `:quant` for safetensors: the repository already identifies the quantization.
+If a repo contains several model directories, select one with
+`-hff path/to/config.json`. Repos containing both formats still prefer GGUF;
+`-hff config.json` explicitly selects the native model. Indexed downloads fetch
+only the named weight shards, plus metadata and supported auxiliary files.
+Subsequent runs reuse the cache; `--offline` requires the model to be cached already.
+Downloading a repository does not add support for a new architecture or quantization.
+
 <table align="center">
     <tr>
         <td align="center" width=50%>

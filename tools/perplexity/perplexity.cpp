@@ -172,6 +172,37 @@ static void process_logits(std::ostream& out, int n_vocab, const float * logits,
     out.write((const char *)log_probs.data(), size_t(n_token)*nv*sizeof(uint16_t));
 }
 
+static void process_logits_exact(std::ostream & out, int n_vocab, const float * logits, const int * tokens, int n_token,
+        std::vector<std::thread> & workers, double & nll, double & nll2) {
+    std::mutex mutex;
+    int counter = 0;
+    auto compute = [&]() {
+        double local_nll = 0.0;
+        double local_nll2 = 0.0;
+        while (true) {
+            std::unique_lock<std::mutex> lock(mutex);
+            const int i = counter++;
+            if (i >= n_token) {
+                nll += local_nll;
+                nll2 += local_nll2;
+                break;
+            }
+            lock.unlock();
+            const double value = -log_softmax(n_vocab, logits + size_t(i) * n_vocab, tokens[i + 1]).log_softmax;
+            local_nll += value;
+            local_nll2 += value * value;
+        }
+    };
+    for (auto & worker : workers) {
+        worker = std::thread(compute);
+    }
+    compute();
+    for (auto & worker : workers) {
+        worker.join();
+    }
+    out.write(reinterpret_cast<const char *>(logits), size_t(n_token) * n_vocab * sizeof(float));
+}
+
 struct kl_divergence_result {
     double sum_nll          = 0.0;
     double sum_nll2         = 0.0;
@@ -187,6 +218,22 @@ struct kl_divergence_result {
     size_t n_same_top       = 0.0;
     size_t count            = 0.0;
 };
+
+static void merge_kl_divergence(kl_divergence_result & dst, const kl_divergence_result & src) {
+    dst.sum_nll += src.sum_nll;
+    dst.sum_nll2 += src.sum_nll2;
+    dst.sum_nll_base += src.sum_nll_base;
+    dst.sum_nll_base2 += src.sum_nll_base2;
+    dst.sum_nll_nll_base += src.sum_nll_nll_base;
+    dst.sum_kld += src.sum_kld;
+    dst.sum_kld2 += src.sum_kld2;
+    dst.sum_p_diff += src.sum_p_diff;
+    dst.sum_p_diff2 += src.sum_p_diff2;
+    dst.sum_p_diff4 += src.sum_p_diff4;
+    dst.n_same_top += src.n_same_top;
+    dst.max_p_diff = std::max(dst.max_p_diff, src.max_p_diff);
+    dst.count += src.count;
+}
 
 static std::pair<double, float> log_softmax(int n_vocab, const float * logits, const uint16_t * base_log_prob, int tok, kl_divergence_result & kld) {
     float max_logit = logits[0];
@@ -251,6 +298,79 @@ static std::pair<double, float> log_softmax(int n_vocab, const float * logits, c
     return std::make_pair(sum, p_diff);
 }
 
+static std::pair<double, float> log_softmax_exact(
+        int n_vocab, const float * logits, const float * base_logits, int tok, kl_divergence_result & kld) {
+    float max_logit = logits[0];
+    float max_logit_base = base_logits[0];
+    int imax = 0;
+    int imax_base = 0;
+    for (int i = 1; i < n_vocab; ++i) {
+        if (logits[i] > max_logit) {
+            max_logit = logits[i];
+            imax = i;
+        }
+        if (base_logits[i] > max_logit_base) {
+            max_logit_base = base_logits[i];
+            imax_base = i;
+        }
+    }
+
+    double sum_exp = 0.0;
+    double sum_exp_base = 0.0;
+    for (int i = 0; i < n_vocab; ++i) {
+        sum_exp += expf(logits[i] - max_logit);
+        sum_exp_base += expf(base_logits[i] - max_logit_base);
+    }
+    const float log_sum_exp = log(sum_exp);
+    const float log_sum_exp_base = log(sum_exp_base);
+    const float nll = max_logit + log_sum_exp - logits[tok];
+    const float nll_base = max_logit_base + log_sum_exp_base - base_logits[tok];
+
+    kld.sum_nll += nll;
+    kld.sum_nll2 += nll * nll;
+    kld.sum_nll_base += nll_base;
+    kld.sum_nll_base2 += nll_base * nll_base;
+    kld.sum_nll_nll_base += nll * nll_base;
+
+    double divergence = 0.0;
+    if (std::memcmp(logits, base_logits, size_t(n_vocab) * sizeof(float)) != 0) {
+        for (int i = 0; i < n_vocab; ++i) {
+            const float log_p = base_logits[i] - max_logit_base - log_sum_exp_base;
+            if (log_p > -16.0f) {
+                const float log_q = logits[i] - max_logit - log_sum_exp;
+                divergence += expf(log_p) * (log_p - log_q);
+            }
+        }
+    }
+
+    kld.sum_kld += divergence;
+    kld.sum_kld2 += divergence * divergence;
+    ++kld.count;
+    if (imax == imax_base) {
+        ++kld.n_same_top;
+    }
+
+    const float p_diff = expf(-nll) - expf(-nll_base);
+    kld.sum_p_diff += p_diff;
+    const double p_diff2 = p_diff * p_diff;
+    kld.sum_p_diff2 += p_diff2;
+    kld.sum_p_diff4 += p_diff2 * p_diff2;
+    kld.max_p_diff = std::max(kld.max_p_diff, std::fabs(p_diff));
+
+    return std::make_pair(divergence, p_diff);
+}
+
+static int kld_score_last_k() {
+    static const int value = []() {
+        if (const char * env = getenv("TURBO_SCORE_LAST_K")) {
+            const int parsed = atoi(env);
+            return parsed > 0 ? parsed : 0;
+        }
+        return getenv("TURBO_SCORE_LAST_ONLY") != nullptr ? 1 : 0;
+    }();
+    return value;
+}
+
 static void process_logits(int n_vocab, const float * logits, const int * tokens, int n_token,
         std::vector<std::thread> & workers, const std::vector<uint16_t> & base_log_probs, kl_divergence_result & kld,
         float * kld_values, float * p_diff_values) {
@@ -263,30 +383,15 @@ static void process_logits(int n_vocab, const float * logits, const int * tokens
     // TURBO_SCORE_LAST_K=N => last N (more samples at long ctx, position blur N).
     // Skipped positions are zero-filled (mean over kld.count stays exact; percentiles
     // are meaningless in this mode and should be ignored).
-    static const int score_last_k = []() {
-        const char * k = getenv("TURBO_SCORE_LAST_K");
-        if (k) { int v = atoi(k); return v > 0 ? v : 0; }
-        return getenv("TURBO_SCORE_LAST_ONLY") != nullptr ? 1 : 0;
-    }();
-    auto compute = [&mutex, &counter, &base_log_probs, &kld, n_vocab, logits, tokens, n_token, nv, kld_values, p_diff_values] () {
+    const int score_last_k = kld_score_last_k();
+    auto compute = [&mutex, &counter, &base_log_probs, &kld, n_vocab, logits, tokens, n_token, nv,
+                    kld_values, p_diff_values, score_last_k] () {
         kl_divergence_result local_kld;
         while (true) {
             std::unique_lock<std::mutex> lock(mutex);
             int i = counter++;
             if (i >= n_token) {
-                kld.sum_nll          += local_kld.sum_nll;
-                kld.sum_nll2         += local_kld.sum_nll2;
-                kld.sum_nll_base     += local_kld.sum_nll_base;
-                kld.sum_nll_base2    += local_kld.sum_nll_base2;
-                kld.sum_nll_nll_base += local_kld.sum_nll_nll_base;
-                kld.sum_kld          += local_kld.sum_kld;
-                kld.sum_kld2         += local_kld.sum_kld2;
-                kld.sum_p_diff       += local_kld.sum_p_diff;
-                kld.sum_p_diff2      += local_kld.sum_p_diff2;
-                kld.sum_p_diff4      += local_kld.sum_p_diff4;
-                kld.n_same_top       += local_kld.n_same_top;
-                kld.max_p_diff        = std::max(kld.max_p_diff, local_kld.max_p_diff);
-                kld.count            += local_kld.count;
+                merge_kl_divergence(kld, local_kld);
                 break;
             }
             lock.unlock();
@@ -306,6 +411,46 @@ static void process_logits(int n_vocab, const float * logits, const int * tokens
     compute();
     for (auto & w : workers) {
         w.join();
+    }
+}
+
+static void process_logits_exact(int n_vocab, const float * logits, const int * tokens, int n_token,
+        std::vector<std::thread> & workers, const std::vector<float> & base_logits, kl_divergence_result & kld,
+        float * kld_values, float * p_diff_values) {
+    std::mutex mutex;
+    int counter = 0;
+    const int score_last_k = kld_score_last_k();
+    auto compute = [&]() {
+        kl_divergence_result local_kld;
+        while (true) {
+            std::unique_lock<std::mutex> lock(mutex);
+            const int i = counter++;
+            if (i >= n_token) {
+                merge_kl_divergence(kld, local_kld);
+                break;
+            }
+            lock.unlock();
+            if (score_last_k > 0 && i < n_token - score_last_k) {
+                kld_values[i] = 0.0f;
+                p_diff_values[i] = 0.0f;
+                continue;
+            }
+            const auto value = log_softmax_exact(
+                    n_vocab,
+                    logits + size_t(i) * n_vocab,
+                    base_logits.data() + size_t(i) * n_vocab,
+                    tokens[i + 1],
+                    local_kld);
+            kld_values[i] = value.first;
+            p_diff_values[i] = value.second;
+        }
+    };
+    for (auto & worker : workers) {
+        worker = std::thread(compute);
+    }
+    compute();
+    for (auto & worker : workers) {
+        worker.join();
     }
 }
 
@@ -473,6 +618,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     const bool add_bos = llama_vocab_get_add_bos(vocab);
     GGML_ASSERT(!llama_vocab_get_add_eos(vocab));
 
+    const bool exact_logits_base = std::getenv("LLAMA_KLD_EXACT_BASE") != nullptr;
     std::ofstream logits_stream;
     if (!params.logits_file.empty()) {
         logits_stream.open(params.logits_file.c_str(), std::ios::binary);
@@ -480,8 +626,10 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
             LOG_ERR("%s: failed to open %s for writing\n", __func__, params.logits_file.c_str());
             return {};
         }
-        LOG_INF("%s: saving all logits to %s\n", __func__, params.logits_file.c_str());
-        logits_stream.write("_logits_", 8);
+        LOG_INF("%s: saving %s reference to %s\n", __func__,
+                exact_logits_base ? "exact float logits" : "quantized log-probability",
+                params.logits_file.c_str());
+        logits_stream.write(exact_logits_base ? "_logitf_" : "_logits_", 8);
         logits_stream.write(reinterpret_cast<const char *>(&n_ctx), sizeof(n_ctx));
     }
 
@@ -539,8 +687,10 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
         logits_stream.write((const char *)&n_vocab, sizeof(n_vocab));
         logits_stream.write((const char *)&n_chunk, sizeof(n_chunk));
         logits_stream.write((const char *)tokens.data(), (size_t)n_chunk*n_ctx*sizeof(tokens[0]));
-        const int nv = 2*((n_vocab + 1)/2) + 4;
-        log_probs.resize(size_t(n_ctx) * nv);
+        if (!exact_logits_base) {
+            const int nv = 2*((n_vocab + 1)/2) + 4;
+            log_probs.resize(size_t(n_ctx) * nv);
+        }
     }
 
     // We get the logits for all the tokens in the context window (params.n_ctx)
@@ -631,7 +781,11 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
             const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx + first);
 
             llama_token * tokens_data = tokens.data() + start + seq*n_ctx + first;
-            if (!params.logits_file.empty()) {
+            if (!params.logits_file.empty() && exact_logits_base) {
+                process_logits_exact(logits_stream, n_vocab, all_logits,
+                        tokens_data, n_ctx - 1 - first,
+                        workers, nll, nll2);
+            } else if (!params.logits_file.empty()) {
                 process_logits(logits_stream, n_vocab, all_logits,
                         tokens_data, n_ctx - 1 - first,
                         workers, log_probs, nll, nll2);
@@ -1730,11 +1884,13 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
         LOG_ERR("%s: failed to open %s\n", __func__, params.logits_file.c_str());
         return;
     }
+    bool exact_logits_base = false;
     {
         char check[9]; check[8] = 0;
         in.read(check, 8);
-        if (in.fail() || strncmp("_logits_", check, 8) != 0) {
-            LOG_ERR("%s: %s does not look like a file containing log-probabilities\n", __func__, params.logits_file.c_str());
+        exact_logits_base = !in.fail() && strncmp("_logitf_", check, 8) == 0;
+        if (in.fail() || (!exact_logits_base && strncmp("_logits_", check, 8) != 0)) {
+            LOG_ERR("%s: %s does not look like a KLD reference file\n", __func__, params.logits_file.c_str());
             return;
         }
     }
@@ -1790,7 +1946,13 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
 
     llama_batch batch = llama_batch_init(std::min(n_batch, static_cast<int>(n_ctx)*n_seq), 0, 1);
 
-    std::vector<uint16_t> log_probs_uint16(size_t(n_ctx - 1 - n_ctx/2) * nv);
+    std::vector<uint16_t> log_probs_uint16;
+    std::vector<float> base_logits;
+    if (exact_logits_base) {
+        base_logits.resize(size_t(n_ctx - 1 - n_ctx/2) * n_vocab);
+    } else {
+        log_probs_uint16.resize(size_t(n_ctx - 1 - n_ctx/2) * nv);
+    }
     std::vector<float>    kld_values(size_t(n_ctx - 1 - n_ctx/2)*n_chunk);
     std::vector<float> p_diff_values(size_t(n_ctx - 1 - n_ctx/2)*n_chunk);
     std::vector<float> logits;
@@ -1896,9 +2058,13 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
             LOG("chunk             PPL               ln(PPL(Q)/PPL(base))          KL Divergence              Δp RMS            Same top p\n");
         }
 
-        // Read log probs for each sequence in the batch
+        // Read the reference distribution for each sequence in the batch.
         for (int seq = 0; seq < n_seq_batch; seq++) {
-            if (in.read((char *)log_probs_uint16.data(), log_probs_uint16.size()*sizeof(uint16_t)).fail()) {
+            const size_t reference_bytes = exact_logits_base ?
+                    base_logits.size() * sizeof(float) : log_probs_uint16.size() * sizeof(uint16_t);
+            void * reference_data = exact_logits_base ?
+                    static_cast<void *>(base_logits.data()) : static_cast<void *>(log_probs_uint16.data());
+            if (in.read(static_cast<char *>(reference_data), reference_bytes).fail()) {
                 LOG_ERR("%s: failed reading log-probs for chunk %d\n", __func__, i + seq);
                 llama_batch_free(batch);
                 return;
@@ -1906,8 +2072,13 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
 
             const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx + first);
 
-            process_logits(n_vocab, all_logits, tokens.data() + start + seq*n_ctx + first, n_ctx - 1 - first,
-                    workers, log_probs_uint16, kld, kld_ptr, p_diff_ptr);
+            if (exact_logits_base) {
+                process_logits_exact(n_vocab, all_logits, tokens.data() + start + seq*n_ctx + first, n_ctx - 1 - first,
+                        workers, base_logits, kld, kld_ptr, p_diff_ptr);
+            } else {
+                process_logits(n_vocab, all_logits, tokens.data() + start + seq*n_ctx + first, n_ctx - 1 - first,
+                        workers, log_probs_uint16, kld, kld_ptr, p_diff_ptr);
+            }
             p_diff_ptr += n_ctx - 1 - first;
             kld_ptr    += n_ctx - 1 - first;
 
@@ -1921,7 +2092,9 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
             auto log_ppl_base = mean_and_uncertainty(kld.sum_nll_base, kld.sum_nll_base2, kld.count);
             const double log_ppl_cov = covariance(kld.sum_nll, kld.sum_nll_base, kld.sum_nll_nll_base, kld.count);
             const double log_ppl_ratio_val = log_ppl.first - log_ppl_base.first;
-            const double log_ppl_ratio_unc = sqrt(log_ppl.second*log_ppl.second + log_ppl_base.second*log_ppl_base.second - 2.0*log_ppl_cov);
+            const double log_ppl_ratio_var = log_ppl.second*log_ppl.second +
+                    log_ppl_base.second*log_ppl_base.second - 2.0*log_ppl_cov;
+            const double log_ppl_ratio_unc = sqrt(std::max(0.0, log_ppl_ratio_var));
             LOG("    %10.5lf ± %10.5lf", log_ppl_ratio_val, log_ppl_ratio_unc);
 
             auto kl_div = mean_and_uncertainty(kld.sum_kld, kld.sum_kld2, kld.count);
@@ -1929,7 +2102,7 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
 
             auto p_diff_mse   = mean_and_uncertainty(kld.sum_p_diff2, kld.sum_p_diff4, kld.count);
             const double p_diff_rms_val = sqrt(p_diff_mse.first);
-            const double p_diff_rms_unc = 0.5/p_diff_rms_val * p_diff_mse.second;
+            const double p_diff_rms_unc = p_diff_rms_val > 0.0 ? 0.5/p_diff_rms_val * p_diff_mse.second : 0.0;
             LOG("    %6.3lf ± %6.3lf %%", 100.0*p_diff_rms_val, 100.0*p_diff_rms_unc);
 
             double p_top_val = 1.*kld.n_same_top/kld.count;
@@ -1989,7 +2162,9 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
     LOG("Cor(ln(PPL(Q)), ln(PPL(base))): %6.2lf%%\n", 100.0*log_ppl_cor);
 
     const double log_ppl_ratio_val = log_ppl.first - log_ppl_base.first;
-    const double log_ppl_ratio_unc = sqrt(log_ppl.second*log_ppl.second + log_ppl_base.second*log_ppl_base.second - 2.0*log_ppl_cov);
+    const double log_ppl_ratio_var = log_ppl.second*log_ppl.second +
+            log_ppl_base.second*log_ppl_base.second - 2.0*log_ppl_cov;
+    const double log_ppl_ratio_unc = sqrt(std::max(0.0, log_ppl_ratio_var));
     LOG("Mean ln(PPL(Q)/PPL(base))     : %10.6lf ± %10.6lf\n", log_ppl_ratio_val, log_ppl_ratio_unc);
 
     const double ppl_ratio_val = exp(log_ppl_ratio_val);
@@ -1998,7 +2173,8 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
 
     const double ppl_cov = ppl_val * ppl_base_val * log_ppl_cov;
     const double ppl_diff_val = ppl_val - ppl_base_val;
-    const double ppl_diff_unc = sqrt(ppl_unc*ppl_unc + ppl_base_unc*ppl_base_unc - 2.0*ppl_cov);
+    const double ppl_diff_var = ppl_unc*ppl_unc + ppl_base_unc*ppl_base_unc - 2.0*ppl_cov;
+    const double ppl_diff_unc = sqrt(std::max(0.0, ppl_diff_var));
     LOG("Mean PPL(Q)-PPL(base)         : %10.6lf ± %10.6lf\n", ppl_diff_val, ppl_diff_unc);
 
     LOG("\n");
@@ -2057,7 +2233,7 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
     // LOG("MSE Δp    : %10.6lf ± %10.6lf\n", p_diff_mse.first, p_diff_mse.second);
 
     const double p_diff_rms_val = sqrt(p_diff_mse.first);
-    const double p_diff_rms_unc = 0.5/p_diff_rms_val * p_diff_mse.second;
+    const double p_diff_rms_unc = p_diff_rms_val > 0.0 ? 0.5/p_diff_rms_val * p_diff_mse.second : 0.0;
     LOG("RMS Δp    : %6.3lf ± %5.3lf %%\n", 100.0*p_diff_rms_val, 100.0*p_diff_rms_unc);
 
     const double same_top_p = 1.0*kld.n_same_top/kld.count;

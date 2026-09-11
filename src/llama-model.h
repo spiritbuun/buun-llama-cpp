@@ -220,6 +220,14 @@ struct llama_layer_nextn {
     struct ggml_tensor * eh_proj               = nullptr;
     struct ggml_tensor * eh_proj_s             = nullptr;
     struct ggml_tensor * eh_proj_in_s          = nullptr;
+    // EXL3 checkpoints split the fc over its two inputs (separate output scales), so the
+    // draft head applies fc_embedding(e_norm) + fc_hidden(h_norm) instead of one eh_proj.
+    struct ggml_tensor * eh_proj_embd          = nullptr;
+    struct ggml_tensor * eh_proj_embd_s        = nullptr;
+    struct ggml_tensor * eh_proj_embd_in_s     = nullptr;
+    struct ggml_tensor * eh_proj_hidden        = nullptr;
+    struct ggml_tensor * eh_proj_hidden_s      = nullptr;
+    struct ggml_tensor * eh_proj_hidden_in_s   = nullptr;
     struct ggml_tensor * embed_tokens          = nullptr;
     struct ggml_tensor * enorm                 = nullptr;
     struct ggml_tensor * hnorm                 = nullptr;
@@ -525,6 +533,19 @@ struct llama_layer {
     struct ggml_tensor * indexer_comp_wgate = nullptr;
     struct ggml_tensor * indexer_comp_ape   = nullptr;
     struct ggml_tensor * indexer_comp_norm  = nullptr;
+    // Native block-FP8 sidecars. These are separate tensors because the
+    // published DeepSeek checkpoint keeps 128x128 E8M0 scales out of line.
+    struct ggml_tensor * wq_a_s               = nullptr;
+    struct ggml_tensor * wq_b_s               = nullptr;
+    struct ggml_tensor * wkv_s                = nullptr;
+    struct ggml_tensor * wo_a_s               = nullptr;
+    struct ggml_tensor * wo_b_s               = nullptr;
+    struct ggml_tensor * attn_comp_wkv_s      = nullptr;
+    struct ggml_tensor * attn_comp_wgate_s    = nullptr;
+    struct ggml_tensor * indexer_proj_s        = nullptr;
+    struct ggml_tensor * indexer_attn_q_b_s    = nullptr;
+    struct ggml_tensor * indexer_comp_wkv_s    = nullptr;
+    struct ggml_tensor * indexer_comp_wgate_s  = nullptr;
 
     // cogvlm
     struct ggml_tensor * visexp_attn_wqkv = nullptr;
@@ -569,6 +590,10 @@ struct llama_layer {
     // MSA
     struct ggml_tensor * index_q_proj = nullptr;
     struct ggml_tensor * index_k_proj = nullptr;
+    struct ggml_tensor * index_q_proj_s    = nullptr;
+    struct ggml_tensor * index_k_proj_s    = nullptr;
+    struct ggml_tensor * index_q_proj_in_s = nullptr;
+    struct ggml_tensor * index_k_proj_in_s = nullptr;
     struct ggml_tensor * index_q_norm = nullptr;
     struct ggml_tensor * index_k_norm = nullptr;
 
@@ -672,6 +697,8 @@ struct llama_model {
     struct ggml_tensor * altup_proj           = nullptr;
     struct ggml_tensor * altup_unembd_proj    = nullptr;
     struct ggml_tensor * per_layer_tok_embd   = nullptr;
+    struct ggml_tensor * per_layer_tok_embd_scale = nullptr;
+    struct ggml_tensor * per_layer_tok_embd_bias  = nullptr;   // EXL3 n-gram tables: per-head bias [head_dim, n_heads]
 
     struct ggml_tensor * hc_head_norm = nullptr;
     struct ggml_tensor * hc_head_down = nullptr;

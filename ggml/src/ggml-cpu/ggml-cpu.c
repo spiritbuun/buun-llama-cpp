@@ -87,6 +87,7 @@ float ggml_table_f32_e8m0_half[1 << 8];
 
 // precomputed f32 table for ue4m3 (1 KB) (simd-mappings.h)
 float ggml_table_f32_ue4m3[1 << 8];
+float ggml_table_f32_e4m3[1 << 8];
 
 #if defined(__ARM_ARCH)
 struct ggml_arm_arch_features_type {
@@ -265,6 +266,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .nrows                    = 1,
 #endif
     },
+    [GGML_TYPE_Q4_A32] = {
+        .from_float               = quantize_row_q4_a32,
+        .vec_dot                  = ggml_vec_dot_q4_a32_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_Q5_0] = {
         .from_float               = quantize_row_q5_0,
         .vec_dot                  = ggml_vec_dot_q5_0_q8_0,
@@ -287,6 +294,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .nrows                    = 1,
 #endif
     },
+    [GGML_TYPE_Q8_0_G128] = {
+        .from_float               = quantize_row_q8_0_g128,
+        .vec_dot                  = ggml_vec_dot_q8_0_g128_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_Q8_1] = {
         .from_float               = quantize_row_q8_1,
         .vec_dot_type             = GGML_TYPE_Q8_1,
@@ -302,6 +315,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = quantize_row_nvfp4,
         .vec_dot                  = ggml_vec_dot_nvfp4_q8_0,
         .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_F8_E4M3] = {
+        .from_float               = quantize_row_f8_e4m3,
+        .vec_dot                  = ggml_vec_dot_f8_e4m3_bf16,
+        .vec_dot_type             = GGML_TYPE_BF16,
         .nrows                    = 1,
     },
     [GGML_TYPE_Q2_K] = {
@@ -1284,12 +1303,745 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     }
 }
 
+static float ggml_cpu_quant_scale_value(const struct ggml_tensor * scale, int64_t row) {
+    if (scale->type == GGML_TYPE_F32) {
+        return ((const float *) scale->data)[row];
+    }
+    if (scale->type == GGML_TYPE_F16) {
+        return ggml_fp16_to_fp32(((const ggml_fp16_t *) scale->data)[row]);
+    }
+    GGML_ASSERT(scale->type == GGML_TYPE_BF16);
+    return ggml_bf16_to_fp32(((const ggml_bf16_t *) scale->data)[row]);
+}
+
+static void ggml_compute_forward_mul_mat_i8_channel(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    const struct ggml_tensor * weight = dst->src[0];
+    const struct ggml_tensor * input = dst->src[1];
+    const struct ggml_tensor * weight_scale = dst->src[2];
+    const struct ggml_tensor * input_scale = dst->src[3];
+    GGML_ASSERT(weight->type == GGML_TYPE_I8 && input->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+
+    const int64_t k = weight->ne[0];
+    const int64_t n = weight->ne[1];
+    const int64_t m = input->ne[1];
+    const int64_t r2 = input->ne[2] / weight->ne[2];
+    const int64_t r3 = input->ne[3] / weight->ne[3];
+    const int64_t total = n * m * input->ne[2] * input->ne[3];
+
+    for (int64_t index = params->ith; index < total; index += params->nth) {
+        int64_t rem = index;
+        const int64_t row = rem % n; rem /= n;
+        const int64_t token = rem % m; rem /= m;
+        const int64_t i2 = rem % input->ne[2];
+        const int64_t i3 = rem / input->ne[2];
+        const int64_t w2 = i2 / r2;
+        const int64_t w3 = i3 / r3;
+        const int8_t * w = (const int8_t *) ((const char *) weight->data +
+            row * weight->nb[1] + w2 * weight->nb[2] + w3 * weight->nb[3]);
+        const float * x = (const float *) ((const char *) input->data +
+            token * input->nb[1] + i2 * input->nb[2] + i3 * input->nb[3]);
+
+        float sx;
+        int32_t zero_point = 0;
+        float outlier_threshold = 0.0f;
+        if (input_scale != NULL) {
+            if (input_scale->type == GGML_TYPE_I64) {
+                memcpy(&sx, input_scale->data, sizeof(sx));
+                int8_t zero_point_i8;
+                memcpy(&zero_point_i8, (const char *) input_scale->data + sizeof(sx), sizeof(zero_point_i8));
+                zero_point = zero_point_i8;
+            } else if (input_scale->type == GGML_TYPE_I32) {
+                memcpy(&outlier_threshold, input_scale->data, sizeof(outlier_threshold));
+                float max_abs = 0.0f;
+                for (int64_t col = 0; col < k; ++col) {
+                    bool outlier = false;
+                    for (int64_t other_token = 0; other_token < m && !outlier; ++other_token) {
+                        const float * other = (const float *) ((const char *) input->data +
+                            other_token * input->nb[1] + i2 * input->nb[2] + i3 * input->nb[3]);
+                        outlier = fabsf(other[col]) > outlier_threshold;
+                    }
+                    const float value = fabsf(x[col]);
+                    if (outlier_threshold <= 0.0f || !outlier) {
+                        max_abs = MAX(max_abs, value);
+                    }
+                }
+                sx = max_abs / 127.0f;
+            } else {
+                GGML_ASSERT(input_scale->type == GGML_TYPE_F32);
+                sx = *(const float *) input_scale->data;
+            }
+        } else {
+            float max_abs = 0.0f;
+            for (int64_t col = 0; col < k; ++col) {
+                max_abs = MAX(max_abs, fabsf(x[col]));
+            }
+            sx = max_abs / 127.0f;
+        }
+        const float inverse = sx == 0.0f ? 0.0f : 1.0f / sx;
+        int32_t sum = 0;
+        int32_t weight_sum = 0;
+        float outlier_sum = 0.0f;
+        for (int64_t col = 0; col < k; ++col) {
+            bool outlier = false;
+            for (int64_t other_token = 0; other_token < m && outlier_threshold > 0.0f && !outlier; ++other_token) {
+                const float * other = (const float *) ((const char *) input->data +
+                    other_token * input->nb[1] + i2 * input->nb[2] + i3 * input->nb[3]);
+                outlier = fabsf(other[col]) > outlier_threshold;
+            }
+            const float rounded = outlier ? 0.0f : nearbyintf(x[col] * inverse) + zero_point;
+            const int32_t q = (int32_t) MAX(-128.0f, MIN(127.0f, rounded));
+            sum += (int32_t) w[col] * q;
+            weight_sum += w[col];
+            if (outlier) {
+                outlier_sum += (float) w[col] * x[col];
+            }
+        }
+        float * out = (float *) ((char *) dst->data +
+            row * dst->nb[0] + token * dst->nb[1] + i2 * dst->nb[2] + i3 * dst->nb[3]);
+        const float sw = ggml_cpu_quant_scale_value(weight_scale, row);
+        *out = (float) (sum - zero_point * weight_sum) * sx * sw + outlier_sum * sw;
+    }
+}
+
+static void ggml_compute_forward_mul_mat_w8a16(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    const struct ggml_tensor * weight = dst->src[0];
+    const struct ggml_tensor * input = dst->src[1];
+    const struct ggml_tensor * bundle = dst->src[2];
+    GGML_ASSERT((weight->type == GGML_TYPE_I8 || weight->type == GGML_TYPE_F8_E4M3) &&
+        input->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+        bundle->type == GGML_TYPE_I8);
+    const struct ggml_w8a16_scale_header * header =
+        (const struct ggml_w8a16_scale_header *) bundle->data;
+    GGML_ASSERT(header->magic == GGML_W8A16_SCALE_MAGIC && header->version == 1 &&
+        header->n_channels == weight->ne[1] && header->total_size == bundle->ne[0] &&
+        header->values_offset + header->n_channels * sizeof(ggml_bf16_t) <= header->total_size);
+    const ggml_bf16_t * scales = (const ggml_bf16_t *)
+        ((const uint8_t *) bundle->data + header->values_offset);
+
+    const int64_t k = weight->ne[0];
+    const int64_t n = weight->ne[1];
+    const int64_t m = input->ne[1];
+    const int64_t r2 = input->ne[2] / weight->ne[2];
+    const int64_t r3 = input->ne[3] / weight->ne[3];
+    const int64_t total = n * m * input->ne[2] * input->ne[3];
+    for (int64_t index = params->ith; index < total; index += params->nth) {
+        int64_t rem = index;
+        const int64_t row = rem % n; rem /= n;
+        const int64_t token = rem % m; rem /= m;
+        const int64_t i2 = rem % input->ne[2];
+        const int64_t i3 = rem / input->ne[2];
+        const int64_t w2 = i2 / r2;
+        const int64_t w3 = i3 / r3;
+        const uint8_t * w = (const uint8_t *) weight->data +
+            row * weight->nb[1] + w2 * weight->nb[2] + w3 * weight->nb[3];
+        const float * x = (const float *) ((const char *) input->data +
+            token * input->nb[1] + i2 * input->nb[2] + i3 * input->nb[3]);
+        const float scale = ggml_bf16_to_fp32(scales[row]);
+        float sum = 0.0f;
+        for (int64_t col = 0; col < k; ++col) {
+            const float code = weight->type == GGML_TYPE_I8 ?
+                (float) ((const int8_t *) w)[col] : ggml_e4m3_to_fp32(w[col]);
+            const float value = ggml_bf16_to_fp32(ggml_fp32_to_bf16(code * scale));
+            sum += value * x[col];
+        }
+        float * out = (float *) ((char *) dst->data +
+            row * dst->nb[0] + token * dst->nb[1] + i2 * dst->nb[2] + i3 * dst->nb[3]);
+        *out = sum;
+    }
+}
+
+static void ggml_compute_forward_mul_mat_f8_quantized_input(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    const struct ggml_tensor * weight = dst->src[0];
+    const struct ggml_tensor * input = dst->src[1];
+    const struct ggml_tensor * weight_scale = dst->src[2];
+    const struct ggml_tensor * input_scale = dst->src[3];
+    GGML_ASSERT(weight->type == GGML_TYPE_F8_E4M3 && input->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+
+    const int64_t k = weight->ne[0];
+    const int64_t n = weight->ne[1];
+    const int64_t m = input->ne[1];
+    const int64_t r2 = input->ne[2] / weight->ne[2];
+    const int64_t r3 = input->ne[3] / weight->ne[3];
+    const int64_t total = n * m * input->ne[2] * input->ne[3];
+    const struct ggml_type_traits * f8 = ggml_get_type_traits(GGML_TYPE_F8_E4M3);
+
+    for (int64_t index = params->ith; index < total; index += params->nth) {
+        int64_t rem = index;
+        const int64_t row = rem % n; rem /= n;
+        const int64_t token = rem % m; rem /= m;
+        const int64_t i2 = rem % input->ne[2];
+        const int64_t i3 = rem / input->ne[2];
+        const int64_t w2 = i2 / r2;
+        const int64_t w3 = i3 / r3;
+        const uint8_t * w = (const uint8_t *) ((const char *) weight->data +
+            row * weight->nb[1] + w2 * weight->nb[2] + w3 * weight->nb[3]);
+        const float * x = (const float *) ((const char *) input->data +
+            token * input->nb[1] + i2 * input->nb[2] + i3 * input->nb[3]);
+
+        float sx;
+        if (input_scale->type == GGML_TYPE_F32) {
+            sx = *(const float *) input_scale->data;
+        } else {
+            float max_abs = 0.0f;
+            for (int64_t col = 0; col < k; ++col) {
+                max_abs = MAX(max_abs, fabsf(x[col]));
+            }
+            int32_t marker;
+            memcpy(&marker, input_scale->data, sizeof(marker));
+            float upper_bound;
+            memcpy(&upper_bound, &marker, sizeof(upper_bound));
+            if (upper_bound > 0.0f) {
+                max_abs = MIN(max_abs, upper_bound);
+            }
+            sx = max_abs / 448.0f;
+        }
+        const float inverse = sx == 0.0f ? 0.0f : 1.0f / sx;
+        float sum = 0.0f;
+        for (int64_t col = 0; col < k; ++col) {
+            uint8_t q;
+            float xq;
+            float wf;
+            const float normalized = x[col] * inverse;
+            f8->from_float_ref(&normalized, &q, 1);
+            f8->to_float(&q, &xq, 1);
+            f8->to_float(w + col, &wf, 1);
+            sum += wf * xq * sx;
+        }
+        float * out = (float *) ((char *) dst->data +
+            row * dst->nb[0] + token * dst->nb[1] + i2 * dst->nb[2] + i3 * dst->nb[3]);
+        *out = weight_scale == NULL ? sum : sum * ggml_cpu_quant_scale_value(weight_scale, row);
+    }
+}
+
+static void ggml_compute_forward_mul_mat_f8_channel(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    const struct ggml_tensor * weight = dst->src[0];
+    const struct ggml_tensor * input  = dst->src[1];
+    const struct ggml_tensor * scale  = dst->src[2];
+    GGML_ASSERT(weight->type == GGML_TYPE_F8_E4M3 && input->type == GGML_TYPE_F32 &&
+        scale != NULL && (scale->type == GGML_TYPE_BF16 || scale->type == GGML_TYPE_F32) && dst->type == GGML_TYPE_F32 &&
+        scale->ne[0] == weight->ne[1] && scale->ne[1] == 1 &&
+        scale->ne[2] == 1 && scale->ne[3] == 1);
+
+    const int64_t k = weight->ne[0];
+    const int64_t n = weight->ne[1];
+    const int64_t m = input->ne[1];
+    const int64_t r2 = input->ne[2] / weight->ne[2];
+    const int64_t r3 = input->ne[3] / weight->ne[3];
+    const int64_t total = n * m * input->ne[2] * input->ne[3];
+    for (int64_t index = params->ith; index < total; index += params->nth) {
+        int64_t rem = index;
+        const int64_t row = rem % n; rem /= n;
+        const int64_t token = rem % m; rem /= m;
+        const int64_t i2 = rem % input->ne[2];
+        const int64_t i3 = rem / input->ne[2];
+        const int64_t w2 = i2 / r2;
+        const int64_t w3 = i3 / r3;
+        const uint8_t * w = (const uint8_t *) weight->data +
+            row * weight->nb[1] + w2 * weight->nb[2] + w3 * weight->nb[3];
+        const float * x = (const float *) ((const char *) input->data +
+            token * input->nb[1] + i2 * input->nb[2] + i3 * input->nb[3]);
+        float sum = 0.0f;
+        for (int64_t col = 0; col < k; ++col) {
+            sum += ggml_e4m3_to_fp32(w[col]) * x[col];
+        }
+        float * out = (float *) ((char *) dst->data +
+            row * dst->nb[0] + token * dst->nb[1] + i2 * dst->nb[2] + i3 * dst->nb[3]);
+        *out = sum * ggml_cpu_quant_scale_value(scale, row);
+    }
+}
+
+static void ggml_compute_forward_mul_mat_f8_block_scale(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    const struct ggml_tensor * weight = dst->src[0];
+    const struct ggml_tensor * input  = dst->src[1];
+    const struct ggml_tensor * scale  = dst->src[2];
+    GGML_ASSERT(weight->type == GGML_TYPE_F8_E4M3 && input->type == GGML_TYPE_F32 &&
+                scale != NULL && scale->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+                weight->ne[0] % 128 == 0 && weight->ne[1] % 128 == 0 &&
+                weight->ne[3] == 1 && input->ne[2] == weight->ne[2] && input->ne[3] == 1 &&
+                scale->ne[0] == weight->ne[1] * weight->ne[2] / 128 &&
+                scale->ne[1] == weight->ne[0] / 128 && scale->ne[2] == 1 && scale->ne[3] == 1);
+
+    const int64_t k       = weight->ne[0];
+    const int64_t n       = weight->ne[1];
+    const int64_t batches = weight->ne[2];
+    const int64_t m       = input->ne[1];
+    const int64_t total   = n * m * batches;
+    const int64_t n_blocks = n / 128;
+    const int64_t all_n_blocks = n_blocks * batches;
+    const float * scales = (const float *) scale->data;
+
+    for (int64_t index = params->ith; index < total; index += params->nth) {
+        int64_t rem = index;
+        const int64_t row = rem % n; rem /= n;
+        const int64_t token = rem % m; rem /= m;
+        const int64_t batch = rem;
+        const uint8_t * w = (const uint8_t *) weight->data +
+            row * weight->nb[1] + batch * weight->nb[2];
+        const float * x = (const float *) ((const char *) input->data +
+            token * input->nb[1] + batch * input->nb[2]);
+
+        float sum = 0.0f;
+        for (int64_t col = 0; col < k; ++col) {
+            const float block_scale = scales[
+                (col / 128) * all_n_blocks + batch * n_blocks + row / 128];
+            const float dequant = ggml_bf16_to_fp32(ggml_fp32_to_bf16(
+                ggml_e4m3_to_fp32(w[col]) * block_scale));
+            sum += dequant * x[col];
+        }
+        float * out = (float *) ((char *) dst->data +
+            row * dst->nb[0] + token * dst->nb[1] + batch * dst->nb[2]);
+        *out = sum;
+    }
+}
+
+static void ggml_compute_forward_mul_mat_mxfp8_quantized_input(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    const struct ggml_tensor * weight = dst->src[0];
+    const struct ggml_tensor * input = dst->src[1];
+    const struct ggml_tensor * weight_scale = dst->src[2];
+    const struct ggml_tensor * marker = dst->src[3];
+    GGML_ASSERT(weight->type == GGML_TYPE_F8_E4M3 && input->type == GGML_TYPE_F32 &&
+                weight_scale != NULL && weight_scale->type == GGML_TYPE_I8 &&
+                marker != NULL && marker->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_F32);
+
+    const int64_t k = weight->ne[0];
+    const int64_t n = weight->ne[1];
+    const int64_t m = input->ne[1];
+    const int64_t total = n * m;
+
+    for (int64_t index = params->ith; index < total; index += params->nth) {
+        const int64_t row = index % n;
+        const int64_t token = index / n;
+        const uint8_t * w = (const uint8_t *) weight->data + row * weight->nb[1];
+        const uint8_t * sw = (const uint8_t *) weight_scale->data + row * weight_scale->nb[1];
+        const float * x = (const float *) ((const char *) input->data + token * input->nb[1]);
+        float sum = 0.0f;
+        for (int64_t block = 0; block < k / 32; ++block) {
+            float amax = 0.0f;
+            for (int col = 0; col < 32; ++col) {
+                amax = MAX(amax, fabsf(x[block * 32 + col]));
+            }
+            int exponent = amax > 0.0f ? (int) ceilf(log2f(amax / 448.0f)) + 127 : 0;
+            exponent = MAX(0, MIN(254, exponent));
+            const float input_scale = ldexpf(1.0f, exponent - 127);
+            const float weight_scale_value = ldexpf(1.0f, (int) sw[block] - 127);
+            for (int col = 0; col < 32; ++col) {
+                const int64_t offset = block * 32 + col;
+                const uint8_t qx = ggml_fp32_to_e4m3(x[offset] / input_scale);
+                sum += ggml_e4m3_to_fp32(w[offset]) * weight_scale_value *
+                       ggml_e4m3_to_fp32(qx) * input_scale;
+            }
+        }
+        ((float *) ((char *) dst->data + token * dst->nb[1]))[row] = sum;
+    }
+}
+
+static void ggml_compute_forward_mul_mat_grouped_fp8_quantized_input(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    const struct ggml_tensor * weight = dst->src[0];
+    const struct ggml_tensor * input = dst->src[1];
+    const struct ggml_tensor * weight_scale = dst->src[2];
+    const struct ggml_tensor * marker = dst->src[3];
+    GGML_ASSERT(weight->type == GGML_TYPE_F8_E4M3 && input->type == GGML_TYPE_F32 &&
+                weight_scale != NULL && weight_scale->type == GGML_TYPE_BF16 &&
+                marker != NULL && marker->type == GGML_TYPE_I16 && dst->type == GGML_TYPE_F32);
+
+    const int64_t k = weight->ne[0];
+    const int64_t n = weight->ne[1];
+    const int64_t m = input->ne[1];
+    const int64_t total = n * m;
+
+    for (int64_t index = params->ith; index < total; index += params->nth) {
+        const int64_t row = index % n;
+        const int64_t token = index / n;
+        const uint8_t * w = (const uint8_t *) weight->data + row * weight->nb[1];
+        const ggml_bf16_t * sw = (const ggml_bf16_t *) ((const char *) weight_scale->data + row * weight_scale->nb[1]);
+        const float * x = (const float *) ((const char *) input->data + token * input->nb[1]);
+        float sum = 0.0f;
+        for (int64_t block = 0; block < k / 32; ++block) {
+            float amax = 0.0f;
+            for (int col = 0; col < 32; ++col) {
+                amax = MAX(amax, fabsf(x[block * 32 + col]));
+            }
+            const ggml_bf16_t input_scale_bf16 = ggml_fp32_to_bf16(amax / 448.0f);
+            const float input_scale = ggml_bf16_to_fp32(input_scale_bf16);
+            const float weight_scale_value = ggml_bf16_to_fp32(sw[block]);
+            for (int col = 0; col < 32; ++col) {
+                const int64_t offset = block * 32 + col;
+                const uint8_t qx = ggml_fp32_to_e4m3(input_scale == 0.0f ? 0.0f : x[offset] / input_scale);
+                sum += ggml_e4m3_to_fp32(w[offset]) * weight_scale_value *
+                       ggml_e4m3_to_fp32(qx) * input_scale;
+            }
+        }
+        ((float *) ((char *) dst->data + token * dst->nb[1]))[row] = sum;
+    }
+}
+
+static uint32_t ggml_bnb_source_scale_block(
+        const struct ggml_bnb_scale_header * header, uint32_t block) {
+    if (header->layout == GGML_BNB_SCALE_LAYOUT_NONE) {
+        return block;
+    }
+
+    GGML_ASSERT((header->layout == GGML_BNB_SCALE_LAYOUT_ROWS ||
+                 header->layout == GGML_BNB_SCALE_LAYOUT_COLUMNS) &&
+                header->layout_rows > 0 && header->layout_cols > 0 &&
+                header->layout_cols % header->block_size == 0 &&
+                header->layout_n_key_heads > 0 && header->layout_values_per_key > 0 &&
+                header->layout_head_span > 0);
+    const uint32_t row_blocks = header->layout_cols / header->block_size;
+    const uint32_t row = block / row_blocks;
+    const uint32_t col_block = block % row_blocks;
+    if (header->layout == GGML_BNB_SCALE_LAYOUT_ROWS) {
+        if (row < header->layout_prefix) {
+            return block;
+        }
+        const uint32_t relative = row - header->layout_prefix;
+        const uint32_t dst_head = relative / header->layout_head_span;
+        const uint32_t lane = relative % header->layout_head_span;
+        const uint32_t v = dst_head / header->layout_n_key_heads;
+        const uint32_t k = dst_head % header->layout_n_key_heads;
+        const uint32_t src_head = k * header->layout_values_per_key + v;
+        return (header->layout_prefix + src_head * header->layout_head_span + lane) * row_blocks + col_block;
+    }
+
+    GGML_ASSERT(header->layout == GGML_BNB_SCALE_LAYOUT_COLUMNS);
+    const uint32_t dst_head = col_block / header->layout_head_span;
+    const uint32_t lane = col_block % header->layout_head_span;
+    const uint32_t v = dst_head / header->layout_n_key_heads;
+    const uint32_t k = dst_head % header->layout_n_key_heads;
+    const uint32_t src_head = k * header->layout_values_per_key + v;
+    return row * row_blocks + src_head * header->layout_head_span + lane;
+}
+
+static float ggml_bnb_block_scale(const struct ggml_bnb_scale_header * header, uint32_t block) {
+    block = ggml_bnb_source_scale_block(header, block);
+    GGML_ASSERT(block < header->n_blocks);
+    const uint8_t * bundle = (const uint8_t *) header;
+    if (header->nested_block_size == 0) {
+        float value;
+        memcpy(&value, bundle + header->absmax_offset + (size_t) block * sizeof(value), sizeof(value));
+        return value;
+    }
+    const uint8_t code = bundle[header->absmax_offset + block];
+    float nested_absmax;
+    float nested_value;
+    memcpy(&nested_absmax,
+           bundle + header->nested_absmax_offset + (size_t) (block / header->nested_block_size) * sizeof(float),
+           sizeof(nested_absmax));
+    memcpy(&nested_value,
+           bundle + header->nested_quant_map_offset + (size_t) code * sizeof(float), sizeof(nested_value));
+    return nested_value * nested_absmax + header->nested_offset;
+}
+
+static void ggml_compute_forward_mul_mat_bnb4(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    const struct ggml_tensor * weight = dst->src[0];
+    const struct ggml_tensor * input = dst->src[1];
+    const struct ggml_tensor * scale = dst->src[2];
+    GGML_ASSERT((weight->type == GGML_TYPE_BNB_NF4 || weight->type == GGML_TYPE_BNB_FP4) &&
+                input->type == GGML_TYPE_F32 && scale != NULL && scale->type == GGML_TYPE_I8 &&
+                dst->type == GGML_TYPE_F32 && weight->ne[2] == 1 && weight->ne[3] == 1 &&
+                input->ne[2] == 1 && input->ne[3] == 1);
+
+    const struct ggml_bnb_scale_header * header = (const struct ggml_bnb_scale_header *) scale->data;
+    GGML_ASSERT(header->magic == GGML_BNB_SCALE_MAGIC && header->version == 1 &&
+                header->block_size == 64 && header->n_blocks == ggml_nelements(weight) / 64);
+    const uint8_t * bundle = (const uint8_t *) scale->data;
+    const float * codebook = (const float *) (bundle + header->quant_map_offset);
+    const int64_t k = weight->ne[0];
+    const int64_t n = weight->ne[1];
+    const int64_t m = input->ne[1];
+    const int64_t total = n * m;
+
+    for (int64_t index = params->ith; index < total; index += params->nth) {
+        const int64_t row = index % n;
+        const int64_t token = index / n;
+        const uint8_t * packed = (const uint8_t *) weight->data + row * weight->nb[1];
+        const float * x = (const float *) ((const char *) input->data + token * input->nb[1]);
+        float sum = 0.0f;
+        for (int64_t col = 0; col < k; ++col) {
+            const uint8_t byte = packed[col / 2];
+            const uint8_t code = (col & 1) ? (byte & 0x0f) : (byte >> 4);
+            const uint32_t block = ((uint64_t) row * k + col) / header->block_size;
+            // BitsAndBytes materializes 4-bit weights in the tensor's declared
+            // compute dtype before GEMM.  Preserve that BF16 rounding contract
+            // even though this reference path accumulates in FP32.
+            const ggml_bf16_t value = ggml_fp32_to_bf16(
+                codebook[code] * ggml_bnb_block_scale(header, block));
+            sum += ggml_bf16_to_fp32(value) * x[col];
+        }
+        ((float *) ((char *) dst->data + token * dst->nb[1]))[row] = sum;
+    }
+}
+
+static float ggml_gptq_ao_scale(
+        const struct ggml_gptq_ao_header * header, uint32_t group, uint32_t row) {
+    const uint8_t * bundle = (const uint8_t *) header;
+    uint16_t bits;
+    memcpy(&bits, bundle + header->scales_offset +
+        ((size_t) group * header->rows + row) * sizeof(bits), sizeof(bits));
+    if (header->scale_type == 1) {
+        ggml_bf16_t value;
+        memcpy(&value, &bits, sizeof(value));
+        return ggml_bf16_to_fp32(value);
+    }
+    return ggml_fp16_to_fp32(bits);
+}
+
+static void ggml_compute_forward_mul_mat_gptq_ao(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    const struct ggml_tensor * weight = dst->src[0];
+    const struct ggml_tensor * input = dst->src[1];
+    const struct ggml_tensor * auxiliary = dst->src[2];
+    GGML_ASSERT(weight->type == GGML_TYPE_GPTQ_AO && input->type == GGML_TYPE_F32 &&
+                auxiliary != NULL && auxiliary->type == GGML_TYPE_I8 && dst->type == GGML_TYPE_F32 &&
+                weight->ne[2] == 1 && weight->ne[3] == 1 && input->ne[2] == 1 && input->ne[3] == 1);
+    const struct ggml_gptq_ao_header * header =
+        (const struct ggml_gptq_ao_header *) auxiliary->data;
+    const int64_t k = weight->ne[0];
+    const int64_t n = weight->ne[1];
+    const int64_t m = input->ne[1];
+    GGML_ASSERT(header->magic == GGML_GPTQ_AO_MAGIC && header->version == 1 &&
+                header->cols == (uint32_t) k && header->rows == (uint32_t) n &&
+                (header->scale_type == 0 || header->scale_type == 1));
+    const uint8_t * bundle = (const uint8_t *) header;
+    const uint8_t * zeros = bundle + header->zeros_offset;
+    const uint16_t * g_idx = (const uint16_t *) (bundle + header->g_idx_offset);
+    const uint8_t * packed = (const uint8_t *) weight->data;
+    const int64_t total = n * m;
+    for (int64_t index = params->ith; index < total; index += params->nth) {
+        const uint32_t row = index % n;
+        const int64_t token = index / n;
+        const float * x = (const float *) ((const char *) input->data + token * input->nb[1]);
+        float sum = 0.0f;
+        for (uint32_t col = 0; col < (uint32_t) k; ++col) {
+            uint32_t word;
+            memcpy(&word, packed + (((size_t) (col / 8) * n + row) * sizeof(word)), sizeof(word));
+            const uint8_t code = (word >> (4 * (col % 8))) & 0x0f;
+            const uint16_t group = g_idx[col];
+            const uint8_t zero = zeros[(size_t) group * n + row];
+            sum += ((float) code - zero) * ggml_gptq_ao_scale(header, group, row) * x[col];
+        }
+        ((float *) ((char *) dst->data + token * dst->nb[1]))[row] = sum;
+    }
+}
+
+static void ggml_compute_forward_mul_mat_q4_a32_quantized_input(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    const struct ggml_tensor * weight = dst->src[0];
+    const struct ggml_tensor * input = dst->src[1];
+    const struct ggml_tensor * input_scale = dst->src[3];
+    GGML_ASSERT(weight->type == GGML_TYPE_Q4_A32 && input->type == GGML_TYPE_F32 &&
+                dst->type == GGML_TYPE_F32 && input_scale != NULL);
+
+    const int64_t k = weight->ne[0];
+    const int64_t n = weight->ne[1];
+    const int64_t m = input->ne[1];
+    const int64_t r2 = input->ne[2] / weight->ne[2];
+    const int64_t r3 = input->ne[3] / weight->ne[3];
+    const int64_t total = n * m * input->ne[2] * input->ne[3];
+
+    for (int64_t index = params->ith; index < total; index += params->nth) {
+        int64_t rem = index;
+        const int64_t row = rem % n; rem /= n;
+        const int64_t token = rem % m; rem /= m;
+        const int64_t i2 = rem % input->ne[2];
+        const int64_t i3 = rem / input->ne[2];
+        const int64_t w2 = i2 / r2;
+        const int64_t w3 = i3 / r3;
+        const block_q4_a32 * blocks = (const block_q4_a32 *) ((const char *) weight->data +
+            row * weight->nb[1] + w2 * weight->nb[2] + w3 * weight->nb[3]);
+        const float * x = (const float *) ((const char *) input->data +
+            token * input->nb[1] + i2 * input->nb[2] + i3 * input->nb[3]);
+
+        const bool fp8_input = input_scale->type == GGML_TYPE_I16;
+        float sx;
+        if (input_scale->type == GGML_TYPE_F32) {
+            sx = *(const float *) input_scale->data;
+        } else {
+            float max_abs = 0.0f;
+            for (int64_t col = 0; col < k; ++col) {
+                max_abs = MAX(max_abs, fabsf(x[col]));
+            }
+            sx = max_abs / (fp8_input ? 448.0f : 127.0f);
+        }
+        const float inverse = sx == 0.0f ? 0.0f : 1.0f / sx;
+        float sum = 0.0f;
+        for (int64_t col = 0; col < k; ++col) {
+            const float rounded = fp8_input ?
+                ggml_e4m3_to_fp32(ggml_fp32_to_e4m3(x[col] * inverse)) :
+                MAX(-128.0f, MIN(127.0f, nearbyintf(x[col] * inverse)));
+            const block_q4_a32 * block = &blocks[col / QK4_A32];
+            const int offset = col % QK4_A32;
+            const int group = offset / QG4_A32;
+            const int code = (block->qs[offset / 2] >> (4 * (offset % 2))) & 0x0f;
+            const int zero = (block->z[group / 2] >> (4 * (group % 2))) & 0x0f;
+            const ggml_bf16_t db = { block->d[group] };
+            sum += (float) (code - zero) * rounded * ggml_bf16_to_fp32(db);
+        }
+        float * out = (float *) ((char *) dst->data +
+            row * dst->nb[0] + token * dst->nb[1] + i2 * dst->nb[2] + i3 * dst->nb[3]);
+        *out = sum * sx;
+    }
+}
+
+static int8_t ggml_nearest_mxfp4_doubled(float value) {
+    static const int8_t magnitudes[8] = { 0, 1, 2, 3, 4, 6, 8, 12 };
+    const float magnitude = fabsf(value);
+    int8_t best = magnitudes[0];
+    float best_error = magnitude;
+    for (int i = 1; i < 8; ++i) {
+        const float error = fabsf(magnitude - 0.5f * magnitudes[i]);
+        if (error < best_error) {
+            best = magnitudes[i];
+            best_error = error;
+        }
+    }
+    return value < 0.0f ? -best : best;
+}
+
+static int8_t ggml_mxfp4_doubled(uint8_t code) {
+    static const int8_t magnitudes[8] = { 0, 1, 2, 3, 4, 6, 8, 12 };
+    return code < 8 ? magnitudes[code] : -magnitudes[code & 7];
+}
+
+static void ggml_compute_forward_mul_mat_mxfp4_quantized_input(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+    const struct ggml_tensor * weight = dst->src[0];
+    const struct ggml_tensor * input = dst->src[1];
+    const struct ggml_tensor * marker = dst->src[3];
+    GGML_ASSERT(weight->type == GGML_TYPE_MXFP4 && input->type == GGML_TYPE_F32 &&
+                dst->type == GGML_TYPE_F32 && marker != NULL && marker->type == GGML_TYPE_I32);
+
+    const int64_t k = weight->ne[0];
+    const int64_t n = weight->ne[1];
+    const int64_t m = input->ne[1];
+    const int64_t r2 = input->ne[2] / weight->ne[2];
+    const int64_t r3 = input->ne[3] / weight->ne[3];
+    const int64_t total = n * m * input->ne[2] * input->ne[3];
+
+    for (int64_t index = params->ith; index < total; index += params->nth) {
+        int64_t rem = index;
+        const int64_t row = rem % n; rem /= n;
+        const int64_t token = rem % m; rem /= m;
+        const int64_t i2 = rem % input->ne[2];
+        const int64_t i3 = rem / input->ne[2];
+        const int64_t w2 = i2 / r2;
+        const int64_t w3 = i3 / r3;
+        const block_mxfp4 * blocks = (const block_mxfp4 *) ((const char *) weight->data +
+            row * weight->nb[1] + w2 * weight->nb[2] + w3 * weight->nb[3]);
+        const float * x = (const float *) ((const char *) input->data +
+            token * input->nb[1] + i2 * input->nb[2] + i3 * input->nb[3]);
+
+        float sum = 0.0f;
+        for (int64_t block_index = 0; block_index < k / QK_MXFP4; ++block_index) {
+            float max_abs = 0.0f;
+            for (int col = 0; col < QK_MXFP4; ++col) {
+                max_abs = MAX(max_abs, fabsf(x[block_index * QK_MXFP4 + col]));
+            }
+            int exponent = max_abs > 0.0f ? (int) nearbyintf(log2f(max_abs)) - 2 + 127 : 0;
+            exponent = MAX(0, MIN(254, exponent));
+            const float input_scale = ldexpf(1.0f, exponent - 127);
+            const float weight_scale = GGML_E8M0_TO_FP32_HALF(blocks[block_index].e);
+            int dot = 0;
+            for (int col = 0; col < QK_MXFP4; ++col) {
+                const int packed_index = col % (QK_MXFP4 / 2);
+                const uint8_t code = col < QK_MXFP4 / 2 ?
+                    blocks[block_index].qs[packed_index] & 0x0f :
+                    blocks[block_index].qs[packed_index] >> 4;
+                const int8_t qx = ggml_nearest_mxfp4_doubled(
+                    x[block_index * QK_MXFP4 + col] / input_scale);
+                dot += ggml_mxfp4_doubled(code) * qx;
+            }
+            sum += 0.5f * weight_scale * input_scale * dot;
+        }
+        float * out = (float *) ((char *) dst->data +
+            row * dst->nb[0] + token * dst->nb[1] + i2 * dst->nb[2] + i3 * dst->nb[3]);
+        *out = sum;
+    }
+}
+
 void ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
+
+    if (src0->type == GGML_TYPE_F8_E4M3 && dst->src[2] != NULL &&
+            dst->src[2]->type == GGML_TYPE_I8 && dst->src[3] != NULL) {
+        ggml_compute_forward_mul_mat_mxfp8_quantized_input(params, dst);
+        return;
+    }
+    if ((src0->type == GGML_TYPE_BNB_NF4 || src0->type == GGML_TYPE_BNB_FP4) &&
+            dst->src[2] != NULL) {
+        ggml_compute_forward_mul_mat_bnb4(params, dst);
+        return;
+    }
+    if (src0->type == GGML_TYPE_GPTQ_AO && dst->src[2] != NULL) {
+        ggml_compute_forward_mul_mat_gptq_ao(params, dst);
+        return;
+    }
+    if (src0->type == GGML_TYPE_F8_E4M3 && dst->src[2] != NULL &&
+            dst->src[2]->type == GGML_TYPE_BF16 && dst->src[3] != NULL &&
+            dst->src[3]->type == GGML_TYPE_I16) {
+        ggml_compute_forward_mul_mat_grouped_fp8_quantized_input(params, dst);
+        return;
+    }
+    if (src0->type == GGML_TYPE_F8_E4M3 && dst->src[2] != NULL &&
+            dst->src[2]->type == GGML_TYPE_F32 && dst->src[3] == NULL &&
+            src0->ne[0] % 128 == 0 && src0->ne[1] % 128 == 0 &&
+            src0->ne[3] == 1 && src1->ne[2] == src0->ne[2] && src1->ne[3] == 1 &&
+            dst->src[2]->ne[0] == src0->ne[1] * src0->ne[2] / 128 &&
+            dst->src[2]->ne[1] == src0->ne[0] / 128 &&
+            dst->src[2]->ne[2] == 1 && dst->src[2]->ne[3] == 1) {
+        ggml_compute_forward_mul_mat_f8_block_scale(params, dst);
+        return;
+    }
+    if (src0->type == GGML_TYPE_F8_E4M3 && dst->src[3] != NULL) {
+        ggml_compute_forward_mul_mat_f8_quantized_input(params, dst);
+        return;
+    }
+    if (src0->type == GGML_TYPE_F8_E4M3 && dst->src[2] != NULL &&
+            (dst->src[2]->type == GGML_TYPE_BF16 || dst->src[2]->type == GGML_TYPE_F32)) {
+        ggml_compute_forward_mul_mat_f8_channel(params, dst);
+        return;
+    }
+    if (src0->type == GGML_TYPE_Q4_A32 && dst->src[3] != NULL) {
+        ggml_compute_forward_mul_mat_q4_a32_quantized_input(params, dst);
+        return;
+    }
+    if (src0->type == GGML_TYPE_MXFP4 && dst->src[3] != NULL) {
+        ggml_compute_forward_mul_mat_mxfp4_quantized_input(params, dst);
+        return;
+    }
+    if ((src0->type == GGML_TYPE_I8 || src0->type == GGML_TYPE_F8_E4M3) &&
+            dst->src[2] != NULL && dst->src[2]->type == GGML_TYPE_I8 &&
+            dst->src[2]->ne[0] >= (int64_t) sizeof(struct ggml_w8a16_scale_header)) {
+        ggml_compute_forward_mul_mat_w8a16(params, dst);
+        return;
+    }
+    if (src0->type == GGML_TYPE_I8 && dst->src[2] != NULL) {
+        ggml_compute_forward_mul_mat_i8_channel(params, dst);
+        return;
+    }
 
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && !params->use_ref) {
@@ -1593,6 +2345,9 @@ static void ggml_compute_forward_mul_mat_id_impl(
     const int ith = params->ith;
     const int nth = params->nth;
 
+    const int32_t mmid_lo      = ggml_mmid_window_lo(dst);
+    const int32_t mmid_n_local = ggml_mmid_window_n_local(dst);
+
     const enum ggml_type type = src0->type;
 
     const bool src1_cont = ggml_is_contiguous(src1);
@@ -1700,7 +2455,7 @@ static void ggml_compute_forward_mul_mat_id_impl(
         if (allow_moe_cache &&
             ggml_moe_cache.begin && ggml_moe_cache.plan &&
             ggml_moe_cache.dispatch && ggml_moe_cache.collect && ggml_moe_cache.end &&
-            src0->op == GGML_OP_NONE && src0_buffer &&
+            src0->op == GGML_OP_NONE && src0_buffer && mmid_n_local == 0 &&
             ggml_backend_buffer_is_host(src0_buffer) &&
             ggml_backend_buffer_get_usage(src0_buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
             src1->type == GGML_TYPE_F32) {
@@ -1714,7 +2469,7 @@ static void ggml_compute_forward_mul_mat_id_impl(
                 int32_t expert_ids[MOE_CACHE_MAX_TOPK];
                 for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
                     for (int id = 0; id < n_ids; ++id) {
-                        expert_ids[iid1*n_ids + id] = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+                        expert_ids[iid1*n_ids + id] = ggml_mmid_expert_index(*(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]), mmid_lo, mmid_n_local);
                     }
                 }
                 ggml_moe_cache.plan(moe_cache_node, expert_ids, n_ids * ids->ne[1], moe_cache_slot_idx);
@@ -1734,7 +2489,12 @@ static void ggml_compute_forward_mul_mat_id_impl(
                         continue;
                     }
                 }
-                const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+                const int32_t i02 = ggml_mmid_expert_index(*(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]), mmid_lo, mmid_n_local);
+                if (i02 < 0) {
+                    // expert-parallel window: the expert lives on another device, the row is zero here
+                    memset((char *) dst->data + iid1*nb2 + id*nb1, 0, ne0*sizeof(float));
+                    continue;
+                }
 
                 assert(i02 >= 0 && i02 < n_as);
 
@@ -4497,6 +5257,7 @@ void ggml_cpu_init(void) {
             // initialize UE4M3 table (256 entries)
             for (int i = 0; i < (1 << 8); ++i) {
                 ggml_table_f32_ue4m3[i] = ggml_ue4m3_to_fp32(i);
+                ggml_table_f32_e4m3[i]  = ggml_e4m3_to_fp32(i);
             }
 
             const uint64_t t_end = ggml_time_us(); UNUSED(t_end);

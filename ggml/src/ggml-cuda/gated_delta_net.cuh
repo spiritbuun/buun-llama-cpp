@@ -5,6 +5,19 @@
 struct ggml_cuda_gated_delta_net_fused_cache {
     float * data;        // rollback slot 0
     int64_t slot_stride; // between rollback slots (0 when K==1)
+
+    // Optional FLA-only output epilogue. When populated, the imported BF16
+    // attention result is normalized directly into rms_output instead of
+    // first being expanded into the GDN node's temporary F32 output. When
+    // rms_gate is set, its SiLU gate and final multiply are folded in too.
+    const float * rms_weight = nullptr;
+    const float * rms_gate   = nullptr;
+    bool          rms_gate_bf16 = false;
+    float *       rms_output = nullptr;
+    bool          rms_output_bf16 = false;
+    bool          rms_output_int8 = false;
+    float *       rms_output_scale = nullptr;
+    float         rms_eps    = 0.0f;
 };
 
 void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

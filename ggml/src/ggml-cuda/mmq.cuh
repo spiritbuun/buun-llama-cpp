@@ -62,6 +62,8 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
         case GGML_TYPE_Q2_0_G128:
+        case GGML_TYPE_Q4_A32:
+        case GGML_TYPE_Q8_0_G128:
             return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
@@ -386,6 +388,8 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
         case GGML_TYPE_Q1_0:    return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_Q2_0:    return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_Q2_0_G128: return MMQ_DP4A_TXS_Q8_0;
+        case GGML_TYPE_Q4_A32:    return MMQ_DP4A_TXS_Q8_0;
+        case GGML_TYPE_Q8_0_G128: return MMQ_DP4A_TXS_Q8_0;
         case GGML_TYPE_Q4_0:    return MMQ_DP4A_TXS_Q4_0;
         case GGML_TYPE_Q4_1:    return MMQ_DP4A_TXS_Q4_1;
         case GGML_TYPE_Q5_0:    return MMQ_DP4A_TXS_Q8_0;
@@ -553,6 +557,13 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                 return ggml_cuda_mmq_util_funcs(
                     VDR_Q2_0_Q8_1_MMQ,
                     ggml_cuda_mmq_load_tiles_q2_0_g128<type, J, fallback>,
+                    ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback>,
+                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback>);
+            case GGML_TYPE_Q4_A32:
+            case GGML_TYPE_Q8_0_G128:
+                return ggml_cuda_mmq_util_funcs(
+                    VDR_Q8_0_Q8_1_MMQ,
+                    ggml_cuda_mmq_load_tiles_packed_int<type, J, fallback>,
                     ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a<type, J, fallback>,
                     ggml_cuda_mmq_write_back_dp4a<type, J, fallback>);
             case GGML_TYPE_Q4_0:
@@ -723,6 +734,13 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
             return ggml_cuda_mmq_util_funcs(
                 -1,
                 ggml_cuda_mmq_load_tiles_q2_0_g128<type, J, fallback>,
+                ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
+                ggml_cuda_mmq_write_back_mma<type, J, fallback>);
+        case GGML_TYPE_Q4_A32:
+        case GGML_TYPE_Q8_0_G128:
+            return ggml_cuda_mmq_util_funcs(
+                -1,
+                ggml_cuda_mmq_load_tiles_packed_int<type, J, fallback>,
                 ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
                 ggml_cuda_mmq_write_back_mma<type, J, fallback>);
         case GGML_TYPE_Q4_0:
@@ -1195,14 +1213,30 @@ static __global__ void mul_mat_q(
     while (kbc < kbc_stop && kb0_stop == int(blocks_per_ne00.z)) {
         int tmp = fastdiv(kbc, blocks_per_ne00);
         uint2 tmp2 = fast_div_modulo(tmp, ntx);
-        const int jt = tmp2.y;
+        int jt = tmp2.y;
         tmp = tmp2.x;
         tmp2 = fast_div_modulo(tmp, nchannels_y);
         const int zt = tmp2.y;
         tmp = tmp2.x;
         tmp2 = fast_div_modulo(tmp, nsamples_y);
         const int wt = tmp2.y;
-        const int it = tmp2.x;
+        int it = tmp2.x;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
+        if constexpr (type == GGML_TYPE_NVFP4 && J == 128 && !fallback) {
+            // Keep whole-K tiles in small row groups for activation/weight reuse.
+            // Partial-K, expert and batched launches retain their original map.
+            if (!ids_dst && nchannels_y.z == 1 && nsamples_y.z == 1 &&
+                    ncols_dst >= 1024 && gridDim.x == ntx.z*nty) {
+                constexpr int group_rows = 8;
+                const int group = blockIdx.x / (group_rows*ntx.z);
+                const int first = group*group_rows;
+                const int width = min(group_rows, int(nty)-first);
+                const int within = blockIdx.x-group*group_rows*ntx.z;
+                it = first+within%width;
+                jt = within/width;
+            }
+        }
+#endif
 
         // Defaults for regular matrix multiplication:
         int col_low    = 0;
@@ -1505,6 +1539,8 @@ struct mmq_args {
     int64_t ncols_max;
 };
 
+bool ggml_cuda_mmq_nvfp4_tma(const mmq_args & args, cudaStream_t stream);
+
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
     const size_t nbs_ids = config.J*sizeof(int);
     const size_t nbs_x = ggml_cuda_mmq_get_nbytes_shared_x(config, cc);
@@ -1619,6 +1655,14 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
 
     const bool fixup_needed = ntiles_dst % block_nums_stream_k.x != 0;
+
+    if constexpr (type == GGML_TYPE_NVFP4 && J == 128 && !fallback) {
+        // Preserve the original dispatch's accumulation grouping. A TMA tile
+        // owns a complete K row; never replace a split-K/fixup contraction.
+        if (block_nums_stream_k.x == unsigned(ntiles_dst) && ggml_cuda_mmq_nvfp4_tma(args, stream)) {
+            return;
+        }
+    }
 
     ggml_cuda_pool & pool = ctx.pool(id);
     ggml_cuda_pool_alloc<float> tmp_fixup(pool);
@@ -1771,6 +1815,8 @@ extern DECL_MMQ_CASE(GGML_TYPE_Q4_1);
 extern DECL_MMQ_CASE(GGML_TYPE_Q5_0);
 extern DECL_MMQ_CASE(GGML_TYPE_Q5_1);
 extern DECL_MMQ_CASE(GGML_TYPE_Q8_0);
+extern DECL_MMQ_CASE(GGML_TYPE_Q4_A32);
+extern DECL_MMQ_CASE(GGML_TYPE_Q8_0_G128);
 // -----------------------------------------
 extern DECL_MMQ_CASE(GGML_TYPE_Q2_K);
 extern DECL_MMQ_CASE(GGML_TYPE_Q3_K);

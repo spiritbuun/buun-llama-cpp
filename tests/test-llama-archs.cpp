@@ -1014,6 +1014,9 @@ static void test_qwen4_qsa_layout_cpu(llama_model * model, size_t seed) {
 }
 
 static void test_qwen4_indexed_cache_admission(const size_t seed) {
+    // Keep model-level admission aligned with the implemented Meta split path.
+    // Otherwise the generic backend test below silently skips its tensor arm.
+    GGML_ASSERT(llm_arch_supports_sm_tensor(LLM_ARCH_QWEN4EXP));
     struct qsa_trace {
         size_t raw_key_nodes = 0;
         size_t score_nodes = 0;
@@ -2624,6 +2627,7 @@ static void test_dflash_loader_exact_identity() {
                 /* metadata        */ nullptr,
                 /* set_tensor_data */ nullptr,
                 /* user_data       */ nullptr,
+                /* tensor_source   */ nullptr,
                 /* fname           */ "",
                 splits,
                 file.get(),
@@ -2674,7 +2678,7 @@ static void test_dflash_loader_exact_identity() {
     GGML_ASSERT(mixed_file != nullptr);
     std::vector<std::string> splits;
     llama_model_loader mixed_loader(
-            nullptr, nullptr, nullptr, "", splits, mixed_file.get(), LLAMA_LOAD_MODE_NONE,
+            nullptr, nullptr, nullptr, nullptr, "", splits, mixed_file.get(), LLAMA_LOAD_MODE_NONE,
             false, true, false, nullptr, nullptr);
     GGML_ASSERT(llm_dflash_selector_family_from_loader(true, 1, mixed_loader) ==
             llm_dflash_selector_family::mixed);
@@ -2700,7 +2704,7 @@ static void test_dflash_loader_exact_identity() {
     GGML_ASSERT(partial_mixed_file != nullptr);
     splits.clear();
     llama_model_loader partial_mixed_loader(
-            nullptr, nullptr, nullptr, "", splits, partial_mixed_file.get(), LLAMA_LOAD_MODE_NONE,
+            nullptr, nullptr, nullptr, nullptr, "", splits, partial_mixed_file.get(), LLAMA_LOAD_MODE_NONE,
             false, true, false, nullptr, nullptr);
     GGML_ASSERT(llm_dflash_selector_family_from_loader(true, 1, partial_mixed_loader) ==
             llm_dflash_selector_family::mixed);
@@ -2723,7 +2727,7 @@ static void test_dflash_loader_exact_identity() {
     GGML_ASSERT(unidentified_file != nullptr);
     splits.clear();
     llama_model_loader unidentified_loader(
-            nullptr, nullptr, nullptr, "", splits, unidentified_file.get(), LLAMA_LOAD_MODE_NONE,
+            nullptr, nullptr, nullptr, nullptr, "", splits, unidentified_file.get(), LLAMA_LOAD_MODE_NONE,
             false, true, false, nullptr, nullptr);
     {
         llama_model_params params = llama_model_default_params();
@@ -3094,7 +3098,9 @@ static file_ptr make_qwen4_mtp_combined(
                     extra_ctx.get(), GGML_TYPE_F32, source->hparams.n_embd, n_qkv);
             ggml_set_name(qkv, "blk.1.attn_qkv.weight");
             saver.add_tensor(qkv);
-            for (const char * suffix : { "scale", "input_scale" }) {
+            // an F32 projection takes an output scale but no static activation scale
+            // (input_scale is only created for FP8/I8/Q4_A32/MXFP4/EXL3 weights)
+            for (const char * suffix : { "scale" }) {
                 ggml_tensor * scale = ggml_new_tensor_1d(extra_ctx.get(), GGML_TYPE_F32, 1);
                 ggml_set_name(scale, format("blk.1.attn_qkv.%s", suffix).c_str());
                 saver.add_tensor(scale);
@@ -4017,6 +4023,13 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                         llama_model_saver ms = llama_model_saver(model_and_ctx_dev.first.get());
                         ms.add_kv_from_model();
                         ms.add_tensors_from_model();
+                        for (const ggml_tensor * tensor : {
+                                model_and_ctx_dev.first->per_layer_tok_embd_scale,
+                                model_and_ctx_dev.first->per_layer_tok_embd_bias }) {
+                            if (tensor) {
+                                GGML_ASSERT(gguf_find_tensor(ms.gguf_ctx, tensor->name) >= 0);
+                            }
+                        }
                         ms.save(file.get());
                         rewind(file.get());
 

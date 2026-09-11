@@ -713,6 +713,249 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_q4_1,
         .from_float_ref           = (ggml_from_float_t) quantize_row_q4_1_ref,
     },
+    [GGML_TYPE_Q4_A32] = {
+        .type_name                = "q4_a32",
+        .blck_size                = QK4_A32,
+        .type_size                = sizeof(block_q4_a32),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q4_a32,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_q4_a32_ref,
+    },
+    [GGML_TYPE_EXL3_1] = {
+        .type_name                = "exl3_1",
+        .blck_size                = QK_EXL3,
+        .type_size                = GGML_EXL3_TILE_BYTES(1),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3,
+    },
+    [GGML_TYPE_EXL3_2] = {
+        .type_name                = "exl3_2",
+        .blck_size                = QK_EXL3,
+        .type_size                = GGML_EXL3_TILE_BYTES(2),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3,
+    },
+    [GGML_TYPE_EXL3_3] = {
+        .type_name                = "exl3_3",
+        .blck_size                = QK_EXL3,
+        .type_size                = GGML_EXL3_TILE_BYTES(3),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3,
+    },
+    [GGML_TYPE_EXL3_4] = {
+        .type_name                = "exl3_4",
+        .blck_size                = QK_EXL3,
+        .type_size                = GGML_EXL3_TILE_BYTES(4),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3,
+    },
+    [GGML_TYPE_EXL3_5] = {
+        .type_name                = "exl3_5",
+        .blck_size                = QK_EXL3,
+        .type_size                = GGML_EXL3_TILE_BYTES(5),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3,
+    },
+    [GGML_TYPE_EXL3_6] = {
+        .type_name                = "exl3_6",
+        .blck_size                = QK_EXL3,
+        .type_size                = GGML_EXL3_TILE_BYTES(6),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3,
+    },
+    [GGML_TYPE_EXL3_7] = {
+        .type_name                = "exl3_7",
+        .blck_size                = QK_EXL3,
+        .type_size                = GGML_EXL3_TILE_BYTES(7),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3,
+    },
+    [GGML_TYPE_EXL3_8] = {
+        .type_name                = "exl3_8",
+        .blck_size                = QK_EXL3,
+        .type_size                = GGML_EXL3_TILE_BYTES(8),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3,
+    },
+    [GGML_TYPE_EXL3M_1] = {
+        .type_name                = "exl3m_1",
+        .blck_size                = QK_EXL3,
+        .type_size                = GGML_EXL3_TILE_BYTES(1),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3,
+    },
+    [GGML_TYPE_EXL3M_2] = {
+        .type_name                = "exl3m_2",
+        .blck_size                = QK_EXL3,
+        .type_size                = GGML_EXL3_TILE_BYTES(2),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3,
+    },
+    [GGML_TYPE_EXL3M_3] = {
+        .type_name                = "exl3m_3",
+        .blck_size                = QK_EXL3,
+        .type_size                = GGML_EXL3_TILE_BYTES(3),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3,
+    },
+    [GGML_TYPE_EXL3M_4] = {
+        .type_name                = "exl3m_4",
+        .blck_size                = QK_EXL3,
+        .type_size                = GGML_EXL3_TILE_BYTES(4),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3,
+    },
+    [GGML_TYPE_EXL3M_5] = {
+        .type_name                = "exl3m_5",
+        .blck_size                = QK_EXL3,
+        .type_size                = GGML_EXL3_TILE_BYTES(5),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3,
+    },
+    [GGML_TYPE_EXL3M_6] = {
+        .type_name                = "exl3m_6",
+        .blck_size                = QK_EXL3,
+        .type_size                = GGML_EXL3_TILE_BYTES(6),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3,
+    },
+    [GGML_TYPE_EXL3M_7] = {
+        .type_name                = "exl3m_7",
+        .blck_size                = QK_EXL3,
+        .type_size                = GGML_EXL3_TILE_BYTES(7),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3,
+    },
+    [GGML_TYPE_EXL3M_8] = {
+        .type_name                = "exl3m_8",
+        .blck_size                = QK_EXL3,
+        .type_size                = GGML_EXL3_TILE_BYTES(8),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3,
+    },
+    [GGML_TYPE_EXL3T_1] = {
+        .type_name                = "exl3t_1",
+        .blck_size                = QK_EXL3,
+        .type_size                = GGML_EXL3_TILE_BYTES(1),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3,
+    },
+    [GGML_TYPE_EXL3T_2] = {
+        .type_name                = "exl3t_2",
+        .blck_size                = QK_EXL3,
+        .type_size                = GGML_EXL3_TILE_BYTES(2),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3,
+    },
+    [GGML_TYPE_EXL3T_3] = {
+        .type_name                = "exl3t_3",
+        .blck_size                = QK_EXL3,
+        .type_size                = GGML_EXL3_TILE_BYTES(3),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3,
+    },
+    [GGML_TYPE_EXL3T_4] = {
+        .type_name                = "exl3t_4",
+        .blck_size                = QK_EXL3,
+        .type_size                = GGML_EXL3_TILE_BYTES(4),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3,
+    },
+    [GGML_TYPE_EXL3T_5] = {
+        .type_name                = "exl3t_5",
+        .blck_size                = QK_EXL3,
+        .type_size                = GGML_EXL3_TILE_BYTES(5),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3,
+    },
+    [GGML_TYPE_EXL3T_6] = {
+        .type_name                = "exl3t_6",
+        .blck_size                = QK_EXL3,
+        .type_size                = GGML_EXL3_TILE_BYTES(6),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3,
+    },
+    [GGML_TYPE_EXL3T_7] = {
+        .type_name                = "exl3t_7",
+        .blck_size                = QK_EXL3,
+        .type_size                = GGML_EXL3_TILE_BYTES(7),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3,
+    },
+    [GGML_TYPE_EXL3T_8] = {
+        .type_name                = "exl3t_8",
+        .blck_size                = QK_EXL3,
+        .type_size                = GGML_EXL3_TILE_BYTES(8),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3,
+    },
+    [GGML_TYPE_EXL3N_2] = {
+        .type_name                = "exl3n_2",
+        .blck_size                = QK_EXL3N,
+        .type_size                = GGML_EXL3N_ROW_BYTES(2),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3n_2,
+    },
+    [GGML_TYPE_EXL3N_3] = {
+        .type_name                = "exl3n_3",
+        .blck_size                = QK_EXL3N,
+        .type_size                = GGML_EXL3N_ROW_BYTES(3),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3n_3,
+    },
+    [GGML_TYPE_EXL3N_4] = {
+        .type_name                = "exl3n_4",
+        .blck_size                = QK_EXL3N,
+        .type_size                = GGML_EXL3N_ROW_BYTES(4),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3n_4,
+    },
+    [GGML_TYPE_EXL3N_5] = {
+        .type_name                = "exl3n_5",
+        .blck_size                = QK_EXL3N,
+        .type_size                = GGML_EXL3N_ROW_BYTES(5),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3n_5,
+    },
+    [GGML_TYPE_EXL3N_6] = {
+        .type_name                = "exl3n_6",
+        .blck_size                = QK_EXL3N,
+        .type_size                = GGML_EXL3N_ROW_BYTES(6),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3n_6,
+    },
+    [GGML_TYPE_EXL3N_7] = {
+        .type_name                = "exl3n_7",
+        .blck_size                = QK_EXL3N,
+        .type_size                = GGML_EXL3N_ROW_BYTES(7),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3n_7,
+    },
+    [GGML_TYPE_EXL3N_8] = {
+        .type_name                = "exl3n_8",
+        .blck_size                = QK_EXL3N,
+        .type_size                = GGML_EXL3N_ROW_BYTES(8),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3n_8,
+    },
+    [GGML_TYPE_BNB_NF4] = {
+        .type_name                = "bnb_nf4",
+        .blck_size                = 2,
+        .type_size                = 1,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_BNB_FP4] = {
+        .type_name                = "bnb_fp4",
+        .blck_size                = 2,
+        .type_size                = 1,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_GPTQ_AO] = {
+        .type_name                = "gptq_ao",
+        .blck_size                = 2,
+        .type_size                = 1,
+        .is_quantized             = true,
+    },
     [4] = { // GGML_TYPE_Q4_2
         .type_name                = "DEPRECATED",
         .blck_size                = 0,
@@ -749,6 +992,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_q8_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_q8_0_ref,
     },
+    [GGML_TYPE_Q8_0_G128] = {
+        .type_name                = "q8_0_g128",
+        .blck_size                = QK8_0_G128,
+        .type_size                = sizeof(block_q8_0_g128),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q8_0_g128,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_q8_0_g128_ref,
+    },
     [GGML_TYPE_Q8_1] = {
         .type_name                = "q8_1",
         .blck_size                = QK8_1,
@@ -771,6 +1022,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .is_quantized             = true,
         .to_float                 = (ggml_to_float_t) dequantize_row_nvfp4,
         .from_float_ref           = (ggml_from_float_t)quantize_row_nvfp4_ref,
+    },
+    [GGML_TYPE_F8_E4M3] = {
+        .type_name                = "f8_e4m3",
+        .blck_size                = 1,
+        .type_size                = sizeof(uint8_t),
+        .is_quantized             = false,
+        .to_float                 = (ggml_to_float_t) dequantize_row_f8_e4m3,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_f8_e4m3_ref,
     },
     [GGML_TYPE_TURBO3_0] = {
         .type_name                = "turbo3",
@@ -3518,6 +3777,14 @@ struct ggml_tensor * ggml_mul_mat_id(
     result->src[2] = ids;
 
     return result;
+}
+
+void ggml_mul_mat_id_set_expert_window(struct ggml_tensor * mmid, int32_t lo, int32_t n_local) {
+    GGML_ASSERT(mmid->op == GGML_OP_MUL_MAT_ID);
+    GGML_ASSERT(n_local >= 0 && lo >= 0);
+    GGML_ASSERT(n_local == 0 || mmid->src[0]->ne[2] == n_local);
+    ggml_set_op_params_i32(mmid, 2, lo);
+    ggml_set_op_params_i32(mmid, 3, n_local);
 }
 
 // ggml_out_prod
@@ -8367,9 +8634,17 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_Q2_0_G128: result = quantize_q2_0_g128(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_0:    result = quantize_q4_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_1:    result = quantize_q4_1   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_Q4_A32:
+            quantize_row_q4_a32_ref(src + start, (block_q4_a32 *) ((char *) dst + start_row * row_size), n);
+            result = nrows * row_size;
+            break;
         case GGML_TYPE_Q5_0:    result = quantize_q5_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q5_1:    result = quantize_q5_1   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q8_0:    result = quantize_q8_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_Q8_0_G128:
+            quantize_row_q8_0_g128_ref(src + start, (block_q8_0_g128 *) ((char *) dst + start_row * row_size), n);
+            result = nrows * row_size;
+            break;
         case GGML_TYPE_MXFP4:   result = quantize_mxfp4  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_NVFP4:   result = quantize_nvfp4  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q2_K:    result = quantize_q2_K   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
@@ -8406,6 +8681,11 @@ size_t ggml_quantize_chunk(
                 size_t elemsize = sizeof(ggml_bf16_t);
                 ggml_fp32_to_bf16_row_ref(src + start, (ggml_bf16_t *)dst + start, n);
                 result = n * elemsize;
+            } break;
+        case GGML_TYPE_F8_E4M3:
+            {
+                quantize_row_f8_e4m3_ref(src + start, (uint8_t *) dst + start, n);
+                result = n * sizeof(uint8_t);
             } break;
         case GGML_TYPE_F32:
             {

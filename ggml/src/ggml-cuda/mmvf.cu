@@ -4,6 +4,184 @@
 #include "mmvf.cuh"
 #include "convert.cuh"
 
+template <int block_size, int fixed_ncols = 0>
+static __global__ void qwen35_recurrent_gates_bf16(
+        const nv_bfloat16 * alpha_weight, const nv_bfloat16 * beta_weight,
+        const float * input, const float * dt, const float * a,
+        float * gate, float * beta, int ncols_arg) {
+    const int ncols = fixed_ncols == 0 ? ncols_arg : fixed_ncols;
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const bool is_beta = blockIdx.y != 0;
+
+    // Independent projection rows share a launch, not a block. This exposes
+    // twice as many blocks without changing either dot product's order.
+    const nv_bfloat16 * weight = is_beta ? beta_weight : alpha_weight;
+    const nv_bfloat162 * weight2 = reinterpret_cast<const nv_bfloat162 *>(weight + row*ncols);
+    const float2 * input2 = reinterpret_cast<const float2 *>(input);
+
+    float sum = 0.0f;
+#pragma unroll
+    for (int col2 = tid; col2 < ncols/2; col2 += block_size) {
+        const float2 x = input2[col2];
+        const nv_bfloat162 w = weight2[col2];
+        ggml_cuda_mad(sum, w.x, x.x);
+        ggml_cuda_mad(sum, w.y, x.y);
+    }
+
+    sum = warp_reduce_sum<warp_size>(sum);
+
+    __shared__ float warp_sum[warp_size];
+    // Only unused slots need zeros. Warp leaders write the remaining slots,
+    // so initialization and publication can share one barrier.
+    if (tid >= block_size/warp_size && tid < warp_size) {
+        warp_sum[tid] = 0.0f;
+    }
+    // The XOR warp reduction returns a mathematically complete sum in every
+    // lane, but floating-point association differs by lane. Letting all lanes
+    // race on one shared slot therefore made the selected value scheduling-
+    // dependent. Publish exactly one result per warp.
+    if (tid % warp_size == 0) {
+        warp_sum[tid/warp_size] = sum;
+    }
+    __syncthreads();
+
+    if (tid < warp_size) {
+        sum = warp_reduce_sum<warp_size>(warp_sum[tid]);
+    }
+    if (tid == 0) {
+        if (is_beta) {
+            beta[row] = 1.0f / (1.0f + expf(-sum));
+        } else {
+            const float alpha_biased = sum + dt[row];
+            const float alpha_softplus = alpha_biased > 20.0f
+                ? alpha_biased : logf(1.0f + expf(alpha_biased));
+            gate[row] = alpha_softplus * a[row];
+        }
+    }
+}
+
+void ggml_cuda_op_qwen35_recurrent_gates(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * alpha_weight, const ggml_tensor * beta_weight,
+        const ggml_tensor * input, const ggml_tensor * dt, const ggml_tensor * a,
+        ggml_tensor * gate, ggml_tensor * beta) {
+    GGML_ASSERT(alpha_weight->type == GGML_TYPE_BF16 && beta_weight->type == GGML_TYPE_BF16);
+    GGML_ASSERT(input->type == GGML_TYPE_F32 && dt->type == GGML_TYPE_F32 && a->type == GGML_TYPE_F32);
+    GGML_ASSERT(gate->type == GGML_TYPE_F32 && beta->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(alpha_weight) && ggml_is_contiguous(beta_weight));
+    GGML_ASSERT(ggml_is_contiguous(input) && ggml_is_contiguous(dt) && ggml_is_contiguous(a));
+    GGML_ASSERT(ggml_is_contiguous(gate) && ggml_is_contiguous(beta));
+    GGML_ASSERT(alpha_weight->ne[0] == beta_weight->ne[0] && alpha_weight->ne[1] == beta_weight->ne[1]);
+    GGML_ASSERT(input->ne[0] == alpha_weight->ne[0] && input->ne[1] == 1);
+    GGML_ASSERT(ggml_nelements(dt) == alpha_weight->ne[1] && ggml_nelements(a) == alpha_weight->ne[1]);
+    GGML_ASSERT(ggml_nelements(gate) == alpha_weight->ne[1] && ggml_nelements(beta) == alpha_weight->ne[1]);
+    GGML_ASSERT(alpha_weight->ne[0] % 2 == 0);
+
+    constexpr int block_size = 256;
+    auto kernel = alpha_weight->ne[0] == 5120
+        ? qwen35_recurrent_gates_bf16<block_size, 5120>
+        : qwen35_recurrent_gates_bf16<block_size>;
+    kernel<<<dim3(alpha_weight->ne[1], 2), block_size, 0, ctx.stream()>>>(
+        static_cast<const nv_bfloat16 *>(alpha_weight->data),
+        static_cast<const nv_bfloat16 *>(beta_weight->data),
+        static_cast<const float *>(input->data),
+        static_cast<const float *>(dt->data),
+        static_cast<const float *>(a->data),
+        static_cast<float *>(gate->data),
+        static_cast<float *>(beta->data),
+        alpha_weight->ne[0]);
+}
+
+static __global__ void qwen35_recurrent_gate_epilogue(
+        const float * alpha, const float * beta_input,
+        const float * dt, const float * a,
+        float * gate, float * beta, int nrows, int64_t nelements) {
+    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= nelements) {
+        return;
+    }
+    const int row = i % nrows;
+    const float alpha_biased = alpha[i] + dt[row];
+    const float alpha_softplus = alpha_biased > 20.0f
+        ? alpha_biased : logf(1.0f + expf(alpha_biased));
+    gate[i] = alpha_softplus * a[row];
+    beta[i] = 1.0f / (1.0f + expf(-beta_input[i]));
+}
+
+void ggml_cuda_op_qwen35_recurrent_gate_epilogue(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * alpha, const ggml_tensor * beta_input,
+        const ggml_tensor * dt, const ggml_tensor * a,
+        ggml_tensor * gate, ggml_tensor * beta) {
+    GGML_ASSERT(alpha->type == GGML_TYPE_F32 && beta_input->type == GGML_TYPE_F32);
+    GGML_ASSERT(dt->type == GGML_TYPE_F32 && a->type == GGML_TYPE_F32);
+    GGML_ASSERT(gate->type == GGML_TYPE_F32 && beta->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(alpha) && ggml_is_contiguous(beta_input));
+    GGML_ASSERT(ggml_is_contiguous(dt) && ggml_is_contiguous(a));
+    GGML_ASSERT(ggml_is_contiguous(gate) && ggml_is_contiguous(beta));
+    GGML_ASSERT(ggml_are_same_shape(alpha, beta_input));
+    GGML_ASSERT(ggml_nelements(alpha) == ggml_nelements(gate));
+    GGML_ASSERT(ggml_nelements(alpha) == ggml_nelements(beta));
+    GGML_ASSERT(ggml_nelements(dt) == alpha->ne[0]);
+    GGML_ASSERT(ggml_nelements(a) == alpha->ne[0]);
+
+    constexpr int block_size = 256;
+    const int64_t nelements = ggml_nelements(alpha);
+    qwen35_recurrent_gate_epilogue<<<(nelements + block_size - 1) / block_size, block_size, 0, ctx.stream()>>>(
+        static_cast<const float *>(alpha->data),
+        static_cast<const float *>(beta_input->data),
+        static_cast<const float *>(dt->data),
+        static_cast<const float *>(a->data),
+        static_cast<float *>(gate->data),
+        static_cast<float *>(beta->data),
+        alpha->ne[0], nelements);
+}
+
+static __global__ void qwen35_recurrent_gate_epilogue_combined(
+        const float * mixed, const float * dt, const float * a,
+        float * gate, float * beta, int nrows, int64_t nelements) {
+    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= nelements) {
+        return;
+    }
+    const int row = i % nrows;
+    const int64_t token = i / nrows;
+    const int64_t base = token * 2 * nrows;
+    const float alpha_biased = mixed[base + nrows + row] + dt[row];
+    const float alpha_softplus = alpha_biased > 20.0f
+        ? alpha_biased : logf(1.0f + expf(alpha_biased));
+    gate[i] = alpha_softplus * a[row];
+    beta[i] = 1.0f / (1.0f + expf(-mixed[base + row]));
+}
+
+void ggml_cuda_op_qwen35_recurrent_gate_epilogue_combined(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * mixed,
+        const ggml_tensor * dt, const ggml_tensor * a,
+        ggml_tensor * gate, ggml_tensor * beta) {
+    GGML_ASSERT(mixed->type == GGML_TYPE_F32 && dt->type == GGML_TYPE_F32 && a->type == GGML_TYPE_F32);
+    GGML_ASSERT(gate->type == GGML_TYPE_F32 && beta->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(mixed) && ggml_is_contiguous(dt) && ggml_is_contiguous(a));
+    GGML_ASSERT(ggml_is_contiguous(gate) && ggml_is_contiguous(beta));
+    GGML_ASSERT(mixed->ne[0] == 2 * gate->ne[1]);
+    GGML_ASSERT(ggml_nelements(dt) == gate->ne[1] && ggml_nelements(a) == gate->ne[1]);
+    GGML_ASSERT(ggml_nelements(gate) == ggml_nelements(beta));
+    GGML_ASSERT(ggml_nelements(mixed) == 2 * ggml_nelements(gate));
+
+    constexpr int block_size = 256;
+    const int64_t nelements = ggml_nelements(gate);
+    qwen35_recurrent_gate_epilogue_combined<<<
+        (nelements + block_size - 1) / block_size, block_size, 0, ctx.stream()>>>(
+            static_cast<const float *>(mixed->data),
+            static_cast<const float *>(dt->data),
+            static_cast<const float *>(a->data),
+            static_cast<float *>(gate->data),
+            static_cast<float *>(beta->data),
+            gate->ne[1], nelements);
+}
+
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
 static __global__ void mul_mat_vec_f(
         const T * x_ptr, const float * y_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -826,8 +1004,9 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
         case GGML_TYPE_F16:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
+                const bool src0_thin  = src0_ne[1] <= 64 && src0_ne[2]*src0_ne[3] == 1;
                 if (ampere_mma_available(cc)) {
-                    return src0_small && ne11 == 1;
+                    return src0_small && (ne11 == 1 || (src0_thin && ne11 <= MMVF_MAX_BATCH_SIZE));
                 }
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
                     return src0_small && ne11 <= 4;
@@ -852,8 +1031,12 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
         case GGML_TYPE_BF16:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
+                // A very thin projection (e.g. the 48-row GatedDeltaNet alpha/beta heads) cannot fill a
+                // tensor-core GEMM: cuBLAS runs it as a 2-block 16x16 wmma kernel (~34 us) while the vector
+                // kernel finishes in a few microseconds for every batch size it supports.
+                const bool src0_thin = src0_ne[1] <= 64 && src0_ne[2]*src0_ne[3] == 1;
                 if (ampere_mma_available(cc)) {
-                    return src0_small && ne11 == 1;
+                    return src0_small && (ne11 == 1 || (src0_thin && ne11 <= MMVF_MAX_BATCH_SIZE));
                 }
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
                     return src0_small && ne11 <= 4;

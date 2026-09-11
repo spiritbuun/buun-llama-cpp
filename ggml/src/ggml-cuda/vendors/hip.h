@@ -84,6 +84,8 @@
 #define cudaGetLastError hipGetLastError
 #define cudaPeekAtLastError hipPeekAtLastError
 #define cudaHostRegister hipHostRegister
+#define cudaHostAlloc hipHostMalloc
+#define cudaHostAllocPortable hipHostMallocPortable
 #define cudaHostRegisterPortable hipHostRegisterPortable
 #define cudaHostRegisterReadOnly hipHostRegisterReadOnly
 #define cudaHostUnregister hipHostUnregister
@@ -150,6 +152,7 @@
 #define cudaKernelNodeParams hipKernelNodeParams
 #define cudaGraphExecDestroy hipGraphExecDestroy
 #define cudaGraphLaunch hipGraphLaunch
+#define cudaGraphUpload hipGraphUpload
 #define cudaErrorGraphExecUpdateFailure hipErrorGraphExecUpdateFailure
 #define cudaGraphExecUpdateResult hipGraphExecUpdateResult
 #define cudaGraphNodeType hipGraphNodeType
@@ -164,6 +167,9 @@
 #define cudaGraphGetNodes hipGraphGetNodes
 #define cudaGraphExecUpdate hipGraphExecUpdate
 #define cudaStreamCaptureModeRelaxed hipStreamCaptureModeRelaxed
+#define cudaStreamCaptureStatus hipStreamCaptureStatus
+#define cudaStreamCaptureStatusNone hipStreamCaptureStatusNone
+#define cudaStreamIsCapturing hipStreamIsCapturing
 #define cudaStreamBeginCapture hipStreamBeginCapture
 #define cudaGraph_t hipGraph_t
 #define cudaStream_t hipStream_t

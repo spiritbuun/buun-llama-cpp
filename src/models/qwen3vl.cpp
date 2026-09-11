@@ -119,7 +119,8 @@ llama_model_qwen3vl::graph::graph(const llama_model & model, const llm_graph_par
 
             cur = build_attn(inp_attn,
                     model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
-                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
+                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il,
+                    model.layers[il].wo_in_s);
         }
 
         if (il == n_layer - 1 && inp_out_ids) {
@@ -137,11 +138,14 @@ llama_model_qwen3vl::graph::graph(const llama_model & model, const llm_graph_par
         cb(cur, "ffn_norm", il);
 
         cur = build_ffn(cur,
-                model.layers[il].ffn_up,   NULL, NULL,
-                model.layers[il].ffn_gate, NULL, NULL,
-                model.layers[il].ffn_down, NULL, NULL,
+                model.layers[il].ffn_up,   NULL, model.layers[il].ffn_up_s,
+                model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_s,
+                model.layers[il].ffn_down, NULL, model.layers[il].ffn_down_s,
                 NULL,
-                LLM_FFN_SILU, LLM_FFN_PAR, il);
+                LLM_FFN_SILU, LLM_FFN_PAR, il,
+                model.layers[il].ffn_up_in_s,
+                model.layers[il].ffn_gate_in_s,
+                model.layers[il].ffn_down_in_s);
         cb(cur, "ffn_out", il);
 
         cur = ggml_add(ctx0, cur, ffn_inp);
@@ -169,7 +173,7 @@ llama_model_qwen3vl::graph::graph(const llama_model & model, const llm_graph_par
     res->t_embd = cur;
 
     // lm_head
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = build_lora_mm(model.output, cur, model.output_s, model.output_in_s);
 
     int64_t n_vocab_in  = model.tok_embd->ne[1];
     int64_t n_vocab_out = model.output->ne[1];

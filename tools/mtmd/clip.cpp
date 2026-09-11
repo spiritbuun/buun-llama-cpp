@@ -2,6 +2,7 @@
 #include "clip-impl.h"
 #include "clip-model.h"
 #include "clip-graph.h"
+#include "clip-safetensors.h"
 #include "models/models.h"
 
 #include "ggml.h"
@@ -1154,6 +1155,7 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
 struct clip_model_loader {
     ggml_context_ptr ctx_meta;
     gguf_context_ptr ctx_gguf;
+    std::unique_ptr<clip_safetensors_source> source_safetensors;
 
     std::string fname;
 
@@ -1174,21 +1176,25 @@ struct clip_model_loader {
         : fname(fname),
           progress_callback(progress_cb),
           progress_callback_user_data(progress_user_data) {
-        struct ggml_context * meta = nullptr;
-
-        struct gguf_init_params params = {
-            /*.no_alloc = */ true,
-            /*.ctx      = */ &meta,
-        };
-
-        ctx_gguf = gguf_context_ptr(gguf_init_from_file(fname, params));
-        if (!ctx_gguf.get()) {
-            throw std::runtime_error(string_format("%s: failed to load CLIP model from %s. Does this file exist?\n", __func__, fname));
+        if (clip_safetensors_source::supports(fname)) {
+            source_safetensors = std::make_unique<clip_safetensors_source>(fname);
+            ctx_gguf.reset(source_safetensors->build_metadata());
+            ctx_meta.reset(source_safetensors->build_tensor_metadata());
+        } else {
+            struct ggml_context * meta = nullptr;
+            struct gguf_init_params params = {
+                /*.no_alloc = */ true,
+                /*.ctx      = */ &meta,
+            };
+            ctx_gguf = gguf_context_ptr(gguf_init_from_file(fname, params));
+            if (!ctx_gguf.get()) {
+                throw std::runtime_error(string_format("%s: failed to load CLIP model from %s. Does this file exist?\n", __func__, fname));
+            }
+            ctx_meta.reset(meta);
         }
 
-        ctx_meta.reset(meta);
-
-        const int n_tensors = gguf_get_n_tensors(ctx_gguf.get());
+        const int n_tensors = source_safetensors ?
+            static_cast<int>(source_safetensors->tensor_count()) : gguf_get_n_tensors(ctx_gguf.get());
 
         // print gguf info
         {
@@ -1198,8 +1204,12 @@ struct clip_model_loader {
             get_string(KEY_DESCRIPTION, description, false);
             LOG_INF("%s: model name:   %s\n",  __func__, name.c_str());
             LOG_INF("%s: description:  %s\n",  __func__, description.c_str());
-            LOG_INF("%s: GGUF version: %d\n",  __func__, gguf_get_version(ctx_gguf.get()));
-            LOG_INF("%s: alignment:    %zu\n", __func__, gguf_get_alignment(ctx_gguf.get()));
+            if (source_safetensors) {
+                LOG_INF("%s: format:       safetensors directory\n", __func__);
+            } else {
+                LOG_INF("%s: GGUF version: %d\n",  __func__, gguf_get_version(ctx_gguf.get()));
+                LOG_INF("%s: alignment:    %zu\n", __func__, gguf_get_alignment(ctx_gguf.get()));
+            }
             LOG_INF("%s: n_tensors:    %d\n",  __func__, n_tensors);
             LOG_INF("%s: n_kv:         %d\n",  __func__, (int)gguf_get_n_kv(ctx_gguf.get()));
             LOG_INF("\n");
@@ -1223,12 +1233,14 @@ struct clip_model_loader {
         }
 
         // tensors
-        if (!skip_tensors) {
+        if (!skip_tensors && source_safetensors) {
+            model_size = source_safetensors->model_size();
+        } else if (!skip_tensors) {
             for (int i = 0; i < n_tensors; ++i) {
                 const char * name = gguf_get_tensor_name(ctx_gguf.get(), i);
                 const size_t offset = gguf_get_tensor_offset(ctx_gguf.get(), i);
                 enum ggml_type type = gguf_get_tensor_type(ctx_gguf.get(), i);
-                ggml_tensor * cur = ggml_get_tensor(meta, name);
+                ggml_tensor * cur = ggml_get_tensor(ctx_meta.get(), name);
                 size_t tensor_size = ggml_nbytes(cur);
                 model_size += tensor_size;
                 LOG_DBG("%s: tensor[%d]: n_dims = %d, name = %s, tensor_size=%zu, offset=%zu, shape:[%" PRIu64 ", %" PRIu64 ", %" PRIu64 ", %" PRIu64 "], type = %s\n",
@@ -2074,9 +2086,12 @@ struct clip_model_loader {
         std::map<std::string, size_t> tensor_offset;
         std::vector<ggml_tensor *> tensors_to_load;
 
-        auto fin = open_ifstream_binary(fname);
-        if (!fin) {
-            throw std::runtime_error(string_format("%s: failed to open %s\n", __func__, fname.c_str()));
+        std::ifstream fin;
+        if (!source_safetensors) {
+            fin = open_ifstream_binary(fname);
+            if (!fin) {
+                throw std::runtime_error(string_format("%s: failed to open %s\n", __func__, fname.c_str()));
+            }
         }
 
         // TODO @ngxson : support both audio and video in the future
@@ -2085,14 +2100,17 @@ struct clip_model_loader {
                              : "v";
 
         // get offsets
-        for (int64_t i = 0; i < gguf_get_n_tensors(ctx_gguf.get()); ++i) {
-            const char * name = gguf_get_tensor_name(ctx_gguf.get(), i);
-            tensor_offset[name] = gguf_get_data_offset(ctx_gguf.get()) + gguf_get_tensor_offset(ctx_gguf.get(), i);
+        if (!source_safetensors) {
+            for (int64_t i = 0; i < gguf_get_n_tensors(ctx_gguf.get()); ++i) {
+                const char * name = gguf_get_tensor_name(ctx_gguf.get(), i);
+                tensor_offset[name] = gguf_get_data_offset(ctx_gguf.get()) + gguf_get_tensor_offset(ctx_gguf.get(), i);
+            }
         }
 
         // create data context
         struct ggml_init_params params = {
-            /*.mem_size =*/ static_cast<size_t>(gguf_get_n_tensors(ctx_gguf.get()) + 1) * ggml_tensor_overhead(),
+            /*.mem_size =*/ static_cast<size_t>((source_safetensors ? source_safetensors->tensor_count() :
+                                                 gguf_get_n_tensors(ctx_gguf.get())) + 1) * ggml_tensor_overhead(),
             /*.mem_buffer =*/ NULL,
             /*.no_alloc =*/ true,
         };
@@ -2151,6 +2169,11 @@ struct clip_model_loader {
 
         auto get_vector = [&](const std::string & name) {
             std::vector<float> result;
+            if (source_safetensors) {
+                throw std::runtime_error(string_format(
+                    "%s: scalar/vector side tensor '%s' is not supported by the native Qwen4 vision source\n",
+                    __func__, name.c_str()));
+            }
             auto it = tensor_offset.find(name);
             if (it == tensor_offset.end()) {
                 return result;
@@ -3566,22 +3589,29 @@ struct clip_model_loader {
                 for (auto & t : tensors_to_load) {
                     ggml_tensor * cur = ggml_get_tensor(ctx_clip.ctx_data.get(), t->name);
                     GGML_ASSERT(cur && "tensor not found in ctx_data");
-                    auto it_off = tensor_offset.find(t->name);
-                    GGML_ASSERT(it_off != tensor_offset.end() && "no offset for tensor");
-                    const size_t offset = it_off->second;
-                    fin.seekg(offset, std::ios::beg);
-                    if (!fin) {
-                        throw std::runtime_error(string_format("%s: failed to seek for tensor %s\n", __func__, t->name));
-                    }
                     size_t num_bytes = ggml_nbytes(cur);
-                    if (ggml_backend_buft_is_host(buft)) {
-                        // for the CPU and Metal backend, we can read directly into the tensor
-                        fin.read(reinterpret_cast<char *>(cur->data), num_bytes);
+                    if (source_safetensors) {
+                        if (!source_safetensors->load(t->name, cur)) {
+                            throw std::runtime_error(string_format(
+                                "%s: native Qwen4 vision source did not bind tensor %s\n", __func__, t->name));
+                        }
                     } else {
-                        // read into a temporary buffer first, then copy to device memory
-                        read_buf.resize(num_bytes);
-                        fin.read(reinterpret_cast<char *>(read_buf.data()), num_bytes);
-                        ggml_backend_tensor_set(cur, read_buf.data(), 0, num_bytes);
+                        auto it_off = tensor_offset.find(t->name);
+                        GGML_ASSERT(it_off != tensor_offset.end() && "no offset for tensor");
+                        const size_t offset = it_off->second;
+                        fin.seekg(offset, std::ios::beg);
+                        if (!fin) {
+                            throw std::runtime_error(string_format("%s: failed to seek for tensor %s\n", __func__, t->name));
+                        }
+                        if (ggml_backend_buft_is_host(buft)) {
+                            // for the CPU and Metal backend, we can read directly into the tensor
+                            fin.read(reinterpret_cast<char *>(cur->data), num_bytes);
+                        } else {
+                            // read into a temporary buffer first, then copy to device memory
+                            read_buf.resize(num_bytes);
+                            fin.read(reinterpret_cast<char *>(read_buf.data()), num_bytes);
+                            ggml_backend_tensor_set(cur, read_buf.data(), 0, num_bytes);
+                        }
                     }
                     data_loaded += num_bytes;
                     if (progress_callback && total_data_size > 0) {
@@ -3595,7 +3625,9 @@ struct clip_model_loader {
             } else {
                 LOG_DBG("%s: no_alloc is set, skipping tensor data loading (%zu tensors)\n", __func__, tensors_to_load.size());
             }
-            fin.close();
+            if (fin.is_open()) {
+                fin.close();
+            }
         }
 
     }

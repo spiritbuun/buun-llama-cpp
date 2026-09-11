@@ -209,6 +209,17 @@ extern "C" {
     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
     typedef bool   (*ggml_backend_comm_allreduce_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
 
+    // Whole-step capture for tensor parallelism (meta backend): every device records one graph
+    // compute (all of its subgraph launches and the all-reduces between them) into a single
+    // device graph, which later computes of the same ggml graph replay with one launch per device.
+    typedef bool     (*ggml_backend_step_capturable_t)  (ggml_backend_t backend, struct ggml_cgraph * cgraph);
+    typedef uint64_t (*ggml_backend_step_epoch_t)       (ggml_backend_t backend); // changes when replay would be stale
+    typedef void     (*ggml_backend_step_wait_uploads_t)(ggml_backend_t backend);
+    typedef bool     (*ggml_backend_step_capture_begin_t)(ggml_backend_t backend);
+    typedef void *   (*ggml_backend_step_capture_end_t)  (ggml_backend_t backend); // NULL when the capture failed
+    typedef bool     (*ggml_backend_step_launch_t)       (ggml_backend_t backend, void * step);
+    typedef void     (*ggml_backend_step_free_t)         (ggml_backend_t backend, void * step);
+
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
     // Set the number of threads for the backend
@@ -368,6 +379,8 @@ extern "C" {
 
         GGML_BACKEND_SPLIT_AXIS_MIRRORED = 10, // all values on all backends
         GGML_BACKEND_SPLIT_AXIS_PARTIAL  = 11, // each backend has a partial sum
+        GGML_BACKEND_SPLIT_AXIS_DISJOINT = 12, // partial sum whose every row is non-zero on exactly one backend
+                                               //   (expert-parallel expert outputs): element-wise ops may run on it
 
         // for internal bookkeeping only:
         GGML_BACKEND_SPLIT_AXIS_NONE    = 98,

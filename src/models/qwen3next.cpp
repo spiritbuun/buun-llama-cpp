@@ -35,7 +35,7 @@ void llama_model_qwen3next::load_arch_tensors(llama_model_loader & ml) {
         throw std::runtime_error(arch_name() + " model cannot have zero experts");
     }
 
-    const bool mtp_only = (hparams.n_layer_nextn > 0) && (ml.get_weight("blk.0.attn_norm.weight") == nullptr);
+    const bool mtp_only = (hparams.n_layer_nextn > 0) && !ml.has_tensor("blk.0.attn_norm.weight");
     const int trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
     int mtp_flags = !ml.load_mtp ? TENSOR_SKIP : 0;
 
@@ -550,8 +550,10 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_attn_linear(
     // Apply gated normalization: self.norm(core_attn_out, z)
     ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
 
-    // Final reshape: [head_dim, n_heads, n_tokens, n_seqs] -> [n_tokens, n_seqs, n_heads * head_dim]
-    ggml_tensor * final_output = ggml_reshape_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens, n_seqs);
+    // Final reshape: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * head_dim, n_tokens * n_seqs].
+    // Kept 2-D so the output projection is one GEMM over all tokens; a 3-D [.., n_seq_tokens, n_seqs] operand
+    // makes the CUDA backend run n_seqs separate mat-vecs at decode, re-reading the weights per sequence.
+    ggml_tensor * final_output = ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens * n_seqs);
     cb(final_output, "final_output", il);
 
     // Output projection

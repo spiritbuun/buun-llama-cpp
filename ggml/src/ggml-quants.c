@@ -219,6 +219,45 @@ void quantize_row_q4_1_ref(const float * GGML_RESTRICT x, block_q4_1 * GGML_REST
     }
 }
 
+void quantize_row_q4_a32_ref(const float * GGML_RESTRICT x, block_q4_a32 * GGML_RESTRICT y, int64_t k) {
+    GGML_ASSERT(k % QK4_A32 == 0);
+
+    const int64_t nb = k / QK4_A32;
+    for (int64_t ib = 0; ib < nb; ++ib) {
+        block_q4_a32 * block = &y[ib];
+        memset(block->z, 0, sizeof(block->z));
+        for (int group = 0; group < QK4_A32 / QG4_A32; ++group) {
+            const float * values = x + ib * QK4_A32 + group * QG4_A32;
+            float min = values[0];
+            float max = values[0];
+            for (int i = 1; i < QG4_A32; ++i) {
+                min = MIN(min, values[i]);
+                max = MAX(max, values[i]);
+            }
+
+            float scale = (max - min) / 15.0f;
+            if (!(scale > 0.0f)) {
+                scale = 1.0f;
+            }
+            const ggml_bf16_t scale_bf16 = ggml_fp32_to_bf16(scale);
+            block->d[group] = scale_bf16.bits;
+            scale = ggml_bf16_to_fp32(scale_bf16);
+            const int zero = MIN(15, MAX(0, (int) lrintf(-min / scale)));
+            block->z[group / 2] |= (uint8_t) zero << (4 * (group % 2));
+
+            for (int i = 0; i < QG4_A32; ++i) {
+                const int code = MIN(15, MAX(0, (int) lrintf(values[i] / scale) + zero));
+                const int index = group * QG4_A32 + i;
+                if ((index & 1) == 0) {
+                    block->qs[index / 2] = (uint8_t) code;
+                } else {
+                    block->qs[index / 2] |= (uint8_t) code << 4;
+                }
+            }
+        }
+    }
+}
+
 void quantize_row_q5_0_ref(const float * GGML_RESTRICT x, block_q5_0 * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK5_0;
 
@@ -329,6 +368,28 @@ void quantize_row_q8_0_ref(const float * GGML_RESTRICT x, block_q8_0 * GGML_REST
             const float x0 = x[i*QK8_0 + j]*id;
 
             y[i].qs[j] = roundf(x0);
+        }
+    }
+}
+
+void quantize_row_q8_0_g128_ref(const float * GGML_RESTRICT x, block_q8_0_g128 * GGML_RESTRICT y, int64_t k) {
+    GGML_ASSERT(k % QK8_0_G128 == 0);
+
+    const int64_t nb = k / QK8_0_G128;
+    for (int64_t ib = 0; ib < nb; ++ib) {
+        float amax = 0.0f;
+        for (int i = 0; i < QK8_0_G128; ++i) {
+            amax = MAX(amax, fabsf(x[ib * QK8_0_G128 + i]));
+        }
+        float scale = amax / 127.0f;
+        if (!(scale > 0.0f)) {
+            scale = 1.0f;
+        }
+        const ggml_bf16_t scale_bf16 = ggml_fp32_to_bf16(scale);
+        y[ib].d = scale_bf16.bits;
+        scale = ggml_bf16_to_fp32(scale_bf16);
+        for (int i = 0; i < QK8_0_G128; ++i) {
+            y[ib].qs[i] = (int8_t) MIN(127, MAX(-128, (int) lrintf(x[ib * QK8_0_G128 + i] / scale)));
         }
     }
 }
@@ -451,6 +512,12 @@ void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RE
     }
 }
 
+void quantize_row_f8_e4m3_ref(const float * GGML_RESTRICT x, uint8_t * GGML_RESTRICT y, int64_t k) {
+    for (int64_t i = 0; i < k; ++i) {
+        y[i] = ggml_fp32_to_e4m3(x[i]);
+    }
+}
+
 void dequantize_row_q1_0(const block_q1_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK1_0;
 
@@ -552,6 +619,84 @@ void dequantize_row_q4_1(const block_q4_1 * GGML_RESTRICT x, float * GGML_RESTRI
     }
 }
 
+// EXL3 tiles span 16 rows; a single row cannot be decoded from its own bytes.
+void dequantize_row_exl3(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    GGML_UNUSED(x); GGML_UNUSED(y); GGML_UNUSED(k);
+    GGML_ABORT("EXL3 weights are only served by the CUDA backend");
+}
+
+// exllamav3 n-gram rows: word 0 = fp16 row scale, then 160 K-bit chunks (LSB-first words);
+// element i is mul1(state_i) * scale where state_i concatenates the chunks of positions
+// i, i-1, i-2, ... (tail-biting) into 16 bits.
+static inline float ggml_exl3_mul1_value(uint32_t state) {
+    const uint32_t x = state * 0x83DCD12Du;
+    const uint32_t s = (x & 255) + ((x >> 8) & 255) + ((x >> 16) & 255) + ((x >> 24) & 255);
+    // fp16 arithmetic of the reference: h = 1024 + bytesum exactly; v = h * k_inv + k_bias rounded to fp16
+    const float h = (float) (1024 + s);
+    const float k_inv  = GGML_FP16_TO_FP32(0x1eee);
+    const float k_bias = GGML_FP16_TO_FP32(0xc931);
+    return GGML_FP16_TO_FP32(GGML_FP32_TO_FP16(h * k_inv + k_bias));
+}
+
+static void dequantize_row_exl3n(const uint16_t * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k, int K) {
+    const int words = 1 + 10 * K;
+    for (int64_t r = 0; r < k / QK_EXL3N; ++r) {
+        const uint16_t * row = x + r * words;
+        const float scale = GGML_FP16_TO_FP32(row[0]);
+        const uint16_t * bits = row + 1;
+        for (int i = 0; i < QK_EXL3N; ++i) {
+            // state bit m comes from position (i - m/K) (mod 160), bit m%K of its K-bit chunk
+            uint32_t state = 0;
+            for (int m = 0; m < 16; ++m) {
+                int pos = i - m / K;
+                if (pos < 0) pos += QK_EXL3N;
+                const int b = pos * K + m % K;
+                state |= (uint32_t) ((bits[b >> 4] >> (b & 15)) & 1) << m;
+            }
+            y[r * QK_EXL3N + i] = ggml_exl3_mul1_value(state) * scale;
+        }
+    }
+}
+void dequantize_row_exl3n_2(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    dequantize_row_exl3n((const uint16_t *) x, y, k, 2);
+}
+void dequantize_row_exl3n_3(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    dequantize_row_exl3n((const uint16_t *) x, y, k, 3);
+}
+void dequantize_row_exl3n_4(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    dequantize_row_exl3n((const uint16_t *) x, y, k, 4);
+}
+void dequantize_row_exl3n_5(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    dequantize_row_exl3n((const uint16_t *) x, y, k, 5);
+}
+void dequantize_row_exl3n_6(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    dequantize_row_exl3n((const uint16_t *) x, y, k, 6);
+}
+void dequantize_row_exl3n_7(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    dequantize_row_exl3n((const uint16_t *) x, y, k, 7);
+}
+void dequantize_row_exl3n_8(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    dequantize_row_exl3n((const uint16_t *) x, y, k, 8);
+}
+
+void dequantize_row_q4_a32(const block_q4_a32 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    GGML_ASSERT(k % QK4_A32 == 0);
+
+    const int64_t nb = k / QK4_A32;
+    for (int64_t ib = 0; ib < nb; ++ib) {
+        for (int group = 0; group < QK4_A32 / QG4_A32; ++group) {
+            const ggml_bf16_t scale_bf16 = { x[ib].d[group] };
+            const float scale = ggml_bf16_to_fp32(scale_bf16);
+            const int zero = (x[ib].z[group / 2] >> (4 * (group % 2))) & 0x0f;
+            for (int i = 0; i < QG4_A32; ++i) {
+                const int index = group * QG4_A32 + i;
+                const int code = (x[ib].qs[index / 2] >> (4 * (index % 2))) & 0x0f;
+                y[ib * QK4_A32 + index] = (code - zero) * scale;
+            }
+        }
+    }
+}
+
 void dequantize_row_q5_0(const block_q5_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK5_0;
 
@@ -621,6 +766,19 @@ void dequantize_row_q8_0(const block_q8_0 * GGML_RESTRICT x, float * GGML_RESTRI
     }
 }
 
+void dequantize_row_q8_0_g128(const block_q8_0_g128 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    GGML_ASSERT(k % QK8_0_G128 == 0);
+
+    const int64_t nb = k / QK8_0_G128;
+    for (int64_t ib = 0; ib < nb; ++ib) {
+        const ggml_bf16_t scale_bf16 = { x[ib].d };
+        const float scale = ggml_bf16_to_fp32(scale_bf16);
+        for (int i = 0; i < QK8_0_G128; ++i) {
+            y[ib * QK8_0_G128 + i] = x[ib].qs[i] * scale;
+        }
+    }
+}
+
 void dequantize_row_mxfp4(const block_mxfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK_MXFP4;
 
@@ -663,6 +821,12 @@ void dequantize_row_nvfp4(const block_nvfp4 * GGML_RESTRICT x, float * GGML_REST
                 yb[j + qk_sub/2] = v1*d;
             }
         }
+    }
+}
+
+void dequantize_row_f8_e4m3(const uint8_t * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    for (int64_t i = 0; i < k; ++i) {
+        y[i] = ggml_e4m3_to_fp32(x[i]);
     }
 }
 
@@ -5620,6 +5784,18 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
             {
                 VALIDATE_ROW_DATA_DM_F16_IMPL(block_q4_1, data, nb, d, m);
             } break;
+        case GGML_TYPE_Q4_A32:
+            {
+                const block_q4_a32 * q = (const block_q4_a32 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    for (size_t group = 0; group < QK4_A32 / QG4_A32; ++group) {
+                        if ((q[i].d[group] & 0x7f80) == 0x7f80) {
+                            fprintf(stderr, "%s: found non-finite BF16 scale at block %zu\n", __func__, i);
+                            return false;
+                        }
+                    }
+                }
+            } break;
         case GGML_TYPE_Q5_0:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_q5_0, data, nb);
@@ -5632,6 +5808,16 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_q8_0, data, nb);
             } break;
+        case GGML_TYPE_Q8_0_G128:
+            {
+                const block_q8_0_g128 * q = (const block_q8_0_g128 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if ((q[i].d & 0x7f80) == 0x7f80) {
+                        fprintf(stderr, "%s: found non-finite BF16 scale at block %zu\n", __func__, i);
+                        return false;
+                    }
+                }
+            } break;
         case GGML_TYPE_MXFP4:
             {
                 VALIDATE_ROW_DATA_E_E8M0_IMPL(block_mxfp4, data, nb);
@@ -5642,6 +5828,24 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                 GGML_UNUSED(data);
                 GGML_UNUSED(nb);
             } break;
+        case GGML_TYPE_F8_E4M3:
+            {
+                const uint8_t * f8 = (const uint8_t *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if ((f8[i] & 0x7f) == 0x7f) {
+                        fprintf(stderr, "%s: found NaN at element %zu of E4M3 row\n", __func__, i);
+                        return false;
+                    }
+                }
+            } break;
+        case GGML_TYPE_BNB_NF4:
+        case GGML_TYPE_BNB_FP4:
+        case GGML_TYPE_GPTQ_AO:
+            // Every packed nibble is a valid code. The scale bundle is a
+            // separate tensor and is validated by the safetensors adapter.
+            GGML_UNUSED(data);
+            GGML_UNUSED(nb);
+            break;
         case GGML_TYPE_Q2_K:
             {
                 VALIDATE_ROW_DATA_DM_F16_IMPL(block_q2_K, data, nb, d, dmin);

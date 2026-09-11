@@ -5,6 +5,95 @@
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 bool ggml_cuda_q8_0_mmv_post_silu_supported(int cc, int64_t ncols_x);
 
+// Single-token dynamic FP8 projection followed by four-tap recurrent conv.
+void ggml_cuda_mul_mat_vec_q_conv(ggml_backend_cuda_context & ctx,
+    const ggml_tensor * mm, const ggml_tensor * prefix, const ggml_tensor * conv_weight,
+    ggml_tensor * state, ggml_tensor * dst);
+
+#if !defined(GGML_USE_HIP)
+nv_bfloat16 * ggml_cuda_prepare_bf16_input(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * src,
+    size_t count,
+    cudaStream_t stream);
+
+const nv_bfloat16 * ggml_cuda_get_cached_bf16_input(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * src,
+    size_t count);
+
+bool ggml_cuda_humming_finish_residual_rms(
+    ggml_backend_cuda_context & ctx,
+    const ggml_cuda_mm_fusion_args_host * fusion,
+    const nv_bfloat16 * output,
+    ggml_tensor * dst,
+    int64_t n,
+    int64_t m,
+    cudaStream_t stream);
+
+bool ggml_cuda_mul_mat_humming_fp8(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * src0,
+    const ggml_tensor * src1,
+    const ggml_tensor * ids,
+    ggml_tensor * dst,
+    const ggml_cuda_mm_fusion_args_host * fusion);
+
+bool ggml_cuda_mul_mat_humming_fp8_block(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * src0,
+    const ggml_tensor * src1,
+    ggml_tensor * dst);
+
+void ggml_cuda_dequantize_fp8_block_bf16(
+    const ggml_tensor * weight,
+    const ggml_tensor * scale,
+    nv_bfloat16 * dst,
+    cudaStream_t stream);
+
+bool ggml_cuda_mul_mat_humming_fp8_block_fused(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * src0,
+    const ggml_tensor * src1,
+    const ggml_tensor * scale,
+    ggml_tensor * dst,
+    const ggml_cuda_mm_fusion_args_host * fusion);
+
+bool ggml_cuda_mul_mat_humming_fp8_block_swiglu(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * up,
+    const ggml_tensor * gate,
+    const ggml_tensor * src1,
+    ggml_tensor * dst,
+    bool retain_bf16_output);
+
+bool ggml_cuda_mul_mat_marlin_q4_a32(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * src0,
+    const ggml_tensor * src1,
+    const ggml_tensor * ids,
+    ggml_tensor * dst,
+    const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
+
+// Contract checks shared by the executors and the pre-capture canonicalization
+// pass (ggml-cuda.cu); they do not consult the repacked state.
+bool ggml_cuda_marlin_q4_a32_accepts_mul_mat(
+    const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+    const ggml_tensor * dst, int cc);
+bool ggml_cuda_marlin_q8_g128_accepts_mul_mat(
+    const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+    const ggml_tensor * dst, int cc);
+
+bool ggml_cuda_mul_mat_marlin_q8_g128(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * src0,
+    const ggml_tensor * src1,
+    const ggml_tensor * ids,
+    ggml_tensor * dst,
+    const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
+
+#endif
+
 // Returns the maximum batch size for which MMVQ should be used for MUL_MAT_ID,
 // based on the quantization type and GPU architecture (compute capability).
 int get_mmvq_mmid_max_batch(ggml_type type, int cc);
@@ -24,7 +113,8 @@ int  ggml_cuda_q8_post_silu_test_compute_capability();
 void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
     const ggml_cuda_mm_fusion_args_host * fusion = nullptr,
-    float post_scale = 1.0f, bool post_silu = false);
+    float post_scale = 1.0f, bool post_silu = false,
+    const ggml_tensor * fp8_marker = nullptr);
 
 void ggml_cuda_op_mul_mat_vec_q(
     ggml_backend_cuda_context & ctx,
