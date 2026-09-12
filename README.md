@@ -239,10 +239,10 @@ For SSD-paged experts, also compare `--moe-cache-cpu-overlap 0`: deliberately
 moving a GPU-cache hit to CPU can require another disk read. This is a tuning
 choice, not a claim that overlap is slower on every model or host.
 
-Native safetensors can optionally retain prepared host weights between launches
-with `--repack-cache /path/to/dedicated-directory` (Linux). This saves repeated
-preparation work but can retain tens of GiB; disposable backing remains the default.
-See [storage, validation and cleanup](docs/development/prepared-weight-cache.md).
+For native safetensors SSD offloading, optionally add
+`--repack-cache /path/to/dedicated-directory` (Linux) to reuse prepared host weights
+on later launches. Disposable backing remains the default; retained files can use
+tens of GiB and require manual cleanup. See [storage and validation](docs/development/prepared-weight-cache.md).
 
 ### Choose the KV/VBR entry tier
 
