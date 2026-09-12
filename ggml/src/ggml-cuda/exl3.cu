@@ -437,6 +437,14 @@ __global__ void exl3_cache_dot(const uint8_t * weights, const float * activation
     const float * x = activations + size_t(activation)*k;
     const uint8_t * w = weights + size_t(slots[row])*expert_bytes;
     float sum = 0;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 860
+    // Expose independent tile loads/decodes without changing the FMA order.
+    // SM86 sweeps across expert shapes favor four tiles for mul1 2-4 bit,
+    // two for 3inst 8-bit. Other combinations regress on some down shapes.
+    constexpr int tile_unroll = cb == 2 && bits >= 2 && bits <= 4 ? 4 :
+                               cb == 0 && bits == 8 ? 2 : 1;
+#pragma unroll tile_unroll
+#endif
     for (int kt = 0; kt < k/16; ++kt) {
         const uint32_t * tile = reinterpret_cast<const uint32_t *>(
             w + (size_t(col/16) * (k/16) + kt) * 32 * bits);
