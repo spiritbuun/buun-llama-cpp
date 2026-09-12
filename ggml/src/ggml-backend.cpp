@@ -1847,8 +1847,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     };
 
                     int id = 0;
-                    while (!ggml_bitset_get(used_ids.data(), id)) {
+                    while (id < n_expert && !ggml_bitset_get(used_ids.data(), id)) {
                         id++;
+                    }
+                    if (id == n_expert) {
+                        // A zero-output token batch selects no experts to transfer.
+                        continue;
                     }
                     int32_t first_id = id;
                     int32_t last_id = first_id;
@@ -2017,9 +2021,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
 void ggml_backend_sched_set_moe_cache(
         ggml_backend_sched_t sched, enum ggml_moe_cache_mode mode,
-        size_t budget_mib, int expert_parallel, const char * profile_path) {
+        size_t budget_mib, int expert_parallel, int cpu_overlap, const char * profile_path) {
     GGML_ASSERT(sched);
-    if (mode == GGML_MOE_CACHE_MODE_UNSPECIFIED) {
+    GGML_ASSERT(cpu_overlap >= -2 && cpu_overlap <= 8);
+    if (mode == GGML_MOE_CACHE_MODE_UNSPECIFIED && cpu_overlap == -2) {
         return;
     }
 
@@ -2033,12 +2038,16 @@ void ggml_backend_sched_set_moe_cache(
     }
 
     ggml_moe_cache_config config = {};
-    const int automatic = mode == GGML_MOE_CACHE_MODE_AUTO ? 1 : 0;
+    const int automatic = mode == GGML_MOE_CACHE_MODE_UNSPECIFIED ? -1 :
+        mode == GGML_MOE_CACHE_MODE_AUTO ? 1 : 0;
     if (!ggml_moe_cache.query_config(automatic, budget_mib, &config)) {
         return;
     }
-    config.expert_parallel = expert_parallel;
-    config.profile_path = profile_path;
+    if (mode != GGML_MOE_CACHE_MODE_UNSPECIFIED) {
+        config.expert_parallel = expert_parallel;
+        config.profile_path = profile_path;
+    }
+    if (cpu_overlap != -2) config.overlap_cpu_rows = cpu_overlap;
 
     void * cache_backends[GGML_SCHED_MAX_BACKENDS];
     for (int index = 0; index < sched->n_backends; index++) {

@@ -156,6 +156,7 @@ llama_context::llama_context(
     cparams.moe_cache_mode          = params.moe_cache_mode;
     cparams.moe_cache_budget_mib    = params.moe_cache_budget_mib;
     cparams.moe_cache_expert_parallel = params.moe_cache_expert_parallel;
+    cparams.moe_cache_cpu_overlap = params.moe_cache_cpu_overlap;
     cparams.moe_cache_profile_path = params.moe_cache_profile_path
         ? params.moe_cache_profile_path : "";
     cparams.yarn_ext_factor         = params.yarn_ext_factor  >= 0.0f ? params.yarn_ext_factor  : hparams.yarn_ext_factor;
@@ -879,7 +880,8 @@ static bool llama_model_has_cacheable_moe_weights(
                         name.find("_chexps") == std::string::npos) ||
             ggml_n_dims(tensor) != 3 || tensor->ne[0] <= 0 ||
             tensor->ne[1] <= 0 || tensor->ne[2] <= 0 ||
-            tensor->nb[2] < min_expert_bytes) {
+            tensor->nb[2] < ggml_moe_cache_effective_min_expert_bytes(tensor->type,
+                config.min_expert_explicit, min_expert_bytes)) {
             continue;
         }
 
@@ -1002,6 +1004,7 @@ void llama_context::sched_reserve() {
             sched.get(), moe_cache_mode,
             cparams.moe_cache_budget_mib,
             cparams.moe_cache_expert_parallel,
+            cparams.moe_cache_cpu_overlap,
             cparams.moe_cache_profile_path.empty() ? nullptr :
                 cparams.moe_cache_profile_path.c_str());
 
@@ -1068,6 +1071,7 @@ void llama_context::sched_reserve() {
                         sched.get(), moe_cache_mode,
                         cparams.moe_cache_budget_mib,
                         cparams.moe_cache_expert_parallel,
+                        cparams.moe_cache_cpu_overlap,
                         cparams.moe_cache_profile_path.empty() ? nullptr :
                             cparams.moe_cache_profile_path.c_str());
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
@@ -7188,6 +7192,7 @@ llama_context_params llama_context_default_params() {
         /*.moe_cache_mode              =*/ LLAMA_MOE_CACHE_MODE_UNSPECIFIED,
         /*.moe_cache_budget_mib        =*/ 0,
         /*.moe_cache_expert_parallel   =*/ 0,
+        /*.moe_cache_cpu_overlap       =*/ -2,
         /*.moe_cache_profile_path      =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,

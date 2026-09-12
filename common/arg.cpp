@@ -3863,6 +3863,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_EXPERT_PARALLEL"));
     add_opt(common_arg(
+        {"--moe-cache-cpu-overlap"}, "auto|N",
+        "CPU-assigned cached expert rows per operation: auto uses the type-specific policy "
+        "(EXL3: 0), 0 keeps cache hits on GPU, 1..8 forces a CPU share; uncached experts stay on CPU",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.moe_cache.cpu_overlap = -1;
+                return;
+            }
+            char * end = nullptr;
+            errno = 0;
+            const long long rows = strtoll(value.c_str(), &end, 10);
+            if (errno != 0 || end == value.c_str() || *end != '\0' || rows < 0 || rows > 8) {
+                throw std::invalid_argument("expected auto or a CPU row count from 0 to 8");
+            }
+            params.moe_cache.cpu_overlap = (int)rows;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_CPU_OVERLAP"));
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",

@@ -581,6 +581,7 @@ struct common_moe_cache_params {
     common_moe_cache_mode mode = COMMON_MOE_CACHE_MODE_AUTO;
     size_t budget_mib          = 0;
     int expert_parallel        = 0;
+    int cpu_overlap            = -2; // -2 = inherit provider, -1 = auto, 0..8 = CPU rows
     bool mode_explicit         = false;
     bool fit_selected          = false;
     bool profile               = true;

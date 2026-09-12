@@ -546,13 +546,20 @@ static bool run_capability_queries(
     ok &= config.automatic == 1;
     ok &= config.min_devices == 1;
     ok &= config.minimum_slab_bytes == 1024u * 1024 * 1024;
-    ok &= config.min_compute_capability == 800;
+    ok &= config.min_compute_capability == 700;
     ok &= config.min_expert_bytes == 512u * 1024;
     ok &= config.min_expert_explicit == 0;
     ok &= config.max_batch == 10;
     ok &= config.overlap_cpu_rows == -1;
-    ok &= ggml_moe_cache.query_device(cuda_device, &config, &device) == 1;
-    ok &= device.min_expert_bytes == 512u * 1024;
+    // Automatic and forced modes both support Volta; the byte thresholds for
+    // ordinary quant types still depend on the actual device architecture.
+    // Keep the physical capability from the successful forced probe above.
+    const bool auto_admitted = device.compute_capability >= config.min_compute_capability;
+    ok &= ggml_moe_cache.query_device(cuda_device, &config, &device) == int(auto_admitted);
+    if (auto_admitted) {
+        ok &= device.min_expert_bytes == (device.compute_capability >= 800
+                ? 512u * 1024 : 1024u * 1024);
+    }
 
     ok &= ggml_moe_cache.query_config(0, 0, &config) == 1;
     ok &= config.automatic == 0;
@@ -3715,7 +3722,69 @@ static bool run_admission_policy(
 
 } // namespace
 
+static bool run_scheduler_overlap_config(ggml_backend_t cuda, ggml_backend_t cpu) {
+    configure_cache(nullptr);
+    set_env("GGML_CUDA_MOE_CACHE_OVERLAP_CPU_ROWS", "3");
+    static ggml_moe_cache_config captured;
+    static bool supplied;
+    ggml_backend_t backends[] = {cuda, cpu};
+    auto scheduler = ggml_backend_sched_new(backends, nullptr, 2, 128, false, true);
+    // Backend initialization may refresh the provider's function table.
+    // Observe explicit scheduler configuration only after construction.
+    auto saved_create = ggml_moe_cache.session_create;
+    ggml_moe_cache.session_create = [](void * const *, int, const ggml_moe_cache_config * config) -> void * {
+        if (config) {
+            captured = *config;
+            supplied = true;
+        }
+        return nullptr;
+    };
+    bool ok = true;
+    for (auto mode : {GGML_MOE_CACHE_MODE_UNSPECIFIED, GGML_MOE_CACHE_MODE_AUTO}) {
+        for (int overlap : {-2, -1, 0, 2}) {
+            supplied = false;
+            ggml_backend_sched_set_moe_cache(scheduler, mode, 4, 0, overlap, nullptr);
+            const bool expected_call = mode != GGML_MOE_CACHE_MODE_UNSPECIFIED || overlap != -2;
+            const bool matches = supplied == expected_call &&
+                (!supplied || captured.overlap_cpu_rows == (overlap == -2 ? 3 : overlap));
+            if (!matches) fprintf(stderr, "scheduler overlap mode=%d requested=%d supplied=%d actual=%d\n",
+                int(mode), overlap, supplied, captured.overlap_cpu_rows);
+            ok &= matches;
+        }
+    }
+    supplied = false;
+    ggml_backend_sched_set_moe_cache(scheduler, GGML_MOE_CACHE_MODE_OFF, 4, 0, 2, nullptr);
+    ok &= !supplied;
+    ggml_backend_sched_free(scheduler);
+    ggml_moe_cache.session_create = saved_create;
+    configure_cache(nullptr);
+    printf("cache-scheduler-overlap-config: %s\n", ok ? "OK" : "FAIL");
+    return ok;
+}
+
+static bool run_pool_limits() {
+    bool ok = true;
+    const size_t ordinary_min = 1024u << 10;
+    ok &= ggml_moe_cache_effective_min_expert_bytes(GGML_TYPE_EXL3_2, 0, ordinary_min) == (128u << 10);
+    ok &= ggml_moe_cache_effective_min_expert_bytes(GGML_TYPE_EXL3_2, 1, ordinary_min) == ordinary_min;
+    ok &= ggml_moe_cache_effective_min_expert_bytes(GGML_TYPE_Q4_0, 0, ordinary_min) == ordinary_min;
+    const size_t expert_bytes = 400u << 10;
+    const size_t exl3_limit = ggml_moe_cache_max_pool_slots(GGML_TYPE_EXL3_2, expert_bytes);
+    ok &= exl3_limit == std::min(size_t(INT_MAX), SIZE_MAX / expert_bytes);
+    // 20971 was the erroneous EXL3 limit: four-byte storage blocks, despite
+    // the dedicated kernel addressing the complete pool with byte offsets.
+    if (SIZE_MAX > UINT32_MAX) ok &= exl3_limit > 73728;
+    const size_t q4_bytes = ggml_row_size(GGML_TYPE_Q4_0, 2560) * 640;
+    ok &= ggml_moe_cache_max_pool_slots(GGML_TYPE_Q4_0, q4_bytes) ==
+        std::min(SIZE_MAX / q4_bytes, size_t(INT_MAX) / (q4_bytes / ggml_type_size(GGML_TYPE_Q4_0)));
+    ok &= ggml_moe_cache_max_pool_slots(GGML_TYPE_EXL3_2, 0) == 0;
+    ok &= ggml_moe_cache_max_pool_slots(GGML_TYPE_EXL3_2, expert_bytes + 1) == 0;
+    printf("cache-pool-limits: %s\n", ok ? "OK" : "FAIL");
+    return ok;
+}
+
 int main(int argc, char ** argv) {
+    if (!run_pool_limits()) return 1;
     if (argc > 0 && argv[0]) {
         std::error_code ec;
         test_executable = std::filesystem::absolute(argv[0], ec).string();
@@ -4054,6 +4123,7 @@ int main(int argc, char ** argv) {
             clamped_full_fused_reference.size() * sizeof(float));
 
     bool ok = run_capability_queries(cuda_device, cpu);
+    ok &= run_scheduler_overlap_config(cuda, cpu);
     ok &= run_invalidation_hook_coverage(cpu);
     ok &= run_scenario("cache-hit", nullptr, cuda, cpu, graph, reference, capture);
     scenario_options generic_mmv_options;

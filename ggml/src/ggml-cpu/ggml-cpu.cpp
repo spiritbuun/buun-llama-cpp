@@ -3,6 +3,7 @@
 #include "ggml-cpu.h"
 #include "repack.h"
 #include "traits.h"
+#include "exl3.h"
 #include "ggml-impl.h"
 #include "amx/amx.h"
 
@@ -422,10 +423,10 @@ static ggml_backend_buffer_t ggml_backend_cpu_device_buffer_from_host_ptr(ggml_b
 }
 
 static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    // EXL3 trellis tiles are GPU-only (rows are not independently decodable).
+    // Tiled EXL3 has a matrix executor, not a standalone row dequantizer.
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
         if (op->src[i] != nullptr && ggml_type_is_exl3(op->src[i]->type)) {
-            return false;
+            return ggml_cpu_exl3_supports(op);
         }
     }
     const struct ggml_tensor * src0 = op->src[0];

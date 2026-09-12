@@ -28,5 +28,12 @@ void ggml_cuda_mul_mat_exl3(ggml_backend_cuda_context & ctx, const ggml_tensor *
 bool ggml_cuda_exl3_mul_mat_id_fast(const ggml_tensor * dst);
 void ggml_cuda_mul_mat_id_exl3(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+// CPU MoE-cache bridge: dot products of packed weights and pre-transformed
+// F16-rounded F32 activations. The caller owns both Hadamard transforms.
+void ggml_cuda_exl3_cache_mmv(const void * weights, ggml_type type,
+    const float * activations, const int32_t * slots, const int32_t * activation_ids,
+    float * output, int k, int n, size_t expert_bytes, int rows, int activation_rows,
+    cudaStream_t stream);
+
 // Dequantize the whole tensor to F16 rows W[n][k] (row n contiguous over k); rows [n0, n1).
 void ggml_cuda_exl3_reconstruct_rows(const ggml_tensor * src0, int64_t n0, int64_t n1, half * dst, cudaStream_t stream);

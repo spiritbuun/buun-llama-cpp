@@ -393,6 +393,48 @@ void ggml_cuda_mul_mat_id_exl3(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         static_cast<const uint8_t *>(w->data), static_cast<const half *>(svh->data), static_cast<float *>(dst->data), k, n, pairs, ga, stream);
 }
 
+template<int bits, int cb>
+__global__ void exl3_cache_dot(const uint8_t * weights, const float * activations,
+        const int32_t * slots, const int32_t * activation_ids, float * output,
+        int k, int n, size_t expert_bytes, int activation_rows) {
+    const int col = blockIdx.x*128 + threadIdx.x;
+    const int row = blockIdx.y;
+    if (col >= n) return;
+    const int activation = activation_ids ? activation_ids[row] : row % activation_rows;
+    const float * x = activations + size_t(activation)*k;
+    const uint8_t * w = weights + size_t(slots[row])*expert_bytes;
+    float sum = 0;
+    for (int kt = 0; kt < k/16; ++kt) {
+        const uint32_t * tile = exl3_tile(w, bits, col/16, kt, k/16);
+        const int c = col%16;
+#pragma unroll
+        for (int r = 0; r < 16; ++r) {
+            const int element = ((c%8)*4+(r%8)/2)*8 + r%2 + (r/8)*2 + (c/8)*4;
+            const int pos = ((element+1)*bits + 256*bits - 16) % (256*bits);
+            const uint64_t words = (uint64_t(tile[pos/32]) << 32) | tile[(pos/32+1) % (8*bits)];
+            const uint32_t state = (words >> (48-pos%32)) & 65535;
+            sum = fmaf(__half2float(exl3::decode_3inst<cb>(state)), x[kt*16+r], sum);
+        }
+    }
+    output[size_t(row)*n+col] = sum;
+}
+
+template<int bits, int cb>
+void exl3_cache_launch(const void * weights, const float * activations,
+        const int32_t * slots, const int32_t * activation_ids, float * output,
+        int k, int n, size_t expert_bytes, int rows, int activation_rows, cudaStream_t stream) {
+    exl3_cache_dot<bits, cb><<<dim3((n+127)/128, rows), 128, 0, stream>>>(
+        static_cast<const uint8_t *>(weights), activations, slots, activation_ids,
+        output, k, n, expert_bytes, activation_rows);
+}
+
+void ggml_cuda_exl3_cache_mmv(const void * weights, ggml_type type,
+        const float * activations, const int32_t * slots, const int32_t * activation_ids,
+        float * output, int k, int n, size_t expert_bytes, int rows, int activation_rows, cudaStream_t stream) {
+    EXL3_DISPATCH(exl3_cache_launch, ggml_exl3_bits(type), ggml_exl3_codebook(type),
+        weights, activations, slots, activation_ids, output, k, n, expert_bytes, rows, activation_rows, stream);
+}
+
 #else
 
 bool ggml_cuda_exl3_mul_mat_id_fast(const ggml_tensor *) { return false; }

@@ -426,6 +426,7 @@ extern "C" {
         enum llama_moe_cache_mode moe_cache_mode; // runtime MoE expert cache mode
         size_t moe_cache_budget_mib;               // 0 uses the provider's available-memory budget
         int32_t moe_cache_expert_parallel;          // -1 = provider policy, 0 = disabled, N = device fanout
+        int32_t moe_cache_cpu_overlap;              // -2 = inherit provider, -1 = auto, 0..8 = CPU rows per operation
         const char * moe_cache_profile_path;        // optional versioned expert heatmap
 
         // Abort callback

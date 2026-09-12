@@ -215,6 +215,22 @@ devices. `--moe-cache on` forces canonical CPU expert weights immediately. `soft
 when partial expert eviction is specifically desired: it first tries spare VRAM with stock placement,
 then evicts the minimum expert footprint needed to form cache pools.
 
+### EXL3 and CPU overlap
+
+EXL3 supports CPU expert execution and CUDA MoE caching. By default, cached EXL3 work stays on
+GPU rather than assigning a share to CPU: CPU trellis decoding can otherwise hold up the GPU's
+completed work. Experts missing from the GPU cache still run on CPU.
+
+Use `--moe-cache-cpu-overlap auto|N` to override this policy:
+
+- `auto`: EXL3 overlap is disabled; other quant types retain their automatic policy.
+- `0`: disable deliberate CPU overlap.
+- `1` through `8`: assign that many cached expert rows per operation to CPU when all selected
+  rows are cached, leaving at least one GPU row. For example, `--moe-cache-cpu-overlap 2`.
+
+Leave this unset initially; benchmark explicit counts on your hardware before retaining them.
+See [MoE cache configuration](docs/backend/CUDA-MOE-CACHE.md#configuration) for environment overrides.
+
 ### Choose the KV/VBR entry tier
 
 For these bandwidth-heavy models, start with `--vbr-entry t8`. This starts the dynamic VBR cache at

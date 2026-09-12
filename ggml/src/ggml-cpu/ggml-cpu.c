@@ -5,6 +5,7 @@
 #include "ggml-backend.h"
 #include "traits.h"
 #include "iqp.h"
+#include "exl3.h"
 #include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
 #include "quants.h"
@@ -1985,6 +1986,11 @@ void ggml_compute_forward_mul_mat(
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
+    if (ggml_type_is_exl3(src0->type)) {
+        ggml_cpu_exl3_compute(params, dst);
+        return;
+    }
+
     if (src0->type == GGML_TYPE_F8_E4M3 && dst->src[2] != NULL &&
             dst->src[2]->type == GGML_TYPE_I8 && dst->src[3] != NULL) {
         ggml_compute_forward_mul_mat_mxfp8_quantized_input(params, dst);
@@ -2633,6 +2639,10 @@ static void ggml_compute_forward_mul_mat_id_impl(
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
+    if (ggml_type_is_exl3(dst->src[0]->type)) {
+        ggml_cpu_exl3_compute(params, dst);
+        return;
+    }
     ggml_compute_forward_mul_mat_id_impl(params, dst, 0, false, true, true);
 }
 
@@ -3822,6 +3832,10 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_MUL_MAT:
                     {
+                        if (ggml_type_is_exl3(node->src[0]->type)) {
+                            cur = ggml_cpu_exl3_work_size(node, n_tasks);
+                            break;
+                        }
                         const enum ggml_type vec_dot_type = type_traits_cpu[node->src[0]->type].vec_dot_type;
 
                         if (node->src[1]->type != vec_dot_type) {
@@ -3835,6 +3849,10 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_MUL_MAT_ID:
                     {
+                        if (ggml_type_is_exl3(node->src[0]->type)) {
+                            cur = ggml_cpu_exl3_work_size(node, n_tasks);
+                            break;
+                        }
                         cur = 0;
                         const struct ggml_tensor * src0 = node->src[0];
                         const struct ggml_tensor * src1 = node->src[1];
@@ -4020,6 +4038,7 @@ static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_in
 
 static bool ggml_moe_cache_weight_is_eligible(const struct ggml_tensor * weight) {
     if (!weight || weight->op != GGML_OP_NONE || !weight->data ||
+        ggml_type_is_exl3(weight->type) ||
         weight->ne[0] <= 0 || weight->ne[1] <= 0 || weight->ne[2] <= 0 ||
         weight->nb[0] != ggml_type_size(weight->type)) {
         return false;

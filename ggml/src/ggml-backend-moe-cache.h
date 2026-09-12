@@ -4,6 +4,29 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <limits.h>
+
+// EXL3's CPU trellis decode is costlier than the ordinary vector-dot types.
+// Keep its admission floor consistent in fit, context setup, and the provider.
+static inline size_t ggml_moe_cache_effective_min_expert_bytes(
+        int wtype, int explicit_minimum, size_t default_minimum) {
+    return !explicit_minimum && ggml_type_is_exl3((enum ggml_type)wtype)
+        ? 128u << 10 : default_minimum;
+}
+
+// Slot IDs remain int32. Ordinary kernels also index quant blocks with int32;
+// EXL3's dedicated cache kernel instead uses size_t byte offsets into the slab.
+static inline size_t ggml_moe_cache_max_pool_slots(int wtype, size_t expert_size) {
+    const size_t type_size = ggml_type_size((enum ggml_type)wtype);
+    if (!type_size || !expert_size || expert_size % type_size != 0) return 0;
+    size_t slots = SIZE_MAX / expert_size;
+    if (slots > INT_MAX) slots = INT_MAX;
+    if (!ggml_type_is_exl3((enum ggml_type)wtype)) {
+        const size_t indexed_slots = INT_MAX / (expert_size / type_size);
+        if (slots > indexed_slots) slots = indexed_slots;
+    }
+    return slots;
+}
 
 #ifdef __cplusplus
 extern "C" {
@@ -93,6 +116,9 @@ struct ggml_moe_cache_api {
 
     // Dispatch all planned hit rows. Returns 1 only after the complete GPU operation has been accepted.
     // On 0, the caller must restore every row to the normal CPU mapping before worker threads start.
+    // Tiled EXL3: act_rows are already Hadamard-transformed and F16-rounded;
+    // collect returns dot products before the output Hadamard and scale.
+    // The CPU executor applies those transforms equally to cache hits/misses.
     int (*dispatch)(void * node, int wtype, int64_t n_in, int64_t n_out, int n_hits,
                     const int32_t * slot_idx, const float * const * act_rows);
 
@@ -119,7 +145,7 @@ GGML_API struct ggml_moe_cache_api ggml_moe_cache;
 GGML_API void ggml_moe_cache_unregister(const void * owner);
 GGML_API void ggml_backend_sched_set_moe_cache(
         ggml_backend_sched_t sched, enum ggml_moe_cache_mode mode,
-        size_t budget_mib, int expert_parallel, const char * profile_path);
+        size_t budget_mib, int expert_parallel, int cpu_overlap, const char * profile_path);
 
 #ifdef __cplusplus
 }

@@ -1083,12 +1083,26 @@ static void test(void) {
         {"binary_name", "--moe-cache-expert-parallel", "-1"},
         {"binary_name", "--moe-cache-expert-parallel", "9"},
         {"binary_name", "--moe-cache-expert-parallel", "invalid"},
+        {"binary_name", "--moe-cache-cpu-overlap"},
+        {"binary_name", "--moe-cache-cpu-overlap", "-1"},
+        {"binary_name", "--moe-cache-cpu-overlap", "9"},
+        {"binary_name", "--moe-cache-cpu-overlap", "2x"},
     };
     for (auto invalid_argv : invalid_moe_cache_args) {
         common_params mode_params;
         assert(false == common_params_parse(
                 invalid_argv.size(), list_str_to_char(invalid_argv).data(),
                 mode_params, LLAMA_EXAMPLE_COMMON));
+    }
+
+    for (const std::string value : {"auto", "0", "2", "8"}) {
+        common_params mode_params;
+        assert(common_context_params_to_llama(mode_params).moe_cache_cpu_overlap == -2);
+        argv = {"binary_name", "-m", "model.gguf", "--moe-cache-cpu-overlap", value};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), mode_params, LLAMA_EXAMPLE_COMMON));
+        const int expected = value == "auto" ? -1 : std::stoi(value);
+        assert(mode_params.moe_cache.cpu_overlap == expected);
+        assert(common_context_params_to_llama(mode_params).moe_cache_cpu_overlap == expected);
     }
 
     {
@@ -1244,6 +1258,19 @@ static void test(void) {
         assert(common_context_params_to_llama(mode_params).moe_cache_mode == LLAMA_MOE_CACHE_MODE_OFF);
     }
     unsetenv("LLAMA_ARG_MOE_CACHE");
+
+    setenv("LLAMA_ARG_MOE_CACHE_CPU_OVERLAP", "2", true);
+    for (bool explicit_auto : {false, true}) {
+        common_params overlap_params;
+        argv = {"binary_name"};
+        if (explicit_auto) {
+            argv.push_back("--moe-cache-cpu-overlap");
+            argv.push_back("auto");
+        }
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), overlap_params, LLAMA_EXAMPLE_COMMON));
+        assert(common_context_params_to_llama(overlap_params).moe_cache_cpu_overlap == (explicit_auto ? -1 : 2));
+    }
+    unsetenv("LLAMA_ARG_MOE_CACHE_CPU_OVERLAP");
 
     setenv("LLAMA_ARG_LOAD_MODE", "mmap+mlock", true);
     argv = {"binary_name"};

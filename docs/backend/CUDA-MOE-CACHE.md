@@ -12,11 +12,25 @@ This is an opportunistic path. Unsupported nodes, unavailable cache capacity, co
 
 ## Configuration
 
+`--moe-cache-cpu-overlap auto|N` controls CPU work when all selected rows are
+cached. `auto` uses the type-specific policy: EXL3 keeps resident rows on GPU;
+other supported quant types retain their size-based overlap policy. `0`
+disables deliberate CPU overlap, while `1` through `8` request that many CPU
+rows per operation (clamped to leave at least one GPU row). Cache misses still
+run on CPU. This divides work; it does not race duplicate CPU/GPU computations.
+
+For example, `--moe-cache-cpu-overlap 2` explicitly enables a two-row CPU share
+for EXL3. The public environment equivalent is `LLAMA_ARG_MOE_CACHE_CPU_OVERLAP`.
+An explicit setting, including `auto`, overrides the low-level
+`GGML_CUDA_MOE_CACHE_OVERLAP_CPU_ROWS` variable; omitting the flag preserves
+that variable's behavior. Overrides are context-local and do not enable a
+cache that has otherwise been disabled.
+
 Use `--moe-cache MODE` with programs that use the common argument parser:
 
 | Mode | Cache budget | Weight repacking | Device requirements |
 | --- | --- | --- | --- |
-| `auto` | Free VRAM minus the reserve | Preserved unless cache-aware fit selects canonical CPU experts | At least one eligible selected CUDA device, compute capability 8.0 or newer |
+| `auto` | Free VRAM minus the reserve | Preserved unless cache-aware fit selects canonical CPU experts | At least one eligible selected CUDA device, compute capability 7.0 or newer |
 | `on` | Free VRAM minus the reserve | Disabled | At least one eligible selected CUDA device, compute capability 7.0 or newer |
 | `N` | At most `N` MiB per device, after the reserve | Disabled | Same as `on` |
 | `off` or `0` | No cache session | Preserved unless changed separately | None |
@@ -190,7 +204,7 @@ context size, model quantization, and active devices still determine the selecte
 
 The real OLMoE model also exercised the available quant families from Q2_K through Q8_0. The matched off versus fixed 4096 MiB results were 251.54 versus 263.34 t/s for Q2_K, 215.12 versus 257.65 t/s for Q3_K_M, 200.12 versus 265.97 t/s for Q4_0, 173.49 versus 256.55 t/s for Q5_K_M, 157.75 versus 236.78 t/s for Q6_K, and 130.60 versus 224.03 t/s for Q8_0. F16 remained dormant because that cache matvec type is unsupported and preserved parity at 74.43 versus 74.78 t/s. A fully resident Qwen3.6-35B control preserved repacking and remained dormant at 144.80 t/s off versus 144.68 t/s auto.
 
-The Ampere admission floor is 512 KiB rather than the earlier permissive 64 KiB. This is below the smallest profitable local experts: OLMoE Q2_K uses 672-880 KiB experts and reached `296.37 +/- 0.08` t/s at a 512 KiB floor versus `246.98 +/- 0.87` t/s when a 1 MiB floor made the cache dormant. Qwen3.6 uses 576-704 KiB experts and reached `92.88 +/- 0.76` versus `81.41 +/- 0.10` t/s in the same boundary test. No local measurement supports admitting experts below 512 KiB automatically. `GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB` remains available for explicit experiments.
+The Ampere admission floor is 512 KiB rather than the earlier permissive 64 KiB. This is below the smallest profitable local experts: OLMoE Q2_K uses 672-880 KiB experts and reached `296.37 +/- 0.08` t/s at a 512 KiB floor versus `246.98 +/- 0.87` t/s when a 1 MiB floor made the cache dormant. Qwen3.6 uses 576-704 KiB experts and reached `92.88 +/- 0.76` versus `81.41 +/- 0.10` t/s in the same boundary test. These measurements cover ordinary quant types; EXL3 uses a separate 128 KiB admission floor because its CPU decoding cost differs. `GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB` remains available for explicit experiments.
 
 Automatic policy also requires at least 1 GiB of aggregate slab capacity per device. On OLMoE Q2_K, 160, 256, and 512 MiB caps regressed to 179.66, 203.12, and 235.29 t/s because small pools thrashed. A 640 MiB cap reached parity at 245.25 t/s, 768 MiB reached 254.21 t/s, and 1 GiB reached 268.89 t/s. This device-level floor does not replace the 64-slot shape floor: Llama-4's 22.5 MiB experts require more than 1 GiB to hold 64 slots, and 70 slots per device still improved decode from 25.97 to 31.21 t/s. Fixed modes remain available for deliberate smaller-capacity sweeps.
 
@@ -221,7 +235,7 @@ The following environment variables are implementation controls, not a stable co
 | Variable | Default | Meaning |
 | --- | ---: | --- |
 | `GGML_CUDA_MOE_CACHE_RESERVE_MB` | hardware dependent | VRAM left outside the cache on each device; automatic policy uses 6% rounded to 128 MiB, clamped to 1024--3072 MiB and at most 25% |
-| `GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB` | hardware dependent | Minimum bytes per expert, in KiB; `512` when all selected devices are compute capability 8.0 or newer and `1024` otherwise |
+| `GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB` | type/hardware dependent | Minimum bytes per expert, in KiB; EXL3 uses `128`, ordinary types use `512` when all selected devices are compute capability 8.0 or newer and `1024` otherwise |
 | `GGML_CUDA_MOE_CACHE_MAX_BATCH` | `10` | Maximum tokens in an eligible node |
 | `GGML_CUDA_MOE_CACHE_INSERTS` | `8` (`16` with expert parallelism) | Maximum admissions per node |
 | `GGML_CUDA_MOE_CACHE_ADMIT_AFTER` | adaptive | Override the initial miss count; by default it is `1` for complete pools and `2` for capacity-constrained pools |
@@ -233,8 +247,8 @@ The following environment variables are implementation controls, not a stable co
 | `GGML_CUDA_MOE_CACHE_SERIAL_FILL` | hardware dependent | Serialize fills across devices; defaults to `0` with at least two compute capability 8.0 or newer devices and `1` otherwise |
 | `GGML_CUDA_MOE_CACHE_DEDICATED_MMV` | `0` | Force the cache-specific activation-map matvec; compatible routing uses the existing modulo-index MMV path by default |
 | `GGML_CUDA_MOE_CACHE_DOWN_DEDICATED_MMV` | `0` | Use the cache-specific MMV for a full-fusion down projection; the generic modulo-index MMV remains the default |
-| `GGML_CUDA_MOE_CACHE_OVERLAP_CPU_ROWS` | automatic | Rows retained on CPU only when every row is resident; an explicit value from `0` through `8` overrides the size-aware policy |
-| `GGML_CUDA_MOE_CACHE_MIN_CC` | mode dependent | Override the minimum compute capability encoded as `major * 100 + minor * 10` |
+| `GGML_CUDA_MOE_CACHE_OVERLAP_CPU_ROWS` | automatic | Rows retained on CPU only when every row is resident; EXL3 defaults to zero, other types use the size-aware policy. An explicit value from `0` through `8` overrides it unless the public CPU-overlap setting is supplied |
+| `GGML_CUDA_MOE_CACHE_MIN_CC` | `700` | Override the minimum compute capability encoded as `major * 100 + minor * 10` |
 
 Directly setting `GGML_CUDA_MOE_CACHE_MODE`, `GGML_CUDA_MOE_CACHE`, or `GGML_CUDA_MOE_CACHE_BUDGET_MB` controls the provider only when a program leaves the mode unspecified. Common applications do this for their implicit `auto` default, so provider settings affect fit and runtime consistently. An explicit `--moe-cache` or `LLAMA_ARG_MOE_CACHE` value takes precedence and also controls the model loader's repacking choice. `llama-bench` applies its selected cache arm before every model instance and overwrites the three raw backend variables; use `--moe-cache` or `LLAMA_ARG_MOE_CACHE` to select its benchmark mode.
 
