@@ -5,6 +5,7 @@
 #include <utility>
 #include <vector>
 #include <cstdio>
+#include <string>
 
 struct llama_file;
 struct llama_mmap;
@@ -18,6 +19,12 @@ struct llama_file {
     llama_file(const char * fname, const char * mode, bool use_direct_io = false);
     llama_file(FILE * file);
     ~llama_file();
+
+    // Disposable disk backing, owned until the last mapping/handle is closed.
+    static const bool TEMP_SUPPORTED;
+    static std::unique_ptr<llama_file> create_temp(const std::string & directory);
+    void sync_write(); // drain buffered writes without changing the file position
+    void finish_write();
 
     size_t tell() const;
     size_t size() const;
@@ -36,6 +43,8 @@ struct llama_file {
 
     size_t read_alignment() const;
     bool has_direct_io() const;
+    // Best-effort read-ahead hint for this open handle; false restores NORMAL.
+    void advise_random(bool enabled) const;
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
@@ -54,6 +63,8 @@ struct llama_mmap {
     void * addr() const;
 
     void unmap_fragment(size_t first, size_t last);
+    // Best-effort hint over a live mapped range; false restores NORMAL.
+    void advise_random(size_t first, size_t last, bool enabled) const;
 
     static const bool SUPPORTED;
 

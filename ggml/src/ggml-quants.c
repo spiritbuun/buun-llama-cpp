@@ -5654,6 +5654,22 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
 
     const size_t nb = nbytes/ggml_type_size(type);
 
+    // Tiled EXL3 stores only trellis bits; every bit pattern selects a finite
+    // procedural codebook value. Sign/scale vectors are separate F16 tensors.
+    if (ggml_type_is_exl3(type)) {
+        return true;
+    }
+    if (ggml_type_is_exl3_ngram(type)) {
+        // Independent 160-value rows have one F16 scale followed by trellis bits.
+        const size_t stride = ggml_type_size(type);
+        for (size_t i = 0; i < nb; ++i) {
+            ggml_fp16_t scale;
+            memcpy(&scale, (const char *) data + i * stride, sizeof(scale));
+            if (!validate_fp16(scale, i)) return false;
+        }
+        return true;
+    }
+
     switch (type) {
         case GGML_TYPE_BF16:
             {

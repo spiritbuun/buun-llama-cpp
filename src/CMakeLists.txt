@@ -47,6 +47,7 @@ add_library(llama
             llama-memory-recurrent.cpp
             llama-memory-tree.cpp
             llama-mmap.cpp
+            llama-repack-cache.cpp
             llama-model-loader.cpp
             llama-model-saver.cpp
             llama-model.cpp

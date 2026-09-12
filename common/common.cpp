@@ -1588,6 +1588,10 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         }
     }
 
+    if (!params.repack_cache.empty()) {
+        COM_INF("Prepared-weight cache: %s; retained files survive shutdown and may use tens of GiB. Use -lv 4 for entry sizes.\n",
+                params.repack_cache.c_str());
+    }
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
     if (model == NULL) {
         return;
@@ -2032,6 +2036,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.load_mode       = params.load_mode;
     mparams.lazy_mode = params.lazy_mode;
     mparams.mmap_prefetch = params.mmap_prefetch;
+    mparams.repack_cache = params.repack_cache.empty() ? nullptr : params.repack_cache.c_str();
     mparams.tensor_split    = params.tensor_split;
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;

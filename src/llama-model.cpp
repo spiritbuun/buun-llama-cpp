@@ -2140,7 +2140,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.init_mappings(params.mmap_prefetch, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    ml.init_mappings(params.mmap_prefetch, use_mlock ? &pimpl->mlock_mmaps : nullptr,
+                     params.progress_callback, params.progress_callback_user_data);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -2163,26 +2164,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         llama_buf_map buf_map;
         buf_map.reserve(n_max_backend_buffer);
 
-        // check if it is possible to use buffer_from_host_ptr with this buffer type
-        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-        if (!dev) {
-            // FIXME: workaround for CPU backend buft having a NULL device
-            dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-            if (!dev) {
-                throw std::runtime_error(format("%s: no CPU backend found", __func__));
-            }
-        }
-        ggml_backend_dev_props props;
-        ggml_backend_dev_get_props(dev, &props);
-        bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr;
-        bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
+        const auto dev = llama_model_loader::mmap_buffer_device(buft);
 
         std::vector<ggml_backend_buffer_ptr> bufs;
 
         // a lazy context is mapped whatever the load mode, but the memory-fit pass maps nothing
         const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc;
 
-        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+        const bool mapped_context = ml.tensor_source ? ctx_key.source_mapped : (ml.use_mmap || is_lazy_mapped);
+        if (mapped_context && !ml.no_alloc && use_mmap_buffer && dev) {
             GGML_ASSERT(!ml.no_alloc);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
@@ -2195,6 +2185,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 if (first >= last) {
                     continue;
                 }
+                // Safetensors header/data offsets need not align like GGUF.
+                // The buffer base must align; individual tensor spans keep their
+                // validated file offsets and sizes inside that buffer.
+                first -= first % ggml_backend_buft_get_alignment(buft);
                 const size_t max_size = ggml_get_max_tensor_size(ctx);
                 ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
                 if (buf == nullptr) {
@@ -3293,6 +3287,7 @@ llama_model_params llama_model_default_params() {
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
         /*.mmap_prefetch               =*/ LLAMA_MMAP_PREFETCH_MODE_AUTO,
+        /*.repack_cache                =*/ nullptr,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,

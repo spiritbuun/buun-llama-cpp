@@ -3362,6 +3362,183 @@ std::vector<uint8_t> llama_safetensors_quant_adapters::read(
     return registry_.read(primary);
 }
 
+bool llama_safetensors_quant_adapters::can_stream(const llama_safetensors_quant_binding & binding) const {
+    using materialization = llama_safetensors_quant_materialization;
+    if (binding.materialization == materialization::EXL3_REPACK) return true;
+    // Eight output rows are the minimum strip for packed channel zero points.
+    // Keep even that strip bounded; extraordinary widths use the allocated path.
+    if (binding.target_shape.size() < 2 || binding.target_shape[0] <= 0 ||
+        binding.target_shape[0] > 256 * 1024) return false;
+    switch (binding.materialization) {
+        case materialization::NVFP4_REPACK:
+        case materialization::AWQ_REPACK:
+        case materialization::GPTQ_REPACK:
+        case materialization::GPTQ8_REPACK:
+        case materialization::PACKED_INT4_REPACK:
+        case materialization::PACKED_INT8_REPACK: return true;
+        default: return false;
+    }
+}
+
+void llama_safetensors_quant_adapters::stream(
+        const llama_safetensors_quant_binding & binding,
+        const std::function<void(const void *, size_t)> & write) const {
+    using materialization = llama_safetensors_quant_materialization;
+    if (!can_stream(binding)) throw std::runtime_error("unsupported streaming quantization: " + binding.primary);
+    if (binding.materialization == materialization::EXL3_REPACK) {
+        stream_exl3(binding, write);
+        return;
+    }
+    const bool nv = binding.materialization == materialization::NVFP4_REPACK;
+    const bool awq = binding.materialization == materialization::AWQ_REPACK;
+    const bool gptq = binding.materialization == materialization::GPTQ_REPACK ||
+                      binding.materialization == materialization::GPTQ8_REPACK;
+    const bool eight = binding.materialization == materialization::GPTQ8_REPACK ||
+                       binding.materialization == materialization::PACKED_INT8_REPACK;
+    const bool transposed = awq || gptq;
+    const auto & weight = require_tensor(registry_, binding.primary);
+    const auto & scale = require_tensor(registry_, binding.auxiliaries.at(transposed ? 1 : 0));
+    const size_t k = binding.target_shape[0];
+    size_t n = 1;
+    for (size_t i = 1; i < binding.target_shape.size(); ++i) {
+        if (binding.target_shape[i] <= 0 || uint64_t(binding.target_shape[i]) > SIZE_MAX / n)
+            throw std::runtime_error("invalid streaming weight dimensions");
+        n *= binding.target_shape[i];
+    }
+    const auto * group = nv ? nullptr : match(binding.primary.substr(0, binding.primary.rfind('.')));
+    if (!nv && (!group || (gptq && group->act_order)))
+        throw std::runtime_error("streaming binding no longer matches its quantization group");
+    const size_t g = nv ? 16 : (group->group_size ? group->group_size : k);
+    if (g == 0 || k % g) throw std::runtime_error("invalid streaming weight group size");
+    const size_t groups = k / g, pack = eight ? 4 : 8;
+    const llama_safetensors_tensor * zero = nullptr;
+    if (transposed || (!nv && !group->symmetric))
+        zero = &require_tensor(registry_, binding.auxiliaries.at(transposed ? 0 : 2));
+
+    // Validate full descriptors before replacing their shapes with slice shapes.
+    // The existing repackers below still own dtype, group and numerical checks.
+    const auto check_shape = [](const llama_safetensors_tensor & desc, std::vector<uint64_t> shape) {
+        if (desc.shape != shape) throw std::runtime_error("inconsistent streaming source shape: " + desc.name);
+    };
+    if (nv) {
+        if ((weight.shape.size() != 2 && weight.shape.size() != 3) || scale.shape.size() != weight.shape.size() ||
+            !std::equal(weight.shape.begin(), weight.shape.end() - 1, scale.shape.begin()))
+            throw std::runtime_error("invalid streaming NVFP4 shape");
+        size_t rows = 1;
+        for (size_t i = 0; i + 1 < weight.shape.size(); ++i) rows *= weight.shape[i];
+        if (rows != n || weight.shape.back() != k / 2 || scale.shape.back() != k / 16)
+            throw std::runtime_error("inconsistent streaming NVFP4 dimensions");
+    } else if (transposed) {
+        if (n % pack) throw std::runtime_error("unaligned streaming packed channels");
+        check_shape(weight, awq ? std::vector<uint64_t>{k, n / 8} : std::vector<uint64_t>{k / pack, n});
+        check_shape(scale, {groups, n});
+        check_shape(*zero, {groups, n / pack});
+    } else {
+        const auto shape = read_weight_shape(registry_, binding.primary.substr(0, binding.primary.rfind('.')));
+        if (shape != std::array<uint64_t, 2>{n, k}) throw std::runtime_error("inconsistent streaming weight_shape");
+        check_shape(weight, {n, k / pack});
+        check_shape(scale, {n, groups});
+        if (zero) check_shape(*zero, {(n + 7) / 8, groups});
+    }
+
+    struct slice { llama_safetensors_tensor desc; std::vector<uint8_t> bytes; };
+    // A rectangular slice, including a flattened leading dimension for NVFP4.
+    const auto read_slice = [&](const llama_safetensors_tensor & src, size_t rows, size_t cols,
+                                size_t r, size_t c, size_t nr, size_t nc) {
+        const size_t element = llama_safetensors_dtype_size(src.dtype);
+        if (!element || !cols || rows > SIZE_MAX / element / cols || src.size != rows * cols * element ||
+            r > rows || nr > rows - r || c > cols || nc > cols - c)
+            throw std::runtime_error("invalid streaming source span: " + src.name);
+        slice result{src, std::vector<uint8_t>(nr * nc * element)};
+        result.desc.shape = {nr, nc};
+        result.desc.size = result.bytes.size();
+        if (nc == cols) {
+            registry_.read_into(src, r * cols * element, result.bytes.data(), result.bytes.size());
+        } else {
+            for (size_t row = 0; row < nr; ++row)
+                registry_.read_into(src, ((r + row) * cols + c) * element,
+                                    result.bytes.data() + row * nc * element, nc * element);
+        }
+        return result;
+    };
+    const llama_safetensors_registry::strided_read_scope input_advice(registry_, transposed ?
+        std::vector<const llama_safetensors_tensor *>{&weight, &scale, zero} :
+        std::vector<const llama_safetensors_tensor *>{});
+    const size_t rows_per_strip = std::max(size_t(8), (1024 * 1024 / k / 8) * 8);
+    for (size_t row = 0; row < n; row += rows_per_strip) {
+        const size_t count = std::min(rows_per_strip, n - row);
+        auto w = transposed ?
+            read_slice(weight, awq ? k : k / pack, awq ? n / 8 : n,
+                       0, awq ? row / 8 : row, awq ? k : k / pack, awq ? count / 8 : count) :
+            read_slice(weight, n, nv ? k / 2 : k / pack, row, 0, count, nv ? k / 2 : k / pack);
+        auto s = transposed ? read_slice(scale, groups, n, 0, row, groups, count) :
+                              read_slice(scale, n, groups, row, 0, count, groups);
+        std::optional<slice> z;
+        if (zero) z = transposed ? read_slice(*zero, groups, n / pack, 0, row / pack, groups, count / pack) :
+                                  read_slice(*zero, (n + 7) / 8, groups, row / 8, 0, (count + 7) / 8, groups);
+        std::vector<uint8_t> out;
+        if (nv) {
+            out = repack_nvfp4(w.desc, w.bytes.data(), w.bytes.size(), s.desc, s.bytes.data(), s.bytes.size());
+        } else if (awq) {
+            out = repack_awq(w.desc, w.bytes.data(), z->desc, z->bytes.data(), s.desc, s.bytes.data(), group->group_size);
+        } else if (gptq && !eight) {
+            out = repack_gptq(w.desc, w.bytes.data(), z->desc, z->bytes.data(), s.desc, s.bytes.data(), group->group_size);
+        } else if (gptq) {
+            out = repack_gptq8(w.desc, w.bytes.data(), z->desc, z->bytes.data(), s.desc, s.bytes.data(),
+                               group->group_size, binding.target_type);
+        } else if (eight) {
+            out = repack_packed_int8(w.desc, w.bytes.data(), s.desc, s.bytes.data(), {count, k});
+        } else {
+            out = repack_packed_int4(w.desc, w.bytes.data(), s.desc, s.bytes.data(), z ? &z->desc : nullptr,
+                                    z ? z->bytes.data() : nullptr, {count, k}, group->group_size,
+                                    group->symmetric, binding.target_type);
+        }
+        write(out.data(), out.size());
+    }
+}
+
+void llama_safetensors_quant_adapters::stream_exl3(
+        const llama_safetensors_quant_binding & binding,
+        const std::function<void(const void *, size_t)> & write) const {
+    if (binding.materialization != llama_safetensors_quant_materialization::EXL3_REPACK) {
+        throw std::runtime_error("stream_exl3 requires an EXL3 weight binding");
+    }
+    const auto & desc = require_tensor(registry_, binding.primary);
+    const size_t kt = desc.shape[0], nt = desc.shape[1];
+    const size_t tile = desc.shape[2] * sizeof(uint16_t);
+    // Output-major slabs: gather contiguous tiles from each input K row,
+    // transpose within the slab, then write sequentially. At most 8 MiB of
+    // output plus one gather row. A single unusually large row uses tile chunks.
+    constexpr size_t capacity = 8 * 1024 * 1024;
+    const size_t row_bytes = kt * tile;
+    if (row_bytes > capacity) {
+        std::vector<uint8_t> block(capacity / tile * tile);
+        for (size_t n = 0; n < nt; ++n) {
+            for (size_t k = 0; k < kt;) {
+                const size_t count = std::min(kt - k, block.size() / tile);
+                for (size_t i = 0; i < count; ++i) {
+                    registry_.read_into(desc, ((k + i) * nt + n) * tile, block.data() + i * tile, tile);
+                }
+                write(block.data(), count * tile);
+                k += count;
+            }
+        }
+        return;
+    }
+    const size_t slab_rows = std::min(nt, capacity / row_bytes);
+    std::vector<uint8_t> slab(slab_rows * row_bytes), gather(slab_rows * tile);
+    for (size_t n = 0; n < nt; n += slab_rows) {
+        const size_t rows = std::min(slab_rows, nt - n);
+        for (size_t k = 0; k < kt; ++k) {
+            registry_.read_into(desc, (k * nt + n) * tile, gather.data(), rows * tile);
+            for (size_t j = 0; j < rows; ++j) {
+                std::memcpy(slab.data() + j * row_bytes + k * tile, gather.data() + j * tile, tile);
+            }
+        }
+        write(slab.data(), rows * row_bytes);
+    }
+}
+
 std::vector<uint8_t> llama_safetensors_quant_adapters::finalize(
         const llama_safetensors_quant_binding & binding,
         std::vector<uint8_t> data) const {

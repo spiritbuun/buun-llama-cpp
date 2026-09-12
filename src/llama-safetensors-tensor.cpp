@@ -8,6 +8,17 @@
 #include <stdexcept>
 #include <thread>
 
+void llama_safetensors_stream_raw(const llama_safetensors_registry & registry,
+                                  const llama_safetensors_tensor & source,
+                                  const std::function<void(const void *, size_t)> & write) {
+    std::vector<uint8_t> block(std::min<size_t>(source.size, 8 * 1024 * 1024));
+    for (size_t offset = 0; offset < source.size; offset += block.size()) {
+        const size_t count = std::min<size_t>(block.size(), source.size - offset);
+        registry.read_into(source, offset, block.data(), count);
+        write(block.data(), count);
+    }
+}
+
 namespace {
 
 const llama_safetensors_tensor * find_source(const llama_safetensors_registry &       registry,
@@ -136,21 +147,32 @@ void llama_safetensors_tensor_set_parallel(ggml_tensor * destination, const void
     for (auto & worker : workers) worker.join();
 }
 
+std::optional<llama_model_tensor_file_region> llama_safetensors_tensor_file_region(
+        const llama_safetensors_registry & registry,
+        const llama_safetensors_tensor_binding & binding,
+        const ggml_tensor * destination) {
+    if (binding.quant && binding.quant->materialization != llama_safetensors_quant_materialization::RAW) {
+        return std::nullopt;
+    }
+    const llama_safetensors_tensor * source = find_source(registry, binding);
+    if (source == nullptr) {
+        return std::nullopt;
+    }
+    const ggml_type source_type = binding.quant ? binding.quant->target_type : plain_target_type(*source);
+    if (source_type != destination->type || source->size != ggml_nbytes(destination)) {
+        return std::nullopt;
+    }
+    return llama_model_tensor_file_region { registry.shards().at(source->shard).path.string(), size_t(source->offset) };
+}
+
 bool llama_safetensors_load_tensor_direct(const llama_safetensors_registry &       registry,
                                           const llama_safetensors_tensor_binding & binding,
                                           ggml_tensor *                            destination,
                                           bool                                     check_tensor) {
-    if (binding.quant && binding.quant->materialization != llama_safetensors_quant_materialization::RAW) {
+    if (!llama_safetensors_tensor_file_region(registry, binding, destination)) {
         return false;
     }
-    const llama_safetensors_tensor * source = find_source(registry, binding);
-    if (source == nullptr) {
-        return false;
-    }
-    const ggml_type source_type = binding.quant ? binding.quant->target_type : plain_target_type(*source);
-    if (source_type != destination->type || source->size != ggml_nbytes(destination)) {
-        return false;
-    }
+    const auto * source = find_source(registry, binding);
     const uint8_t * data = registry.data(*source);
     if (data == nullptr) {
         return false;

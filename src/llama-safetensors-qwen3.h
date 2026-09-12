@@ -24,6 +24,9 @@ class llama_safetensors_qwen3_importer final : public llama_safetensors_importer
     size_t               tensor_capacity_hint() const override;
     void                 bind(const std::string & target_name) const override;
     bool                 load(const std::string & target_name, ggml_tensor * destination, bool check_tensor) const override;
+    std::optional<llama_model_tensor_file_region> file_region(const ggml_tensor * destination) const override;
+    bool can_stream(const std::string & target_name) const override;
+    void stream(const std::string & target_name, const std::function<void(const void *, size_t)> & write) const override;
     std::vector<uint8_t> materialize(const std::string & target_name,
                                      ggml_type           target_type,
                                      size_t              target_size) const override;

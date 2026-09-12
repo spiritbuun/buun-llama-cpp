@@ -3743,6 +3743,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MMAP_PREFETCH"));
     add_opt(common_arg(
+        {"--repack-cache"}, "DIR",
+        "retain prepared host safetensors in DIR across launches (Linux; default: disposable)\n"
+        "may retain tens of GiB; use a dedicated directory outside the source model;\n"
+        "--check-tensors also verifies cached payload checksums",
+        [](common_params & params, const std::string & value) {
+            if (value.empty()) throw std::invalid_argument("repack cache directory must not be empty");
+            params.repack_cache = value;
+        }
+    ));
+    add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"
         "- distribute: spread execution evenly over all nodes\n"

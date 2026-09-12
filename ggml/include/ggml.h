@@ -456,7 +456,7 @@ extern "C" {
         GGML_TYPE_GPTQ_AO = 59,
         // EXL3 (exllamav3) trellis-coded weights: 16x16 tiles of 256 weights, K bits per
         // weight through a procedural codebook; per-tensor Hadamard sign/scale vectors are
-        // attached as MUL_MAT sources. Rows are not independently decodable (GPU only).
+        // attached as MUL_MAT sources. Rows are not independently decodable (matrix executor required).
         GGML_TYPE_EXL3_1  = 60,
         GGML_TYPE_EXL3_2  = 61,
         GGML_TYPE_EXL3_3  = 62,

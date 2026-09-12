@@ -163,6 +163,21 @@ class llama_safetensors_quant_config {
 // contracts; those are layered on top by the model importer.
 class llama_safetensors_registry {
   public:
+    // Transposed repacking makes short, strided reads. Scope hints to its input
+    // mappings/handles; runtime weight mappings and contiguous loads are untouched.
+    class strided_read_scope {
+      public:
+        strided_read_scope(const llama_safetensors_registry & registry,
+                           std::vector<const llama_safetensors_tensor *> tensors);
+        ~strided_read_scope();
+        strided_read_scope(const strided_read_scope &) = delete;
+        strided_read_scope & operator=(const strided_read_scope &) = delete;
+      private:
+        void advise(bool enabled) const;
+        const llama_safetensors_registry & registry_;
+        std::vector<const llama_safetensors_tensor *> tensors_;
+    };
+
     static llama_safetensors_registry load(
         const std::filesystem::path & model_dir,
         llama_safetensors_io_mode io_mode = llama_safetensors_io_mode::MMAP);

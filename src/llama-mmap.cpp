@@ -402,6 +402,63 @@ llama_file::llama_file(FILE * file) : pimpl(std::make_unique<impl>(file)) {}
 
 llama_file::~llama_file() = default;
 
+#if defined(_POSIX_MAPPED_FILES)
+const bool llama_file::TEMP_SUPPORTED = true;
+#else
+const bool llama_file::TEMP_SUPPORTED = false;
+#endif
+
+std::unique_ptr<llama_file> llama_file::create_temp(const std::string & directory) {
+#if defined(_POSIX_MAPPED_FILES)
+    std::string pattern = directory + "/llama-weights-XXXXXX";
+    const int fd = mkstemp(pattern.data());
+    if (fd < 0) {
+        throw std::runtime_error("cannot create disk-backed weights in " + directory +
+                                 ": " + strerror(errno) + "; select a writable disk directory with LLAMA_CACHE");
+    }
+    if (unlink(pattern.c_str()) != 0) {
+        const std::string error = strerror(errno);
+        close(fd);
+        throw std::runtime_error("cannot unlink temporary weights: " + error);
+    }
+    FILE * fp = fdopen(fd, "w+b");
+    if (!fp) {
+        close(fd);
+        throw std::runtime_error("cannot open temporary weight stream");
+    }
+    try {
+        auto file = std::make_unique<llama_file>(fp);
+        file->pimpl->owns_fp = true;
+        return file;
+    } catch (...) {
+        fclose(fp);
+        throw;
+    }
+#else
+    (void) directory;
+    throw std::runtime_error("disposable file backing is not supported on this platform");
+#endif
+}
+
+void llama_file::sync_write() {
+    if (fflush(pimpl->fp) != 0) {
+        throw std::runtime_error("flushing prepared weights failed: " + std::string(strerror(errno)));
+    }
+#if defined(_POSIX_MAPPED_FILES)
+    // Report disk-full/writeback errors before exposing a read-only mapping.
+    if (fsync(file_id()) != 0) {
+        throw std::runtime_error("syncing prepared weights failed: " + std::string(strerror(errno)));
+    }
+#endif
+}
+
+void llama_file::finish_write() {
+    sync_write();
+    seek(0, SEEK_END);
+    pimpl->size = tell();
+    seek(0, SEEK_SET);
+}
+
 size_t llama_file::tell() const { return pimpl->tell(); }
 size_t llama_file::size() const { return pimpl->size; }
 
@@ -435,6 +492,15 @@ uint32_t llama_file::read_u32() { return pimpl->read_u32(); }
 
 void llama_file::write_raw(const void * ptr, size_t len) const { pimpl->write_raw(ptr, len); }
 void llama_file::write_u32(uint32_t val) const { pimpl->write_u32(val); }
+
+void llama_file::advise_random(bool enabled) const {
+#ifdef __linux__
+    const int err = posix_fadvise(file_id(), 0, 0, enabled ? POSIX_FADV_RANDOM : POSIX_FADV_NORMAL);
+    if (err) LLAMA_LOG_WARN("warning: file read-ahead hint failed: %s\n", strerror(err));
+#else
+    GGML_UNUSED(enabled);
+#endif
+}
 
 // llama_mmap
 
@@ -670,6 +736,22 @@ size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
+
+void llama_mmap::advise_random(size_t first, size_t last, bool enabled) const {
+#ifdef _POSIX_MAPPED_FILES
+    const size_t page = sysconf(_SC_PAGESIZE);
+    first -= first % page;
+    last = std::min(last, size());
+    if (first >= last) return;
+    const int err = posix_madvise(static_cast<char *>(addr()) + first, last - first,
+                                 enabled ? POSIX_MADV_RANDOM : POSIX_MADV_NORMAL);
+    if (err) LLAMA_LOG_WARN("warning: mapped read-ahead hint failed: %s\n", strerror(err));
+#else
+    GGML_UNUSED(first);
+    GGML_UNUSED(last);
+    GGML_UNUSED(enabled);
+#endif
+}
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mmap::SUPPORTED  = true;

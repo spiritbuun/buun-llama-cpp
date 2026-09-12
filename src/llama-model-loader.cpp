@@ -1593,6 +1593,18 @@ ggml_tensor * llama_model_loader::borrow_shared_tensor(
     return source;
 }
 
+ggml_backend_dev_t llama_model_loader::mmap_buffer_device(ggml_backend_buffer_type_t buft) {
+    auto dev = ggml_backend_buft_get_device(buft);
+    if (!dev) {
+        // Some CPU buffer types have no associated device.
+        dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (!dev) throw std::runtime_error("no CPU backend found");
+    }
+    ggml_backend_dev_props props;
+    ggml_backend_dev_get_props(dev, &props);
+    return props.caps.buffer_from_host_ptr && buft == ggml_backend_dev_buffer_type(dev) ? dev : nullptr;
+}
+
 ggml_backend_buffer_type_t llama_model_loader::lazy_read::buft() {
     auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (!cpu_dev) {
@@ -1634,9 +1646,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     // set below, before buft_for_tensor() runs
     bool is_lazy = false;
+    bool source_mapped = false;
 
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
-        const ctx_key key { buft, is_lazy };
+        const ctx_key key { buft, is_lazy, source_mapped };
 
         auto it = ctx_map.find(key);
         if (it == ctx_map.end()) {
@@ -1901,10 +1914,23 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
         ggml_set_name(&t_meta, tn.str().c_str());
 
+        const auto region = tensor_source && llama_mmap::SUPPORTED &&
+                (use_mmap || (flags & TENSOR_READ_LAZY)) ? tensor_source->file_region(&t_meta) : std::nullopt;
+        const bool preparable = !region && tensor_source && llama_mmap::SUPPORTED &&
+                (use_mmap || (flags & TENSOR_READ_LAZY)) && tensor_source->can_prepare_file(&t_meta);
+        const auto cpu_buft = (region || preparable) ? lazy_read::buft() : nullptr;
+        const bool backing_supported = cpu_buft && mmap_buffer_device(cpu_buft) &&
+            (!region || region->offset % std::min<size_t>(ggml_type_size(type), alignof(float)) == 0);
+        if (backing_supported && (flags & TENSOR_READ_LAZY)) {
+            is_lazy = lazy.add(tn.str(), &t_meta, nullptr);
+        }
         ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
         if (buft == nullptr) {
             return nullptr;
         }
+        // Only default CPU buffers can directly use these file bytes. Transformed
+        // tensors keep a separate allocated context even when they share a buft.
+        source_mapped = backing_supported && (use_mmap || is_lazy) && buft == cpu_buft;
         ggml_context * ctx = ctx_for_buft(buft);
         if (flags & TENSOR_DUPLICATED) {
             if (ggml_tensor * existing = ggml_get_tensor(ctx, tn.str().c_str())) {
@@ -1913,6 +1939,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
         ggml_set_name(ret, tn.str().c_str());
+        if (source_mapped && !no_alloc) {
+            source_regions.emplace(ret, region);
+        }
         if (tensor_source != nullptr) {
             tensor_source->bind(tn.str());
         }
@@ -2035,7 +2064,42 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
 
 void llama_model_loader::init_mappings(
         enum llama_mmap_prefetch_mode prefetch_mode,
-        llama_mlocks * mlock_mmaps) {
+        llama_mlocks * mlock_mmaps, llama_progress_callback progress, void * progress_data) {
+    // Populate the same file/offset records used by GGUF, after tensor placement
+    // and the no_alloc fit pass. A source can supply raw regions or prepare
+    // canonical CPU bytes; unsupported transforms keep the allocated path.
+    std::map<std::string, uint16_t> source_files;
+    for (const auto & [tensor, region] : source_regions) {
+        uint16_t idx;
+        if (!region) {
+            if (files.size() > UINT16_MAX) {
+                throw std::runtime_error("too many mapped model files");
+            }
+            idx = uint16_t(files.size());
+            files.push_back(tensor_source->prepare_file(tensor, [&]() {
+                if (progress && !progress(0.0f, progress_data)) {
+                    throw std::runtime_error("model load cancelled during weight preparation");
+                }
+            }));
+        } else {
+            auto it = source_files.find(region->path);
+            if (it == source_files.end()) {
+                if (files.size() > UINT16_MAX) throw std::runtime_error("too many mapped model files");
+                const uint16_t next = uint16_t(files.size());
+                files.emplace_back(new llama_file(region->path.c_str(), "rb"));
+                it = source_files.emplace(region->path, next).first;
+            }
+            idx = it->second;
+        }
+        const auto [weight, inserted] = weights_map.emplace(tensor->name,
+            llama_tensor_weight(files[idx].get(), idx, region ? region->offset : 0, tensor));
+        (void) inserted; // tied tensors may bind the same canonical name in two contexts
+        for (const auto & [key, ctx] : ctx_map) {
+            if (key.lazy && ggml_get_tensor(ctx.get(), tensor->name) == tensor) {
+                lazy.add(tensor->name, tensor, &weight->second);
+            }
+        }
+    }
     // Lazy reading requires mmap even when the requested load mode is not mmap.
     if (use_mmap || lazy.any()) {
         uint64_t mapped_bytes = 0;
@@ -2083,8 +2147,10 @@ void llama_model_loader::init_mappings(
     }
 
     // compute the total size of all tensors for progress reporting
-    for (const auto & it : weights_map) {
-        size_data += ggml_nbytes(it.second.tensor);
+    if (tensor_source == nullptr) {
+        for (const auto & it : weights_map) {
+            size_data += ggml_nbytes(it.second.tensor);
+        }
     }
 }
 
@@ -2180,7 +2246,7 @@ bool llama_model_loader::load_all_data(
     std::vector<void *> host_ptrs;
     size_t buffer_idx = 0; // buffer to use for async loads
     ggml_backend_t upload_backend = [&](const char * func) -> ggml_backend_t {
-        if (use_mmap || check_tensors) {
+        if (tensor_source || use_mmap || check_tensors) {
             return nullptr;
         }
         // When not using mmaped io use async uploads from pinned memory to GPU memory.
@@ -2262,6 +2328,14 @@ bool llama_model_loader::load_all_data(
 
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         const auto * weight = get_weight(ggml_get_name(cur));
+        if (tensor_source && cur->data != nullptr) {
+            if (progress_callback && !progress_callback((float) size_done / size_data, progress_callback_user_data)) {
+                return false;
+            }
+            tensor_source->load(cur);
+            size_done += ggml_nbytes(cur);
+            continue;
+        }
         if (weight == nullptr) {
             // this can happen with split experts models
             continue;
@@ -2285,7 +2359,7 @@ bool llama_model_loader::load_all_data(
             }
             uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
 
-            if (check_tensors) {
+            if (check_tensors && tensor_source == nullptr) {
                 validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size] {
                     return std::make_pair(cur, ggml_validate_row_data(cur->type, data, n_size));
                 }));
@@ -2294,6 +2368,9 @@ bool llama_model_loader::load_all_data(
             GGML_ASSERT(buf_mmap || cur->data); // either we have a buffer to allocate the tensor in, or it is already allocated
             if (buf_mmap && cur->data == nullptr) {
                 ggml_backend_tensor_alloc(buf_mmap, cur, data);
+                if (tensor_source) {
+                    tensor_source->load(cur, true);
+                }
 
                 // locking a lazy tensor would fault all of it in, which is what lazy avoids
                 if (lmlocks && !lazy.has(cur)) {

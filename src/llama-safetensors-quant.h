@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -111,6 +112,13 @@ class llama_safetensors_quant_adapters {
     uint32_t file_type() const;
 
     std::vector<uint8_t> read(const llama_safetensors_quant_binding & binding) const;
+    bool can_stream(const llama_safetensors_quant_binding & binding) const;
+    // Bounded slices through the ordinary repackers; identical canonical bytes.
+    void stream(const llama_safetensors_quant_binding & binding,
+                const std::function<void(const void *, size_t)> & write) const;
+    // Bounded EXL3 tile transpose; emits the same bytes as read()+finalize().
+    void stream_exl3(const llama_safetensors_quant_binding & binding,
+                    const std::function<void(const void *, size_t)> & write) const;
     std::vector<uint8_t> finalize(
         const llama_safetensors_quant_binding & binding,
         std::vector<uint8_t> data) const;

@@ -1779,6 +1779,37 @@ const llama_safetensors_tensor * llama_safetensors_registry::find(const std::str
     return it == tensor_index_.end() ? nullptr : &tensors_[it->second];
 }
 
+llama_safetensors_registry::strided_read_scope::strided_read_scope(
+        const llama_safetensors_registry & registry,
+        std::vector<const llama_safetensors_tensor *> tensors) : registry_(registry), tensors_(std::move(tensors)) {
+    for (const auto * tensor : tensors_) {
+        if (!tensor || tensor->shard >= registry_.shards_.size() ||
+            tensor->offset > registry_.shards_[tensor->shard].file_size ||
+            tensor->size > registry_.shards_[tensor->shard].file_size - tensor->offset) {
+            throw std::runtime_error("invalid strided safetensors input span");
+        }
+    }
+    advise(true);
+}
+
+llama_safetensors_registry::strided_read_scope::~strided_read_scope() { advise(false); }
+
+void llama_safetensors_registry::strided_read_scope::advise(bool enabled) const {
+    for (size_t i = 0; i < tensors_.size(); ++i) {
+        const auto & tensor = *tensors_[i];
+        if (tensor.shard < registry_.mappings_.size()) {
+            // Registry mappings start with NORMAL VMA advice (no lazy ranges).
+            registry_.mappings_[tensor.shard]->advise_random(tensor.offset, tensor.offset + tensor.size, enabled);
+        } else {
+            // Buffered advice is handle-wide, not tensor-local. Set it once per
+            // shard. The registry's unmapped handles start with NORMAL advice.
+            bool seen = false;
+            for (size_t j = 0; j < i; ++j) seen |= tensors_[j]->shard == tensor.shard;
+            if (!seen) registry_.files_[tensor.shard]->advise_random(enabled);
+        }
+    }
+}
+
 const std::string * llama_safetensors_registry::metadata(const std::string & key) const {
     const auto it = metadata_.find(key);
     return it == metadata_.end() ? nullptr : &it->second;

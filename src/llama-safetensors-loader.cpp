@@ -8,6 +8,7 @@
 #include "llama-safetensors-qwen4exp.h"
 #include "llama-safetensors-deepseek4.h"
 #include "llama-model-source.h"
+#include "llama-repack-cache.h"
 #include "llama.h"
 
 #include "ggml-backend.h"
@@ -15,6 +16,7 @@
 
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -158,15 +160,22 @@ llama_safetensors_json llama_safetensors_read_model_config(const std::filesystem
 
 llama_model * llama_model_load_from_safetensors_dir(
         const std::filesystem::path & model_dir, llama_model_params params) {
+    // Capture before opening import sources; reject a replacement during import.
+    std::unique_ptr<llama_repack_cache> cache;
+    if (params.repack_cache && *params.repack_cache) {
+        cache = std::make_unique<llama_repack_cache>(model_dir, params.repack_cache);
+    }
     std::unique_ptr<llama_safetensors_importer> importer = select_importer(model_dir, source_io_mode(params.load_mode));
+    if (cache) cache->validate_source();
     std::unique_ptr<gguf_context, decltype(&gguf_free)> metadata(importer->build_metadata(), gguf_free);
 
     class safetensors_source final : public llama_model_tensor_source {
       public:
         safetensors_source(
                 std::unique_ptr<llama_safetensors_importer> importer,
-                bool check_tensors) :
-            importer_(std::move(importer)), check_tensors_(check_tensors) {}
+                bool check_tensors, const std::filesystem::path & model_dir,
+                const llama_repack_cache * cache) :
+            importer_(std::move(importer)), check_tensors_(check_tensors), model_dir_(model_dir), cache_(cache) {}
 
         bool describe(
                 const std::string & canonical_name,
@@ -184,7 +193,52 @@ llama_model * llama_model_load_from_safetensors_dir(
             importer_->bind(canonical_name);
         }
 
-        void load(ggml_tensor * tensor) const override {
+        std::optional<llama_model_tensor_file_region> file_region(const ggml_tensor * tensor) const override {
+            return importer_->file_region(tensor);
+        }
+
+        bool can_prepare_file(const ggml_tensor * tensor) const override {
+            return llama_file::TEMP_SUPPORTED && importer_->can_stream(tensor->name);
+        }
+
+        std::unique_ptr<llama_file> prepare_file(
+                const ggml_tensor * tensor, const std::function<void()> & poll) const override {
+            poll();
+            if (cache_) {
+                std::string layout = std::string(tensor->name) + ":" + ggml_type_name(tensor->type);
+                for (auto dim : tensor->ne) layout += ":" + std::to_string(dim);
+                return cache_->get(layout, ggml_nbytes(tensor), check_tensors_, poll,
+                                   [&](const auto & write) { importer_->stream(tensor->name, write); });
+            }
+            const char * cache = std::getenv("LLAMA_CACHE");
+            const auto directory = cache && *cache ? std::filesystem::path(cache) : model_dir_;
+            if (cache && *cache) std::filesystem::create_directories(directory);
+            auto file = llama_file::create_temp(directory.string());
+            size_t written = 0;
+            size_t unsynced = 0;
+            const size_t expected = ggml_nbytes(tensor);
+            LLAMA_LOG_INFO("%s: preparing %s (%.2f MiB) in %s\n", __func__, tensor->name,
+                           expected / (1024.0 * 1024.0), directory.string().c_str());
+            importer_->stream(tensor->name, [&](const void * data, size_t size) {
+                poll();
+                if (size > expected - written) throw std::runtime_error("prepared tensor exceeds destination");
+                if (size) file->write_raw(data, size);
+                written += size;
+                unsynced += size;
+                // Bounded staging alone does not bound dirty page-cache memory.
+                // Drain the disposable file periodically so a low-RAM process
+                // can reclaim its clean pages while preparing a large table.
+                if (unsynced >= 64 * 1024 * 1024) {
+                    file->sync_write();
+                    unsynced = 0;
+                }
+            });
+            if (written != expected) throw std::runtime_error("prepared tensor is incomplete");
+            file->finish_write();
+            return file;
+        }
+
+        void load(ggml_tensor * tensor, bool mapped) const override {
             const std::string canonical_name = tensor->name;
             auto target = targets_.find(canonical_name);
             if (target == targets_.end()) {
@@ -194,6 +248,12 @@ llama_model * llama_model_load_from_safetensors_dir(
                 throw std::runtime_error("excess safetensors target load for '" + canonical_name + "'");
             }
             ++target->second.loaded;
+            if (mapped) {
+                if (check_tensors_ && !ggml_validate_row_data(tensor->type, tensor->data, ggml_nbytes(tensor))) {
+                    throw std::runtime_error("tensor '" + canonical_name + "' has invalid data");
+                }
+                return;
+            }
             const auto t_start = std::chrono::steady_clock::now();
             const auto log_slow = [&](const char * path) {
                 const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
@@ -216,6 +276,7 @@ llama_model * llama_model_load_from_safetensors_dir(
         }
 
         void validate_complete() const override {
+            if (cache_) cache_->validate_source();
             for (const auto & [name, target] : targets_) {
                 if (target.loaded != target.bound) {
                     throw std::runtime_error("described safetensors target was not loaded: '" + name + "'");
@@ -232,9 +293,11 @@ llama_model * llama_model_load_from_safetensors_dir(
 
         std::unique_ptr<llama_safetensors_importer> importer_;
         bool check_tensors_;
+        std::filesystem::path model_dir_;
+        const llama_repack_cache * cache_;
         mutable std::unordered_map<std::string, target_state> targets_;
     };
-    safetensors_source source(std::move(importer), params.check_tensors);
+    safetensors_source source(std::move(importer), params.check_tensors, model_dir, cache.get());
 
     return llama_model_init_from_source(metadata.get(), &source, params);
 }

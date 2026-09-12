@@ -56,6 +56,13 @@ struct source_spec {
     bool fp8_channel_parts = false;
     bool concat_vectors = false;
 
+    bool has_transform() const {
+        return !transforms.empty() || row_count != 0 || !hqq_scale.empty();
+    }
+    bool uses_parts(const llama_safetensors_registry & registry) const {
+        return !part_targets.empty() && (parts_first || stack_parts || registry.find(name) == nullptr);
+    }
+
     source_spec() = default;
     source_spec(
             std::string source_name,
@@ -1620,6 +1627,48 @@ void llama_safetensors_qwen35_importer::bind(const std::string & target_name) co
     }
 }
 
+std::optional<llama_model_tensor_file_region> llama_safetensors_qwen35_importer::file_region(
+        const ggml_tensor * destination) const {
+    const qwen_geometry geometry {
+        n_layer_, n_mtp_, n_key_heads_, n_value_heads_, key_head_dim_, value_head_dim_,
+        full_attention_interval_, text_only_, moe_, executorch_flat_, n_expert_,
+    };
+    const source_spec spec = map_target(registry_, *quant_, geometry, destination->name);
+    if (spec.uses_parts(registry_) || spec.has_transform()) {
+        return std::nullopt;
+    }
+    return llama_safetensors_tensor_file_region(registry_, { spec.name, spec.quant }, destination);
+}
+
+bool llama_safetensors_qwen35_importer::can_stream(const std::string & target_name) const {
+    const qwen_geometry geometry {
+        n_layer_, n_mtp_, n_key_heads_, n_value_heads_, key_head_dim_, value_head_dim_,
+        full_attention_interval_, text_only_, moe_, executorch_flat_, n_expert_,
+    };
+    const source_spec spec = map_target(registry_, *quant_, geometry, target_name);
+    if (spec.has_transform()) return false;
+    if (spec.uses_parts(registry_)) {
+        return std::all_of(spec.part_targets.begin(), spec.part_targets.end(),
+                           [&](const std::string & part) { return can_stream(part); });
+    }
+    return spec.quant && quant_->can_stream(*spec.quant);
+}
+
+void llama_safetensors_qwen35_importer::stream(
+        const std::string & target_name, const std::function<void(const void *, size_t)> & write) const {
+    if (!can_stream(target_name)) throw std::runtime_error("unsupported Qwen3.5 streaming transform: " + target_name);
+    const qwen_geometry geometry {
+        n_layer_, n_mtp_, n_key_heads_, n_value_heads_, key_head_dim_, value_head_dim_,
+        full_attention_interval_, text_only_, moe_, executorch_flat_, n_expert_,
+    };
+    const source_spec spec = map_target(registry_, *quant_, geometry, target_name);
+    if (spec.uses_parts(registry_)) {
+        for (const auto & part : spec.part_targets) stream(part, write);
+    } else {
+        quant_->stream(*spec.quant, write);
+    }
+}
+
 bool llama_safetensors_qwen35_importer::load(
         const std::string & target_name, ggml_tensor * destination, bool check_tensor) const {
     const qwen_geometry geometry {
@@ -1627,10 +1676,10 @@ bool llama_safetensors_qwen35_importer::load(
         full_attention_interval_, text_only_, moe_, executorch_flat_, n_expert_,
     };
     const source_spec spec = map_target(registry_, *quant_, geometry, target_name);
-    if (!spec.part_targets.empty() && (spec.parts_first || spec.stack_parts || registry_.find(spec.name) == nullptr)) {
+    if (spec.uses_parts(registry_)) {
         return false;
     }
-    if (spec.transforms.empty() && spec.row_count == 0 && spec.hqq_scale.empty()) {
+    if (!spec.has_transform()) {
         return llama_safetensors_load_tensor_direct(
             registry_, { spec.name, spec.quant }, destination, check_tensor);
     }

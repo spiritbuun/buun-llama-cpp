@@ -40,6 +40,13 @@ struct llama_model_loader {
 
         ggml_tensor * tensor;
 
+        llama_tensor_weight(const llama_file * file, uint16_t idx, size_t offset, ggml_tensor * tensor) :
+            idx(idx), offs(offset), tensor(tensor) {
+            if (offs > file->size() || ggml_nbytes(tensor) > file->size() - offs) {
+                throw std::runtime_error(format("tensor '%s' data is not within the file bounds", tensor->name));
+            }
+        }
+
         llama_tensor_weight(const llama_file * file, uint16_t idx, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), tensor(tensor) {
             const int tensor_idx = gguf_find_tensor(gguf_ctx,  ggml_get_name(tensor));
             if (tensor_idx < 0) {
@@ -136,6 +143,8 @@ struct llama_model_loader {
     } lazy;
 
     llama_files files;
+    // nullopt denotes canonical bytes to be prepared after placement.
+    std::map<ggml_tensor *, std::optional<llama_model_tensor_file_region>> source_regions;
     llama_ftype ftype;
     llama_fver  fver;
 
@@ -170,10 +179,14 @@ struct llama_model_loader {
     struct ctx_key {
         ggml_backend_buffer_type_t buft;
         bool lazy;
+        bool source_mapped = false;
     };
 
     struct ctx_key_comparator {
         bool operator()(const ctx_key & lhs, const ctx_key & rhs) const {
+            if (lhs.source_mapped != rhs.source_mapped) {
+                return lhs.source_mapped < rhs.source_mapped;
+            }
             if (lhs.lazy != rhs.lazy) {
                 return lhs.lazy < rhs.lazy;
             }
@@ -273,7 +286,11 @@ struct llama_model_loader {
 
     void done_getting_tensors(bool partial = false) const;
 
-    void init_mappings(enum llama_mmap_prefetch_mode prefetch, llama_mlocks * mlock_mmaps = nullptr);
+    // Device that can wrap mapped bytes in this buffer type, or nullptr.
+    static ggml_backend_dev_t mmap_buffer_device(ggml_backend_buffer_type_t buft);
+
+    void init_mappings(enum llama_mmap_prefetch_mode prefetch, llama_mlocks * mlock_mmaps = nullptr,
+                       llama_progress_callback progress = nullptr, void * progress_data = nullptr);
 
     void get_mapping_range(size_t * first, size_t * last, void ** addr, int idx, ggml_context * ctx) const;
 

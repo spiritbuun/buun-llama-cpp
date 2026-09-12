@@ -264,6 +264,28 @@ void llama_safetensors_qwen3_importer::bind(const std::string & target_name) con
     llama_safetensors_consume_tensor(*quant_, map_target(*quant_, n_layer_, source_prefix_, target_name));
 }
 
+std::optional<llama_model_tensor_file_region> llama_safetensors_qwen3_importer::file_region(
+        const ggml_tensor * destination) const {
+    if (architecture_ == "llama" && llama_rope_permuted_target(destination->name) && ggml_nelements(destination) > 1) {
+        return std::nullopt;
+    }
+    return llama_safetensors_tensor_file_region(registry_,
+        map_target(*quant_, n_layer_, source_prefix_, destination->name), destination);
+}
+
+bool llama_safetensors_qwen3_importer::can_stream(const std::string & target_name) const {
+    if (architecture_ == "llama" && llama_rope_permuted_target(target_name)) return false;
+    const auto binding = map_target(*quant_, n_layer_, source_prefix_, target_name);
+    return binding.quant && quant_->can_stream(*binding.quant);
+}
+
+void llama_safetensors_qwen3_importer::stream(
+        const std::string & target_name, const std::function<void(const void *, size_t)> & write) const {
+    if (!can_stream(target_name)) throw std::runtime_error("unsupported Qwen3 streaming transform: " + target_name);
+    const auto binding = map_target(*quant_, n_layer_, source_prefix_, target_name);
+    quant_->stream(*binding.quant, write);
+}
+
 bool llama_safetensors_qwen3_importer::load(
         const std::string & target_name, ggml_tensor * destination, bool check_tensor) const {
     if (architecture_ == "llama" && llama_rope_permuted_target(target_name) &&

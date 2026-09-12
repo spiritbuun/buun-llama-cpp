@@ -1,4 +1,5 @@
 #include "ggml-backend.h"
+#include "ggml-cpp.h"
 #include "gguf.h"
 #include "llama-safetensors-names.h"
 #include "llama-safetensors-quant.h"
@@ -790,6 +791,12 @@ int main(int argc, char ** argv) {
                 "Qwen4 permutation-only matrix did not retain BF16");
         require(importer.materialize("blk.0.attn_qkv.weight", type, 48).size() == 48,
                 "Qwen4 BF16 matrix permutation changed its byte width");
+        for (const char * name : {"blk.0.attn_qkv.weight", "blk.0.ssm_dt.bias", "blk.1.nextn.eh_proj.weight"}) {
+            ggml_tensor probe {};
+            ggml_set_name(&probe, name);
+            require(!importer.can_stream(name) && !importer.file_region(&probe),
+                    "transformed/assembled Qwen4 source bypassed its conversion");
+        }
 
         require(importer.describe("blk.0.ssm_dt.bias", type, ne) &&
                     type == GGML_TYPE_F32 && ne[0] == 2,
@@ -825,6 +832,107 @@ int main(int argc, char ** argv) {
         require(importer.describe("blk.1.hc_attn_norm.weight", type, ne) &&
                     type == GGML_TYPE_F32 && ne[0] == 8,
                 "Qwen4 embedded MTP layer did not use the mtp.layers.0 prefix");
+    }
+
+    {
+        // Streamed stacked experts must retain exact expert order. The PLE
+        // table has a different (already canonical) on-disk layout.
+        const auto path = dir.path / "qwen-streamed-exl3";
+        std::vector<tensor_fixture> tensors;
+        for (int e = 0; e < 2; ++e) {
+            const auto module = "model.layers.0.mlp.experts." + std::to_string(e) + ".gate_proj";
+            std::vector<uint8_t> trellis(8 * 8 * 64);
+            for (size_t i = 0; i < trellis.size(); ++i) trellis[i] = uint8_t(e * 97 + i / 64 * 11 + i % 64);
+            tensors.push_back({module + ".trellis", "I16", {8, 8, 32}, trellis});
+            tensors.push_back({module + ".suh", "F16", {128}, std::vector<uint8_t>(256, 0)});
+            tensors.push_back({module + ".svh", "F16", {128}, std::vector<uint8_t>(256, 0)});
+        }
+        write_single_shard_model(path, tensors);
+        write_text(path / "tokenizer.json", "{}");
+        json config = {
+            {"model_type", "qwen4_exp"}, {"num_hidden_layers", 1},
+            {"linear_num_key_heads", 1}, {"linear_num_value_heads", 2},
+            {"linear_key_head_dim", 2}, {"linear_value_head_dim", 2},
+            {"indexer_n_heads", 1}, {"indexer_head_dim", 2},
+            {"num_experts", 2}, {"moe_intermediate_size", 128},
+            {"quantization_config", {{"quant_method", "exl3"}}},
+        };
+        const auto check_stack = [&](const llama_safetensors_importer & importer) {
+            const std::string name = "blk.0.ffn_gate_exps.weight";
+            ggml_type type;
+            std::array<int64_t, GGML_MAX_DIMS> ne;
+            require(importer.describe(name, type, ne), "missing stacked quantized descriptor");
+            require(importer.can_stream(name), "quantized stack did not select streaming");
+            const size_t size = ggml_row_size(type, ne[0]) * ne[1] * ne[2];
+            const auto expected = importer.materialize(name, type, size);
+            std::vector<uint8_t> actual;
+            importer.stream(name, [&](const void * ptr, size_t count) {
+                const auto * data = static_cast<const uint8_t *>(ptr);
+                actual.insert(actual.end(), data, data + count);
+            });
+            require(actual == expected, "streamed expert order/bytes differ");
+        };
+        check_stack(llama_safetensors_qwen4exp_importer(path, config, llama_safetensors_io_mode::BUFFERED));
+        config["model_type"] = "qwen3_5_moe_text";
+        config["num_hidden_layers"] = 40;
+        check_stack(llama_safetensors_qwen35_importer(path, config, llama_safetensors_io_mode::BUFFERED));
+
+        for (int bits : {4, 8}) {
+            const auto packed_path = dir.path / ("qwen-streamed-int" + std::to_string(bits));
+            tensors.clear();
+            for (int e = 0; e < 2; ++e) {
+                const auto module = "model.layers.0.mlp.experts." + std::to_string(e) + ".gate_proj";
+                std::vector<uint8_t> codes(128 * 128 * bits / 8), scales(256);
+                for (size_t i = 0; i < codes.size(); ++i) codes[i] = uint8_t(e * 97 + i * 11 + i / 128);
+                for (size_t i = 0; i < scales.size(); i += 2) { scales[i] = 0x80; scales[i + 1] = 0x3f; }
+                tensors.push_back({module + ".weight_packed", "I32", {128, size_t(128 * bits / 32)}, codes});
+                tensors.push_back({module + ".weight_scale", "BF16", {128, 1}, scales});
+                tensors.push_back({module + ".weight_shape", "I64", {2}, i64_bytes({128, 128})});
+            }
+            write_single_shard_model(packed_path, tensors);
+            write_text(packed_path / "tokenizer.json", "{}");
+            config["quantization_config"] = json::parse(packed_int4_symmetric_config).at("quantization_config");
+            auto & group = config["quantization_config"]["config_groups"]["int4"];
+            group["targets"] = {"re:.*"};
+            group["weights"]["num_bits"] = bits;
+            for (auto mode : {llama_safetensors_io_mode::BUFFERED, llama_safetensors_io_mode::MMAP}) {
+                config["model_type"] = "qwen4_exp";
+                config["num_hidden_layers"] = 1;
+                check_stack(llama_safetensors_qwen4exp_importer(packed_path, config, mode));
+                config["model_type"] = "qwen3_5_moe_text";
+                config["num_hidden_layers"] = 40;
+                check_stack(llama_safetensors_qwen35_importer(packed_path, config, mode));
+            }
+        }
+
+        for (bool trellis : {false, true}) {
+            // Separate fixture without ordinary EXL3 weights: n-gram trellises
+            // are not matrix trellises and must never be tile-transposed.
+            const auto ple_path = dir.path / (trellis ? "ple-trellis-stream" : "ple-plain-stream");
+            const size_t words = trellis ? 21 : 160;
+            const std::string prefix = "model.layers.0.ple.ple_embedding.ngram_embedding.shard_";
+            const std::string suffix = trellis ? ".trellis" : ".weight";
+            const std::vector<uint8_t> first(3 * words * 2, 17), second(5 * words * 2, 23);
+            write_single_shard_model(ple_path, {
+                {prefix + "0" + suffix, trellis ? "I16" : "BF16", {3, words}, first},
+                {prefix + "1" + suffix, trellis ? "I16" : "BF16", {5, words}, second},
+            });
+            write_text(ple_path / "tokenizer.json", "{}");
+            config["model_type"] = "qwen4_exp";
+            config["num_hidden_layers"] = 1;
+            config["split_ngram_parts"] = 2;
+            config["ple_layer_ids"] = json::array({1});
+            config.erase("quantization_config");
+            llama_safetensors_qwen4exp_importer importer(ple_path, config, llama_safetensors_io_mode::BUFFERED);
+            std::vector<uint8_t> actual, expected = first;
+            expected.insert(expected.end(), second.begin(), second.end());
+            require(importer.can_stream("per_layer_token_embd.weight"), "PLE streaming missing");
+            importer.stream("per_layer_token_embd.weight", [&](const void * ptr, size_t size) {
+                const auto * data = static_cast<const uint8_t *>(ptr);
+                actual.insert(actual.end(), data, data + size);
+            });
+            require(actual == expected, "PLE concatenation changed canonical rows");
+        }
     }
 
     {
@@ -907,6 +1015,18 @@ int main(int argc, char ** argv) {
                     llama_safetensors_materialize_tensor(
                         registry, adapters, vector, type, expected.size()) == expected,
                 "plain F16 vector did not convert to F32");
+        ggml_context_ptr ctx(ggml_init({2 * ggml_tensor_overhead(), nullptr, true}));
+        auto * raw = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F16, 2, 2);
+        const auto region = llama_safetensors_tensor_file_region(registry, matrix, raw);
+        require(region.has_value(), "layout-compatible matrix did not expose file backing");
+        llama_file file(region->path.c_str(), "rb");
+        file.seek(region->offset, SEEK_SET);
+        std::vector<uint8_t> mapped_bytes(ggml_nbytes(raw));
+        file.read_raw(mapped_bytes.data(), mapped_bytes.size());
+        require(mapped_bytes == registry.read(*registry.find("matrix.weight")), "wrong raw file span");
+        auto * converted = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 2);
+        require(!llama_safetensors_tensor_file_region(registry, vector, converted),
+                "converted norm exposed unconverted file bytes");
     }
 
     // A conventional Qwen3 adapter must reuse the shared block-FP8 contract

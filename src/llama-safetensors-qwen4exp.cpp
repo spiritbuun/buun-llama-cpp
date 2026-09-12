@@ -50,6 +50,14 @@ struct source_spec {
     std::vector<llama_safetensors_quant_binding> stack_exl3;
     bool ple_table = false;
     bool ple_scale = false;
+
+    bool has_transform() const {
+        return ple_scale || !transforms.empty() || row_count != 0 || scale_broadcast != 0;
+    }
+    bool direct_source() const {
+        return !ple_table && !has_transform() && stack_quant_weights.empty() &&
+            concat_sources.empty() && stack_sources.empty() && stack_exl3.empty();
+    }
 };
 
 class unsupported_target : public std::runtime_error {
@@ -1140,6 +1148,56 @@ void llama_safetensors_qwen4exp_importer::bind(const std::string & target) const
     for (const auto & binding : spec.stack_quant_scales)  quant_->consume(binding);
 }
 
+std::optional<llama_model_tensor_file_region> llama_safetensors_qwen4exp_importer::file_region(
+        const ggml_tensor * destination) const {
+    const auto & text = text_config(config_);
+    const qwen4_geometry geometry { model_prefix_, n_layer_, n_mtp_, n_key_heads_, n_value_heads_, key_head_dim_, value_head_dim_,
+        indexer_n_heads_, indexer_head_dim_, full_attention_interval_, text.at("num_experts").get<uint32_t>(), text.at("moe_intermediate_size").get<uint32_t>(), ple_layer_, ple_shards_ };
+    const auto spec = map_target(registry_, *quant_, geometry, destination->name);
+    if (!spec.direct_source()) return std::nullopt;
+    return llama_safetensors_tensor_file_region(registry_, {spec.source, spec.quant}, destination);
+}
+
+bool llama_safetensors_qwen4exp_importer::can_stream(const std::string & target) const {
+    const auto & text = text_config(config_);
+    const qwen4_geometry geometry { model_prefix_, n_layer_, n_mtp_, n_key_heads_, n_value_heads_, key_head_dim_, value_head_dim_,
+        indexer_n_heads_, indexer_head_dim_, full_attention_interval_, text.at("num_experts").get<uint32_t>(), text.at("moe_intermediate_size").get<uint32_t>(), ple_layer_, ple_shards_ };
+    const auto spec = map_target(registry_, *quant_, geometry, target);
+    if (spec.ple_table) return true; // describe() verifies homogeneous, row-canonical shards
+    if (spec.has_transform() ||
+        !spec.stack_quant_weights.empty() || !spec.concat_sources.empty() || !spec.stack_sources.empty()) return false;
+    const auto streamable = [&](const llama_safetensors_quant_binding & binding) {
+        return quant_->can_stream(binding);
+    };
+    if (!spec.stack_exl3.empty()) return std::all_of(spec.stack_exl3.begin(), spec.stack_exl3.end(), streamable);
+    return spec.quant && streamable(*spec.quant);
+}
+
+void llama_safetensors_qwen4exp_importer::stream(
+        const std::string & target, const std::function<void(const void *, size_t)> & write) const {
+    if (!can_stream(target)) throw std::runtime_error("unsupported Qwen4 streaming transform: " + target);
+    const auto & text = text_config(config_);
+    const qwen4_geometry geometry { model_prefix_, n_layer_, n_mtp_, n_key_heads_, n_value_heads_, key_head_dim_, value_head_dim_,
+        indexer_n_heads_, indexer_head_dim_, full_attention_interval_, text.at("num_experts").get<uint32_t>(), text.at("moe_intermediate_size").get<uint32_t>(), ple_layer_, ple_shards_ };
+    const auto spec = map_target(registry_, *quant_, geometry, target);
+    if (spec.ple_table) {
+        ggml_type type;
+        std::array<int64_t, GGML_MAX_DIMS> ne;
+        if (!describe(target, type, ne)) throw std::runtime_error("missing Qwen4 PLE table");
+        const std::string prefix = model_prefix_ + ".layers." + std::to_string(ple_layer_) +
+            ".ple.ple_embedding.ngram_embedding.shard_";
+        for (uint32_t i = 0; i < ple_shards_; ++i) {
+            const auto name = ggml_type_is_exl3_ngram(type) ? prefix + std::to_string(i) + ".trellis" :
+                              ple_shard_name(registry_, prefix, i);
+            llama_safetensors_stream_raw(registry_, require_tensor(registry_, name), write);
+        }
+    } else if (!spec.stack_exl3.empty()) {
+        for (const auto & binding : spec.stack_exl3) quant_->stream(binding, write);
+    } else {
+        quant_->stream(*spec.quant, write);
+    }
+}
+
 bool llama_safetensors_qwen4exp_importer::load(
         const std::string & target, ggml_tensor * destination, bool check_tensor) const {
     const auto & text = text_config(config_);
@@ -1203,9 +1261,7 @@ bool llama_safetensors_qwen4exp_importer::load(
     if (spec.ple_scale) {
         return false;
     }
-    if (!spec.transforms.empty() || spec.row_count != 0 || spec.scale_broadcast != 0 ||
-        !spec.stack_quant_weights.empty() ||
-        !spec.concat_sources.empty() || !spec.stack_sources.empty() || !spec.stack_exl3.empty()) return false;
+    if (!spec.direct_source()) return false;
     return llama_safetensors_load_tensor_direct(registry_, { spec.source, spec.quant }, destination, check_tensor);
 }
 

@@ -34,6 +34,9 @@ class llama_safetensors_qwen4exp_importer final : public llama_safetensors_impor
     std::vector<uint8_t> materialize(
         const std::string & target_name, ggml_type target_type, size_t target_size) const override;
     void validate_complete() const override;
+    std::optional<llama_model_tensor_file_region> file_region(const ggml_tensor * destination) const override;
+    bool can_stream(const std::string & target) const override;
+    void stream(const std::string & target, const std::function<void(const void *, size_t)> & write) const override;
 
   private:
     std::filesystem::path model_dir_;

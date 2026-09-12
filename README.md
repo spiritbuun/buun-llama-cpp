@@ -219,7 +219,8 @@ then evicts the minimum expert footprint needed to form cache pools.
 
 EXL3 supports CPU expert execution and CUDA/HIP MoE caching. HIP currently uses CPU
 execution for standalone EXL3 matrix operations; only cached expert dot products
-run on the GPU. CPU-resident weights still require host memory.
+run on the GPU. Eligible mmap-backed CPU weights can be paged from SSD; active
+pages still use host RAM, and heavy paging can be much slower than RAM residency.
 By default, cached EXL3 work stays on
 GPU rather than assigning a share to CPU: CPU trellis decoding can otherwise hold up the GPU's
 completed work. Experts missing from the GPU cache still run on CPU.
@@ -233,6 +234,15 @@ Use `--moe-cache-cpu-overlap auto|N` to override this policy:
 
 Leave this unset initially; benchmark explicit counts on your hardware before retaining them.
 See [MoE cache configuration](docs/backend/CUDA-MOE-CACHE.md#configuration) for environment overrides.
+
+For SSD-paged experts, also compare `--moe-cache-cpu-overlap 0`: deliberately
+moving a GPU-cache hit to CPU can require another disk read. This is a tuning
+choice, not a claim that overlap is slower on every model or host.
+
+Native safetensors can optionally retain prepared host weights between launches
+with `--repack-cache /path/to/dedicated-directory` (Linux). This saves repeated
+preparation work but can retain tens of GiB; disposable backing remains the default.
+See [storage, validation and cleanup](docs/development/prepared-weight-cache.md).
 
 ### Choose the KV/VBR entry tier
 
