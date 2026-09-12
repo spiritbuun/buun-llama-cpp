@@ -33,13 +33,14 @@ static void set_tcq_data(ggml_tensor * tensor, uint8_t salt) {
     ggml_backend_tensor_set(tensor, bytes.data(), 0, bytes.size());
 }
 
-static int test_pair(ggml_backend_t backend, ggml_type type_k, ggml_type type_v) {
+static int test_pair(ggml_backend_t backend, ggml_type type_k, ggml_type type_v, int64_t gqa, int64_t n_decode) {
     constexpr int64_t d = 256;
-    constexpr int64_t kv = 113;
-    constexpr int64_t n_head_kv = 2;
-    constexpr int64_t gqa = 16;
+    // Match the production Qwen decode geometry on RDNA. A ragged, unmasked fixture selects an
+    // unsupported ncols2=1 specialization there instead of the fused path this test targets.
+    constexpr int64_t kv = 256;
+    constexpr int64_t n_head_kv = 4;
     // Deliberately above the <=4 fused-decode cutoff: this is the materialized reference arm.
-    constexpr int64_t n_prefill = 5;
+    const int64_t n_prefill = 8*n_decode;
 
     const ggml_init_params params = { 16*1024*1024, nullptr, true };
     ggml_context * ctx = ggml_init(params);
@@ -47,18 +48,20 @@ static int test_pair(ggml_backend_t backend, ggml_type type_k, ggml_type type_v)
         return EXIT_FAILURE;
     }
 
-    ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, 1, n_head_kv*gqa, 1);
+    ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, n_decode, n_head_kv*gqa, 1);
     ggml_tensor * k = ggml_new_tensor_4d(ctx, type_k, d, kv, n_head_kv, 1);
     ggml_tensor * v = ggml_new_tensor_4d(ctx, type_v, d, kv, n_head_kv, 1);
+    ggml_tensor * mask_decode = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kv, n_decode);
 
-    ggml_tensor * out_decode = ggml_flash_attn_ext(ctx, q, k, v, nullptr, 1.0f/std::sqrt((float) d), 0.0f, 0.0f);
+    ggml_tensor * out_decode = ggml_flash_attn_ext(ctx, q, k, v, mask_decode, 1.0f/std::sqrt((float) d), 0.0f, 0.0f);
     ggml_flash_attn_ext_set_prec(out_decode, GGML_PREC_F32);
 
     ggml_tensor * q_prefill = ggml_repeat_4d(ctx, q, d, n_prefill, n_head_kv*gqa, 1);
-    ggml_tensor * out_prefill = ggml_flash_attn_ext(ctx, q_prefill, k, v, nullptr, 1.0f/std::sqrt((float) d), 0.0f, 0.0f);
+    ggml_tensor * mask_prefill = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kv, n_prefill);
+    ggml_tensor * out_prefill = ggml_flash_attn_ext(ctx, q_prefill, k, v, mask_prefill, 1.0f/std::sqrt((float) d), 0.0f, 0.0f);
     ggml_flash_attn_ext_set_prec(out_prefill, GGML_PREC_F32);
     ggml_tensor * out_prefill_first = ggml_view_4d(ctx, out_prefill,
-        out_decode->ne[0], out_decode->ne[1], 1, 1,
+        out_decode->ne[0], out_decode->ne[1], out_decode->ne[2], 1,
         out_prefill->nb[1], out_prefill->nb[2], out_prefill->nb[3], 0);
     ggml_tensor * difference = ggml_sub(ctx, out_decode, out_prefill_first);
 
@@ -84,6 +87,9 @@ static int test_pair(ggml_backend_t backend, ggml_type type_k, ggml_type type_v)
     ggml_backend_tensor_set(q, q_data.data(), 0, q_data.size()*sizeof(q_data[0]));
     set_tcq_data(k, 11);
     set_tcq_data(v, 73);
+    std::vector<ggml_fp16_t> mask_data((size_t) ggml_nelements(mask_prefill), ggml_fp32_to_fp16(0.0f));
+    ggml_backend_tensor_set(mask_decode, mask_data.data(), 0, ggml_nbytes(mask_decode));
+    ggml_backend_tensor_set(mask_prefill, mask_data.data(), 0, ggml_nbytes(mask_prefill));
 
     const ggml_status status = ggml_backend_graph_compute(backend, graph);
     std::vector<float> result((size_t) ggml_nelements(difference));
@@ -134,6 +140,27 @@ int main() {
     if (!device) {
         return 77;
     }
+    const char * fused = std::getenv("GGML_TURBO_MMA_FUSED");
+    if (fused && std::atoi(fused) == 0) {
+        std::fprintf(stderr, "GGML_TURBO_MMA_FUSED disables the fused path this test requires\n");
+        return EXIT_FAILURE;
+    }
+    // A runtime FUSED=1 cannot enable dispatch that was compiled out. Otherwise this
+    // test can silently compare two materialized paths and miss fused-kernel bugs.
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
+    auto get_features = (ggml_backend_get_features_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_features");
+    bool turbo_fa = false;
+    if (get_features) {
+        for (const ggml_backend_feature * feature = get_features(reg); feature && feature->name; ++feature) {
+            if (std::strcmp(feature->name, "TURBO_FA") == 0 && std::strcmp(feature->value, "1") == 0) {
+                turbo_fa = true;
+            }
+        }
+    }
+    if (!turbo_fa) {
+        std::fprintf(stderr, "Turbo flash-attention dispatch was not compiled into the selected backend\n");
+        return EXIT_FAILURE;
+    }
     ggml_backend_t backend = ggml_backend_dev_init(device, nullptr);
     if (!backend) {
         return EXIT_FAILURE;
@@ -146,10 +173,17 @@ int main() {
         { GGML_TYPE_TURBO1_TCQ, GGML_TYPE_TURBO2_TCQ },
     };
     int result = EXIT_SUCCESS;
-    for (const auto & pair : pairs) {
-        const int pair_result = test_pair(backend, pair[0], pair[1]);
-        if (pair_result != EXIT_SUCCESS) {
-            result = EXIT_FAILURE;
+    // Cover both head-group geometries and the full fused decode/speculative batch range.
+    for (int64_t gqa : { 6, 16 }) {
+        for (int64_t n_decode : { 1, 2, 3, 4 }) {
+            for (const auto & pair : pairs) {
+                const int pair_result = test_pair(backend, pair[0], pair[1], gqa, n_decode);
+                if (pair_result != EXIT_SUCCESS) {
+                    std::fprintf(stderr, "failed with GQA ratio %lld, decode batch %lld\n",
+                        (long long) gqa, (long long) n_decode);
+                    result = EXIT_FAILURE;
+                }
+            }
         }
     }
 

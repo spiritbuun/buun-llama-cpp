@@ -15,6 +15,7 @@
 #include "vbr-vmm-policy.h"
 
 #include <set>
+#include <vector>
 
 #if defined(GGML_USE_VMM)
 
@@ -25,7 +26,25 @@ struct ggml_vbr_vmm_pool {
     size_t      gran    = 0;
     uint64_t    residency_epoch = 0;
     std::set<size_t> chunks; // mapped chunk offsets (each gran bytes)
+#if defined(GGML_USE_HIP) && defined(__linux__)
+    void * mapping_guard = nullptr;
+#endif
 };
+
+static void vmm_pool_mapping_boundary(ggml_vbr_vmm_pool * pool) {
+#if defined(GGML_USE_HIP) && defined(__linux__)
+    // ROCr's DRM VMM path can leave stale translations after same-VA remaps. A KFD
+    // allocation waits for page-table updates and invalidates the compute TLB.
+    // Uncached bypasses ROCr's fragment allocator: an ordinary small hipMalloc
+    // can return a suballocation without issuing any kernel mapping operation.
+    // Keep a page reserved between boundaries so this also works near VRAM capacity.
+    CUDA_CHECK(hipFree(pool->mapping_guard));
+    pool->mapping_guard = nullptr;
+    CUDA_CHECK(hipExtMallocWithFlags(&pool->mapping_guard, 4096, hipDeviceMallocUncached));
+#else
+    GGML_UNUSED(pool);
+#endif
+}
 
 bool ggml_backend_cuda_vmm_available(int device) {
     return device >= 0 && device < ggml_cuda_info().device_count && ggml_cuda_info().devices[device].vmm;
@@ -59,6 +78,14 @@ ggml_vbr_vmm_pool * ggml_backend_cuda_vmm_pool_init(int device, size_t va_size) 
         return nullptr;
     }
     pool->base = base;
+#if defined(GGML_USE_HIP) && defined(__linux__)
+    ggml_cuda_set_device(device);
+    if (hipExtMallocWithFlags(&pool->mapping_guard, 4096, hipDeviceMallocUncached) != hipSuccess) {
+        CU_CHECK(cuMemAddressFree(base, pool->va_size));
+        delete pool;
+        return nullptr;
+    }
+#endif
     return pool;
 }
 
@@ -96,10 +123,26 @@ bool ggml_backend_cuda_vmm_pool_map(ggml_vbr_vmm_pool * pool, size_t off, size_t
     }
     GGML_ASSERT(off + len <= pool->va_size);
     ggml_cuda_set_device(pool->device);
-    bool zeroed = false;
+    std::vector<size_t> new_chunks;
     const size_t g  = pool->gran;
     const size_t c0 = (off / g) * g;
     const size_t c1 = GGML_PAD(off + len, g);
+    auto finish_mapping = [&]() {
+        if (new_chunks.empty()) {
+            return;
+        }
+        // Publish mapping updates before even the initialization writes. In particular,
+        // a stream/device wait alone does not invalidate stale HIP address translations.
+        vmm_pool_mapping_boundary(pool);
+        for (size_t c : new_chunks) {
+            CUDA_CHECK(cudaMemset((char *) pool->base + c, 0, g));
+        }
+        // The initialization runs on the legacy stream, while ggml uses non-blocking
+        // streams. Also settle a partial allocation before returning it to the caller.
+        CUDA_CHECK(cudaStreamSynchronize(nullptr));
+        GGML_ASSERT(pool->residency_epoch != UINT64_MAX);
+        pool->residency_epoch++;
+    };
     for (size_t c = c0; c < c1; c += g) {
         if (pool->chunks.count(c)) {
             continue;
@@ -113,14 +156,7 @@ bool ggml_backend_cuda_vmm_pool_map(ggml_vbr_vmm_pool * pool, size_t off, size_t
         prop.location.id   = ggml_cuda_info().devices[pool->device].physical_device;
         CUmemGenericAllocationHandle handle;
         if (cuMemCreate(&handle, g, &prop, 0) != CUDA_SUCCESS) {
-            // Earlier chunks in this same call were zeroed on the legacy stream. A recoverable
-            // partial failure retains them, so settle their initialization before exposing them
-            // through mapped()/mapped_in_range() or a later idempotent retry.
-            if (zeroed) {
-                CUDA_CHECK(cudaStreamSynchronize(nullptr));
-                GGML_ASSERT(pool->residency_epoch != UINT64_MAX);
-                pool->residency_epoch++;
-            }
+            finish_mapping();
             return false; // physical exhausted — caller decides (degrade / abort)
         }
         const CUdeviceptr ptr = (CUdeviceptr)((char *) pool->base + c);
@@ -131,19 +167,10 @@ bool ggml_backend_cuda_vmm_pool_map(ggml_vbr_vmm_pool * pool, size_t off, size_t
         access.location.id   = ggml_cuda_info().devices[pool->device].physical_device;
         access.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
         CU_CHECK(cuMemSetAccess(ptr, g, &access, 1));
-        // fresh pages start zeroed: same NaN-in-padding guarantee the eager buffer clear gave
-        CUDA_CHECK(cudaMemset((void *) ptr, 0, g));
         pool->chunks.insert(c);
-        zeroed = true;
+        new_chunks.push_back(c);
     }
-    if (zeroed) {
-        // the memsets ran on the legacy stream; ggml streams are non-blocking, so nothing orders
-        // them against the compute/side streams that write these pages next — settle them here
-        // (rare: only on watermark growth, and the pages are new)
-        CUDA_CHECK(cudaStreamSynchronize(nullptr));
-        GGML_ASSERT(pool->residency_epoch != UINT64_MAX);
-        pool->residency_epoch++;
-    }
+    finish_mapping();
     return true;
 }
 
@@ -164,6 +191,7 @@ bool ggml_backend_cuda_vmm_pool_unmap(ggml_vbr_vmm_pool * pool, size_t off, size
         changed = true;
     }
     if (changed) {
+        vmm_pool_mapping_boundary(pool);
         GGML_ASSERT(pool->residency_epoch != UINT64_MAX);
         pool->residency_epoch++;
     }
@@ -195,6 +223,9 @@ void ggml_backend_cuda_vmm_pool_free(ggml_vbr_vmm_pool * pool) {
         CU_CHECK(cuMemUnmap((CUdeviceptr)((char *) pool->base + c), pool->gran));
     }
     CU_CHECK(cuMemAddressFree(pool->base, pool->va_size));
+#if defined(GGML_USE_HIP) && defined(__linux__)
+    CUDA_CHECK(hipFree(pool->mapping_guard));
+#endif
     delete pool;
 }
 

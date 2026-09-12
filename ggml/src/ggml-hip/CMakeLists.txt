@@ -98,6 +98,9 @@ ggml_add_backend_library(ggml-hip
                          ${GGML_SOURCES_ROCM}
                         )
 
+# HIP always builds the Turbo instances above. Enable their shared dispatch too.
+target_compile_definitions(ggml-hip PRIVATE GGML_CUDA_TURBO_FA)
+
 # TODO: do not use CUDA definitions for HIP
 if (NOT GGML_BACKEND_DL)
     target_compile_definitions(ggml PUBLIC GGML_USE_CUDA)
