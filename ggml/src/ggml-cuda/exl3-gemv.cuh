@@ -39,8 +39,8 @@ __device__ __forceinline__ void exl3_mma_ab_h(const FragB & a01, const FragB & a
 __device__ __forceinline__ half2 exl3_decode_pair_cb2(uint32_t x0, uint32_t x1) {
     x0 *= 0x83DCD12Du;
     x1 *= 0x83DCD12Du;
-    const uint32_t sum0 = __dp4a(x0, 0x01010101u, 0x6400u);
-    const uint32_t sum1 = __dp4a(x1, 0x01010101u, 0x6400u);
+    const uint32_t sum0 = exl3::byte_sum(x0, 0x6400u);
+    const uint32_t sum1 = exl3::byte_sum(x1, 0x6400u);
     const half2 k_inv  = __half2half2(__ushort_as_half(0x1eee));
     const half2 k_bias = __half2half2(__ushort_as_half(0xc931));
     return __hfma2(__halves2half2(__ushort_as_half(uint16_t(sum0)), __ushort_as_half(uint16_t(sum1))), k_inv, k_bias);

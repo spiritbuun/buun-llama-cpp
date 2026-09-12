@@ -10,6 +10,16 @@
 
 namespace exl3 {
 
+// Codebook products contain unsigned bytes. The signed ggml_cuda_dp4a
+// fallback would change values with the high bit set on pre-SM61 devices.
+__device__ __forceinline__ uint32_t byte_sum(uint32_t x, uint32_t acc) {
+#if __CUDA_ARCH__ >= 610
+    return __dp4a(x, 0x01010101u, acc);
+#else
+    return acc + (x & 255u) + ((x >> 8) & 255u) + ((x >> 16) & 255u) + (x >> 24);
+#endif
+}
+
 template <typename T, int n>
 struct Vec {
     T elems[n];
@@ -51,8 +61,8 @@ __device__ inline half2 decode_mul1_product_2(uint32_t x0, uint32_t x1)
     // uint32_t sum1;
     // asm ("vabsdiff4.u32.u32.u32.add %0, %1, %2, %3;" : "=r"(sum0) : "r"(x0), "r"(0), "r"(acc) : );
     // asm ("vabsdiff4.u32.u32.u32.add %0, %1, %2, %3;" : "=r"(sum1) : "r"(x1), "r"(0), "r"(acc) : );
-    uint32_t sum0 = __dp4a(x0, 0x01010101u, acc);
-    uint32_t sum1 = __dp4a(x1, 0x01010101u, acc);
+    uint32_t sum0 = byte_sum(x0, acc);
+    uint32_t sum1 = byte_sum(x1, acc);
     half2 k_inv_h2 = __half2half2(__ushort_as_half(0x1eee));  //  0.00677 = 1/147.7
     half2 k_bias_h2 = __half2half2(__ushort_as_half(0xc931));  // -10.39 = (-1024.0 - 510.0) * k_inv_h
     half_uint16 h0((uint16_t) sum0);
@@ -100,7 +110,7 @@ __device__ inline half decode_3inst(uint32_t x)
         // where vabsdiff4 is emulated. dp4a also wins om Ampere now, possibly after compiler changes, and ties on Ada
         // uint32_t sum;
         // asm ("vabsdiff4.u32.u32.u32.add %0, %1, %2, %3;" : "=r"(sum) : "r"(x), "r"(0), "r"(acc) : );
-        uint32_t sum = __dp4a(x, 0x01010101u, acc);
+        uint32_t sum = byte_sum(x, acc);
         const __half k_inv_h = __ushort_as_half(0x1eee);  //  0.00677 = 1/147.7
         const __half k_bias_h = __ushort_as_half(0xc931);  // -10.39 = (-1024.0 - 510.0) * k_inv_h
         half_uint16 h((uint16_t) sum);

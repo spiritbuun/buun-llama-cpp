@@ -62,9 +62,19 @@ __device__ __forceinline__ float dot2(half2 w, half2 x) {
 }
 
 __device__ __forceinline__ int dp4a_us(uint32_t a, uint32_t b, int c) {
+#if __CUDA_ARCH__ >= 610
     int d;
     asm("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
     return d;
+#else
+    // Match unsigned weight bytes, signed activation bytes and wrapping sum.
+    uint32_t sum = uint32_t(c);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        sum += uint32_t(int((a >> (8*i)) & 255u) * int(int8_t(b >> (8*i))));
+    }
+    return int32_t(sum);
+#endif
 }
 
 // 4 bpw: 8 windows for run t0..t0+7 from words (a = previous, b = this)

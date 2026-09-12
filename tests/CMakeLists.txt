@@ -534,6 +534,11 @@ if ((TARGET ggml-cuda OR TARGET ggml-hip) AND NOT GGML_BACKEND_DL)
     set_property(TEST test-exl3-cpu-cache PROPERTY SKIP_RETURN_CODE 77)
 endif()
 if (TARGET ggml-cuda AND NOT GGML_BACKEND_DL)
+    enable_language(CUDA)
+    llama_build_and_test(test-exl3-byte-dot.cu)
+    target_include_directories(test-exl3-byte-dot PRIVATE ../ggml/src ../ggml/src/ggml-cuda)
+    set_target_properties(test-exl3-byte-dot PROPERTIES CUDA_STANDARD 17)
+    set_tests_properties(test-exl3-byte-dot PROPERTIES SKIP_RETURN_CODE 77)
     # Small scale-aware cases exercise generic fallbacks without the expensive
     # CPU reference of production-sized dynamic FP8 GEMMs.
     llama_test(test-backend-ops NAME test-cuda-native-quant-fallbacks

@@ -414,10 +414,10 @@ __global__ void gemv_i8_channel(
     for (int64_t col = threadIdx.x; col < width / 16; col += blockDim.x) {
         const int4 w = weight16[col];
         const int4 x = activation16[col];
-        sum = __dp4a(w.x, x.x, sum);
-        sum = __dp4a(w.y, x.y, sum);
-        sum = __dp4a(w.z, x.z, sum);
-        sum = __dp4a(w.w, x.w, sum);
+        sum = ggml_cuda_dp4a(w.x, x.x, sum);
+        sum = ggml_cuda_dp4a(w.y, x.y, sum);
+        sum = ggml_cuda_dp4a(w.z, x.z, sum);
+        sum = ggml_cuda_dp4a(w.w, x.w, sum);
     }
 
     for (int offset = warpSize / 2; offset > 0; offset /= 2) {
@@ -464,14 +464,14 @@ __global__ void gemv_i8_channel_swiglu(
         const int4 x = activation16[col];
         const int4 up = up16[col];
         const int4 gate = gate16[col];
-        up_sum = __dp4a(up.x, x.x, up_sum);
-        up_sum = __dp4a(up.y, x.y, up_sum);
-        up_sum = __dp4a(up.z, x.z, up_sum);
-        up_sum = __dp4a(up.w, x.w, up_sum);
-        gate_sum = __dp4a(gate.x, x.x, gate_sum);
-        gate_sum = __dp4a(gate.y, x.y, gate_sum);
-        gate_sum = __dp4a(gate.z, x.z, gate_sum);
-        gate_sum = __dp4a(gate.w, x.w, gate_sum);
+        up_sum = ggml_cuda_dp4a(up.x, x.x, up_sum);
+        up_sum = ggml_cuda_dp4a(up.y, x.y, up_sum);
+        up_sum = ggml_cuda_dp4a(up.z, x.z, up_sum);
+        up_sum = ggml_cuda_dp4a(up.w, x.w, up_sum);
+        gate_sum = ggml_cuda_dp4a(gate.x, x.x, gate_sum);
+        gate_sum = ggml_cuda_dp4a(gate.y, x.y, gate_sum);
+        gate_sum = ggml_cuda_dp4a(gate.z, x.z, gate_sum);
+        gate_sum = ggml_cuda_dp4a(gate.w, x.w, gate_sum);
     }
 
     for (int offset = warpSize / 2; offset > 0; offset /= 2) {

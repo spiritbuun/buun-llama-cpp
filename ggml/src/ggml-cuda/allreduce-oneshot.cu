@@ -49,13 +49,22 @@ struct ggml_cuda_ar_oneshot {
 // flags live in mapped host memory: system-scope acquire loads and release stores, with a system fence after
 // each store so the flag is pushed out while the same thread keeps polling
 static __device__ __forceinline__ int ar1_load_flag(const int * p) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
     int v;
     asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
     return v;
+#else
+    NO_DEVICE_CODE;
+    return 0;
+#endif
 }
 static __device__ __forceinline__ void ar1_store_flag(int * p, int v) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
     asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(p), "r"(v) : "memory");
     __threadfence_system();
+#else
+    NO_DEVICE_CODE;
+#endif
 }
 
 // flag address of (slot, rank, which) inside the host block: 0 = slice published, 1 = done reading, 2 = own
@@ -66,9 +75,13 @@ static __device__ __forceinline__ int * ar1_flag(char * base, size_t data_bytes,
 }
 // Wait for the peer before using its slice. Never continue with incomplete data.
 static __device__ __forceinline__ void ar1_spin(const int * f, int value) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
     while (ar1_load_flag(f) < value) {
         __nanosleep(100);
     }
+#else
+    NO_DEVICE_CODE;
+#endif
 }
 
 // the slice blocks as this device sees them

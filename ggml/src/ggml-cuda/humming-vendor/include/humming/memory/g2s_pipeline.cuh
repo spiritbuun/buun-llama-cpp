@@ -1,7 +1,10 @@
 #pragma once
 
 #include <cooperative_groups.h>
+// The CUDA header rejects pre-SM70 passes even when this pipeline is never instantiated.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
 #include <cuda_awbarrier_primitives.h>
+#endif
 #include <humming/memory/g2s_loader/loader_a.cuh>
 #include <humming/memory/g2s_loader/loader_as.cuh>
 #include <humming/memory/g2s_loader/loader_b.cuh>
