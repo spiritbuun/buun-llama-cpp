@@ -217,7 +217,10 @@ then evicts the minimum expert footprint needed to form cache pools.
 
 ### EXL3 and CPU overlap
 
-EXL3 supports CPU expert execution and CUDA MoE caching. By default, cached EXL3 work stays on
+EXL3 supports CPU expert execution and CUDA/HIP MoE caching. HIP currently uses CPU
+execution for standalone EXL3 matrix operations; only cached expert dot products
+run on the GPU. CPU-resident weights still require host memory.
+By default, cached EXL3 work stays on
 GPU rather than assigning a share to CPU: CPU trellis decoding can otherwise hold up the GPU's
 completed work. Experts missing from the GPU cache still run on CPU.
 

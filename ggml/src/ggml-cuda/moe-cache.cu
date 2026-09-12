@@ -20,9 +20,7 @@ void ggml_moe_cache_register(const void * owner) {
 #include "common.cuh"
 #include "mmvq.cuh"
 #include "quantize.cuh"
-#if !defined(GGML_USE_HIP)
 #include "exl3.cuh"
-#endif
 #include "ggml-backend-impl.h"
 #include "ggml-cuda.h"
 #include "../ggml-backend-moe-cache.h"
@@ -1125,9 +1123,7 @@ static bool moe_cache_tensor_name_supported(const char * name) {
 }
 
 static bool moe_cache_type_supported(ggml_type type) {
-#if !defined(GGML_USE_HIP)
     if (ggml_type_is_exl3(type)) return true;
-#endif
     switch (type) {
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
@@ -3118,14 +3114,11 @@ static int moe_cache_dispatch_internal(
                 device, cudaPeekAtLastError(), "activation quantization", true);
     }
     if (ok) {
-#if !defined(GGML_USE_HIP)
         if (exl3) {
             ggml_cuda_exl3_cache_mmv(pool.slab, (ggml_type)wtype, d_act, d_ids,
                 use_activation_map ? d_ids+n_hits : nullptr, device.d_out,
                 int(n_in), int(n_out), pool.expert_size, n_hits, activation_rows, device.compute_stream);
-        } else
-#endif
-        if (fused) {
+        } else if (fused) {
             ggml_cuda_moe_cache_mmv_fused(
                     pool.slab, gate_pool->slab, (ggml_type)wtype,
                     (const char *)device.d_act_q8,

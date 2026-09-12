@@ -69,7 +69,7 @@ static void had(float * x, int n) {
 }
 
 static bool run(ggml_backend_t backend, int bits, int cb, bool grouped, int tokens, int lanes, bool windowed = false,
-                int k = 256, int n = 384, int overlap = -1) {
+                int k = 256, int n = 384, int overlap = -1, bool automatic = false) {
     constexpr float norm = 0.088388347648f;
     // The cache's existing pool policy requires at least 64 expert entries.
     const int experts = grouped ? (cache_gpu && !windowed ? 64 : 3) : 1;
@@ -100,6 +100,12 @@ static bool run(ggml_backend_t backend, int bits, int cb, bool grouped, int toke
         printf("CPU_EXL3_UNSUPPORTED bits=%d cb=%d grouped=%d\n", bits, cb, grouped);
         ggml_free(ctx);
         return false;
+    }
+    // HIP's cache bridge is available, but its standalone EXL3 executor is
+    // not. The scheduler must leave both dense and routed nodes on CPU.
+    if (cache_gpu && std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(
+            ggml_backend_get_device(cache_gpu))), "ROCm") == 0) {
+        GGML_ASSERT(!ggml_backend_supports_op(cache_gpu, y));
     }
     // Capability probes must decline malformed auxiliaries and geometry,
     // while still admitting the loader's pre-attachment probe.
@@ -197,13 +203,15 @@ static bool run(ggml_backend_t backend, int bits, int cb, bool grouped, int toke
         ggml_moe_cache_config config{};
         // Keep room for the minimum 64-entry pool at the larger MoE shapes too.
         const int cache_mib = std::max(16, int((ggml_nbytes(w) + (1 << 20) - 1) >> 20) + 8);
-        GGML_ASSERT(ggml_moe_cache.query_config(0, cache_mib, &config));
-        config.reserve_bytes = 0;
-        config.reserve_explicit = 1;
-        config.min_expert_bytes = 1;
-        config.min_expert_explicit = 1;
-        config.minimum_slab_bytes = 1 << 20;
-        config.min_devices = 1;
+        GGML_ASSERT(ggml_moe_cache.query_config(automatic ? 1 : 0, automatic ? 0 : cache_mib, &config));
+        if (!automatic) {
+            config.reserve_bytes = 0;
+            config.reserve_explicit = 1;
+            config.min_expert_bytes = 1;
+            config.min_expert_explicit = 1;
+            config.minimum_slab_bytes = 1 << 20;
+            config.min_devices = 1;
+        }
         config.expert_parallel = 0;
         config.overlap_cpu_rows = overlap;
         void * backends[] = {cache_gpu, backend};
@@ -242,8 +250,8 @@ static bool run(ggml_backend_t backend, int bits, int cb, bool grouped, int toke
             reject_collect = false;
             ok &= collect_attempts > before_collect;
             ok &= check();
-            printf("cache bits=%d cb=%d threads=%d hits=%d dispatch_failure=%d collect_failure=%d exact=%d\n",
-                bits, cb, threads, cache_hits, dispatch_attempts > before_dispatch, collect_attempts > before_collect, ok);
+            printf("cache bits=%d cb=%d threads=%d auto=%d hits=%d dispatch_failure=%d collect_failure=%d pass=%d\n",
+                bits, cb, threads, automatic, cache_hits, dispatch_attempts > before_dispatch, collect_attempts > before_collect, ok);
         }
         ggml_moe_cache.dispatch = real_dispatch;
         ggml_moe_cache.collect = real_collect;
@@ -262,6 +270,7 @@ int main(int argc, char ** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--cache") == 0) {
         ggml_backend_load_all();
         cache_gpu = ggml_backend_init_by_name("CUDA0", nullptr);
+        if (!cache_gpu) cache_gpu = ggml_backend_init_by_name("ROCm0", nullptr);
         if (!cache_gpu || !ggml_moe_cache.session_create) return 77;
     }
     auto * backend = ggml_backend_cpu_init();
@@ -286,6 +295,7 @@ int main(int argc, char ** argv) {
     if (cache_gpu) {
         ok &= run(backend, 2, 2, true, 1, 1, false, 2560, 640, 1);
         ok &= run(backend, 3, 0, true, 2, 3, false, 256, 384, 2);
+        ok &= run(backend, 2, 2, true, 1, 1, false, 2560, 640, -1, true);
     }
     ggml_backend_free(backend);
     if (cache_gpu) ggml_backend_free(cache_gpu);

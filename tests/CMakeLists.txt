@@ -529,6 +529,10 @@ target_include_directories(test-backend-expert-transfer PRIVATE ../ggml/src)
 llama_build_and_test(test-exl3-cpu.cpp)
 llama_build_and_test(test-cuda-graph-key.cpp)
 llama_build_and_test(test-cuda-rdna2-vmm-policy.cpp)
+if ((TARGET ggml-cuda OR TARGET ggml-hip) AND NOT GGML_BACKEND_DL)
+    llama_test(test-exl3-cpu NAME test-exl3-cpu-cache ARGS --cache)
+    set_property(TEST test-exl3-cpu-cache PROPERTY SKIP_RETURN_CODE 77)
+endif()
 if (TARGET ggml-cuda AND NOT GGML_BACKEND_DL)
     # Small scale-aware cases exercise generic fallbacks without the expensive
     # CPU reference of production-sized dynamic FP8 GEMMs.
@@ -536,8 +540,6 @@ if (TARGET ggml-cuda AND NOT GGML_BACKEND_DL)
         ARGS test -b CUDA0
         -o MUL_MAT_STATIC_I8,MUL_MAT_DYNAMIC_I4,MUL_MAT_DYNAMIC_W4A8_FP8,MUL_MAT_STATIC_FP8,MUL_MAT_CHANNEL_FP8,MUL_MAT_BLOCK_FP8
         -p "^k=(32|128|256),n=[0-9]+(,m=(1|3|8)(,|$)|,scale=)")
-    llama_test(test-exl3-cpu NAME test-exl3-cpu-cache ARGS --cache)
-    set_property(TEST test-exl3-cpu-cache PROPERTY SKIP_RETURN_CODE 77)
     llama_build(test-exl3-cache-large-pool.cpp)
     target_link_libraries(test-exl3-cache-large-pool PRIVATE ggml-cuda CUDA::cudart)
     llama_test(test-exl3-cache-large-pool LABEL "backend")

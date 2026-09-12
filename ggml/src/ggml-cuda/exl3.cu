@@ -4,6 +4,28 @@
 // exllamav3_ext/quant/{exl3_gemv_kernel,hadamard_inner,reconstruct}.cu*.
 #include "exl3.cuh"
 
+#define EXL3_DISPATCH_CB(fn, bits, cb, ...)                    \
+    switch (bits) {                                          \
+        case 1: fn<1, cb>(__VA_ARGS__); break;                \
+        case 2: fn<2, cb>(__VA_ARGS__); break;                \
+        case 3: fn<3, cb>(__VA_ARGS__); break;                \
+        case 4: fn<4, cb>(__VA_ARGS__); break;                \
+        case 5: fn<5, cb>(__VA_ARGS__); break;                \
+        case 6: fn<6, cb>(__VA_ARGS__); break;                \
+        case 7: fn<7, cb>(__VA_ARGS__); break;                \
+        case 8: fn<8, cb>(__VA_ARGS__); break;                \
+        default: GGML_ABORT("invalid EXL3 bit width");        \
+    }
+
+// bits x codebook (2 = mul1, 1 = mcg, 0 = 3inst)
+#define EXL3_DISPATCH(fn, bits, cb, ...)                       \
+    switch (cb) {                                            \
+        case 2: EXL3_DISPATCH_CB(fn, bits, 2, __VA_ARGS__); break; \
+        case 1: EXL3_DISPATCH_CB(fn, bits, 1, __VA_ARGS__); break; \
+        case 0: EXL3_DISPATCH_CB(fn, bits, 0, __VA_ARGS__); break; \
+        default: GGML_ABORT("invalid EXL3 codebook");         \
+    }
+
 #if !defined(GGML_USE_HIP)
 
 #include <cstring>
@@ -115,28 +137,6 @@ void exl3_reconstruct_launch(const uint8_t * data, half * dst, int k, int n0, in
     const size_t tiles = size_t(n1 - n0) / 16 * (k / 16);
     exl3_reconstruct_kernel<bits, cb><<<unsigned((tiles + 7) / 8), 256, 0, stream>>>(data, dst, k, n0 / 16, n1 / 16);
 }
-
-#define EXL3_DISPATCH_CB(fn, bits, cb, ...)                   \
-    switch (bits) {                                           \
-        case 1: fn<1, cb>(__VA_ARGS__); break;                \
-        case 2: fn<2, cb>(__VA_ARGS__); break;                \
-        case 3: fn<3, cb>(__VA_ARGS__); break;                \
-        case 4: fn<4, cb>(__VA_ARGS__); break;                \
-        case 5: fn<5, cb>(__VA_ARGS__); break;                \
-        case 6: fn<6, cb>(__VA_ARGS__); break;                \
-        case 7: fn<7, cb>(__VA_ARGS__); break;                \
-        case 8: fn<8, cb>(__VA_ARGS__); break;                \
-        default: GGML_ABORT("invalid EXL3 bit width");        \
-    }
-
-// bits x codebook (2 = mul1, 1 = mcg, 0 = 3inst)
-#define EXL3_DISPATCH(fn, bits, cb, ...)                      \
-    switch (cb) {                                             \
-        case 2: EXL3_DISPATCH_CB(fn, bits, 2, __VA_ARGS__); break; \
-        case 1: EXL3_DISPATCH_CB(fn, bits, 1, __VA_ARGS__); break; \
-        case 0: EXL3_DISPATCH_CB(fn, bits, 0, __VA_ARGS__); break; \
-        default: GGML_ABORT("invalid EXL3 codebook");         \
-    }
 
 // ---- int8 activation path (m <= MAX_M) ---------------------------------------------------
 // GGML_EXL3_INT8: 0 = off (fp16 tensor-core gemv), 1 = int8 + error-feedback residual everywhere,
@@ -393,6 +393,39 @@ void ggml_cuda_mul_mat_id_exl3(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         static_cast<const uint8_t *>(w->data), static_cast<const half *>(svh->data), static_cast<float *>(dst->data), k, n, pairs, ga, stream);
 }
 
+#else
+
+bool ggml_cuda_exl3_mul_mat_id_fast(const ggml_tensor *) { return false; }
+void ggml_cuda_mul_mat_id_exl3(ggml_backend_cuda_context &, ggml_tensor *) { GGML_ABORT("EXL3 is CUDA only"); }
+bool ggml_cuda_exl3_supports_mul_mat(const ggml_tensor *) { return false; }
+void ggml_cuda_exl3_reconstruct_rows(const ggml_tensor *, int64_t, int64_t, half *, cudaStream_t) { GGML_ABORT("EXL3 is CUDA only"); }
+void ggml_cuda_mul_mat_exl3(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) { GGML_ABORT("EXL3 is CUDA only"); }
+
+#endif
+
+// The cache receives CPU-transformed activations and returns untransformed
+// dot products. It needs no NVIDIA MMA instructions; keep its accumulation
+// order and F16 codebook rounding identical to the CPU fallback on HIP too.
+template<int cb>
+__device__ __forceinline__ float exl3_cache_value(uint32_t state) {
+#if defined(GGML_USE_HIP)
+    if constexpr (cb == 2) {
+        const uint32_t x = state * 0x83dcd12du;
+        const uint16_t sum = 0x6400 + (x & 255) + ((x >> 8) & 255) +
+                             ((x >> 16) & 255) + (x >> 24);
+        return __half2float(__float2half_rn(fmaf(__half2float(__ushort_as_half(sum)),
+            __half2float(__ushort_as_half(0x1eee)), __half2float(__ushort_as_half(0xc931)))));
+    } else {
+        uint32_t x = cb == 1 ? state * 0xcbac1fedu : state * 89226354u + 64248484u;
+        x = (x & 0x8fff8fffu) ^ 0x3b603b60u;
+        return __half2float(__float2half_rn(__half2float(__ushort_as_half(uint16_t(x))) +
+                                           __half2float(__ushort_as_half(uint16_t(x >> 16)))));
+    }
+#else
+    return __half2float(exl3::decode_3inst<cb>(state));
+#endif
+}
+
 template<int bits, int cb>
 __global__ void exl3_cache_dot(const uint8_t * weights, const float * activations,
         const int32_t * slots, const int32_t * activation_ids, float * output,
@@ -405,7 +438,8 @@ __global__ void exl3_cache_dot(const uint8_t * weights, const float * activation
     const uint8_t * w = weights + size_t(slots[row])*expert_bytes;
     float sum = 0;
     for (int kt = 0; kt < k/16; ++kt) {
-        const uint32_t * tile = exl3_tile(w, bits, col/16, kt, k/16);
+        const uint32_t * tile = reinterpret_cast<const uint32_t *>(
+            w + (size_t(col/16) * (k/16) + kt) * 32 * bits);
         const int c = col%16;
 #pragma unroll
         for (int r = 0; r < 16; ++r) {
@@ -413,7 +447,7 @@ __global__ void exl3_cache_dot(const uint8_t * weights, const float * activation
             const int pos = ((element+1)*bits + 256*bits - 16) % (256*bits);
             const uint64_t words = (uint64_t(tile[pos/32]) << 32) | tile[(pos/32+1) % (8*bits)];
             const uint32_t state = (words >> (48-pos%32)) & 65535;
-            sum = fmaf(__half2float(exl3::decode_3inst<cb>(state)), x[kt*16+r], sum);
+            sum = fmaf(exl3_cache_value<cb>(state), x[kt*16+r], sum);
         }
     }
     output[size_t(row)*n+col] = sum;
@@ -434,13 +468,3 @@ void ggml_cuda_exl3_cache_mmv(const void * weights, ggml_type type,
     EXL3_DISPATCH(exl3_cache_launch, ggml_exl3_bits(type), ggml_exl3_codebook(type),
         weights, activations, slots, activation_ids, output, k, n, expert_bytes, rows, activation_rows, stream);
 }
-
-#else
-
-bool ggml_cuda_exl3_mul_mat_id_fast(const ggml_tensor *) { return false; }
-void ggml_cuda_mul_mat_id_exl3(ggml_backend_cuda_context &, ggml_tensor *) { GGML_ABORT("EXL3 is CUDA only"); }
-bool ggml_cuda_exl3_supports_mul_mat(const ggml_tensor *) { return false; }
-void ggml_cuda_exl3_reconstruct_rows(const ggml_tensor *, int64_t, int64_t, half *, cudaStream_t) { GGML_ABORT("EXL3 is CUDA only"); }
-void ggml_cuda_mul_mat_exl3(ggml_backend_cuda_context &, const ggml_tensor *, const ggml_tensor *, ggml_tensor *) { GGML_ABORT("EXL3 is CUDA only"); }
-
-#endif

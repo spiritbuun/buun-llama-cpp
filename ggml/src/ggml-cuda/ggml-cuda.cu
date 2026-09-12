@@ -8675,12 +8675,18 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 struct ggml_tensor * a = op->src[0];
                 struct ggml_tensor * b = op->src[1];
                 if (ggml_cuda_is_exl3(a->type)) {
+#if defined(GGML_USE_HIP)
+                    // HIP supports EXL3 through the CPU expert-cache bridge,
+                    // not the standalone CUDA dense/routed executors.
+                    return false;
+#else
                     if (op->op == GGML_OP_MUL_MAT_ID) {
                         // per-expert dispatch through the EXL3 mul_mat; scales are src[3]/src[4]
                         return op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                             a->ne[0] % 128 == 0 && a->ne[1] % 128 == 0;
                     }
                     return op->op == GGML_OP_MUL_MAT && ggml_cuda_exl3_supports_mul_mat(op);
+#endif
                 }
                 if (op->op == GGML_OP_MUL_MAT && op->src[3] != nullptr) {
 #if defined(GGML_USE_HIP)
