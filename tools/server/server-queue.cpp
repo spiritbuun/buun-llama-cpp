@@ -1,5 +1,6 @@
 #include "server-task.h"
 #include "server-queue.h"
+#include "ggml-stall-trace.h"
 
 #include "log.h"
 
@@ -445,6 +446,7 @@ void server_queue::worker_stop() {
 }
 
 void server_queue::yield_to_queue(std::function<void()> && work) {
+    ggml_stall_trace trace("queue.yield", this);
     GGML_ASSERT(worker.thread.joinable() && "yield_to_queue() requires start_loop() to be running");
 
     QUE_DBG("%s", "yielding to queue\n");

@@ -1,4 +1,5 @@
 #include "ggml-cuda.h"
+#include "ggml-stall-trace.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
@@ -3994,6 +3995,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
+    ggml_stall_trace trace("gpu.stream_sync", cuda_ctx);
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
 
     GGML_UNUSED(backend);

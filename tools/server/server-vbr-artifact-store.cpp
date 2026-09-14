@@ -1,4 +1,5 @@
 #include "server-vbr-artifact-store.h"
+#include "ggml-stall-trace.h"
 
 #include "server-prompt-cache-payload.h"
 #include "../../common/speculative.h"
@@ -2265,6 +2266,7 @@ server_vbr_artifact_store::prepare_host_payload(
         llama_memory_i & memory,
         vbr_explicit_capture_request request,
         server_vbr_explicit_host_capture & operation) noexcept {
+    ggml_stall_trace trace("artifact.prepare", this);
     operation.reset();
     server_vbr_artifact_capture_output output;
     impl_->counters.requested++;
@@ -2330,6 +2332,7 @@ server_vbr_artifact_store::prepare_host_payload(
 server_vbr_artifact_capture_output
 server_vbr_artifact_store::transfer_host_payload(
         server_vbr_explicit_host_capture & operation) noexcept {
+    ggml_stall_trace trace("artifact.transfer", this);
     server_vbr_artifact_capture_output output;
     if (!operation.ready_for_transfer()) {
         return output;
@@ -2346,6 +2349,7 @@ server_vbr_artifact_store::publish_host_payload(
         server_vbr_explicit_host_capture & operation,
         std::shared_ptr<const server_prompt_cache_vbr_payload> & payload)
         noexcept {
+    ggml_stall_trace trace("artifact.publish", this);
     payload.reset();
     server_vbr_artifact_capture_output output;
     if (!operation.ready_for_publication()) {
@@ -2585,6 +2589,7 @@ bool server_vbr_artifact_store::publish_projected_host_batch_impl(
         llama_vbr_projected_publication_batch_claim && batch_claim,
         std::vector<server_vbr_projected_host_publish_result> & output,
         server_vbr_projected_host_publish_diagnostics * diagnostics) noexcept {
+    ggml_stall_trace trace("artifact.projected_publish", this, publications.size());
     output.clear();
     if (diagnostics) {
         *diagnostics = {};
@@ -2733,6 +2738,7 @@ bool server_vbr_artifact_store::capture_projected_host_batch(
         std::vector<server_vbr_projected_host_publish_result> & output,
         const server_vbr_projected_capture_admission * admission,
         server_vbr_projected_host_capture_diagnostics * diagnostics) noexcept {
+    ggml_stall_trace trace("artifact.projected_batch", this, manifests.size(), max_packed_bytes);
     output.clear();
     if (diagnostics) {
         *diagnostics = {};

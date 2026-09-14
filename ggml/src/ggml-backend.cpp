@@ -9,6 +9,7 @@
 #endif
 
 #include "ggml-backend.h"
+#include "ggml-stall-trace.h"
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
@@ -517,6 +518,8 @@ enum ggml_status ggml_backend_graph_compute(ggml_backend_t backend, struct ggml_
 
 enum ggml_status ggml_backend_graph_compute_async(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     GGML_ASSERT(backend);
+    // CPU execution can finish here; GPU execution may only enqueue work.
+    ggml_stall_trace trace(ggml_backend_name(backend), backend, cgraph->n_nodes);
     return backend->iface.graph_compute(backend, cgraph);
 }
 

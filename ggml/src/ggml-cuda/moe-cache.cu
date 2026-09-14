@@ -3,6 +3,7 @@
 // (TheTom/llama-cpp-turboquant#284). MIT.
 
 #include "moe-cache.cuh"
+#include "ggml-stall-trace.h"
 
 #if defined(GGML_USE_MUSA)
 
@@ -1495,6 +1496,7 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             device->inflight_bytes = job.bytes;
         }
 
+        ggml_stall_trace job_trace("moe.fill_job", device, job.pool, job.slot, job.bytes);
         cudaError_t error = cudaSuccess;
         ggml_cuda_set_device(device->logical);
 
@@ -1551,13 +1553,18 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                 fill_lock.lock();
             }
             if (error == cudaSuccess && stage && stage_capacity >= job.bytes) {
-                memcpy(stage, job.source, job.bytes);
+                {
+                    ggml_stall_trace trace("moe.host_copy", device, job.bytes);
+                    memcpy(stage, job.source, job.bytes);
+                }
                 error = cudaMemcpyAsync(
                         destination, stage, job.bytes, cudaMemcpyHostToDevice, stream);
                 if (error == cudaSuccess) {
+                    ggml_stall_trace trace("moe.copy_sync", device, job.bytes);
                     error = cudaStreamSynchronize(stream);
                 }
             } else if (error == cudaSuccess) {
+                ggml_stall_trace trace("moe.copy_blocking", device, job.bytes);
                 error = cudaMemcpy(
                         destination, job.source, job.bytes, cudaMemcpyHostToDevice);
             }

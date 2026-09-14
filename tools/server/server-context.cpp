@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include "ggml-stall-trace.h"
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
@@ -13440,6 +13441,7 @@ private:
             return 0;
         }
         if (pending->worker.joinable()) {
+            ggml_stall_trace trace("idle_capture.join", this, allow_publish, task_arrival);
             pending->worker.join();
         }
         const auto trace_terminal = [&](const char * event,
@@ -13802,6 +13804,7 @@ private:
     size_t publish_idle_vbr_batch(
             server_queue::idle_capture_session & capture_session,
             bool readiness_only = false) noexcept {
+        ggml_stall_trace trace("idle_capture.batch", this, readiness_only);
         if (!params_base.vbr_prompt_cache || !prompt_cache ||
             !vbr_artifact_store ||
             !capture_session.continue_capture()) {
@@ -17297,7 +17300,10 @@ private:
 
             if (!batch_slot_ids.empty()) {
                 const int64_t t_batch_start = ggml_time_us();
-                common_speculative_draft(spec.get());
+                {
+                    ggml_stall_trace trace("spec.draft", spec.get(), batch_slot_ids.size());
+                    common_speculative_draft(spec.get());
+                }
                 t_draft_total += ggml_time_us() - t_batch_start;
 
                 const bool decode_succeeded =
@@ -19073,6 +19079,7 @@ private:
                     }
                     std::list<common_prompt_checkpoint> staged;
                     if (do_checkpoint) {
+                        ggml_stall_trace trace("checkpoint.stage", ctx_tgt, slot.id, ckpt_id_task, ckpt_n_tokens);
                         // Stage the complete checkpoint in a detached list node before evicting
                         // anything. Allocation failure or a short state write must retain every good
                         // published checkpoint and must never leave a half-filled entry selectable.
@@ -19185,6 +19192,7 @@ private:
                                 next.data_tgt.overwrite(
                                     checkpoint_size,
                                     [&](uint8_t * data, size_t size) {
+                                        ggml_stall_trace trace("checkpoint.target_copy", ctx_tgt, slot.id, ckpt_id_task, size);
                                         n = llama_state_seq_get_data_ext(
                                             ctx_tgt, data, size, slot.id,
                                             LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -19238,6 +19246,7 @@ private:
                                     next.data_dft.overwrite(
                                         draft_size,
                                         [&](uint8_t * data, size_t size) {
+                                            ggml_stall_trace trace("checkpoint.draft_copy", ctx_dft.get(), slot.id, ckpt_id_task, size);
                                             draft_written =
                                                 llama_state_seq_get_data_ext(
                                                     ctx_dft.get(), data, size,
@@ -19314,6 +19323,7 @@ private:
                     bool staged_checkpoint_acquired_destination = false;
                     server_retention_instance_key staged_checkpoint_key;
                     if (do_checkpoint && slot.lifecycle_authority) {
+                        ggml_stall_trace trace("checkpoint.publish", ctx_tgt, slot.id, ckpt_id_task, ckpt_n_tokens);
                         // The detached node has its final address, so publish and
                         // account it before thinning any incumbent. A failed
                         // checkpoint publication must be a no-mutation result for
@@ -19403,6 +19413,7 @@ private:
                     }
 
                     if (do_checkpoint) {
+                        ggml_stall_trace trace("checkpoint.finalize", ctx_tgt, slot.id, ckpt_id_task, ckpt_n_tokens);
                         // First evict thin checkpoints that sit within
                         // checkpoint_min_step of the previous KEPT one (redundantly close), never
                         // evicting the current task's own -- this keeps early anchors alive across
@@ -19850,8 +19861,13 @@ private:
         int64_t t_verify_elapsed = 0;
         const std::exception_ptr yield_exception =
             queue_tasks.yield_to_queue_capture_exception([&]() {
-            ret = llama_decode(ctx_tgt, batch_view);
+            {
+                ggml_stall_trace trace("target.decode", ctx_tgt, batch_view.n_tokens,
+                    batch_view.pos ? batch_view.pos[0] : -1, has_output);
+                ret = llama_decode(ctx_tgt, batch_view);
+            }
             if (ret == 0 && has_output) {
+                ggml_stall_trace trace("target.sync", ctx_tgt, batch_view.n_tokens);
                 llama_synchronize(ctx_tgt);
             }
 
@@ -19859,6 +19875,7 @@ private:
 
             if (ret == 0 && spec) {
                 try {
+                    ggml_stall_trace trace("spec.process", spec.get(), batch_view.n_tokens);
                     speculative_ok = common_speculative_process(
                         spec.get(), batch_view);
                 } catch (...) {
