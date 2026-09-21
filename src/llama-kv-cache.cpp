@@ -1,5 +1,6 @@
 #include "llama-kv-cache.h"
 #include "llama-vbr-codec.h"
+#include "ggml-vbr-diagnostic.h"
 
 #include "llama-vbr-artifact-capture.h"
 #include "llama-vbr-explicit-capture.h"
@@ -3312,6 +3313,31 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
         // (wm <= wm_cells). Runs after the non-stable path's fence arm so an already-queued transcode
         // wave stays fenced for the NEXT batch's graph. apply_ubatch's ensure_mapped is the mid-batch
         // backstop for placements past the prediction.
+        if (ggml_vbr_diag_enabled()) {
+            for (const auto & p : vbr_pools_) {
+                if (!p.vmm) {
+                    continue;
+                }
+                size_t pending = 0;
+                for (const auto & range : p.unmap_deferred) {
+                    pending += range.second;
+                }
+                // Do not call budget_eff here: an additional sample would mutate
+                // its memoization and could change the policy under investigation.
+                ggml_vbr_diag_record(GGML_VBR_DIAG_PRESSURE,
+                    "prepare controller=%p pool=%p device=%d boundary=%llu used=%u wm=%u old_wm=%u "
+                    "projected=%zu mapped=%zu nominal=%zu effective_cached=%zu effective_stamp=%llu "
+                    "pending_ranges=%zu pending_requested_bytes=%zu wave=%d cursor=%zu limit=%zu freeze_depth=%u stable=%d",
+                    (void *) this, (void *) p.vmm, p.device, (unsigned long long) vbr_boundary_count_,
+                    used_now, wm_next, p.wm_cells, vbr_vmm_projected_bytes(p, wm_next),
+                    p.be->vmm_pool_mapped(p.vmm), p.budget, p.budget_eff_cache,
+                    (unsigned long long) p.budget_eff_stamp, p.unmap_deferred.size(), pending,
+                    int(p.wave_pending), vbr_degrade_cursor_, vbr_degrade_limit_, vbr_retier_freeze_depth_, int(vbr_stable));
+            }
+            if (vbr_boundary_count_ % 64 == 0) {
+                ggml_vbr_diag_dump("periodic_prepare");
+            }
+        }
         if (!vbr_vmm_try_map(wm_next)) {
             LLAMA_LOG_ERROR("%s: VBR VMM: physical map to %u cells failed (device memory exhausted) — "
                     "failing this batch recoverably\n", __func__, wm_next);
@@ -4324,6 +4350,12 @@ size_t llama_kv_cache::vbr_budget_eff_uncached(const vbr_pool & p) const {
         // window so no consumer (including our own degrade loop) ever sees a budget below
         // what is physically mapped. budget_eff = max(mapped, min(budget, live_cap) - Σdecr).
         budget_eff = budget_eff > p.grant_decrement ? budget_eff - p.grant_decrement : 0;
+        ggml_vbr_diag_record(GGML_VBR_DIAG_PRESSURE,
+            "budget_sample controller=%p pool=%p device=%d boundary=%llu free=%zu total=%zu "
+            "mapped=%zu nominal=%zu effective=%zu headroom=%zu growth_headroom=%zu live=%u decrement=%zu explicit=%d",
+            (const void *) this, (void *) p.vmm, p.device, (unsigned long long) vbr_boundary_count_,
+            free_b, total_b, mapped_now, p.budget, std::max(budget_eff, mapped_now),
+            headroom_eff, vbr_growth_headroom_, n_live, p.grant_decrement, int(vbr_budget_explicit_));
     }
     if (budget_eff < mapped_now) {
         budget_eff = mapped_now;
@@ -4609,6 +4641,11 @@ bool llama_kv_cache::vbr_vmm_try_map(uint32_t wm) {
                 const size_t row_b = ggml_row_size(t->type, t->ne[0]); // n_stream == 1 (gated at construction)
                 const size_t start = row_b * pool.wm_cells;
                 const size_t need  = row_b * wm;
+                ggml_vbr_diag_record(GGML_VBR_DIAG_MAP,
+                    "growth_owner controller=%p pool=%p device=%d tensor=%s layer_index=%zu side=%s "
+                    "type=%s wm=%u old_wm=%u row_bytes=%zu extent_off=%zu map_off=%zu map_len=%zu",
+                    (void *) this, (void *) pool.vmm, pool.device, t->name, ikv, side ? "V" : "K",
+                    ggml_type_name(t->type), wm, pool.wm_cells, row_b, e.byte_off, e.byte_off + start, need - start);
                 if (!pool.be->vmm_pool_map(pool.vmm, e.byte_off + start, need - start)) {
                     // Physical exhaustion here is usually the FIRST big degrade wave's transient:
                     // the wave's old-tier tail pages are still mapped (their unmap is deferred to
@@ -4800,6 +4837,8 @@ size_t llama_kv_cache::vbr_flush_deferred_unmaps() {
     for (auto & p : vbr_pools_) {
         if (!p.unmap_deferred.empty() && blocked.count(vbr_pool_busid(p)) == 0 &&
             !vbr_retire_pending_before_unmap(vbr_pool_busid(p))) {
+            ggml_vbr_diag_record(GGML_VBR_DIAG_STATE, "deferred_unmap_blocked controller=%p pool=%p device=%d ranges=%zu",
+                (void *) this, (void *) p.vmm, p.device, p.unmap_deferred.size());
             blocked.insert(vbr_pool_busid(p));
         }
     }
@@ -4809,6 +4848,8 @@ size_t llama_kv_cache::vbr_flush_deferred_unmaps() {
             continue;
         }
         for (const auto & [off, len] : p.unmap_deferred) {
+            ggml_vbr_diag_record(GGML_VBR_DIAG_STATE, "deferred_unmap controller=%p pool=%p device=%d off=%zu len=%zu",
+                (void *) this, (void *) p.vmm, p.device, off, len);
             p.be->vmm_pool_unmap(p.vmm, off, len);
         }
         flushed += p.unmap_deferred.size();
@@ -9054,6 +9095,10 @@ llama_kv_cache::vbr_degrade_result llama_kv_cache::vbr_degrade_next(uint32_t wm_
                 pp->unmap_deferred.push_back({ e.byte_off + keep_live, slot - keep_live });
             }
 
+            ggml_vbr_diag_record(GGML_VBR_DIAG_STATE,
+                "degrade controller=%p pool=%p device=%d tensor=%s from=%s to=%s cells=%lld cursor=%zu pending_ranges=%zu",
+                (void *) this, (void *) pp->vmm, pp->device, e.t->name, ggml_type_name(e.t->type),
+                ggml_type_name(type_B), (long long) n_cells, vbr_degrade_cursor_, pp->unmap_deferred.size());
             LLAMA_LOG_INFO("%s: VBR degrade #%zu: %s L%d -> %s (%lld cells transcoding on side stream, "
                     "device %d mapped %.2f MiB pre-release)\n",
                     __func__, vbr_degrade_cursor_, e.t->name, (int) st.il, ggml_type_name(type_B),
@@ -9710,6 +9755,8 @@ bool llama_kv_cache::vbr_retier_freeze_begin(
     };
     vbr_retier_freeze_depth_++;
     vbr_retier_freeze_enters_++;
+    ggml_vbr_diag_record(GGML_VBR_DIAG_STATE, "freeze_enter controller=%p owner=%s operation=%llu depth=%u",
+        (void *) this, owner ? owner : "-", (unsigned long long) operation_id.value, vbr_retier_freeze_depth_);
     LLAMA_LOG_INFO("VBR_RETIER_FREEZE event=enter controller=%s owner=%s operation_id=%llu "
             "depth=%u env_freeze=%u enters_total=%llu\n",
             vbr_params_.trace_label != nullptr ? vbr_params_.trace_label : "single",
@@ -9747,6 +9794,9 @@ void llama_kv_cache::vbr_retier_freeze_end(
     if (vbr_retier_freeze_depth_ == 0) {
         vbr_capture_controller_write_end();
     }
+    ggml_vbr_diag_record(GGML_VBR_DIAG_STATE, "freeze_exit controller=%p owner=%s operation=%llu depth=%u duration_us=%llu",
+        (void *) this, owner ? owner : "-", (unsigned long long) operation_id.value,
+        vbr_retier_freeze_depth_, (unsigned long long) duration_us);
     LLAMA_LOG_INFO("VBR_RETIER_FREEZE event=exit controller=%s owner=%s operation_id=%llu "
             "depth=%u duration_us=%llu "
             "deferred_scope=%llu deferred_total=%llu exits_total=%llu action=%s\n",

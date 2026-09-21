@@ -13,6 +13,7 @@
 #include "common.cuh"
 #include "ggml-cuda.h"
 #include "vbr-vmm-policy.h"
+#include "ggml-vbr-diagnostic.h"
 
 #include <set>
 #include <vector>
@@ -78,6 +79,10 @@ ggml_vbr_vmm_pool * ggml_backend_cuda_vmm_pool_init(int device, size_t va_size) 
         return nullptr;
     }
     pool->base = base;
+    ggml_vbr_diag_record(GGML_VBR_DIAG_MAP,
+        "pool_init pool=%p device=%d physical=%d base=%llu va_bytes=%zu gran=%zu",
+        (void *) pool, device, ggml_cuda_info().devices[device].physical_device,
+        (unsigned long long) base, pool->va_size, pool->gran);
 #if defined(GGML_USE_HIP) && defined(__linux__)
     ggml_cuda_set_device(device);
     if (hipExtMallocWithFlags(&pool->mapping_guard, 4096, hipDeviceMallocUncached) != hipSuccess) {
@@ -127,6 +132,27 @@ bool ggml_backend_cuda_vmm_pool_map(ggml_vbr_vmm_pool * pool, size_t off, size_t
     const size_t g  = pool->gran;
     const size_t c0 = (off / g) * g;
     const size_t c1 = GGML_PAD(off + len, g);
+    if (ggml_vbr_diag_enabled()) {
+        ggml_vbr_diag_record(GGML_VBR_DIAG_MAP,
+            "map_begin pool=%p device=%d physical=%d base=%llu off=%zu len=%zu gran=%zu mapped=%zu epoch=%llu",
+            (void *) pool, pool->device, ggml_cuda_info().devices[pool->device].physical_device,
+            (unsigned long long) pool->base, off, len, g, pool->chunks.size() * g,
+            (unsigned long long) pool->residency_epoch);
+    }
+    // Observe the ORIGINAL return value; no retries, error clearing, device
+    // queries, or synchronization are introduced around the failing call.
+    auto observe = [&](CUresult rc, const char * operation, size_t chunk) {
+        if (rc != CUDA_SUCCESS) {
+            ggml_vbr_diag_record(GGML_VBR_DIAG_MAP,
+                "map_failure operation=%s result=%d pool=%p device=%d physical=%d base=%llu "
+                "chunk=%zu gran=%zu request_off=%zu request_len=%zu mapped=%zu new_chunks=%zu epoch=%llu",
+                operation, int(rc), (void *) pool, pool->device,
+                ggml_cuda_info().devices[pool->device].physical_device, (unsigned long long) pool->base,
+                chunk, g, off, len, pool->chunks.size() * g, new_chunks.size(),
+                (unsigned long long) pool->residency_epoch);
+        }
+        return rc;
+    };
     auto finish_mapping = [&]() {
         if (new_chunks.empty()) {
             return;
@@ -155,22 +181,25 @@ bool ggml_backend_cuda_vmm_pool_map(ggml_vbr_vmm_pool * pool, size_t off, size_t
         // don't go through ggml_cuda_set_device's translation).
         prop.location.id   = ggml_cuda_info().devices[pool->device].physical_device;
         CUmemGenericAllocationHandle handle;
-        if (cuMemCreate(&handle, g, &prop, 0) != CUDA_SUCCESS) {
+        if (observe(cuMemCreate(&handle, g, &prop, 0), "cuMemCreate", c) != CUDA_SUCCESS) {
+            ggml_vbr_diag_dump("cuMemCreate_failure_existing_recovery");
             finish_mapping();
             return false; // physical exhausted — caller decides (degrade / abort)
         }
         const CUdeviceptr ptr = (CUdeviceptr)((char *) pool->base + c);
-        CU_CHECK(cuMemMap(ptr, g, 0, handle, 0));
-        CU_CHECK(cuMemRelease(handle)); // physical is freed when the chunk is unmapped
+        CU_CHECK(observe(cuMemMap(ptr, g, 0, handle, 0), "cuMemMap", c));
+        CU_CHECK(observe(cuMemRelease(handle), "cuMemRelease", c)); // physical is freed when the chunk is unmapped
         CUmemAccessDesc access = {};
         access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
         access.location.id   = ggml_cuda_info().devices[pool->device].physical_device;
         access.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-        CU_CHECK(cuMemSetAccess(ptr, g, &access, 1));
+        CU_CHECK(observe(cuMemSetAccess(ptr, g, &access, 1), "cuMemSetAccess", c));
         pool->chunks.insert(c);
         new_chunks.push_back(c);
     }
     finish_mapping();
+    ggml_vbr_diag_record(GGML_VBR_DIAG_MAP, "map_end pool=%p new_chunks=%zu mapped=%zu epoch=%llu",
+        (void *) pool, new_chunks.size(), pool->chunks.size() * g, (unsigned long long) pool->residency_epoch);
     return true;
 }
 
@@ -181,6 +210,8 @@ bool ggml_backend_cuda_vmm_pool_unmap(ggml_vbr_vmm_pool * pool, size_t off, size
     const size_t c0 = GGML_PAD(off, g);
     const size_t c1 = ((off + len) / g) * g;
     bool changed = false;
+    ggml_vbr_diag_record(GGML_VBR_DIAG_MAP, "unmap_begin pool=%p device=%d off=%zu len=%zu mapped=%zu",
+        (void *) pool, pool->device, off, len, pool->chunks.size() * g);
     for (size_t c = c0; c < c1; c += g) {
         auto it = pool->chunks.find(c);
         if (it == pool->chunks.end()) {
@@ -195,6 +226,8 @@ bool ggml_backend_cuda_vmm_pool_unmap(ggml_vbr_vmm_pool * pool, size_t off, size
         GGML_ASSERT(pool->residency_epoch != UINT64_MAX);
         pool->residency_epoch++;
     }
+    ggml_vbr_diag_record(GGML_VBR_DIAG_MAP, "unmap_end pool=%p mapped=%zu epoch=%llu",
+        (void *) pool, pool->chunks.size() * g, (unsigned long long) pool->residency_epoch);
     return true;
 }
 

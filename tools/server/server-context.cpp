@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include "ggml-vbr-diagnostic.h"
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
@@ -17237,6 +17238,9 @@ private:
                                                 it->id_task = slot.task->id;
 
                                                 SLT_WRN(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) checkpoint_size / 1024 / 1024);
+                                                ggml_vbr_diag_record(GGML_VBR_DIAG_STATE,
+                                                    "checkpoint_restored slot=%d pos_min=%d pos_max=%d tokens=%lld n_past=%d bytes=%zu",
+                                                    slot.id, it->pos_min, it->pos_max, (long long) it->n_tokens, n_past, checkpoint_size);
                                                 slot.cache_status = "restored context checkpoint";
                                                 // Transport the shipped
                                                 // restore's own values into the observer row.
@@ -18474,6 +18478,9 @@ private:
                                 }
                             }
 
+                            ggml_vbr_diag_record(GGML_VBR_DIAG_STATE,
+                                "checkpoint_created slot=%d pos_min=%d pos_max=%d tokens=%lld bytes=%zu",
+                                slot.id, cur.pos_min, cur.pos_max, (long long) cur.n_tokens, cur.size());
                             SLT_WRN(slot,
                                     "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64
                                     ", size = %.3f MiB)\n",

@@ -594,6 +594,16 @@ target_include_directories(test-backend-expert-transfer PRIVATE ../ggml/src)
 llama_build_and_test(test-exl3-cpu.cpp)
 llama_build_and_test(test-cuda-graph-key.cpp)
 llama_build_and_test(test-cuda-rdna2-vmm-policy.cpp)
+
+# Issue #134 diagnostic branch: shared ggml-base recorder, also tested without CUDA.
+add_executable(test-vbr-diagnostic test-vbr-diagnostic.cpp)
+find_package(Threads REQUIRED)
+target_link_libraries(test-vbr-diagnostic PRIVATE ggml-base Threads::Threads)
+foreach(mode enabled disabled)
+    add_test(NAME test-vbr-diagnostic-${mode}
+        COMMAND ${CMAKE_COMMAND} "-DDIAG_PROGRAM=$<TARGET_FILE:test-vbr-diagnostic>" "-DDIAG_MODE=${mode}"
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/test-vbr-diagnostic.cmake)
+endforeach()
 # Calls private Marlin symbols, which are not exported from Windows DLLs.
 if (TARGET ggml-cuda AND NOT GGML_BACKEND_DL AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
     enable_language(CUDA)

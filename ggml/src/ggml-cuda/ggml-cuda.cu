@@ -113,6 +113,7 @@
 #include <cstdlib>
 #include <string>
 #include <unordered_set>
+#include "ggml-vbr-diagnostic.h"
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
@@ -122,6 +123,11 @@ static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
+    // Dump before making any further CUDA calls; the failing API may have left
+    // the context unhealthy. This does not change the existing fatal policy.
+    ggml_vbr_diag_record(GGML_VBR_DIAG_MAP, "cuda_fatal function=%s source=%s:%d statement=%s message=%s",
+                         func, file, line, stmt, msg);
+    ggml_vbr_diag_dump("cuda_fatal");
     int id = -1; // in case cudaGetDevice fails
     (void)cudaGetDevice(&id);
 
