@@ -1,0 +1,47 @@
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 971846f98..69dd6344f 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1756,6 +1756,42 @@ static __global__ void mul_mat_vec_q(
+         }
+ #endif
+ 
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 860
++        if constexpr (type == GGML_TYPE_Q2_K && !has_fusion && ncols_dst > 1 && ncols_dst <= 4) {
++            // Each scaled 2-bit value is at most 3*15=45, so multiplying
++            // the packed bytes cannot carry into their neighbors. Hoist
++            // that exact integer work out of the activation-column loop.
++            const int bq8_offset = QR2_K * (kqs / QI8_1);
++            const int scale_offset = kqs - kqs % QI8_1 + (kqs % QI8_1) / (QI8_1/2);
++#pragma unroll
++            for (int i = 0; i < rows_per_cuda_block; ++i) {
++                const block_q2_K * w = static_cast<const block_q2_K *>(vx) + kbx_offset + i*stride_row_x + kbx;
++                const int packed = get_int_b4(w->qs, kqs);
++                const float2 dm = __half22float2(w->dm);
++                int weights[QR2_K], minima[QR2_K];
++#pragma unroll
++                for (int t = 0; t < QR2_K; ++t) {
++                    const int sc = w->scales[scale_offset + 2*t];
++                    weights[t] = ((packed >> (2*t)) & 0x03030303) * (sc & 15);
++                    minima[t] = (sc >> 4) * 0x01010101;
++                }
++#pragma unroll
++                for (int j = 0; j < ncols_dst; ++j) {
++                    float sum_d = 0.0f, sum_m = 0.0f;
++#pragma unroll
++                    for (int t = 0; t < QR2_K; ++t) {
++                        const block_q8_1 & a = y[j*stride_col_y + kby + bq8_offset + t];
++                        const int u = get_int_b4(a.qs, kqs % QI8_1);
++                        const float d = __low2float(a.ds);
++                        sum_d += d * ggml_cuda_dp4a(weights[t], u, 0);
++                        sum_m += d * ggml_cuda_dp4a(minima[t], u, 0);
++                    }
++                    tmp[j][i] += dm.x*sum_d - dm.y*sum_m;
++                }
++            }
++            continue;
++        }
++#endif
+ #pragma unroll
+         for (int j = 0; j < ncols_dst; ++j) {
+ #pragma unroll

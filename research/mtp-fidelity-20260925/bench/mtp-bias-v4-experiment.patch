@@ -1,0 +1,179 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index fdc5ce2d4..c5ae4adcd 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2655,7 +2655,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
+     return use_mul_mat_vec_f;
+ }
+ 
+-static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor);
++static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, bool batch_bias = false);
+ 
+ static bool ggml_cuda_should_fuse_mmvq_post_silu(const ggml_tensor * mm) {
+     if (!ggml_cuda_should_fuse_mul_mat_vec_q(mm) ||
+@@ -2669,7 +2669,7 @@ static bool ggml_cuda_should_fuse_mmvq_post_silu(const ggml_tensor * mm) {
+         ggml_cuda_q8_0_mmv_post_silu_supported(cc, mm->src[0]->ne[0]);
+ }
+ 
+-static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
++static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, bool batch_bias) {
+     ggml_tensor *       src0 = tensor->src[0];
+     ggml_tensor *       src1 = tensor->src[1];
+     const ggml_tensor * dst  = tensor;
+@@ -2700,8 +2700,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+     if (cc <= GGML_CUDA_CC_PASCAL) {
+         return false;
+     }
+-    //we only support fusion for ncols_dst = 1
+-    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
++    const bool multi_row_bias = batch_bias && cc == 860 && dst->ne[1] <= 4 &&
++        ggml_cuda_mmvq_batch_bias_type(src0->type) &&
++        src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1;
++    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1 && !multi_row_bias) {
+         return false;
+     }
+ 
+@@ -7689,7 +7691,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+             break;
+         }
+ 
+-        if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
++        const bool batch_bias = bias_op == GGML_OP_ADD && bias_tensor->type == GGML_TYPE_F32 &&
++            ggml_is_contiguous(bias_tensor) && ggml_is_contiguous(bias_node) &&
++            !ggml_cuda_tensors_overlap(bias_node, src0) &&
++            !ggml_cuda_tensors_overlap(bias_node, src1) &&
++            (!ggml_cuda_tensors_overlap(bias_node, bias_tensor) || bias_node->data == bias_tensor->data);
++        if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node, batch_bias)) {
+             ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
+             fused_mul_mat_vec = true;
+             fused_node_count  = 2;
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 971846f98..93866cea2 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1534,7 +1534,11 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
+     return 1;
+ }
+ 
+-static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
++static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false,
++        int nwarps = 1, ggml_type type = GGML_TYPE_COUNT, bool sm86 = false) {
++    if (sm86 && ncols_dst >= 3 && ncols_dst <= 4 && ggml_cuda_mmvq_batch_bias_type(type)) {
++        return 4;
++    }
+     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
+         switch (ncols_dst) {
+             case 1:
+@@ -1591,7 +1595,12 @@ static __global__ void mul_mat_vec_q(
+     constexpr int vdr = get_vdr_mmvq(type);
+     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
+     constexpr int nwarps = nwarps_override > 0 ? nwarps_override : calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
+-    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 860
++    constexpr bool sm86 = true;
++#else
++    constexpr bool sm86 = false;
++#endif
++    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps, type, sm86);
+     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+ 
+     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+@@ -1662,20 +1671,24 @@ static __global__ void mul_mat_vec_q(
+     float glu_limit = 0.0f;
+ 
+     if constexpr (has_fusion) {
+-        use_gate      = fusion.gate      != nullptr;
+         use_bias      = fusion.x_bias    != nullptr;
+-        use_gate_bias = fusion.gate_bias != nullptr && use_gate;
+-        vgate         = fusion.gate;
+         x_bias        = (const float *) fusion.x_bias;
+-        gate_bias     = (const float *) fusion.gate_bias;
+-        active_glu    = fusion.glu_op;
+-        glu_limit     = fusion.glu_limit;
+-        if constexpr (type == GGML_TYPE_NVFP4 || type == GGML_TYPE_F8_E4M3) {
+-            use_scale      = fusion.x_scale    != nullptr;
+-            use_gate_scale = fusion.gate_scale != nullptr && use_gate;
+-        x_scale        = fusion.x_scale;
+-        gate_scale     = fusion.gate_scale;
+-        residual       = fusion.residual;
++        // Multi-row fusion admits a same-shape ADD only. Do not carry the
++        // single-row gate/scale machinery into its inner dot-product loop.
++        if constexpr (ncols_dst == 1) {
++            use_gate      = fusion.gate      != nullptr;
++            use_gate_bias = fusion.gate_bias != nullptr && use_gate;
++            vgate         = fusion.gate;
++            gate_bias     = (const float *) fusion.gate_bias;
++            active_glu    = fusion.glu_op;
++            glu_limit     = fusion.glu_limit;
++            if constexpr (type == GGML_TYPE_NVFP4 || type == GGML_TYPE_F8_E4M3) {
++                use_scale      = fusion.x_scale    != nullptr;
++                use_gate_scale = fusion.gate_scale != nullptr && use_gate;
++                x_scale        = fusion.x_scale;
++                gate_scale     = fusion.gate_scale;
++                residual       = fusion.residual;
++            }
+         }
+     }
+ 
+@@ -1760,6 +1773,11 @@ static __global__ void mul_mat_vec_q(
+         for (int j = 0; j < ncols_dst; ++j) {
+ #pragma unroll
+             for (int i = 0; i < rows_per_cuda_block; ++i) {
++                if constexpr (rows_per_cuda_block > 2) {
++                    if (row0 + i >= stride_col_dst) {
++                        continue;
++                    }
++                }
+                 if constexpr (type == GGML_TYPE_F8_E4M3) {
+                     tmp[j][i] += vec_dot_f8_e4m3_q8_1_lut(
+                         vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs, f8_lut);
+@@ -2109,7 +2127,8 @@ static std::pair<dim3, dim3> calc_launch_params(
+         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
+         const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false) {
+     const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
+-    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
++    const bool sm86 = ggml_cuda_highest_compiled_arch(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) == 860;
++    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps, type, sm86);
+     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
+     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
+     const dim3 block_dims(warp_size, nwarps, 1);
+@@ -2132,8 +2151,12 @@ static void mul_mat_vec_q_switch_fusion(
+         const uint32_t ids_stride, cudaStream_t stream) {
+ 
+     const bool has_existing_fusion = mmvq_has_existing_fusion(fusion);
+-    if constexpr (c_ncols_dst == 1) {
++    if constexpr (c_ncols_dst == 1 || (c_ncols_dst <= 4 && ggml_cuda_mmvq_batch_bias_type(type))) {
+         if (has_existing_fusion) {
++            if constexpr (c_ncols_dst > 1) {
++                GGML_ASSERT(fusion.x_bias && !fusion.gate && !fusion.gate_bias &&
++                    !fusion.x_scale && !fusion.gate_scale && !fusion.residual && !fusion.post_silu);
++            }
+             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
+             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, nwarps_override>, launch_params,
+                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+@@ -2716,7 +2739,9 @@ static void ggml_cuda_mul_mat_vec_q_impl(
+     if (fusion) {
+         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+         GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));
+-        GGML_ASSERT(  ids || dst->ne[1] == 1);
++        GGML_ASSERT(ids || dst->ne[1] == 1 || (cc == 860 && dst->ne[1] <= 4 &&
++            ggml_cuda_mmvq_batch_bias_type(src0->type) && fusion->x_bias &&
++            !fusion->gate && !fusion->gate_bias && !fusion->x_scale && !fusion->gate_scale && !fusion->residual));
+         // Restrict scale fusion to NVFP4/FP8: checking this at run-time in the prologue is
+         // non-negligible for some models such as gpt-oss-20b
+         GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) ||
+diff --git a/ggml/src/ggml-cuda/mmvq.cuh b/ggml/src/ggml-cuda/mmvq.cuh
+index b68ec11ae..ec64ef317 100644
+--- a/ggml/src/ggml-cuda/mmvq.cuh
++++ b/ggml/src/ggml-cuda/mmvq.cuh
+@@ -2,6 +2,10 @@
+ 
+ #define MMVQ_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVQ kernels.
+ 
++static constexpr bool ggml_cuda_mmvq_batch_bias_type(ggml_type type) {
++    return type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ3_S;
++}
++
+ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
+ bool ggml_cuda_q8_0_mmv_post_silu_supported(int cc, int64_t ncols_x);
+ 
