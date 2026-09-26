@@ -1092,8 +1092,6 @@ bool vbr_generation_tracker::prepare_import_image_impl(
             // Rebuild one coherent tracker image for the shared physical
             // stream. The guard authenticates the destination mapping and all
             // single-owner cells retained for the other logical sequences.
-            uint32_t previous_physical = 0;
-            bool first = true;
             auto & stream = next->streams.front();
             std::map<llama_seq_id, std::pair<llama_pos, llama_pos>> ranges;
             for (const auto & cell : replacement->preserved_cells()) {
@@ -1134,15 +1132,15 @@ bool vbr_generation_tracker::prepare_import_image_impl(
                 }
             }
             const auto destination_handle = import_extents.front();
+            // Recycled incumbent rows are mapped in logical-token order,
+            // not necessarily physical order. stamp() still rejects duplicate
+            // destinations and collisions with the preserved foreign rows.
             for (const auto & cell : replacement->cell_mapping()) {
                 if (cell.source_stream != 0 ||
                     cell.destination_physical_cell >= n_cells_ ||
-                    cell.logical_position < 0 ||
-                    (!first && cell.destination_physical_cell <= previous_physical)) {
+                    cell.logical_position < 0) {
                     return false;
                 }
-                first = false;
-                previous_physical = cell.destination_physical_cell;
                 const uint32_t physical = cell.destination_physical_cell;
                 if (!stamp(stream, physical, destination, destination_handle)) {
                     return false;

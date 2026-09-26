@@ -3644,10 +3644,10 @@ static void test_occupied_transformed_recycle_uses_recovery_geometry() {
     CHECK(!f.target.operation_quarantined);
 }
 
-static void test_occupied_replacement_tracker_consumes_canonical_map() {
+static void test_occupied_replacement_tracker_consumes_canonical_map(bool permuted_recycle = false) {
     fixture f(false, false, false, GGML_TYPE_TURBO8_0, GGML_TYPE_F16,
               0, vbr_artifact_clean_stash_state::absent_at_source,
-              false, false, true);
+              false, false, true, permuted_recycle, false, false, permuted_recycle);
     auto staged = f.stage();
     CHECK(staged.status == vbr_adopt_stage_status::staged);
     CHECK(staged.manifest && staged.manifest->is_occupied_replacement());
@@ -3664,6 +3664,12 @@ static void test_occupied_replacement_tracker_consumes_canonical_map() {
     }
 
     auto plan = staged.manifest->tracker_install().children.front();
+    if (permuted_recycle) {
+        CHECK(!std::is_sorted(guard->cell_mapping().begin(), guard->cell_mapping().end(),
+            [](const auto & a, const auto & b) {
+                return a.destination_physical_cell < b.destination_physical_cell;
+            }));
+    }
     vbr_generation_tracker tracker(
         1, 10, uint32_t(plan.units.size()),
         vbr_lineage_uuid { 0x81, 0x82 });
@@ -3694,6 +3700,9 @@ static void test_occupied_replacement_tracker_consumes_canonical_map() {
     CHECK(tracker.prepare_relocated_import_image(
         plan, *source, 0, *guard, image));
     CHECK(image.ready());
+    if (!image.ready()) {
+        return;
+    }
     CHECK(image.stable());
     for (uint32_t unit = 0; unit < live_units.size(); ++unit) {
         // Preparation is off-side: a failure/abort before publication must
@@ -7284,6 +7293,7 @@ int main(int argc, char ** argv) {
     adoption_fixture::test_occupied_recycle_replay_failure_quarantines();
     adoption_fixture::test_occupied_transformed_recycle_uses_recovery_geometry();
     adoption_fixture::test_occupied_replacement_tracker_consumes_canonical_map();
+    adoption_fixture::test_occupied_replacement_tracker_consumes_canonical_map(true);
     test_checkpoint_recurrent_frontier_header();
     test_dflash_ring_frontier_header();
     test_epoch_capacity_preflight();
