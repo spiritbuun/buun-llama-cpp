@@ -811,7 +811,7 @@ static bool run_fused_cpu_fallbacks(ggml_backend_t cpu) {
             ggml_moe_cache.end = [](void *) {};
             for (uint64_t mask : { UINT64_C(0), UINT64_MAX, UINT64_C(0xf0f0f0f0f0f0f0f0) }) {
                 forced_mask = mask;
-                fused_calls = 0;
+                fused_calls = full_calls = 0;
                 // Reference execution populated the intermediates too. Poison
                 // every computed tensor so omitted up/gate/GLU work cannot pass.
                 poison_graph(graph);
@@ -820,7 +820,7 @@ static bool run_fused_cpu_fallbacks(ggml_backend_t cpu) {
                 ggml_backend_tensor_get(graph.out, actual.data(), 0, actual.size()*sizeof(float));
                 // Mixed hits can move an expert below the IQ panel's batch cutoff.
                 const bool match = compare_output(reference, actual, 1e-10);
-                const bool cell_ok = match && fused_calls > 0;
+                const bool cell_ok = match && fused_calls > 0 && full_calls > 0;
                 printf("cache-fused-cpu-%s-tokens%d-mask%llx: %s\n", ggml_type_name(type),
                         tokens, (unsigned long long)mask, cell_ok ? "OK" : "FAIL");
                 ok &= cell_ok;
@@ -3923,8 +3923,18 @@ int main(int argc, char ** argv) {
     ggml_log_set(log_callback, &capture);
 
     ggml_backend_dev_t cuda_device = find_cuda_device();
+    ggml_backend_t cpu = init_cpu_backend();
+    if (!cpu) {
+        fprintf(stderr, "failed to initialize CPU backend\n");
+        return 1;
+    }
+    if (!run_fused_cpu_fallbacks(cpu)) {
+        ggml_backend_free(cpu);
+        return 1;
+    }
     if (!cuda_device) {
-        printf("SKIP: CUDA/HIP backend unavailable\n");
+        printf("SKIP: GPU cache scenarios (CUDA/HIP backend unavailable); CPU fallbacks passed\n");
+        ggml_backend_free(cpu);
         return 0;
     }
     ggml_backend_reg_t cuda_reg =
@@ -3942,25 +3952,15 @@ int main(int argc, char ** argv) {
             cuda_reg, "ggml_cuda_moe_cache_flat_hits_test_stats_get");
         if (!flat_hits_reset || !flat_hits_get) {
             std::fprintf(stderr, "cache-flat-hits: instrumentation hooks unavailable\n");
+            ggml_backend_free(cpu);
             return 1;
         }
         flat_hits_reset();
     }
 
     ggml_backend_t cuda = ggml_backend_dev_init(cuda_device, nullptr);
-    ggml_backend_t cpu = init_cpu_backend();
-    if (!cuda || !cpu) {
-        fprintf(stderr, "failed to initialize GPU and CPU backends\n");
-        if (cuda) {
-            ggml_backend_free(cuda);
-        }
-        if (cpu) {
-            ggml_backend_free(cpu);
-        }
-        return 1;
-    }
-    if (!run_fused_cpu_fallbacks(cpu)) {
-        ggml_backend_free(cuda);
+    if (!cuda) {
+        fprintf(stderr, "failed to initialize GPU backend\n");
         ggml_backend_free(cpu);
         return 1;
     }
