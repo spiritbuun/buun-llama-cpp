@@ -42,6 +42,9 @@ server_committed_decode_reset_for_test();
 
 bool server_active_prefix_retention_for_test();
 bool server_vbr_media_publish_for_test(const server_tokens & ledger);
+bool server_vbr_restored_stem_for_test(
+    server_prompt_cache & cache, const server_prompt & prompt,
+    const std::string & execution, const std::string & adapter, bool available);
 bool server_resume_media_placement_for_test(const server_tokens & ledger);
 
 struct server_slot_frontier_logits_test_result {

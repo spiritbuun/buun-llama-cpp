@@ -5815,6 +5815,8 @@ static void test_prompt_cache_vbr_media_lookup() {
     CHECK(cache.prepare_vbr_publication_metadata(prompt, identity.execution_identity,
         identity.adapter_config_identity, source_slot, metadata));
     CHECK(cache.publish_vbr(metadata, server_prompt_cache_payload::from_vbr(owner), {}, false));
+    CHECK(server_vbr_restored_stem_for_test(
+        cache, prompt, identity.execution_identity, identity.adapter_config_identity, true));
 
     const auto lookup = [&](const server_tokens & request, bool expected) {
         server_prompt_cache_vbr_restore_candidate candidate;
@@ -5842,9 +5844,25 @@ static void test_prompt_cache_vbr_media_lookup() {
     lookup(extended, true); // full request scope differs from the saved prefix
     lookup(image("image-c"), false); // same null token IDs, different content
     lookup(image(""), false);
+    server_prompt stem_source;
+    stem_source.sequence_epoch = prompt.sequence_epoch;
+    stem_source.tokens = extended.clone();
+    const auto find_stem = [&](int64_t coverage) {
+        return cache.find_vbr_durable_stem(stem_source, coverage,
+            identity.execution_identity, identity.adapter_config_identity);
+    };
+    CHECK(find_stem(2).v != 0);
+    CHECK(find_stem(1).v == 0); // never cut through an image
+    stem_source.tokens = image("image-c");
+    stem_source.tokens.push_back(104);
+    CHECK(find_stem(2).v == 0); // matching placeholders are not matching media
+    stem_source.tokens = extended.clone();
     for (auto & state : cache.states) {
         retention.retire(server_retention_instance_key::for_host_entry(&state));
     }
+    CHECK(find_stem(2).v == 0);
+    CHECK(server_vbr_restored_stem_for_test(
+        cache, prompt, identity.execution_identity, identity.adapter_config_identity, false));
     cache.states.clear();
 }
 
@@ -6304,6 +6322,45 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
     CHECK(!prepared.ready());
     CHECK(logical != cache.states.end());
     CHECK(cache.states.size() == 1);
+    CHECK(server_vbr_restored_stem_for_test(cache, prompt,
+        fixture.package.manifest.identity.execution_identity,
+        fixture.package.manifest.identity.adapter_config_identity, true));
+    {
+        const auto & identity = fixture.package.manifest.identity;
+        auto extended = prompt.clone();
+        extended.tokens.push_back(777);
+        const auto saved = cache.vbr_host_artifact_id(logical);
+        CHECK(saved.v != 0);
+        const auto find_stem = [&](int64_t coverage) {
+            return cache.find_vbr_durable_stem(
+                extended, coverage, identity.execution_identity,
+                identity.adapter_config_identity);
+        };
+        CHECK(find_stem(prompt.n_tokens()) == saved);
+        CHECK(find_stem(0).v == 0);
+        CHECK(find_stem(-1).v == 0);
+        CHECK(find_stem(prompt.n_tokens() - 1).v == 0);
+        CHECK(find_stem(extended.n_tokens()).v == 0);
+        CHECK(find_stem(extended.n_tokens() + 1).v == 0);
+        extended.tokens.set_token(size_t(prompt.n_tokens()), 778);
+        CHECK(find_stem(prompt.n_tokens()) == saved);
+        extended.sequence_epoch++;
+        CHECK(find_stem(prompt.n_tokens()).v == 0);
+        extended.sequence_epoch--;
+        extended.tokens.set_token(0, extended.tokens[0] + 1);
+        CHECK(find_stem(prompt.n_tokens()).v == 0);
+        extended.tokens.set_token(0, prompt.tokens[0]);
+        CHECK(cache.find_vbr_durable_stem(extended, prompt.n_tokens(),
+            identity.execution_identity + "-other",
+            identity.adapter_config_identity).v == 0);
+        CHECK(cache.find_vbr_durable_stem(extended, prompt.n_tokens(),
+            identity.execution_identity,
+            identity.adapter_config_identity + "-other").v == 0);
+        cache.retention_obs = nullptr;
+        CHECK(find_stem(prompt.n_tokens()).v == 0);
+        cache.retention_obs = &retention;
+        CHECK(find_stem(prompt.n_tokens()) == saved);
+    }
     CHECK(!cache.contains(
         prompt.tokens,
         fixture.package.manifest.identity.adapter_config_identity));

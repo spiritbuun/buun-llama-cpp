@@ -1720,6 +1720,7 @@ struct server_slot {
     server_vbr_prompt_cache_support_status vbr_idle_support_status =
         server_vbr_prompt_cache_support_status::supported;
     std::array<uint8_t, 32> vbr_idle_capture_published_identity = {};
+    std::array<uint8_t, 32> vbr_restored_stem_identity = {};
     bool vbr_idle_capture_representation_valid = false;
     // A stem is independently durable but cannot authorize clearing the full
     // live frontier. Bind its retry/completion state to the complete source
@@ -2050,6 +2051,7 @@ struct server_slot {
         vbr_idle_support_status =
             server_vbr_prompt_cache_support_status::supported;
         vbr_idle_capture_published_identity = {};
+        vbr_restored_stem_identity = {};
         vbr_idle_capture_representation_valid = false;
         vbr_idle_stem_source_identity = {};
         vbr_idle_stem_coverage_tokens = 0;
@@ -3612,6 +3614,9 @@ static void server_wire_standalone_retention_metadata(
 
 struct server_context_impl {
     friend bool server_vbr_media_publish_for_test(const server_tokens & ledger);
+    friend bool server_vbr_restored_stem_for_test(
+        server_prompt_cache &, const server_prompt &,
+        const std::string &, const std::string &, bool);
     friend bool server_resume_media_placement_for_test(const server_tokens & ledger);
     friend struct server_swa_window_selection_test;
     friend struct server_context;
@@ -13540,10 +13545,10 @@ private:
                     vbr_restore_event_for(slot.id, ticket.incoming_payload());
                 prompt_cache->commit_vbr_occupied_replacement(
                     ticket, slot.prompt, slot.cache_family, slot.id);
-                if (!occupied_prefix_projection &&
-                    (imported.decision == vbr_import_decision::native_import ||
-                     imported.decision == vbr_import_decision::live_rebased)) {
-                    mark_exact_vbr_restore_durable(slot, *memory);
+                if (!occupied_prefix_projection) {
+                    record_vbr_restored_representation(slot, memory->vbr_representation_identity(),
+                        imported.decision == vbr_import_decision::native_import ||
+                        imported.decision == vbr_import_decision::live_rebased);
                 }
                 common_speculative_sequence_transition(
                     slot.get_spec(), slot.id, restore_event);
@@ -13739,8 +13744,9 @@ private:
             GGML_ASSERT(state.published);
             const uint64_t prefix_tokens = candidate.prefix_tokens();
             const int32_t source_id = candidate.source_id();
+            const bool restored_stem = !candidate.requires_prefix_projection();
             const bool exact_reusable_restore =
-                !candidate.requires_prefix_projection() &&
+                restored_stem &&
                 (imported.decision == vbr_import_decision::native_import ||
                  imported.decision == vbr_import_decision::live_rebased);
             const auto restore_event =
@@ -13754,8 +13760,9 @@ private:
             if (!committed) {
                 return false;
             }
-            if (exact_reusable_restore) {
-                mark_exact_vbr_restore_durable(slot, *memory);
+            if (restored_stem) {
+                record_vbr_restored_representation(
+                    slot, memory->vbr_representation_identity(), exact_reusable_restore);
             }
             common_speculative_sequence_transition(
                 slot.get_spec(), slot.id, restore_event);
@@ -15123,27 +15130,64 @@ private:
         return published_hash.finish();
     }
 
-    void mark_exact_vbr_restore_durable(
-            server_slot & slot, llama_memory_i & memory) {
+    void record_vbr_restored_representation(
+            server_slot & slot,
+            const llama_memory_vbr_representation_identity & representation, bool exact) {
         std::array<uint8_t, 32> token_digest = {};
+        std::array<uint8_t, 32> prefix_digest = {};
         vbr_artifact_identity_block identity;
         server_vbr_artifact_capture_status status;
         if (!slot.prompt.tokens.retention_token_digest(token_digest) ||
+            !slot.prompt.tokens.retention_token_prefix_digest(
+                size_t(slot.prompt.n_tokens()), prefix_digest) ||
             !build_capture_identity_fields(slot, identity, status)) {
             return;
         }
-        const auto representation = memory.vbr_representation_identity();
         slot.vbr_idle_capture_source_reset();
-        slot.vbr_idle_capture_published_identity =
+        slot.vbr_restored_stem_identity =
             vbr_idle_publication_identity(
-                token_digest, representation.tier_epoch,
+                prefix_digest, representation.tier_epoch,
                 representation.tier_epoch_swa);
+        // A transcoding restore still has a reusable saved prefix, but must
+        // not acquire exact physical recovery authority for the live image.
+        if (!exact) {
+            return;
+        }
+        slot.vbr_idle_capture_published_identity = vbr_idle_publication_identity(
+            token_digest, representation.tier_epoch, representation.tier_epoch_swa);
         slot.vbr_idle_capture_representation_valid = true;
         slot.vbr_idle_capture_attempt_identity =
             vbr_idle_capture_attempt_digest(
                 identity, token_digest, representation.tier_epoch,
                 representation.tier_epoch_swa);
         slot.vbr_idle_capture_terminal = true;
+    }
+
+    static bool reuse_vbr_restored_stem(
+            server_prompt_cache & cache, server_slot & slot,
+            const vbr_artifact_identity_block & checkpoint_identity,
+            const std::array<uint8_t, 32> & prefix_digest,
+            const llama_memory_vbr_representation_identity & representation,
+            const std::array<uint8_t, 32> & full_source_identity) {
+        if (slot.vbr_restored_stem_identity != vbr_idle_publication_identity(
+                prefix_digest, representation.tier_epoch, representation.tier_epoch_swa)) {
+            return false;
+        }
+        const auto saved_stem = cache.find_vbr_durable_stem(
+            slot.prompt, checkpoint_identity.token_count,
+            checkpoint_identity.execution_identity, checkpoint_identity.adapter_config_identity);
+        if (saved_stem.v == 0) {
+            return false;
+        }
+        slot.vbr_idle_stem_source_identity = full_source_identity;
+        slot.vbr_idle_stem_coverage_tokens = checkpoint_identity.token_count;
+        slot.vbr_idle_stem_host_artifact = saved_stem;
+        slot.vbr_idle_stem_source_valid = true;
+        slot.vbr_idle_stem_retry = false;
+        if (slot.vbr_reuse_capture_frontier == slot.vbr_idle_stem_coverage_tokens) {
+            slot.vbr_reuse_capture_frontier = 0;
+        }
+        return true;
     }
 
     static bool vbr_idle_retry_immediately(
@@ -16733,6 +16777,16 @@ private:
                 }
             }
             bool checkpoint_stem = checkpoint_frontier != nullptr;
+
+            // Replaying a restored suffix can select the same saved
+            // checkpoint again. Reuse its host witness only while its restored
+            // representation is unchanged; a retier still gets a fresh capture.
+            // This is not the exact live recovery image for occupied replacement.
+            if (checkpoint_stem && reuse_vbr_restored_stem(
+                    *prompt_cache, idle, manifest.identity, token_identity_digest,
+                    representation, full_source_identity)) {
+                continue;
+            }
 
             bool stem_retry = false;
             const bool matching_attempt_stem_source =
@@ -23716,6 +23770,72 @@ bool server_vbr_media_publish_for_test(const server_tokens & ledger) {
         slot.prompt.tokens.get_common_prefix(ledger) == ledger.size();
 }
 
+bool server_vbr_restored_stem_for_test(
+        server_prompt_cache & cache, const server_prompt & prompt,
+        const std::string & execution, const std::string & adapter, bool available) {
+    server_context_impl context;
+    context.sleeping = true;
+    context.frontier_execution_identity = execution;
+    const llama_memory_vbr_representation_identity representation { 7, 11 };
+    const size_t cache_size = cache.states.size();
+    for (bool exact : { false, true }) {
+        server_slot slot;
+        slot.prompt = prompt.clone();
+        slot.vbr_adapter_config_identity = adapter;
+        slot.vbr_adapter_config_identity_valid = true;
+        // A transcoding restore must retire a previous exact-recovery stamp.
+        slot.vbr_idle_capture_representation_valid = true;
+        slot.vbr_idle_capture_terminal = true;
+        slot.vbr_idle_capture_published_identity.fill(1);
+        context.record_vbr_restored_representation(slot, representation, exact);
+        if (slot.vbr_idle_capture_representation_valid != exact ||
+            slot.vbr_idle_capture_terminal != exact ||
+            (!exact && slot.vbr_idle_capture_published_identity != std::array<uint8_t, 32> {})) {
+            return false;
+        }
+        slot.prompt.tokens.push_back(777);
+        slot.vbr_reuse_capture_frontier = prompt.n_tokens();
+        vbr_artifact_identity_block checkpoint;
+        server_vbr_artifact_capture_status status;
+        std::array<uint8_t, 32> prefix_digest = {}, source_digest = {};
+        if (!context.build_capture_identity_fields(slot, checkpoint, status, prompt.n_tokens()) ||
+            !slot.prompt.tokens.retention_token_prefix_digest(prompt.n_tokens(), prefix_digest) ||
+            !slot.prompt.tokens.retention_token_digest(source_digest)) {
+            return false;
+        }
+        const auto reuse = [&](llama_memory_vbr_representation_identity current) {
+            return context.reuse_vbr_restored_stem(
+                cache, slot, checkpoint, prefix_digest, current, source_digest);
+        };
+        if (reuse({ 8, 11 }) || reuse({ 7, 12 }) || slot.vbr_idle_stem_source_valid ||
+            reuse(representation) != available || cache.states.size() != cache_size ||
+            slot.vbr_idle_capture_representation_valid != exact) {
+            return false;
+        }
+        if (available) {
+            if (!slot.vbr_idle_stem_source_valid || slot.vbr_idle_stem_host_artifact.v == 0 ||
+                slot.vbr_idle_stem_source_identity != source_digest ||
+                slot.vbr_idle_stem_coverage_tokens != uint64_t(prompt.n_tokens()) ||
+                slot.vbr_reuse_capture_frontier != 0 || slot.vbr_idle_stem_retry) {
+                return false;
+            }
+            slot.vbr_reuse_capture_frontier = prompt.n_tokens() + 1;
+            if (!reuse(representation) ||
+                slot.vbr_reuse_capture_frontier != uint64_t(prompt.n_tokens() + 1)) {
+                return false;
+            }
+        } else if (slot.vbr_idle_stem_source_valid ||
+                   slot.vbr_reuse_capture_frontier != uint64_t(prompt.n_tokens())) {
+            return false;
+        }
+        slot.vbr_idle_capture_source_reset();
+        if (reuse(representation) || slot.vbr_idle_stem_source_valid) {
+            return false;
+        }
+    }
+    return true;
+}
+
 server_mmproj_lifecycle_test_result
 server_mmproj_lifecycle_for_test() {
     server_mmproj_lifecycle_test_result result;
@@ -24879,6 +24999,7 @@ server_vbr_slot_selection_for_test(
     rebound.vbr_idle_capture_attempt_identity[0] = 1;
     rebound.vbr_idle_capture_terminal = true;
     rebound.vbr_idle_capture_published_identity[0] = 2;
+    rebound.vbr_restored_stem_identity[0] = 4;
     rebound.vbr_idle_capture_representation_valid = true;
     rebound.vbr_idle_stem_source_identity[0] = 3;
     rebound.vbr_idle_stem_coverage_tokens = 2;
@@ -24892,6 +25013,7 @@ server_vbr_slot_selection_for_test(
         !rebound.vbr_idle_capture_terminal &&
         rebound.vbr_idle_capture_published_identity ==
             std::array<uint8_t, 32> {} &&
+        rebound.vbr_restored_stem_identity == std::array<uint8_t, 32> {} &&
         !rebound.vbr_idle_capture_representation_valid &&
         rebound.vbr_idle_stem_source_identity ==
             std::array<uint8_t, 32> {} &&

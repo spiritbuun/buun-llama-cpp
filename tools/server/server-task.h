@@ -1442,6 +1442,13 @@ public:
         const std::string & execution_identity,
         const std::string & adapter_config_key,
         const server_vbr_artifact_store * projector = nullptr) const noexcept;
+    // Find an exact saved prefix of this execution, not a physical rollback
+    // image. Used to avoid recapturing a checkpoint already held by the cache.
+    llama_cache_acct_artifact_id find_vbr_durable_stem(
+        const server_prompt & prompt,
+        int64_t coverage_tokens,
+        const std::string & execution_identity,
+        const std::string & adapter_config_key) const noexcept;
     // Read-only suppression check for an already-durable shorter frontier.
     // The host package must be exact for coverage and the current live prompt
     // must still carry that exact prefix under the same source epoch.

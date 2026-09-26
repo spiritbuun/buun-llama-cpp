@@ -2554,11 +2554,17 @@ static bool server_prompt_cache_vbr_frontier_matches(
         const server_prompt_cache_payload & payload,
         const std::string & execution_identity,
         const std::string & adapter_config_key,
-        bool * raw_token_comparison = nullptr) noexcept {
+        bool * raw_token_comparison = nullptr,
+        int64_t coverage_tokens = -1) noexcept {
     if (raw_token_comparison) {
         *raw_token_comparison = false;
     }
     try {
+        const int64_t n_tokens = coverage_tokens < 0
+            ? prompt.n_tokens() : coverage_tokens;
+        if (n_tokens <= 0 || n_tokens > prompt.n_tokens()) {
+            return false;
+        }
         const auto * artifact = payload.vbr_artifact();
         if (!artifact || execution_identity.empty()) {
             return false;
@@ -2572,20 +2578,22 @@ static bool server_prompt_cache_vbr_frontier_matches(
         if (identity.execution_identity != execution_identity ||
             identity.adapter_config_identity != adapter_config_key ||
             identity.sequence_epoch != prompt.sequence_epoch ||
-            identity.token_count != prompt.n_tokens() ||
-            identity.next_position != prompt.tokens.pos_next()) {
+            identity.token_count != n_tokens ||
+            identity.next_position != prompt.tokens.pos_next(coverage_tokens)) {
             return false;
         }
         if (raw_token_comparison) {
             *raw_token_comparison = true;
         }
-        if (manifest.token_block.tokens !=
-                prompt.tokens.retention_token_ids()) {
+        const auto & tokens = prompt.tokens.retention_token_ids();
+        if (manifest.token_block.tokens.size() != size_t(n_tokens) ||
+            !std::equal(manifest.token_block.tokens.begin(),
+                        manifest.token_block.tokens.end(), tokens.begin())) {
             return false;
         }
         std::string media_identity;
         return prompt.tokens.media_content_identity(
-                   prompt.n_tokens(), media_identity) &&
+                   n_tokens, media_identity) &&
                media_identity == identity.media_content_identity;
     } catch (...) {
         return false;
@@ -2642,6 +2650,27 @@ bool server_prompt_cache::contains_vbr_frontier(
         }
     }
     return false;
+}
+
+llama_cache_acct_artifact_id server_prompt_cache::find_vbr_durable_stem(
+        const server_prompt & prompt,
+        int64_t coverage_tokens,
+        const std::string & execution_identity,
+        const std::string & adapter_config_key) const noexcept {
+    if (coverage_tokens <= 0 || coverage_tokens >= prompt.n_tokens()) {
+        return {};
+    }
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        if (it->payload.kind() == server_prompt_cache_payload_kind::vbr_artifact &&
+            it->adapter_config_key == adapter_config_key &&
+            it->vbr_execution_identity == execution_identity &&
+            server_prompt_cache_vbr_frontier_matches(
+                prompt, it->payload, execution_identity, adapter_config_key,
+                nullptr, coverage_tokens)) {
+            return vbr_host_artifact_id(it);
+        }
+    }
+    return {};
 }
 
 bool server_prompt_cache::mark_vbr_frontiers(
