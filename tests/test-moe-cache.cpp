@@ -639,6 +639,8 @@ static test_graph make_fused_graph(
     return result;
 }
 
+enum class ffn_clamp { none, separate, combined };
+
 static test_graph make_full_fused_graph(
         ggml_backend_t cpu,
         ggml_tensor * up_weights,
@@ -646,7 +648,7 @@ static test_graph make_full_fused_graph(
         ggml_tensor * down_weights,
         ggml_tensor * activations,
         ggml_tensor * ids,
-        bool clamped) {
+        ffn_clamp clamp) {
     ggml_init_params params = {
         16 * ggml_tensor_overhead() + ggml_graph_overhead(),
         nullptr,
@@ -662,7 +664,9 @@ static test_graph make_full_fused_graph(
     ggml_tensor * gate = ggml_mul_mat_id(
             result.ctx, gate_weights, activations, ids);
     ggml_tensor * glu = nullptr;
-    if (clamped) {
+    if (clamp == ffn_clamp::combined) {
+        glu = ggml_swiglu_clamp(result.ctx, gate, up, 0.20f);
+    } else if (clamp == ffn_clamp::separate) {
         ggml_tensor * up_clamped =
             ggml_clamp(result.ctx, up, -0.25f, 0.25f);
         ggml_tensor * gate_clamped = ggml_clamp(
@@ -730,6 +734,129 @@ static void free_graph(test_graph & graph) {
         ggml_free(graph.ctx);
     }
     graph = {};
+}
+
+static void poison_graph(test_graph & graph) {
+    for (int i = 0; i < ggml_graph_n_nodes(graph.graph); ++i) {
+        ggml_tensor * node = ggml_graph_node(graph.graph, i);
+        GGML_ASSERT(node->type == GGML_TYPE_F32);
+        std::vector<float> poison(ggml_nelements(node), std::numeric_limits<float>::quiet_NaN());
+        ggml_backend_tensor_set(node, poison.data(), 0, poison.size()*sizeof(float));
+    }
+}
+
+// Force the CPU miss and failed-collect routes independently of GPU admission.
+// Repeated experts exercise the IQ panel path as well as ordinary vec-dot work.
+static bool run_fused_cpu_fallbacks(ggml_backend_t cpu) {
+    const auto saved_api = ggml_moe_cache;
+    static uint64_t forced_mask;
+    static int fused_calls;
+    static int full_calls;
+    bool ok = true;
+    for (ggml_type type : { GGML_TYPE_MXFP4, GGML_TYPE_Q4_K, GGML_TYPE_IQ2_XXS }) {
+        for (int tokens : { 1, 4, 8, 16 }) {
+            ggml_context * ctx = ggml_init({ 8*ggml_tensor_overhead(), nullptr, true });
+            GGML_ASSERT(ctx);
+            constexpr int width = 256;
+            ggml_tensor * up = ggml_new_tensor_3d(ctx, type, width, width, 4);
+            ggml_tensor * gate = ggml_dup_tensor(ctx, up);
+            ggml_tensor * down = ggml_dup_tensor(ctx, up);
+            ggml_tensor * acts = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, width, 1, tokens);
+            ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, tokens);
+            ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, cpu);
+            GGML_ASSERT(buffer);
+            ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            std::vector<float> imatrix(width, 1.0f);
+            int seed = 0;
+            for (ggml_tensor * weight : { up, gate, down }) {
+                std::vector<float> data(ggml_nelements(weight));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = 0.02f*std::sin(float(i + 37*seed)*0.013f);
+                }
+                std::vector<uint8_t> quantized(ggml_nbytes(weight));
+                GGML_ASSERT(ggml_quantize_chunk(type, data.data(), quantized.data(),
+                            0, width*4, width, imatrix.data()) == quantized.size());
+                ggml_backend_tensor_set(weight, quantized.data(), 0, quantized.size());
+                ++seed;
+            }
+            std::vector<float> activation(ggml_nelements(acts));
+            for (size_t i = 0; i < activation.size(); ++i) {
+                activation[i] = std::sin(float(i)*0.037f);
+            }
+            ggml_backend_tensor_set(acts, activation.data(), 0, activation.size()*sizeof(float));
+            std::vector<int32_t> routes(4*tokens);
+            for (size_t i = 0; i < routes.size(); ++i) {
+                routes[i] = i % 4;
+            }
+            ggml_backend_tensor_set(ids, routes.data(), 0, routes.size()*sizeof(int32_t));
+            test_graph graph = make_full_fused_graph(cpu, up, gate, down, acts, ids, ffn_clamp::combined);
+            GGML_ASSERT(graph.ctx && graph.buffer);
+            ggml_moe_cache = {};
+            ok &= ggml_backend_graph_compute(cpu, graph.graph) == GGML_STATUS_SUCCESS;
+            std::vector<float> reference(ggml_nelements(graph.out));
+            ggml_backend_tensor_get(graph.out, reference.data(), 0, reference.size()*sizeof(float));
+            ggml_moe_cache.fused_begin = [](
+                    const ggml_moe_cache_tensor_desc *, const ggml_moe_cache_tensor_desc *,
+                    const ggml_moe_cache_tensor_desc * down, int, float, float, float, float,
+                    const int32_t *, int rows, int64_t, const float * const *, uint64_t * mask) -> void * {
+                ++fused_calls;
+                full_calls += down != nullptr;
+                const uint64_t valid = rows == 64 ? UINT64_MAX : (UINT64_C(1) << rows) - 1;
+                *mask = forced_mask & valid;
+                return &forced_mask;
+            };
+            ggml_moe_cache.collect = [](void *, int hits, float * const *, int64_t) {
+                return hits == 0 ? 1 : 0;
+            };
+            ggml_moe_cache.end = [](void *) {};
+            for (uint64_t mask : { UINT64_C(0), UINT64_MAX, UINT64_C(0xf0f0f0f0f0f0f0f0) }) {
+                forced_mask = mask;
+                fused_calls = full_calls = 0;
+                // Reference execution populated the intermediates too. Poison
+                // every computed tensor so omitted up/gate/GLU work cannot pass.
+                poison_graph(graph);
+                std::vector<float> actual(reference.size());
+                ok &= ggml_backend_graph_compute(cpu, graph.graph) == GGML_STATUS_SUCCESS;
+                ggml_backend_tensor_get(graph.out, actual.data(), 0, actual.size()*sizeof(float));
+                // Mixed hits can move an expert below the IQ panel's batch cutoff.
+                const bool match = compare_output(reference, actual, 1e-10);
+                const bool cell_ok = match && fused_calls > 0 && full_calls > 0;
+                printf("cache-fused-cpu-%s-tokens%d-mask%llx: %s\n", ggml_type_name(type),
+                        tokens, (unsigned long long)mask, cell_ok ? "OK" : "FAIL");
+                ok &= cell_ok;
+            }
+            const auto forced_api = ggml_moe_cache;
+            for (bool window_pair : { false, true }) {
+                ggml_tensor * glu = graph.out->src[1];
+                ggml_mul_mat_id_set_expert_window(glu->src[0], window_pair ? 2 : 0, window_pair ? 4 : 0);
+                ggml_mul_mat_id_set_expert_window(glu->src[1], window_pair ? 2 : 0, window_pair ? 4 : 0);
+                ggml_mul_mat_id_set_expert_window(graph.out, 2, 4);
+                // IDs 0/1 must zero when the window is active; 2/3 must
+                // select local experts 0/1, not cache experts 2/3.
+                ggml_moe_cache = {};
+                ok &= ggml_backend_graph_compute(cpu, graph.graph) == GGML_STATUS_SUCCESS;
+                ggml_backend_tensor_get(graph.out, reference.data(), 0, reference.size()*sizeof(float));
+                ggml_moe_cache = forced_api;
+                forced_mask = 0;
+                fused_calls = full_calls = 0;
+                poison_graph(graph);
+                ok &= ggml_backend_graph_compute(cpu, graph.graph) == GGML_STATUS_SUCCESS;
+                std::vector<float> actual(reference.size());
+                ggml_backend_tensor_get(graph.out, actual.data(), 0, actual.size()*sizeof(float));
+                const bool cell_ok = compare_output(reference, actual, 1e-10) &&
+                    full_calls == 0 && (window_pair ? fused_calls == 0 : fused_calls > 0);
+                printf("cache-fused-window-%s-tokens%d-pair%d: %s\n", ggml_type_name(type),
+                        tokens, window_pair, cell_ok ? "OK" : "FAIL");
+                ok &= cell_ok;
+            }
+            ggml_moe_cache = {};
+            free_graph(graph);
+            ggml_backend_buffer_free(buffer);
+            ggml_free(ctx);
+        }
+    }
+    ggml_moe_cache = saved_api;
+    return ok;
 }
 
 enum class down_mmv_expectation {
@@ -988,7 +1115,7 @@ static bool run_multi_token_scenario(
             cpu, weights, gate_weights, activations, ids);
     test_graph full_fused_graph = make_full_fused_graph(
             cpu, weights, gate_weights, down_weights,
-            activations, ids, false);
+            activations, ids, ffn_clamp::none);
     bool ok = graph.ctx && graph.buffer &&
         fused_graph.ctx && fused_graph.buffer &&
         clamped_fused_graph.ctx && clamped_fused_graph.buffer &&
@@ -3796,8 +3923,18 @@ int main(int argc, char ** argv) {
     ggml_log_set(log_callback, &capture);
 
     ggml_backend_dev_t cuda_device = find_cuda_device();
+    ggml_backend_t cpu = init_cpu_backend();
+    if (!cpu) {
+        fprintf(stderr, "failed to initialize CPU backend\n");
+        return 1;
+    }
+    if (!run_fused_cpu_fallbacks(cpu)) {
+        ggml_backend_free(cpu);
+        return 1;
+    }
     if (!cuda_device) {
-        printf("SKIP: CUDA/HIP backend unavailable\n");
+        printf("SKIP: GPU cache scenarios (CUDA/HIP backend unavailable); CPU fallbacks passed\n");
+        ggml_backend_free(cpu);
         return 0;
     }
     ggml_backend_reg_t cuda_reg =
@@ -3815,21 +3952,16 @@ int main(int argc, char ** argv) {
             cuda_reg, "ggml_cuda_moe_cache_flat_hits_test_stats_get");
         if (!flat_hits_reset || !flat_hits_get) {
             std::fprintf(stderr, "cache-flat-hits: instrumentation hooks unavailable\n");
+            ggml_backend_free(cpu);
             return 1;
         }
         flat_hits_reset();
     }
 
     ggml_backend_t cuda = ggml_backend_dev_init(cuda_device, nullptr);
-    ggml_backend_t cpu = init_cpu_backend();
-    if (!cuda || !cpu) {
-        fprintf(stderr, "failed to initialize GPU and CPU backends\n");
-        if (cuda) {
-            ggml_backend_free(cuda);
-        }
-        if (cpu) {
-            ggml_backend_free(cpu);
-        }
+    if (!cuda) {
+        fprintf(stderr, "failed to initialize GPU backend\n");
+        ggml_backend_free(cpu);
         return 1;
     }
     ggml_init_params static_params = {
@@ -4052,7 +4184,7 @@ int main(int argc, char ** argv) {
             clamped_fused_reference.size() * sizeof(float));
 
     test_graph full_fused_graph = make_full_fused_graph(
-            cpu, weights, gate_weights, down_weights, activations, ids, false);
+            cpu, weights, gate_weights, down_weights, activations, ids, ffn_clamp::none);
     if (!full_fused_graph.ctx || !full_fused_graph.buffer) {
         fprintf(stderr, "failed to create full fused test graph\n");
         free_graph(full_fused_graph);
@@ -4086,7 +4218,7 @@ int main(int argc, char ** argv) {
             full_fused_reference.size() * sizeof(float));
 
     test_graph clamped_full_fused_graph = make_full_fused_graph(
-            cpu, weights, gate_weights, down_weights, activations, ids, true);
+            cpu, weights, gate_weights, down_weights, activations, ids, ffn_clamp::separate);
     if (!clamped_full_fused_graph.ctx || !clamped_full_fused_graph.buffer) {
         fprintf(stderr, "failed to create clamped full fused test graph\n");
         free_graph(clamped_full_fused_graph);
@@ -4176,6 +4308,27 @@ int main(int argc, char ** argv) {
             "cache-fused-clamped-full-ffn-graph", nullptr, cuda, cpu,
             clamped_full_fused_graph, clamped_full_fused_reference, capture,
             full_options);
+    // DeepSeek's combined SWIGLU_CLAMP must use the same cache fusion as the
+    // decomposed graph, including CPU misses and failed GPU collection.
+    test_graph combined_graph = make_full_fused_graph(
+            cpu, weights, gate_weights, down_weights, activations, ids, ffn_clamp::combined);
+    if (!combined_graph.ctx || !combined_graph.buffer) {
+        ok = false;
+    } else {
+        set_env("GGML_CUDA_MOE_CACHE", "0");
+        if (ggml_backend_graph_compute(cpu, combined_graph.graph) != GGML_STATUS_SUCCESS) {
+            ok = false;
+        } else {
+            std::vector<float> combined_reference(ggml_nelements(combined_graph.out));
+            ggml_backend_tensor_get(combined_graph.out, combined_reference.data(), 0,
+                    combined_reference.size()*sizeof(float));
+            ok &= run_scenario("cache-combined-clamp-full-ffn", nullptr, cuda, cpu,
+                    combined_graph, combined_reference, capture, full_options);
+            ok &= run_scenario("cache-combined-clamp-collect-fallback", "collect", cuda, cpu,
+                    combined_graph, combined_reference, capture, full_options);
+        }
+    }
+    free_graph(combined_graph);
     ok &= run_fused_partial_invalidation(
             cuda, cpu, weights, gate_weights, activations,
             weights_q4.data(), gate_weights_q4.data(),
