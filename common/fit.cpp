@@ -480,7 +480,9 @@ struct common_fit_logger_guard {
 
     static void callback(ggml_log_level level, const char * text, void * user_data) {
         const common_fit_logger_guard * guard = (const common_fit_logger_guard *) user_data;
-        const ggml_log_level level_eff = level >= guard->min_level ? level : GGML_LOG_LEVEL_DEBUG;
+        // Errors pass through at full visibility: a failed measurement context must never
+        // hide its own cause behind the fit probe's quiet mode.
+        const ggml_log_level level_eff = level == GGML_LOG_LEVEL_ERROR ? level : (level >= guard->min_level ? level : GGML_LOG_LEVEL_DEBUG);
         guard->original_callback(level_eff, text, guard->original_user_data);
     }
 };

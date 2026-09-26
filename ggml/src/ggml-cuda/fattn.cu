@@ -9,6 +9,14 @@
 #include "fattn.cuh"
 #include "ggml-backend-impl.h"
 
+// sm70-attn plugin (Volta D256 prefill): Split-D kernel + launcher live in
+// fattn-sm70-d256.cu / fattn-sm70-d256-kernel.cuh / sm70-vendor/. Gated to
+// cc==700 + head_dim 256 + causal + prefill + F16/Q4_0 KV; LLAMA_SM70_D256=0
+// disables (recompile-free). Everything else falls through to the stock paths.
+extern bool   ggml_cuda_sm70_d256_supported(int cc, const ggml_tensor * dst);
+extern size_t ggml_cuda_sm70_d256_alloc_size(const ggml_tensor * dst);
+extern void   ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
 #include <atomic>
 #include <sys/stat.h>
 #include <vector>
@@ -1738,7 +1746,15 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_TILE      = 200,
     BEST_FATTN_KERNEL_WMMA_F16 = 300,
     BEST_FATTN_KERNEL_MMA_F16  = 400,
+    BEST_FATTN_KERNEL_SM70_D256 = 500, // sm70-attn plugin (fattn-sm70-d256.cu)
 };
+
+// sm70-attn plugin: route (SM70 + head_dim 256 + causal mask + prefill) to the SM70 D256
+// Split-D kernel. supported()/alloc_size() live in fattn-sm70-d256.cu; LLAMA_SM70_D256=0
+// disables (recompile-free). Non-Volta / non-D256 / non-causal / decode stay on stock paths.
+static bool sm70_d256_supported(const int cc, const ggml_tensor * dst) {
+    return ggml_cuda_sm70_d256_supported(cc, dst);
+}
 
 static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(int device, const ggml_tensor * dst);
@@ -1975,6 +1991,9 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_SM70_D256:
+            ggml_cuda_flash_attn_ext_sm70_d256(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
@@ -2283,6 +2302,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     if (volta_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+        // sm70-attn hook: D256 prefill on SM70 -> bespoke Split-D kernel (see fattn-sm70-d256.cu).
+        if (sm70_d256_supported(cc, dst)) {
+            return BEST_FATTN_KERNEL_SM70_D256;
+        }
         if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
             return BEST_FATTN_KERNEL_VEC;
         }
@@ -2399,6 +2422,12 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     GGML_ASSERT(V != nullptr);
 
     const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
+
+    if (kernel == BEST_FATTN_KERNEL_SM70_D256) {
+        // self-contained scratch accounting: padded f16 Q staging, f16 output writeback
+        // and K/V dequant staging (when needed) live in the sm70 launcher's own extra region.
+        return ggml_cuda_sm70_d256_alloc_size(dst);
+    }
 
     bool need_f16_K = false;
     bool need_f16_V = false;
@@ -2905,6 +2934,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         }
 
         switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+        case BEST_FATTN_KERNEL_SM70_D256:
+            ggml_cuda_flash_attn_ext_sm70_d256(ctx, dst);
+            break;
             case BEST_FATTN_KERNEL_NONE:
                 GGML_ABORT("fatal error");
             case BEST_FATTN_KERNEL_TILE:

@@ -898,6 +898,12 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
         // could be fatal
         return false;
     }
+    // a cache with no resident recurrent layers holds no state that could be partially
+    // erased, so the restriction does not apply to it. this is the glm5next MTP draft
+    // context, which runs only the NextN block and filters every KDA layer out.
+    const bool has_state = std::any_of(s_l.begin(), s_l.end(),
+            [](const ggml_tensor * t) { return t != nullptr; });
+
     if (0 <= seq_id) {
         int32_t & tail_id = cells[seq_id].tail;
         if (tail_id >= 0) {
@@ -910,7 +916,9 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 GGML_ASSERT(rollback_valid_depth[seq_id] <= n_rs_seq);
                 const bool pending = rs_idx[seq_id] != 0;
                 if (rollback >= 1 && (pending || rollback > (llama_pos) rollback_valid_depth[seq_id])) {
-                    return false;
+                    if (has_state) {
+                        return false;
+                    }
                 }
                 if (rollback >= 1) {
                     GGML_ASSERT(rollback <= (llama_pos) n_rs_seq);
@@ -923,7 +931,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 tail_id = -1;
             }
         }
-    } else {
+    } else if (seq_id < 0) {
         // seq_id is negative, then the range should include everything or nothing
         if (p0 != p1 && (p0 != 0 || p1 != std::numeric_limits<llama_pos>::max())) {
             return false;

@@ -1125,8 +1125,10 @@ thread_local ggml_cuda_upload_ring ggml_cuda_uploads[GGML_CUDA_MAX_DEVICES];
 }
 
 static bool ggml_cuda_upload_async(void * dst, const void * data, size_t size) {
+    // Diagnostic kill-switch: sync-copy fallback matching upstream behavior.
+    static const bool upload_ring_disabled = getenv("GGML_CUDA_DISABLE_UPLOAD_RING") != nullptr;
     auto & ring = ggml_cuda_uploads[ggml_cuda_get_device()];
-    if (ring.disabled || size > ring.max_upload) {
+    if (ring.disabled || upload_ring_disabled || size > ring.max_upload) {
         return false;
     }
     if (ring.host == nullptr) {
@@ -3144,7 +3146,10 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     }
 
     if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE) {
-        if (ggml_is_quantized(src0->type)) {
+        // must mirror the MMVQ/MMVF selection in ggml_cuda_mul_mat_id, including the
+        // should_use_mmvq batch caps (GA10x/Orin/Ada per-type) — the graph planner relies
+        // on this predicate; a mismatch lets a sync-requiring fallback run mid-capture.
+        if (ggml_cuda_should_use_mmvq(src0->type, cc, dst->ne[2])) {
             if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
                 return false;
             }
@@ -4026,8 +4031,16 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         if (node->op == GGML_OP_MUL_MAT_ID) {
             // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
             // TODO: figure out a way to enable for larger batch sizes, without hurting performance
-            const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-            if (ggml_cuda_mul_mat_id_needs_sync(node, cc)) {
+            // heterogeneous rigs: the executing device's cc decides the dispatch path and can differ
+            // from the device binding at guard time - require sync-free dispatch on every device
+            bool mul_mat_id_needs_sync = false;
+            for (const auto & dev : ggml_cuda_info().devices) {
+                if (ggml_cuda_mul_mat_id_needs_sync(node, dev.cc)) {
+                    mul_mat_id_needs_sync = true;
+                    break;
+                }
+            }
+            if (mul_mat_id_needs_sync) {
                 // the mul_mat_id fallback path synchronizes the stream, so we cannot use CUDA graphs
                 // ref: https://github.com/ggml-org/llama.cpp/pull/18958
                 use_cuda_graph = false;
@@ -5803,6 +5816,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 0;
     }
 
+    // Multi-GPU rigs: per-device splits make the fused state read/write paths
+    // unsafe (split-input ids ordering / compute-buffer clobbers); the unfused
+    // paths are correct everywhere and cost a few KB per layer.
+    static const bool gdn_cache_fusion_allowed = ggml_cuda_info().device_count == 1;
+
     ggml_tensor * node = cgraph->nodes[i];
     const ggml_op scale_add_ops[] = { GGML_OP_MUL, GGML_OP_ADD };
     const int scale_add_output = i + 1;
@@ -6285,7 +6303,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // projection) is followed by a VIEW of its last columns copied back into
     // the state buffer. One kernel writes both the concatenation and the state
     // slot from the two sources; SSM_CONV then reads the concatenation.
-    if (node->op == GGML_OP_CONCAT && ggml_get_op_params_i32(node, 0) == 0 &&
+    // Multi-GPU: under per-device splits this fused write can clobber the
+    // graph-input allocations sharing the compute buffer (recurrent-state ids
+    // read as float bits), so keep the unfused path there.
+    if (gdn_cache_fusion_allowed && node->op == GGML_OP_CONCAT && ggml_get_op_params_i32(node, 0) == 0 &&
             node->type == GGML_TYPE_F32 && i + 2 < cgraph->n_nodes) {
         const ggml_tensor * prefix = node->src[0];
         const ggml_tensor * body   = node->src[1];
@@ -6497,7 +6518,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // Single-sequence verification can read the indexed initial state directly.
     // The source remains an explicit graph dependency; no host-side row index
     // is baked into a captured graph. Keep all other shapes on the gather path.
-    if (node->op == GGML_OP_GET_ROWS && i + 2 < cgraph->n_nodes &&
+    // Multi-GPU: the state-row ids arrive through per-split input copies whose
+    // ordering is not captured with the fused kernel on other devices, leaving
+    // the baked pointer reading stale memory. The unfused gather is correct
+    // everywhere and costs a few KB per layer, so fuse only on single-device rigs.
+    if (gdn_cache_fusion_allowed &&
+        node->op == GGML_OP_GET_ROWS && i + 2 < cgraph->n_nodes &&
         ggml_cuda_info().devices[cuda_ctx->device].cc == 860) {
         constexpr ggml_op ops[] = {GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_GATED_DELTA_NET};
         const int outputs[] = {i + 2};
@@ -6524,7 +6550,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
-    if (node->op == GGML_OP_GATED_DELTA_NET) {
+    // (single-device rigs only — see the multi-GPU note above).
+    if (gdn_cache_fusion_allowed && node->op == GGML_OP_GATED_DELTA_NET) {
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy{};
         const int nodes_to_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, i, cuda_ctx, fused_state_cpy);
         if (nodes_to_skip > 0) {
@@ -7997,6 +8024,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    static const bool log_fusion = getenv("GGML_CUDA_LOG_FUSION") != nullptr;
+                    if (log_fusion && cuda_ctx->device == 1) {
+                        const int last_fused = i + nodes_to_skip;
+                        fprintf(stderr, "FUSE dev=1 n=%d first=[%d]%s('%s') last=[%d]%s('%s')\n",
+                                nodes_to_skip + 1, i, ggml_op_name(node->op), node->name,
+                                last_fused, ggml_op_name(cgraph->nodes[last_fused]->op),
+                                cgraph->nodes[last_fused]->name);
+                    }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",

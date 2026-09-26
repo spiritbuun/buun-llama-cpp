@@ -312,10 +312,10 @@ void llama_kv_cache::vbr_shared_scratch_registration::reset() {
 // Turbo TCQ prompt cache safety: compute a fingerprint from the codebook env
 // vars so that loading a cache created with a different codebook is detected.
 // The fingerprint is a CRC32 of the codebook FILE CONTENTS (not the path),
-// so the check is relocatable — only the actual data matters.
+// so the check is relocatable â€” only the actual data matters.
 static uint32_t turbo_tcq_codebook_crc32(const char * path, size_t n_floats) {
     if (!path || !path[0]) {
-        return 0; // no custom codebook → use compiled-in default → hash 0
+        return 0; // no custom codebook â†’ use compiled-in default â†’ hash 0
     }
     FILE * f = fopen(path, "rb");
     if (!f) { return 0; }
@@ -343,7 +343,7 @@ static bool ggml_type_is_turbo(enum ggml_type t) {
 }
 
 // Resolve the backend's turbo/VBR vtable (ggml-vbr.h) for a KV buffer type. Returns nullptr
-// when the owning backend does not export GGML_VBR_BACKEND_IFACE_PROC — i.e. it cannot host
+// when the owning backend does not export GGML_VBR_BACKEND_IFACE_PROC â€” i.e. it cannot host
 // turbo-typed KV at all (CPU, or a GPU backend without the kernels). libllama never links
 // backend symbols for this feature; everything goes through the resolved vtable.
 static const ggml_vbr_backend_iface * llama_vbr_backend_iface_for_buft(ggml_backend_buffer_type_t buft) {
@@ -390,7 +390,7 @@ struct llama_vbr_dev {
 };
 
 // Resolve every device behind a KV buffer type. A plain device buft resolves to one entry; the
-// meta (--split-mode tensor) buft resolves to one entry per simple device underneath — turbo/VBR
+// meta (--split-mode tensor) buft resolves to one entry per simple device underneath â€” turbo/VBR
 // support then means EVERY simple device exports the vtable. Returns empty when any device lacks
 // support (same contract as a nullptr from llama_vbr_backend_iface_for_buft).
 static std::vector<llama_vbr_dev> llama_vbr_backend_devs_for_buft(ggml_backend_buffer_type_t buft) {
@@ -634,7 +634,7 @@ static turbo_vbr_layer_policy turbo_vbr_layer_policy_from_env(
 
     policy.enabled = true;
     // schedule_ctx = the discovery window the schedule's row coordinates refer to (VBR_SCHEDULE_CTX,
-    // default 8192). Only whole-window bands are supported — see covers_whole_active_cache below.
+    // default 8192). Only whole-window bands are supported â€” see covers_whole_active_cache below.
     const int schedule_ctx = turbo_vbr_schedule_ctx();
     GGML_UNUSED(kv_size);
 
@@ -732,7 +732,7 @@ static turbo_vbr_layer_policy turbo_vbr_layer_policy_from_env(
             }
             // Per-side static VBR allocator: only full-cache layer-side tiers are
             // supported. Partial-row / coordinate (Stage2A) bands are no longer
-            // implemented — ignore them.
+            // implemented â€” ignore them.
             policy.ignored_bands++;
             continue;
         }
@@ -825,7 +825,7 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
 // llama_kv_cache
 //
 
-// fresh cells are fully sized here, in the same initializer that decides ownership — the ctor
+// fresh cells are fully sized here, in the same initializer that decides ownership â€” the ctor
 // body must never resize v_cells: when the cache shares another cache's cells (mem_other,
 // [TAG_KV_CACHE_SHARE_CELLS]) the vector aliases the SOURCE cache's live stream layout
 static std::shared_ptr<llama_kv_cells_vec> kv_cells_make(uint32_t n_stream, uint32_t kv_size) {
@@ -849,7 +849,7 @@ static auto kv_vmm_pool_for(POOLS & pools, ggml_backend_buffer_t pb) -> decltype
 }
 
 // physical buffers behind one KV buffer: the per-device simple buffers underneath a meta
-// buffer (-sm tensor), else the buffer itself — the boundary translation clear() and
+// buffer (-sm tensor), else the buffer itself â€” the boundary translation clear() and
 // memory_breakdown() share
 static std::vector<ggml_backend_buffer_t> kv_phys_buffers(ggml_backend_buffer_t buf) {
     std::vector<ggml_backend_buffer_t> phys;
@@ -970,7 +970,7 @@ llama_kv_cache::llama_kv_cache(
     // A share-linked cache follows the OWNER's dynamic VBR: tier flips mutate the owner's
     // tensors in place (which this cache's layer entries alias) and graph reuse fences on
     // the delegated vbr_tier_epoch() (see llama-kv-cache.h). What a share-linked cache must
-    // NOT do is arm its own controller on top — two controllers would double-manage the
+    // NOT do is arm its own controller on top â€” two controllers would double-manage the
     // same pool and the shared v_cells occupancy would confuse the second watermark.
     // llama_context disarms drafter-side VBR at creation (ctx_other), so hitting this is an
     // internal-API misuse, not a user configuration.
@@ -1049,7 +1049,7 @@ llama_kv_cache::llama_kv_cache(
     }
 
     // fresh cells were sized by kv_cells_make in the initializer; shared cells keep the
-    // source cache's layout — either way this cache's streams must fit inside the vector
+    // source cache's layout â€” either way this cache's streams must fit inside the vector
     GGML_ASSERT(v_cells.size() >= n_stream);
 
     // by default, all sequence ids are mapped to the 0th stream
@@ -1091,13 +1091,13 @@ llama_kv_cache::llama_kv_cache(
                 const auto & layer_share = other->layers[other->map_layer_ids[il_share]];
 
                 // A tensor-split target's cache is head-sharded across devices in the meta
-                // buffer — this drafter's scheduler has no meta backend, so adopting the tensor
+                // buffer â€” this drafter's scheduler has no meta backend, so adopting the tensor
                 // would hard-abort later at sched reserve ("pre-allocated tensor (cache_k_lN)
                 // in a buffer (Meta())"). Refuse here with an actionable message instead.
                 if (layer_share.k->buffer != nullptr && ggml_backend_buffer_is_meta(layer_share.k->buffer)) {
                     throw std::runtime_error(
                         "shared-KV drafter cannot read a tensor-split target: the target's KV cache is "
-                        "head-sharded across devices under --split-mode tensor — run the target with "
+                        "head-sharded across devices under --split-mode tensor â€” run the target with "
                         "--split-mode layer, or drop the drafter (native in-model MTP heads still work)");
                 }
 
@@ -1156,7 +1156,7 @@ llama_kv_cache::llama_kv_cache(
         const bool has_v = !is_mla;
 
         // per-layer types: uniform (-ctk/-ctv) unless a VBR layer schedule overrides.
-        // (the pre-VBR TURBO_LAYER_ADAPTIVE 18-mode experiment matrix was retired 2026-07-05 —
+        // (the pre-VBR TURBO_LAYER_ADAPTIVE 18-mode experiment matrix was retired 2026-07-05 â€”
         // VBR_LAYER_SCHEDULE expresses all of it and more)
         ggml_type layer_type_k = type_k;
         ggml_type layer_type_v = type_v;
@@ -1315,7 +1315,7 @@ llama_kv_cache::llama_kv_cache(
     if (vbr_dynamic_wanted && !vbr_vmm_wanted && !hparams.no_alloc) {
         // fail loud, not silent: the caller asked for the degrade controller and would otherwise
         // get a static max-tier cache while the logs still advertise dynamic VBR
-        LLAMA_LOG_WARN("%s: dynamic VBR requested but the controller cannot arm (%s) — this cache "
+        LLAMA_LOG_WARN("%s: dynamic VBR requested but the controller cannot arm (%s) â€” this cache "
                 "stays static at its entry tiers\n", __func__,
                 !(vbr_layer_policy.enabled || needs_turbo_layout || vbr_params_.dynamic) ? "KV is not VBR-managed" :
                 n_stream != 1 ? "KV is split per sequence (n_stream > 1; run with --kv-unified)" :
@@ -1331,7 +1331,7 @@ llama_kv_cache::llama_kv_cache(
             // Host KV from partial offload is legal under dynamic VBR: movable sides were
             // pinned at q8_0 by the CPU fallback above, while explicitly pinned sides kept
             // their requested type. They live in system memory outside the fit's VRAM budget,
-            // and the degrade walk skips units with no pool — static allocation is correct.
+            // and the degrade walk skips units with no pool â€” static allocation is correct.
             if (ggml_backend_buft_is_host(bft)) {
                 LLAMA_LOG_WARN("%s: dynamic VBR with partial offload: CPU-bound KV layers stay "
                         "static (movable sides use q8_0; explicit side pins keep their type); "
@@ -1340,19 +1340,19 @@ llama_kv_cache::llama_kv_cache(
             }
             // For device KV without VBR backend support (the meta tensor-parallel buft),
             // falling back silently would be a trap: the fit pass priced this KV at the floor
-            // tier (1.25 bits/value) but a static fallback stays at the entry tier — up to
+            // tier (1.25 bits/value) but a static fallback stays at the entry tier â€” up to
             // 12.8x the budgeted VRAM with no degrade possible, an OOM at depth on any
             // fitted config.
             throw std::runtime_error(format(
                     "dynamic VBR (-ctk vbr) requires per-device KV buffers with turbo/VBR backend "
                     "support, but the KV buffer type is %s (or a device underneath it) without "
-                    "that support — offload the KV cache to supported GPUs or use a static KV "
+                    "that support â€” offload the KV cache to supported GPUs or use a static KV "
                     "type (f16/q8_0).",
                     ggml_backend_buft_name(bft)));
         }
         for (const auto & d : devs) {
             if (d.device < 0 || !d.be->vmm_available(d.device)) {
-                LLAMA_LOG_WARN("%s: VBR_VMM requested but %s — falling back to static allocation\n", __func__,
+                LLAMA_LOG_WARN("%s: VBR_VMM requested but %s â€” falling back to static allocation\n", __func__,
                         d.device < 0 ? "the KV buffer type is not a device-default buffer" : "a device lacks VMM support");
                 return nullptr;
             }
@@ -1379,7 +1379,7 @@ llama_kv_cache::llama_kv_cache(
 
         // lay out + place ONE device's tensors into a fresh VMM pool. `cc` holds either the KV
         // context itself (plain device buft) or one device's shard tensors (meta buft under
-        // -sm tensor) — the walk is identical: every non-view tensor gets a page-aligned VA
+        // -sm tensor) â€” the walk is identical: every non-view tensor gets a page-aligned VA
         // slot; cache tensors are sized for the max tier so a later tier change never moves them.
         auto vmm_alloc_ctx = [&](size_t idev, ggml_context * cc) -> ggml_backend_buffer_t {
             const llama_vbr_dev & d = devs[idev];
@@ -1415,7 +1415,7 @@ llama_kv_cache::llama_kv_cache(
 
             ggml_vbr_vmm_pool * pool = be->vmm_pool_init(device, va_size);
             if (pool == nullptr) {
-                LLAMA_LOG_WARN("%s: VBR_VMM: VA reservation of %.2f MiB failed — falling back\n", __func__, va_size/1024.0/1024.0);
+                LLAMA_LOG_WARN("%s: VBR_VMM: VA reservation of %.2f MiB failed â€” falling back\n", __func__, va_size/1024.0/1024.0);
                 return nullptr;
             }
             char * base = (char *) be->vmm_pool_base(pool);
@@ -1454,7 +1454,7 @@ llama_kv_cache::llama_kv_cache(
             p.device      = device;
             p.gran        = gran;
             p.mapped_base = be->vmm_pool_mapped(pool);
-            // co-tenancy: resolve the PCI bus id eagerly — p.backend stays null until the
+            // co-tenancy: resolve the PCI bus id eagerly â€” p.backend stays null until the
             // first degrade wave arms the side stream, far too late for marker publication
             p.busid = std::move(busid);
             vbr_pools_.push_back(std::move(p));
@@ -1468,7 +1468,7 @@ llama_kv_cache::llama_kv_cache(
             return vmm_alloc_ctx(0, c);
         }
 
-        // -sm tensor: the meta backend shards every KV tensor per device (axis-0, head-aligned —
+        // -sm tensor: the meta backend shards every KV tensor per device (axis-0, head-aligned â€”
         // see llama_meta_device_get_split_state); allocate one VMM pool per simple device and
         // hand each device's shard context to the same layout routine. The meta buffer wraps the
         // per-device pool buffers so graph building sees ordinary meta tensors.
@@ -1512,7 +1512,7 @@ llama_kv_cache::llama_kv_cache(
             for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
                 if (ggml_is_turbo_kv_type(t->type)) {
                     LLAMA_LOG_ERROR("%s: KV cache type %s (tensor %s) needs a backend with TurboQuant support "
-                            "(currently: CUDA), but its KV buffer type is %s — offload the KV cache to a "
+                            "(currently: CUDA), but its KV buffer type is %s â€” offload the KV cache to a "
                             "supported GPU (-ngl on all layers, without --no-kv-offload) or use a standard "
                             "cache type (f16/q8_0)\n",
                             __func__, ggml_type_name(t->type), t->name, ggml_backend_buft_name(buft));
@@ -1528,11 +1528,11 @@ llama_kv_cache::llama_kv_cache(
                 t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
             }
         } else if (vbr_vmm_wanted) {
-            // one VMM pool per KV buffer — one per device shard under -sm tensor, else one per
+            // one VMM pool per KV buffer â€” one per device shard under -sm tensor, else one per
             // device KV context under -sm layer
             buf = try_vmm_alloc(ctx.get(), buft); // nullptr -> fall through to static allocation
             // NOTE: under -sm tensor `buf` is the META buffer while the pools hold the per-device
-            // buffers — the flag must come from the allocation path, not a pool.buf match
+            // buffers â€” the flag must come from the allocation path, not a pool.buf match
             is_vmm_buf = buf != nullptr;
         }
         if (buf == nullptr && !hparams.no_alloc) {
@@ -1557,7 +1557,7 @@ llama_kv_cache::llama_kv_cache(
             // turbo_rotation holds R (Q forward rotation), turbo_rotation_inv holds R^T (V output
             // un-rotation). The arrays are row-major; through ggml's column-major view plus
             // ggml_mul_mat's transpose, mul_mat(A, x) computes A @ x for a row-major-stored A
-            // (verified by test) — so each tensor is stored exactly as named.
+            // (verified by test) â€” so each tensor is stored exactly as named.
             ggml_backend_tensor_set(turbo_rotation, TURBO_ROTATION_R, 0, 128 * 128 * sizeof(float));
             ggml_backend_tensor_set(turbo_rotation_inv, TURBO_ROTATION_RT, 0, 128 * 128 * sizeof(float));
             LLAMA_LOG_INFO("%s: TurboQuant rotation matrices initialized (128x128)\n", __func__);
@@ -1675,7 +1675,7 @@ llama_kv_cache::llama_kv_cache(
                         // vtable + device ordinal for the boundary-time dequant-scratch reserve.
                         // inst is always a simple (non-meta) buffer here, so the resolver
                         // returns 0 or 1 entries; empty (no turbo support) leaves be null and
-                        // the reserve loop skips the pool — its types can never be turbo anyway.
+                        // the reserve loop skips the pool â€” its types can never be turbo anyway.
                         const auto pdevs = llama_vbr_backend_devs_for_buft(ggml_backend_buffer_get_type(inst->buffer));
                         if (!pdevs.empty()) {
                             p.be     = pdevs[0].be;
@@ -1709,7 +1709,7 @@ llama_kv_cache::llama_kv_cache(
                 vbr_extent & e = is_v ? p->v[ikv] : p->k[ikv];
                 e.t        = inst;
                 e.byte_off = (size_t)((char *) inst->data - p->base);
-                e.type0    = inst->type; // entry tier — the full-clear reset target
+                e.type0    = inst->type; // entry tier â€” the full-clear reset target
                 p->used = std::max(p->used, e.byte_off + ggml_nbytes(inst));
             }
         };
@@ -1734,7 +1734,7 @@ llama_kv_cache::llama_kv_cache(
         }
 
         // (pool, extent) unit table: which VMM pools hold each (ikv, side) unit is fixed from
-        // here on — precompute so the per-boundary degrade/promote walks never allocate. MUST
+        // here on â€” precompute so the per-boundary degrade/promote walks never allocate. MUST
         // precede vbr_floor_clamp_order below (it consults vbr_unit_pooled), and vbr_pools_
         // must never grow again (the table holds pointers into it).
         vbr_units_tab_.resize(layers.size() * 2);
@@ -1778,7 +1778,7 @@ llama_kv_cache::llama_kv_cache(
                 }
             }
             // consent comes ONLY from the typed flag (or its documented LLAMA_ARG env,
-            // which sets min_bits_explicit through the arg handler) — the raw VBR_MIN_BITS
+            // which sets min_bits_explicit through the arg handler) â€” the raw VBR_MIN_BITS
             // developer override still moves the floor VALUE but never grants peer-yield
             // consent (bare presence of a debug env must not consent to sub-t8 loss)
             vbr_floor_typed_ = vbr_params_.min_bits_explicit;
@@ -1788,7 +1788,7 @@ llama_kv_cache::llama_kv_cache(
                     first_band_end_, vbr_degrade_order_.size(),
                     first_band_end_ == 0 ? " (demand shedding disabled)" : "",
                     first_band_end_ != 0 && vbr_floor_typed_
-                        ? " — explicit floor: peer yield consented to the floor" : "");
+                        ? " â€” explicit floor: peer yield consented to the floor" : "");
             vbr_floor_clamp_order();
             vbr_budget_bytes_    = (size_t) llama_memory_vbr_budget_bytes_resolve(vbr_params_);
             vbr_budget_explicit_ = vbr_params_.budget_explicit;
@@ -1804,15 +1804,15 @@ llama_kv_cache::llama_kv_cache(
                 turbo_vbr_env_enabled("VBR_FREEZE_PRESERVE_EMPTY_TIERS");
             vbr_freeze_preserve_empty_tiers_ = vbr_freeze_ && preserve_empty_tiers;
             if (vbr_freeze_) {
-                LLAMA_LOG_INFO("%s: VBR_FREEZE active — live-VRAM clamp + ledger disabled "
+                LLAMA_LOG_INFO("%s: VBR_FREEZE active â€” live-VRAM clamp + ledger disabled "
                         "(deterministic tier schedule; test/gating only)\n", __func__);
                 if (!vbr_budget_explicit_) {
-                    LLAMA_LOG_WARN("%s: VBR_FREEZE without an explicit VBR_BUDGET_MIB — the auto-budget "
+                    LLAMA_LOG_WARN("%s: VBR_FREEZE without an explicit VBR_BUDGET_MIB â€” the auto-budget "
                             "re-derivation reads live free VRAM and is NOT frozen; set VBR_BUDGET_MIB\n",
                             __func__);
                 }
                 if (vbr_freeze_preserve_empty_tiers_) {
-                    LLAMA_LOG_WARN("%s: VBR_FREEZE_PRESERVE_EMPTY_TIERS active — "
+                    LLAMA_LOG_WARN("%s: VBR_FREEZE_PRESERVE_EMPTY_TIERS active â€” "
                             "empty boundaries retain the current tier vector "
                             "(deterministic freeze testing only)\n", __func__);
                 }
@@ -1851,13 +1851,13 @@ llama_kv_cache::llama_kv_cache(
             }
             // split the global budget across the VMM pools proportional to each pool's VA-size
             // share (single pool -> exact global budget); all mapped-bytes checks are per-pool.
-            // WITHOUT a fit-resolved budget (fit disabled, failed, or not implemented —
+            // WITHOUT a fit-resolved budget (fit disabled, failed, or not implemented â€”
             // SPLIT_MODE_TENSOR), derive each pool's budget HERE from live per-device free
             // memory, the same formula the boundary re-derivation uses. The ctor runs before
             // compute buffers allocate, so the number over-states reach; that optimism is
             // bounded by vbr_budget_eff's live free-VRAM clamp on every decision and corrected
             // by the periodic re-derivation. The re-derivation FLOOR (budget_base) is the pool's
-            // floor-layout share — the minimum that guarantees the advertised context — so the
+            // floor-layout share â€” the minimum that guarantees the advertised context â€” so the
             // derived value can tighten back down under co-tenants, never below the guarantee.
             {
                 size_t total_va = 0;
@@ -1906,7 +1906,7 @@ llama_kv_cache::llama_kv_cache(
                 }
             }
             // f16 sink-stash: DEFAULT ON (128 rows) since the S6 long-decode gate (2026-07-03)
-            // — erases sink-row requant accumulation across any hop count for ~8 MiB + µs per
+            // â€” erases sink-row requant accumulation across any hop count for ~8 MiB + Âµs per
             // degrade. VBR_STASH_ROWS overrides (0 disables).
             const char * stash_env = getenv("VBR_STASH_ROWS");
             vbr_stash_rows_ = vbr_params_.codec == LLAMA_VBR_CODEC_CLASSIC
@@ -2029,7 +2029,7 @@ llama_kv_cache::llama_kv_cache(
             LLAMA_LOG_WARN("%s: attention rotation force disabled (LLAMA_ATTN_ROT_DISABLE)\n", __func__);
         }
 
-        // turbo types have their own FWHT rotation — skip upstream Hadamard rotation
+        // turbo types have their own FWHT rotation â€” skip upstream Hadamard rotation
         const bool is_turbo_k = ggml_type_is_turbo(type_k) || vbr_layer_policy.has_turbo_k;
         const bool is_turbo_v = ggml_type_is_turbo(type_v) || vbr_layer_policy.has_turbo_v;
         const bool classic_dynamic = vbr_params_.dynamic &&
@@ -2404,7 +2404,7 @@ bool llama_kv_cache::seq_rm_impl(
     }
 
     // VBR mutation scope: authenticated (sequence_edit, seq, [p0,p1)). Generic seq_rm remains
-    // membership-only state_api (not provenance-bearing); the destructive §7.5 classes arrive
+    // membership-only state_api (not provenance-bearing); the destructive Â§7.5 classes arrive
     // with the classed server paths in the mutation coordinator commit.
     const bool commit = mode != seq_rm_mode::dry_run;
     vbr_mutation_op mutation_op(commit ? this : nullptr, vbr_operation_kind::sequence_edit,
@@ -2686,7 +2686,7 @@ void llama_kv_cache::seq_cp_impl(
     // cross-stream sequence copies require to copy the actual buffer data
 
     // Deferred-copy fence (pending owner through stream_copy_info, commit at byte-copy
-    // completion) is NOT implemented — it is structurally unreachable because armed VBR
+    // completion) is NOT implemented â€” it is structurally unreachable because armed VBR
     // requires n_stream == 1. Fail loudly if that invariant ever breaks rather than let a
     // cross-stream copy close its operation before bytes land (design finding R3-4).
     GGML_ASSERT(vbr_generation_tracker_mut() == nullptr &&
@@ -2766,7 +2766,7 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 
     // VBR mutation scope: whole-range membership edit. The manifest declares the sequence.
     // Wildcard: keep removes membership from every sequence except the kept one, so
-    // per-cell stamps carry whichever sequence remains (or none) — a single-seq claim would
+    // per-cell stamps carry whichever sequence remains (or none) â€” a single-seq claim would
     // be a false declaration.
     vbr_mutation_op mutation_op(this, vbr_operation_kind::sequence_edit,
             vbr_operation_class::state_api, -1, 0, std::numeric_limits<llama_pos>::max());
@@ -3098,7 +3098,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
     vbr_runtime_was_over_ = false;
     // The VBR degrade trigger must run at the llama_decode boundary, before any of this batch's
     // cells are committed. Measured (VBR_MAP_RAWSCAN): mid-batch, apply_ubatch runs ahead of graph
-    // execution by up to the whole batch — a mid-batch transcode captures positioned-but-unwritten
+    // execution by up to the whole batch â€” a mid-batch transcode captures positioned-but-unwritten
     // rows as zeros and races graphs built against the old tier. Here slot admission has completed,
     // the previous batch's writes are visible, and no built-but-unexecuted graphs exist.
     // prepare_with_slots() is the post-admission choke point both ordinary and iSWA paths use. The
@@ -3132,7 +3132,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
     vbr_runtime_wm_ = vbr_watermark_cells(n_tokens);
     if (vbr_vmm_active() && vbr_budget_bytes_ > 0) {
         // sink-stash staleness: if any sink cell was freed since capture, every stash may hold
-        // another request's rows — drop them all (they recapture at the next first degrade)
+        // another request's rows â€” drop them all (they recapture at the next first degrade)
         vbr_invalidate_dirty_stash();
         // -- Stability fast-path: skip per-batch bookkeeping when settled (avoids ~1ms/token) --
         uint32_t used_now = 0;
@@ -3142,7 +3142,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
         // Stable when: budget fully explored, quiet for N boundaries, occupancy hasn't meaningfully moved.
         static const uint32_t VBR_STABLE_QUICK = 10; // quiet-boundary threshold for fast path
         static const int32_t  VBR_USED_DELTA   = 512; // occupancy delta below which we're stable
-        // co-tenancy: the ledger pre-check runs EVERY boundary, outside the stable gate —
+        // co-tenancy: the ledger pre-check runs EVERY boundary, outside the stable gate â€”
         // a peer's rename (new claim, offer change) forces the full controller path.
         // Freeze mode disables the ledger for deterministic tests, so the schedule ignores co-tenant
         // state; the tree force stays clear and the scan below is skipped too.
@@ -3165,13 +3165,13 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
                            !vbr_tree_forced());
 
         if (!vbr_stable) {
-            // auto budgets track reality: throttle re-derive from live free VRAM — during steady
+            // auto budgets track reality: throttle re-derive from live free VRAM â€” during steady
             // decode occupancy barely changes, so querying every token is waste. Fire on the first
             // boundary (lazy cuBLAS init), or when a degrades/promotes happen, or every 8th token.
             if (!vbr_budget_explicit_) {
                 const bool budget_dirty = vbr_degrade_cursor_ > 0 && vbr_quiet_boundaries_ < VBR_STABLE_QUICK;
                 // vbr_boundary_count_ is a free-running per-boundary counter (incremented once per
-                // prepare() below) — NOT coupled to whether we actually re-derive, or the throttle
+                // prepare() below) â€” NOT coupled to whether we actually re-derive, or the throttle
                 // could never advance its own gate. count==0 is the first boundary (skipped inside
                 // vbr_rederive_budget for lazy cuBLAS); every 8th boundary re-derives thereafter.
                 const bool budget_periodic = (vbr_boundary_count_ % 8 == 0);
@@ -3179,11 +3179,11 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
                     vbr_rederive_budget();
                 }
             }
-            // Degrades are one-way and lossy — the two honest recovery levers both live here, at the
+            // Degrades are one-way and lossy â€” the two honest recovery levers both live here, at the
             // decode boundary, BEFORE the budget check:
             //  - full-clear reset: the cache is EMPTY, so undoing every degrade is free and lossless;
             //  - container promotion: occupancy dropped (seq_rm) far enough that a higher tier fits
-            //    with headroom — old rows keep their degraded quality (re-encoded recon, no
+            //    with headroom â€” old rows keep their degraded quality (re-encoded recon, no
             //    information restored), but FUTURE rows encode at the higher tier.
             if (vbr_degrade_cursor_ > 0 && used_now == 0 &&
                 !vbr_freeze_preserve_empty_tiers_) {
@@ -3192,15 +3192,15 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
             vbr_shrink_watermark(); // occupancy drops release phantom tail pages first
 
             // promote pacing: ONE step per boundary, and only after a quiet window (no degrade in
-            // the last 4 boundaries). Promotes re-encode aged rows from degraded recon — error
-            // compounds per hop — so waves spread out and a clamp-driven degrade vetoes the
+            // the last 4 boundaries). Promotes re-encode aged rows from degraded recon â€” error
+            // compounds per hop â€” so waves spread out and a clamp-driven degrade vetoes the
             // immediate bounce-back. Boundary counting keeps the cooldown deterministic.
             vbr_quiet_boundaries_++;
             // co-tenancy: promotes freeze while any unamortized grant remains, and around
             // presence changes (gates live in vbr_maybe_promote)
             vbr_maybe_promote(wm_next);
             // budget trigger: degrade while ANY pool exceeds its share. A step only shrinks the pool
-            // that owns its tensor, but the cursor is a global price order — advancing it while any
+            // that owns its tensor, but the cursor is a global price order â€” advancing it while any
             // pool is over budget is the simplest rule that terminates and preserves the price order.
             // Pre-loop pressure snapshot: the runtime demand's honest ask is what
             // this boundary was short BEFORE the own ladder's sacrifice resolved it
@@ -3224,10 +3224,10 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
                 vbr_retier_defer("degrade_pressure");
             } else {
                 while (vbr_over_budget(wm_next)) {
-                    vbr_quiet_boundaries_ = 0; // degrade pressure this boundary — cool the promote path
+                    vbr_quiet_boundaries_ = 0; // degrade pressure this boundary â€” cool the promote path
                     const vbr_degrade_result degrade = vbr_degrade_next(wm_next);
                     if (degrade == vbr_degrade_result::reserve_failed) {
-                        LLAMA_LOG_ERROR("%s: VBR component reserve failed before tier mutation — "
+                        LLAMA_LOG_ERROR("%s: VBR component reserve failed before tier mutation â€” "
                                 "failing this batch recoverably\n", __func__);
                         // Earlier successful steps in this boundary remain committed. Fence their
                         // side-stream waves before returning without a graph to carry the normal wait.
@@ -3252,7 +3252,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
                         return {};
                     }
                     if (degrade == vbr_degrade_result::exhausted) {
-                        if (!vbr_budget_warned_) { // terminal state — one warning, not one per batch
+                        if (!vbr_budget_warned_) { // terminal state â€” one warning, not one per batch
                             vbr_budget_warned_ = true;
                             size_t projected_total = 0;
                             for (const auto & p : vbr_pools_) {
@@ -3280,19 +3280,19 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
                         p.be->vmm_pool_mapped(p.vmm)/1024.0/1024.0, wm_next);
             }
             // Runtime-growth demand: the trigger is band-spent and under pressure this
-            // boundary (pre-own-loop snapshot) — the own loop's exit makes post-loop
+            // boundary (pre-own-loop snapshot) â€” the own loop's exit makes post-loop
             // projected <= budget_eff whenever the sub-band ladder still works, which must
             // not hide the demand (the band is what peers owe; the sub-band walk is the
             // demander's own sacrifice)
             // co-tenancy: full ledger pass on a pre-check hit, or unconditionally every 8th
-            // boundary once ≥1s has passed since the last full scan (bounds the miss window
+            // boundary once â‰¥1s has passed since the last full scan (bounds the miss window
             // when our own rename baseline-swallowed a peer's concurrent rename)
             if (!vbr_freeze_ && (vbr_tree_forced() ||
                 (vbr_boundary_count_ % 8 == 0 &&
                  llama_vram_ledger_now_ns() - vbr_last_scan_ns_ >= 1000000000ull))) {
                 vbr_ledger_scan_service(n_tokens);
                 if (vbr_tree_root()->vbr_reserve_failed_) {
-                    LLAMA_LOG_ERROR("%s: VBR demand-shed reserve failed before its tier mutation — "
+                    LLAMA_LOG_ERROR("%s: VBR demand-shed reserve failed before its tier mutation â€” "
                             "failing this batch recoverably\n", __func__);
                     vbr_tree_root()->vbr_arm_wave_fences();
                     return {};
@@ -3303,7 +3303,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
             // to graph build.
             vbr_arm_wave_fences();
         } else {
-            // Fast path: settled — skip the budget/degrade bookkeeping. wm_next stays the current
+            // Fast path: settled â€” skip the budget/degrade bookkeeping. wm_next stays the current
             // watermark; the shared eager map below still covers occupancy that creeps up under the
             // stable threshold.
             vbr_quiet_boundaries_++;
@@ -3315,16 +3315,16 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
         }
         // Eager physical backing to the predicted watermark, for BOTH paths: map failures surface HERE,
         // where no graphs exist and init_batch fails RECOVERABLY (llama_decode returns an error; the
-        // server's decode-failure ladder — idle purge, batch halving — works under VBR instead of a
+        // server's decode-failure ladder â€” idle purge, batch halving â€” works under VBR instead of a
         // process abort killing every client). try_map is a no-op when the watermark hasn't grown
         // (wm <= wm_cells). Runs after the non-stable path's fence arm so an already-queued transcode
         // wave stays fenced for the NEXT batch's graph. apply_ubatch's ensure_mapped is the mid-batch
         // backstop for placements past the prediction.
         if (!vbr_vmm_try_map(wm_next)) {
-            LLAMA_LOG_ERROR("%s: VBR VMM: physical map to %u cells failed (device memory exhausted) — "
+            LLAMA_LOG_ERROR("%s: VBR VMM: physical map to %u cells failed (device memory exhausted) â€” "
                     "failing this batch recoverably\n", __func__, wm_next);
             // co-tenancy (spec: try_map-failed runtime-demand disjunct): route the NEXT
-            // boundary to the full controller path — a stable-path resident squeezed by a
+            // boundary to the full controller path â€” a stable-path resident squeezed by a
             // rename-free co-tenant would otherwise never publish its runtime demand and
             // livelock on failing batches
             vbr_tree_force();
@@ -3343,7 +3343,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
     }
 
     // Grow flash-attention f16 dequant scratch to this batch's watermark outside the graphs, for
-    // the sides that are dequant-active after the wave above — see vbr_scratch_reserve. Runs for
+    // the sides that are dequant-active after the wave above â€” see vbr_scratch_reserve. Runs for
     // every turbo-typed cache (bookkeeping pools exist even without the dynamic controller);
     // non-turbo caches have no pools and skip in O(1).
     if (!vbr_pools_.empty() || !vbr_shared_scratch_bindings_.empty()) {
@@ -3375,7 +3375,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
             }
         }
         if (!vbr_scratch_reserve(scratch_cells)) {
-            LLAMA_LOG_ERROR("%s: f16 dequant scratch reserve failed (device memory exhausted) — "
+            LLAMA_LOG_ERROR("%s: f16 dequant scratch reserve failed (device memory exhausted) â€” "
                     "failing this batch recoverably\n", __func__);
             vbr_tree_force(); // same routing as the try_map failure above
             return {};
@@ -3493,7 +3493,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::plan_slots(const std::vector<lla
 
 void llama_kv_cache::vbr_recovery_settle() {
     // This tracker's cache services its pending quarantines at the decode boundary
-    // — perform the invalidation FIRST, then ack with the token; only the ack reclaims the
+    // â€” perform the invalidation FIRST, then ack with the token; only the ack reclaims the
     // ring slot. Failures without capabilities resolve here too, keeping the ring live.
     if (auto * tracker = vbr_generation_tracker_mut()) {
         const vbr_controller_instance_id instance = tracker->runtime_instance();
@@ -3508,7 +3508,7 @@ void llama_kv_cache::vbr_recovery_settle() {
                         vbr_operation_class::controller)) {
                 // Invalidation impossible right now (mid-mutation): latch unavailable,
                 // RELEASE the take so the record stays serviceable, and retry next boundary
-                // — never ack unperformed work.
+                // â€” never ack unperformed work.
                 tracker->set_shadow_unavailable();
                 GGML_ASSERT(vbr_recovery_untake_quarantine(work.token, instance));
                 break;
@@ -3811,8 +3811,8 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     assert(ubatch.n_tokens == sinfo.n_stream()*sinfo.size());
 
     // One decode-kind operation scope per apply_ubatch commit. Recovery is eager
-    // (reserved in the ctor — the wrap class is provenance-bearing); the extents and the
-    // reuse EVENT are LAZY — reserved per SELECTED target at the first destructive stamp, so
+    // (reserved in the ctor â€” the wrap class is provenance-bearing); the extents and the
+    // reuse EVENT are LAZY â€” reserved per SELECTED target at the first destructive stamp, so
     // a wrap-free decode pays neither extent traffic nor a destructive event.
     // The ubatch target scan is armed-only, so non-VBR decode never pays it, and
     // skipped entirely when a composite wrapper already supplied the manifest (adoption).
@@ -3842,7 +3842,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     if (decode_armed) {
         // Pre-reserve pending capacity before any mutation so allocation never follows
         // apply; geometric growth keeps the ramp O(k), not O(k^2). The
-        // awaiting list must absorb EVERY accumulated pending record without allocating —
+        // awaiting list must absorb EVERY accumulated pending record without allocating â€”
         // terminal transfer runs inside the decode transaction's noexcept destructor.
         if (vbr_pending_decode_ops_.capacity() == vbr_pending_decode_ops_.size()) {
             vbr_pending_decode_ops_.reserve(
@@ -3945,7 +3945,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             if (generation_event != nullptr) {
                 // The stamp proves a covering target for every member of the
                 // token's sequence set at its pre-mutation position; a refusal poisons the
-                // event, latches the shadow, and fails the operation (via vbr_stamp) — the
+                // event, latches the shadow, and fails the operation (via vbr_stamp) â€” the
                 // decode proceeds untracked.
                 vbr_stamp(mutation_op, *generation_event, idx,
                           ubatch.seq_id[i], ubatch.n_seq_id[i],
@@ -3990,7 +3990,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
         head = sinfo.idxs[s].back() + 1;
     }
 
-    // VBR VMM: the graph compute that follows reads/writes cells up to the padded watermark —
+    // VBR VMM: the graph compute that follows reads/writes cells up to the padded watermark â€”
     // grow the physical backing first (no-op unless the watermark advanced past a page)
     if (commit && vbr_vmm_active()) {
         vbr_vmm_ensure_mapped();
@@ -4041,7 +4041,7 @@ void llama_kv_cache::vbr_commit_submitted() {
     }
     // The sync fence delivers the terminal result to each pending owner. Commit
     // success closes the operation committed and releases recovery; a failed commit (slab
-    // reset / obsolete handle) is counted, latches availability, and closes failed — never a
+    // reset / obsolete handle) is counted, latches availability, and closes failed â€” never a
     // silent vanish. Every per-target handle commits; one failure fails the
     // owner and every remaining handle.
     auto * tracker = vbr_generation_tracker_mut();
@@ -4057,7 +4057,7 @@ void llama_kv_cache::vbr_commit_submitted() {
             }
             if (!committed) {
                 // The op terminal-fails: EVERY handle fails, including any committed before
-                // the failing one — failed operations leave no admissible evidence.
+                // the failing one â€” failed operations leave no admissible evidence.
                 vbr_fail_extent_set(tracker, pending.extents);
             }
         }
@@ -4078,7 +4078,7 @@ void llama_kv_cache::vbr_commit_submitted() {
 
 // padded cell watermark: the extent get_n_kv derives read views from (256 = the fattn padding
 // floor), optionally projected forward by an incoming batch's tokens. prepare()'s predictive
-// budget check and ensure_mapped's backing MUST agree on this formula — keep it in one place.
+// budget check and ensure_mapped's backing MUST agree on this formula â€” keep it in one place.
 uint32_t llama_kv_cache::vbr_watermark_cells(uint32_t extra_tokens) const {
     const uint32_t n_pad_cur = std::max(n_pad, get_pad_floor());
     uint32_t wm = 0;
@@ -4256,7 +4256,7 @@ const llama_kv_cache::vbr_pool * llama_kv_cache::vbr_pool_of(const ggml_tensor *
 
 const std::vector<std::pair<llama_kv_cache::vbr_pool *, llama_kv_cache::vbr_extent *>> &
 llama_kv_cache::vbr_units_of(size_t ikv, bool is_v) const {
-    // non-VBR caches never build the table (no pools) — every unit is unpooled
+    // non-VBR caches never build the table (no pools) â€” every unit is unpooled
     static const std::vector<std::pair<vbr_pool *, vbr_extent *>> none;
     return vbr_units_tab_.empty() ? none : vbr_units_tab_[ikv * 2 + (is_v ? 1 : 0)];
 }
@@ -4268,19 +4268,19 @@ bool llama_kv_cache::vbr_unit_pooled(size_t ikv, bool is_v) const {
 // The configured budget bounds the POOL, but the card bounds reality: weights + compute
 // buffers leave whatever they leave, and the floor-cost fallback budget never consulted free
 // VRAM at all. Clamp each pool's target by what its device can actually map right now
-// (mapped + free − headroom) so tiers demote EARLY at the decode boundary instead of
-// ensure_mapped hitting the hard wall mid-batch (seen: first f16→t8 wave on a 24GB card).
+// (mapped + free âˆ’ headroom) so tiers demote EARLY at the decode boundary instead of
+// ensure_mapped hitting the hard wall mid-batch (seen: first f16â†’t8 wave on a 24GB card).
 // Auto budgets already preserve vbr_growth_headroom_ when periodically re-derived. Explicit
-// budgets never re-derive—the typed value is a hard cap—so their live clamp must preserve that
+// budgets never re-deriveâ€”the typed value is a hard capâ€”so their live clamp must preserve that
 // same fit headroom instead of only the smaller co-tenancy reserve. This tightens the effective
 // per-device decision limit without changing or growing the user's configured cap.
 // Shared by the degrade trigger AND the promote hysteresis: gating the two on different
 // references (raw budget vs clamped) made every boundary under a co-tenant clamp promote
-// then re-degrade — two transcodes plus one extra quantization hop on aged rows per flap.
+// then re-degrade â€” two transcodes plus one extra quantization hop on aged rows per flap.
 size_t llama_kv_cache::vbr_budget_eff(const vbr_pool & p) const {
     // memoized per boundary: the degrade loop re-evaluates over_budget per step and the promote
     // hysteresis visits every pool, so an uncached get_device_memory here is a driver round-trip
-    // multiplied by wave length x pools — and free VRAM cannot meaningfully move within one
+    // multiplied by wave length x pools â€” and free VRAM cannot meaningfully move within one
     // boundary (tail unmaps are deferred to the next one)
     if (p.budget_eff_stamp == vbr_boundary_count_) {
         return p.budget_eff_cache;
@@ -4295,7 +4295,7 @@ size_t llama_kv_cache::vbr_budget_eff_uncached(const vbr_pool & p) const {
     size_t budget_eff = p.budget;
     const size_t mapped_now = p.be->vmm_pool_mapped(p.vmm); // deterministic (pool mapped bytes)
     // Freeze mode skips every live-VRAM/co-tenancy input, including the free-VRAM clamp
-    // (cudaMemGetInfo), the N_live>1 fair-share relax, and the grant-decrement subtraction — so
+    // (cudaMemGetInfo), the N_live>1 fair-share relax, and the grant-decrement subtraction â€” so
     // budget_eff stays the fixed armed budget (still floored at mapped_now below). This clamp is the
     // ONLY live-VRAM path that fires under an explicit budget, so neutralizing it makes both the pp
     // one-shot fit and the tg degrade trajectory a pure function of the fixed budget + occupancy.
@@ -4307,12 +4307,12 @@ size_t llama_kv_cache::vbr_budget_eff_uncached(const vbr_pool & p) const {
         // Fairness: reserve ordinary ledger headroom for every live peer. An explicit
         // budget's own process instead reserves the (usually larger) fit growth target because it
         // has no auto re-derivation path. At N_live > 1 the budget base also relaxes to a fair
-        // share of its own spare — mapped-anchored and 64 MiB-quantized.
+        // share of its own spare â€” mapped-anchored and 64 MiB-quantized.
         const uint32_t n_live = vbr_pool_n_live(p);
         // Explicit budgets reserve the fit growth target, but never more than the pool could
         // still MAP (budget - mapped): the fit margin prices consumers that have already
         // materialized by decode time (the spec drafter's model+context+compute raise
-        // fit_params_target before the fit, then allocate at load) — free VRAM already
+        // fit_params_target before the fit, then allocate at load) â€” free VRAM already
         // reflects them, so re-reserving their full size double-counts and strangles a
         // comfortably-fitting pool to the --vbr-floor. Measured 2026-08-10 (27B + DFlash
         // drafter at inherited -cd, --vbr-vram-budget 1024M): margin 3309 MiB vs 1937 MiB
@@ -4334,9 +4334,9 @@ size_t llama_kv_cache::vbr_budget_eff_uncached(const vbr_pool & p) const {
             budget_eff = cap;
         }
         // co-tenancy (mapped-anchored invariant): subtract this pool's unamortized grant
-        // decrements, then floor at mapped — the floor binds precisely in the shed->flush
+        // decrements, then floor at mapped â€” the floor binds precisely in the shed->flush
         // window so no consumer (including our own degrade loop) ever sees a budget below
-        // what is physically mapped. budget_eff = max(mapped, min(budget, live_cap) - Σdecr).
+        // what is physically mapped. budget_eff = max(mapped, min(budget, live_cap) - Î£decr).
         budget_eff = budget_eff > p.grant_decrement ? budget_eff - p.grant_decrement : 0;
     }
     if (budget_eff < mapped_now) {
@@ -4349,10 +4349,10 @@ size_t llama_kv_cache::vbr_budget_eff_uncached(const vbr_pool & p) const {
 }
 
 // Auto-budget runtime re-derivation: the startup number is a snapshot (fit-armed on whatever
-// the box looked like at load, or the bare floor-cost fallback when no fit ran) — a co-tenant
+// the box looked like at load, or the bare floor-cost fallback when no fit ran) â€” a co-tenant
 // present at startup or a missing arm otherwise pinned quality low FOREVER on a box with
 // gigabytes free. Once per boundary, re-derive each pool's budget from what its device can
-// actually give it: share x (mapped + free − growth_headroom), quantized to 64 MiB so driver
+// actually give it: share x (mapped + free âˆ’ growth_headroom), quantized to 64 MiB so driver
 // jitter cannot move a tier decision between identical runs, RE-DERIVED not max-ratcheted (a
 // sawtooth co-tenant's trough must not be captured as permanent), floored at the pool's
 // floor-layout cost for auto budgets (or the init-armed value for explicit budgets), and never
@@ -4502,8 +4502,8 @@ bool llama_kv_cache::vbr_over_budget(uint32_t wm_cells) const {
 // context-linear consumer for unified KV and n_kv*stream_span for non-unified KV. The budget
 // does not own it, and it can JUMP from zero to watermark width in a
 // single graph when a degrade wave first takes a side off f16 (a 217 MiB grow
-// with only the 192 MiB live headroom left at wave time). Growing it HERE — sized for the sides
-// that are dequant-active AFTER this boundary's wave — keeps every grow in an eager pass where
+// with only the 192 MiB live headroom left at wave time). Growing it HERE â€” sized for the sides
+// that are dequant-active AFTER this boundary's wave â€” keeps every grow in an eager pass where
 // exhaustion fails the batch recoverably. Sides that never leave f16 never reserve a byte, so
 // symmetric-vbr sessions under no memory pressure are byte-identical to before. Covers static
 // turbo pools too (bookkeeping-only pools resolve their vtable at init).
@@ -4513,7 +4513,7 @@ bool llama_kv_cache::vbr_scratch_reserve(size_t flat_cells) {
             continue;
         }
         GGML_ASSERT(p.compute_backend != nullptr);
-        // active-side row maxima change only on a tier flip — memoize on the tier epoch so the
+        // active-side row maxima change only on a tier flip â€” memoize on the tier epoch so the
         // per-boundary cost is two multiplies (static caches compute this exactly once)
         if (p.scratch_rows_epoch != vbr_tier_epoch_) {
             p.scratch_k_row = 0;
@@ -4543,8 +4543,8 @@ bool llama_kv_cache::vbr_scratch_reserve(size_t flat_cells) {
             // First-activation transient: the wave that just took this side off f16 queued its
             // freed tier-A tail pages as deferred unmaps (released at the NEXT boundary), so the
             // bytes the wave freed are physically unavailable to the very reserve it triggered.
-            // Reclaim them now and retry once — mirrors vbr_vmm_try_map below.
-            LLAMA_LOG_WARN("%s: f16 dequant scratch reserve of %.1f + %.1f MiB failed on device %d — "
+            // Reclaim them now and retry once â€” mirrors vbr_vmm_try_map below.
+            LLAMA_LOG_WARN("%s: f16 dequant scratch reserve of %.1f + %.1f MiB failed on device %d â€” "
                     "flushing deferred unmaps and retrying\n",
                     __func__, k_bytes/1048576.0, v_bytes/1048576.0, p.device);
             vbr_flush_deferred_unmaps();
@@ -4590,7 +4590,7 @@ bool llama_kv_cache::vbr_scratch_reserve(size_t flat_cells) {
             // flush used by the owner's own reserve path. Retry once before failing this draft
             // boundary recoverably.
             LLAMA_LOG_WARN("%s: shared-KV f16 dequant scratch reserve of %.1f + %.1f MiB failed "
-                    "on device %d — flushing owner deferred unmaps and retrying\n",
+                    "on device %d â€” flushing owner deferred unmaps and retrying\n",
                     __func__, k_bytes/1048576.0, v_bytes/1048576.0, b.device);
             other->vbr_flush_deferred_unmaps();
             if (!b.be->kv_dequant_scratch_reserve(b.compute_backend, k_bytes, v_bytes)) {
@@ -4603,7 +4603,7 @@ bool llama_kv_cache::vbr_scratch_reserve(size_t flat_cells) {
 
 // grow every pool's physical backing to `wm` cells. Returns false on physical exhaustion
 // (after reclaiming the previous wave's deferred tail unmaps and retrying once) WITHOUT
-// aborting — the caller decides whether its position in the batch lifecycle is recoverable.
+// aborting â€” the caller decides whether its position in the batch lifecycle is recoverable.
 // On failure pool.wm_cells stays at its old value; already-mapped delta pages are harmless
 // (maps are idempotent, a later retry re-walks them for free).
 bool llama_kv_cache::vbr_vmm_try_map(uint32_t wm) {
@@ -4627,9 +4627,9 @@ bool llama_kv_cache::vbr_vmm_try_map(uint32_t wm) {
                     // Physical exhaustion here is usually the FIRST big degrade wave's transient:
                     // the wave's old-tier tail pages are still mapped (their unmap is deferred to
                     // the next decode boundary) while this growth maps the new watermark. Reclaim
-                    // them now and retry once before giving up — the flush synchronizes the side
+                    // them now and retry once before giving up â€” the flush synchronizes the side
                     // stream, so nothing can still read those pages.
-                    LLAMA_LOG_WARN("%s: physical map of %zu bytes failed at offset %zu (watermark %u) — "
+                    LLAMA_LOG_WARN("%s: physical map of %zu bytes failed at offset %zu (watermark %u) â€” "
                             "flushing deferred unmaps and retrying\n",
                             __func__, need - start, e.byte_off + start, wm);
                     vbr_flush_deferred_unmaps();
@@ -4649,7 +4649,7 @@ void llama_kv_cache::vbr_vmm_ensure_mapped() {
     // The degrade trigger deliberately does not live here: apply_ubatch runs mid-batch
     // where positioned cells outrun the graph writes (see prepare()). prepare() already mapped to
     // its predicted watermark recoverably, so this fires only when placement outran the
-    // prediction (freed low cells + a head above used_max_p1) — with graphs already built,
+    // prediction (freed low cells + a head above used_max_p1) â€” with graphs already built,
     // aborting is all that is left. Kept as the backstop, expected unreachable.
     const uint32_t wm = vbr_watermark_cells(0);
     if (!vbr_vmm_try_map(wm)) {
@@ -4697,7 +4697,7 @@ size_t llama_kv_cache::vbr_vmm_projected_bytes(const vbr_pool & p, uint32_t wm_c
 // grant math and mapped-floor argument assume freed physical lands before any budget
 // evaluation), then stash-clear, budget rederive (throttled to every 8th tick, mirroring
 // the boundary throttle), full-reset-if-empty, watermark shrink, ledger scan + demand
-// service, promote step, fence-arm (MANDATORY — the next decode graph races the wave
+// service, promote step, fence-arm (MANDATORY â€” the next decode graph races the wave
 // otherwise), boundary count++ (budget memo + promote pacing depend on it).
 void llama_kv_cache::breathe() {
     vbr_runtime_was_over_ = false;
@@ -4746,7 +4746,7 @@ void llama_kv_cache::breathe() {
         vbr_runtime_demand_update(wm_next, /*was_over=*/false); // tick: CLEAR path only
     }
     // no spontaneous degrade pressure at idle: budget_eff floors at mapped and nothing
-    // grows here, so the general over-budget loop cannot fire — only demand decrements
+    // grows here, so the general over-budget loop cannot fire â€” only demand decrements
     // (band-capped, in the scan) shed. Promotes get their idle chance under the same
     // gates as the boundary path.
     vbr_quiet_boundaries_++;
@@ -4757,7 +4757,7 @@ void llama_kv_cache::breathe() {
 }
 
 // Unmap tail pages queued by the previous degrade wave. Safe only after the wave's transcodes
-// finished (they READ the old tier-A extent, which reaches into these pages) — one side-stream
+// finished (they READ the old tier-A extent, which reaches into these pages) â€” one side-stream
 // sync per pool makes that certain; by the next decode boundary the wave is long done, so this is
 // ~free.
 bool llama_kv_cache::vbr_retire_pending_before_unmap(const std::string & busid) {
@@ -4862,11 +4862,11 @@ void llama_kv_cache::vbr_invalidate_dirty_stash() {
 
 // Generic degrade-rank curves for models WITHOUT a baked order (matrix v3, 2026-07-05).
 // Derived by averaging the five measured models' cheap-first price orders (q27, qwen35moe,
-// g12, g26, g31 — dense, MoE-hybrid and SWA-mixed layouts) in NORMALIZED KV-layer position.
+// g12, g26, g31 â€” dense, MoE-hybrid and SWA-mixed layouts) in NORMALIZED KV-layer position.
 // What generalized: the first full-domain band is near-universal (deep-first, front protected, K~V;
 // cross-model rank deviation 0.036); below t8 the robust invariants are final-layer V
 // maximally protected in EVERY band, front V cheapest at the bottom rungs, K positionally
-// flat. Sub-t8 mid-band shapes disagree across models (deviation ~0.2) — the mean is a
+// flat. Sub-t8 mid-band shapes disagree across models (deviation ~0.2) â€” the mean is a
 // hedge, not a truth; a measured per-model order is always better.
 // Classic deliberately reuses only the first two positional bands for F16->Q8_0->Q4_0; it never
 // interprets a baked Turbo price table as classic pricing.
@@ -4896,7 +4896,7 @@ static const float vbr_generic_rank[5][2][17] = {
 
 void llama_kv_cache::vbr_load_degrade_order() {
     vbr_degrade_order_.clear();
-    // VBR_FORCE_GENERIC=1: skip the file/registry paths — A/B instrument for the generic
+    // VBR_FORCE_GENERIC=1: skip the file/registry paths â€” A/B instrument for the generic
     // curves, and exactly the path an unsupported arch takes.
     if (getenv("VBR_FORCE_GENERIC") != nullptr) {
         vbr_synth_generic_order();
@@ -4944,7 +4944,7 @@ void llama_kv_cache::vbr_load_degrade_order() {
             }
             if (n_unmatched > 0) {
                 // valid layer ids that hold no KV in THIS cache (e.g. recurrent layers of a
-                // hybrid model, or the wrong cache of an iSWA pair) — they no-op at runtime,
+                // hybrid model, or the wrong cache of an iSWA pair) â€” they no-op at runtime,
                 // which silently hides typos
                 LLAMA_LOG_WARN("%s: VBR degrade order: %zu of %zu steps reference layers with no KV "
                         "in this cache (they will be skipped)\n",
@@ -4953,7 +4953,7 @@ void llama_kv_cache::vbr_load_degrade_order() {
             LLAMA_LOG_INFO("%s: VBR degrade order: %zu steps from %s\n", __func__, vbr_degrade_order_.size(), path);
             return;
         }
-        LLAMA_LOG_WARN("%s: VBR_DEGRADE_ORDER %s unreadable or malformed (near '%s') — using baked order\n",
+        LLAMA_LOG_WARN("%s: VBR_DEGRADE_ORDER %s unreadable or malformed (near '%s') â€” using baked order\n",
                 __func__, path, tok.c_str());
         vbr_degrade_order_.clear();
     }
@@ -4967,7 +4967,7 @@ void llama_kv_cache::vbr_load_degrade_order() {
     // Arch-keyed baked orders (matrix v3, 2026-07-05): per-model price orders measured under the
     // deployment-true tap config with reliability-gated statistics (bench-validated lens per
     // model; fp16->t8 band from the frac lens). Keyed on (arch, n_layer) so the gemma4 family
-    // resolves per MODEL — their price structures are opposite (front-hot vs deep-hot).
+    // resolves per MODEL â€” their price structures are opposite (front-hot vs deep-hot).
     for (const auto & e : vbr_baked_orders) {
         if (e.arch == model.arch && e.n_layer == hparams.n_layer_all) {
             vbr_degrade_order_.assign(e.steps, e.steps + e.n);
@@ -4977,7 +4977,7 @@ void llama_kv_cache::vbr_load_degrade_order() {
         }
     }
     // Models ship with and without MTP/nextn predict layers, which append to n_layer while
-    // leaving the KV-bearing backbone identical — so fall back to matching on (arch + the
+    // leaving the KV-bearing backbone identical â€” so fall back to matching on (arch + the
     // EXACT KV-layer-id set). Set equality (not subset) so different-sized same-arch models
     // can never cross-match, and a cache holding layers the table does not cover falls
     // through to the generic order instead of silently never degrading them.
@@ -5002,19 +5002,19 @@ void llama_kv_cache::vbr_load_degrade_order() {
         if (same) {
             vbr_degrade_order_.assign(e.steps, e.steps + e.n);
             LLAMA_LOG_INFO("%s: VBR degrade order: %zu baked steps (arch + KV-layout matched; "
-                    "n_layer %u vs table %u — MTP/nextn-style variant)\n",
+                    "n_layer %u vs table %u â€” MTP/nextn-style variant)\n",
                     __func__, vbr_degrade_order_.size(), hparams.n_layer_all, e.n_layer);
             return;
         }
     }
-    LLAMA_LOG_WARN("%s: no measured VBR degrade order for this arch/n_layer — "
+    LLAMA_LOG_WARN("%s: no measured VBR degrade order for this arch/n_layer â€” "
             "using the generic cross-model order (a measured per-model order is better; "
             "set VBR_DEGRADE_ORDER=<file> to supply one)\n", __func__);
     vbr_synth_generic_order();
 }
 
 // Synthesize a degrade order from the generic curves: strictly banded (the whole cache
-// reaches tier N before any unit drops below it — the safe monotone default when real
+// reaches tier N before any unit drops below it â€” the safe monotone default when real
 // per-model prices are unknown), and within each band cells sorted cheap-first by the
 // curve rank at the layer's normalized position among this model's KV-BEARING layers
 // (MoE/hybrid layouts: only layers that hold KV count, matching how the curves were fit).
@@ -5077,14 +5077,14 @@ static double vbr_resolve_floor_bpv(llama_vbr_codec codec, double min_bits) {
 
 // Shared floor-walk core (runtime clamp AND fit capacity math): simulate the degrade order over
 // the per-unit tiers of the entry layout, stopping before the aggregate would cross floor_bpv.
-// PINNED units (non-tier types or a flag-pinned side) stay in the aggregate at their fixed bpv —
-// the floor is a literal aggregate — but no step may move them (mirrors vbr_degrade_next).
+// PINNED units (non-tier types or a flag-pinned side) stay in the aggregate at their fixed bpv â€”
+// the floor is a literal aggregate â€” but no step may move them (mirrors vbr_degrade_next).
 // pooled_only restricts units to VMM-pooled ones (the runtime); dry-load contexts have no pools
 // and pass false. entry_k/entry_v override each side's tensor type (the fit's cparams types are
-// price-swapped during fitting; it passes the true entry types) — GGML_TYPE_COUNT = tensor type.
-// Shared degrade-ladder simulation core. Every consumer of the price order — the floor
+// price-swapped during fitting; it passes the true entry types) â€” GGML_TYPE_COUNT = tensor type.
+// Shared degrade-ladder simulation core. Every consumer of the price order â€” the floor
 // clamp/capacity sim, the pressure telemetry's bpv-if-degraded walk, and the co-tenancy
-// offer — walks the same rules or the ADVERTS LIE: seed a per-(layer, side) type view,
+// offer â€” walks the same rules or the ADVERTS LIE: seed a per-(layer, side) type view,
 // then per step apply exactly vbr_degrade_next's skip rules. Callers own their loop
 // bounds, stop conditions and accounting; the rules live here once.
 void llama_kv_cache::vbr_sim_seed(std::vector<ggml_type> & sim, bool pooled_only,
@@ -5095,7 +5095,7 @@ void llama_kv_cache::vbr_sim_seed(std::vector<ggml_type> & sim, bool pooled_only
         for (int side = 0; side < 2; ++side) {
             const ggml_tensor * t = side ? layers[ikv].v : layers[ikv].k;
             if (t == nullptr || (pooled_only && !vbr_unit_pooled(ikv, side != 0))) {
-                continue; // absent, or (runtime) not VMM-pooled — only pooled units can degrade
+                continue; // absent, or (runtime) not VMM-pooled â€” only pooled units can degrade
             }
             // Dry fit supplies the requested device entry types explicitly,
             // but CPU-bound dynamic units are construction-pinned at Q8_0.
@@ -5325,7 +5325,7 @@ llama_kv_cache::vbr_floor_sim_result llama_kv_cache::vbr_floor_sim(
     return res;
 }
 
-// per-token KV bits of the layout the floor clamp lands on — the fit pass calls this on its
+// per-token KV bits of the layout the floor clamp lands on â€” the fit pass calls this on its
 // dry-load context (llama_vbr_floor_bits_per_token) for floor-true capacity math
 double llama_kv_cache::memory_vbr_floor_bits_per_token(ggml_type entry_k, ggml_type entry_v, double floor_bpv) {
     if (vbr_degrade_order_.empty()) {
@@ -5345,12 +5345,12 @@ double llama_kv_cache::memory_vbr_entry_bits_per_token(ggml_type entry_k, ggml_t
 
 // Per-token bytes of flash-attention f16 dequant scratch at the settled deep-fill state,
 // summed over KV-hosting devices. The scratch is one f16-width buffer per (device, side),
-// shared across layers — its per-token cost is the widest layer's f16 row, NOT a per-layer
+// shared across layers â€” its per-token cost is the widest layer's f16 row, NOT a per-layer
 // sum. A side contributes when its settled state needs dequant: static/pinned turbo entry
 // types always; movable (unpinned f16) sides in dynamic mode whenever the floor is below f16
 // (they leave f16 under pressure at exactly the depths where this cost matters); q8_0/bf16
 // pinned sides only next to an active partner. The fit charges this in the total-VRAM wall
-// constraint (vbr_growth_reachable_ctx_cap) ONLY — the auto/explicit KV budget solves must
+// constraint (vbr_growth_reachable_ctx_cap) ONLY â€” the auto/explicit KV budget solves must
 // not carry it (the scratch draws from the fit margin / free VRAM, not from the KV budget).
 double llama_kv_cache::memory_vbr_scratch_bytes_per_token(ggml_type entry_k, ggml_type entry_v, double floor_bpv) {
     if (layers.empty()) {
@@ -5359,7 +5359,7 @@ double llama_kv_cache::memory_vbr_scratch_bytes_per_token(ggml_type entry_k, ggm
     // Project each side to its SETTLED (deep-fill) type, then ask the one authoritative
     // materialize predicate (ggml-vbr.h): the only genuine difference between "settled active"
     // and "currently active" is that an unpinned dynamic f16 side will leave f16 under pressure
-    // — represent it by the selected codec's first degraded rung and let the predicate own the
+    // â€” represent it by the selected codec's first degraded rung and let the predicate own the
     // pairing rules.
     const double floor_eff = vbr_resolve_floor_bpv(vbr_params_.codec, floor_bpv);
     auto settled_type = [&](ggml_type t0, bool pinned) -> ggml_type {
@@ -5379,7 +5379,7 @@ double llama_kv_cache::memory_vbr_scratch_bytes_per_token(ggml_type entry_k, ggm
     if (!ak && !av) {
         return 0.0;
     }
-    // Widest f16 row per active side over the canonical layer tensors — a SINGLE-DEVICE basis:
+    // Widest f16 row per active side over the canonical layer tensors â€” a SINGLE-DEVICE basis:
     // the only caller is the fit's no_alloc dry-load context, where pools are never built and
     // the dry load is single-device. (A live multi-device caller would need per-pool scratch
     // sums; deliberately not built for a dead path.)
@@ -5398,7 +5398,7 @@ double llama_kv_cache::memory_vbr_scratch_bytes_per_token(ggml_type entry_k, ggm
 
 // --vbr-floor (cparams min_bits; env VBR_MIN_BITS override, decimal bits/value): a LITERAL
 // aggregate floor. Walk the order against the initial layout and clamp the cursor at the first
-// step that would take the aggregate below the floor — e.g. floor 4.25 with t4 = 4.125 bpv stops
+// step that would take the aggregate below the floor â€” e.g. floor 4.25 with t4 = 4.125 bpv stops
 // with a few units still a tier higher. Strict-prefix clamp: the aggregate is monotone decreasing
 // along the order, and skipping ahead to a cheaper later step would violate the measured price
 // order. The default codec floor equals the full order's endpoint, so nothing clamps.
@@ -5412,7 +5412,7 @@ void llama_kv_cache::vbr_floor_clamp_order() {
     }
     vbr_degrade_limit_ = res.clamp_step;
     if (res.n_pinned > 0) {
-        LLAMA_LOG_INFO("%s: VBR: %zu (layer,side) units are PINNED at non-vbr types — degrade steps "
+        LLAMA_LOG_INFO("%s: VBR: %zu (layer,side) units are PINNED at non-vbr types â€” degrade steps "
                 "touching them are skipped; they stay in the aggregate at their fixed bits/value\n",
                 __func__, res.n_pinned);
     }
@@ -5422,7 +5422,7 @@ void llama_kv_cache::vbr_floor_clamp_order() {
                 __func__, floor_bpv, res.clamp_step, vbr_degrade_order_.size(), res.next_bpv);
     }
 
-    // page-exact mapped-physical cost of the FLOOR layout (the sim's end state) at full kv_size —
+    // page-exact mapped-physical cost of the FLOOR layout (the sim's end state) at full kv_size â€”
     // the minimum budget that guarantees the advertised context fits. Used as the fallback budget
     // when dynamic mode reaches us without a fit-resolved one. Summed across pools (page rounding
     // uses each tensor's OWNING pool granularity).
@@ -5451,7 +5451,7 @@ void llama_kv_cache::vbr_floor_clamp_order() {
     }
 }
 
-// flip a cache tensor (and its per-stream views) to a new tier — host metadata consumed at graph
+// flip a cache tensor (and its per-stream views) to a new tier â€” host metadata consumed at graph
 // build time; callers order the GPU against the matching transcode via the wave fence
 static void vbr_set_tensor_type_impl(ggml_tensor * t, const std::vector<ggml_tensor *> & views, ggml_type type) {
     t->type  = type;
@@ -5473,7 +5473,7 @@ static void vbr_set_tensor_type_impl(ggml_tensor * t, const std::vector<ggml_ten
 static void vbr_set_tensor_type(ggml_tensor * t, std::vector<ggml_tensor *> & views, ggml_type type) {
     vbr_set_tensor_type_impl(t, views, type);
     // -sm tensor: graphs are built from this (meta) tensor, but the per-pool byte math and the
-    // transcode kernels operate on the per-device SHARDS — flip them in lockstep. Shard strides
+    // transcode kernels operate on the per-device SHARDS â€” flip them in lockstep. Shard strides
     // derive from the shard's own ne0 (its slice of the head*dim axis), not the meta tensor's.
     if (t->buffer != nullptr && ggml_backend_buffer_is_meta(t->buffer)) {
         const size_t n = ggml_backend_meta_buffer_n_bufs(t->buffer);
@@ -6669,7 +6669,7 @@ bool llama_kv_cache::vbr_generation_capture_live_guarded(
     }
 
     // Gap fix (review): capture enumerates owned cells from the ownership-index masks in page
-    // order — never a legacy cell scan. The scan remains only as the env-gated oracle check.
+    // order â€” never a legacy cell scan. The scan remains only as the env-gated oracle check.
     const auto & cells = v_cells[stream];
     if (vbr_ownership_ == nullptr) {
         return fail(
@@ -6890,7 +6890,7 @@ bool llama_kv_cache::vbr_capture_settle() noexcept {
         // The sole intentional pre-quiescence source-side mutation: discard
         // already-dirty stash metadata. This idempotent housekeeping changes
         // no KV bytes, ownership, generation, or cursor and therefore needs
-        // no §9 rollback if the later capture fails.
+        // no Â§9 rollback if the later capture fails.
         vbr_invalidate_dirty_stash();
         for (const auto & pool : vbr_pools_) {
             if (pool.wave_pending || !pool.unmap_deferred.empty()) {
@@ -7817,7 +7817,7 @@ bool llama_kv_cache::vbr_decode_targets_from_ubatch(vbr_operation_binding & bind
             // Unified-SWA slot selection may reuse a masked cell of a different
             // sequence whose position is unbounded by this batch (find_slot checks only the
             // old owner's own SWA mask), so the destructive claim is the incoming sequence's
-            // whole range — the SELECTED target still binds the exact seq's damage extent.
+            // whole range â€” the SELECTED target still binds the exact seq's damage extent.
             binding.targets[binding.n_targets++] = vbr_make_target(
                     vbr_operation_kind::decode, vbr_operation_class::swa_wrap,
                     instance, stream, seqs[j], 0,
@@ -7826,9 +7826,9 @@ bool llama_kv_cache::vbr_decode_targets_from_ubatch(vbr_operation_binding & bind
     }
     if (wrap_possible) {
         // Wrap overwrites force a prefix purge of the OVERWRITTEN cells' owners
-        // (apply_ubatch's nested seq_rm, the §7.3 composite purge). Those owners are chosen
-        // by slot selection INSIDE apply — unknowable at manifest build (the composite mints
-        // before its children run) — so the purge is DECLARED as one seq-wildcard whole-range
+        // (apply_ubatch's nested seq_rm, the Â§7.3 composite purge). Those owners are chosen
+        // by slot selection INSIDE apply â€” unknowable at manifest build (the composite mints
+        // before its children run) â€” so the purge is DECLARED as one seq-wildcard whole-range
         // target: still instance-exact, operation-bound, and confined to the generic seq_rm
         // trim class; wildcards match only where the manifest declared them.
         binding.targets[binding.n_targets++] = vbr_make_target(
@@ -7895,7 +7895,7 @@ llama_kv_cache::vbr_mutation_op::vbr_mutation_op(llama_kv_cache *              c
     if (cache_->vbr_current_mutation_ != nullptr) {
         // Any outer scope determines nested identity. An active outer is joined;
         // a refused/poisoned/inactive outer makes this nested scope inert under the same
-        // ABSENT identity — it never falls through to mint (operation registry one-id, including refusal).
+        // ABSENT identity â€” it never falls through to mint (operation registry one-id, including refusal).
         joined_       = true;
         operation_id_ = cache_->vbr_current_mutation_->operation_id_;  // empty when inactive
         extent_owner_ = cache_->vbr_current_mutation_->extent_owner_;
@@ -7928,7 +7928,7 @@ llama_kv_cache::vbr_mutation_op::vbr_mutation_op(llama_kv_cache *              c
     }
 
     if (provenance_bearing && !joined_ && operation_id_) {
-        // v3.1 amendment 1: recovery reservation is EAGER — before any mutation (Rev 4 rule
+        // v3.1 amendment 1: recovery reservation is EAGER â€” before any mutation (Rev 4 rule
         // uncompromised). The provenance EXTENTS are lazy: reserved per SELECTED target by
         // ensure_extent_for() at the first destructive stamp, so a wrap-free SWA decode pays
         // no extent traffic.
@@ -7954,7 +7954,7 @@ llama_kv_cache::vbr_mutation_op::~vbr_mutation_op() {
     }
     if (adopted_) {
         // An adopted participant that never transferred its token is terminal
-        // here — setup refusal, poison, and exceptions before detach all report FAILED
+        // here â€” setup refusal, poison, and exceptions before detach all report FAILED
         // exactly once. Its evidence fails; the shared root's failed close autorecords this
         // child's recovery reservation for the quarantine drain.
         if (composite_ != nullptr && !detached_) {
@@ -8025,7 +8025,7 @@ void llama_kv_cache::vbr_mutation_op::fail_extents() {
 // evidence this scope reserved, invalidate the shadow BEFORE the legacy mutation proceeds,
 // and leave the scope inert-but-open (its close stays clean). The recovery reservation is
 // deliberately kept: the operation closes failed, that close autorecords the slot,
-// and the boundary quarantine drain performs the sanctioned invalidation — the slot must
+// and the boundary quarantine drain performs the sanctioned invalidation â€” the slot must
 // survive to that drain.
 void llama_kv_cache::vbr_mutation_op::abort_to_shadow_unavailable() {
     auto * tracker = cache_ != nullptr ? cache_->vbr_generation_tracker_mut() : nullptr;
@@ -8068,7 +8068,7 @@ std::optional<llama_kv_cache::vbr_pending_decode_op> llama_kv_cache::vbr_mutatio
         pending.owns_close   = true;
     } else {
         // Detach transfers the still-open participant token to the pending owner
-        // — never a terminal report; the sealed aggregate closes the root when every
+        // â€” never a terminal report; the sealed aggregate closes the root when every
         // declared slot has terminated.
         pending.operation_id = operation_id_;
         pending.owns_close   = false;
@@ -8131,7 +8131,7 @@ void llama_kv_cache::vbr_composite_outcome::seal(bool wrapper_ok) {
     failed = failed || !wrapper_ok;
     // Declared participants that never claimed their slot (an exception before a child's
     // scope opened, or an armed child that never applied) are terminal failures by
-    // construction — every declared slot reports exactly once.
+    // construction â€” every declared slot reports exactly once.
     if (claimed < declared) {
         failed    = true;
         terminal += declared - claimed;
@@ -8160,7 +8160,7 @@ void llama_kv_cache::vbr_decode_ops_finish(bool ok) {
         return;
     }
     // ok=false conservatively fails only this decode's
-    // operations — awaiting records are PRIOR submitted decodes whose graphs already ran;
+    // operations â€” awaiting records are PRIOR submitted decodes whose graphs already ran;
     // only the scheduler fence may decide them. ok=true moves every per-target extent
     // prepared -> submitted; operations + recovery reservations stay OPEN until the
     // synchronize fence delivers the terminal result (Rev 5.1). A submit failure (obsolete
@@ -8204,9 +8204,9 @@ vbr_generation_event llama_kv_cache::vbr_generation_begin(
         return {};
     }
     // Events cite the innermost open mutation scope. A mutation
-    // reaching here without a scope is a wiring bug — refuse the event loudly rather than mint
+    // reaching here without a scope is a wiring bug â€” refuse the event loudly rather than mint
     // an uncited one. A scope that opened shadow-unavailable (registry refusal) yields inert
-    // events, matching the legacy-proceeds contract — and once a poison latched the shadow
+    // events, matching the legacy-proceeds contract â€” and once a poison latched the shadow
     // mid-decode, later events in the same decode are inert the same way.
     GGML_ASSERT(vbr_current_mutation_ != nullptr && "mutation without an operation scope");
     if (!vbr_current_mutation_->active() || tracker->shadow_unavailable()) {
@@ -8215,7 +8215,7 @@ vbr_generation_event llama_kv_cache::vbr_generation_begin(
     // The per-target extent supplier attaches only to provenance-relevant
     // (destructive/imported) events: apply_ubatch mints an append event and a destructive
     // reuse event under ONE scope, and only the latter's stamps reserve/cite the selected
-    // target's extent (§5.5 row 2). Joined scopes route to their root's extents.
+    // target's extent (Â§5.5 row 2). Joined scopes route to their root's extents.
     const bool provenance = destructive || imported;
     auto event = tracker->begin_event(
             registrant, operation_class, stream, stamp_kind,
@@ -8247,7 +8247,7 @@ void llama_kv_cache::vbr_generation_global(
     if (tracker == nullptr) {
         return;
     }
-    // #11 (v2 verdict): a global invalidation is ONE operation — pending decode owners resolve
+    // #11 (v2 verdict): a global invalidation is ONE operation â€” pending decode owners resolve
     // (conservatively failed) first, then the transition also obsoletes every stored extent
     // reference and resets the slab, so old cells can never pin slab capacity into the next
     // lineage epoch.
@@ -8500,7 +8500,7 @@ bool llama_kv_cache::vbr_retier_take_reconcile(const char * boundary) {
     return true;
 }
 
-// The cache is EMPTY: nothing is stored, so undoing every degrade is free and LOSSLESS — unlike
+// The cache is EMPTY: nothing is stored, so undoing every degrade is free and LOSSLESS â€” unlike
 // container promotion this genuinely restores quality, because all future content is new. Flip
 // every tensor back to its entry tier, rewind the price cursor, drop the (now stale) sink
 // stashes and release every physical page; the next session refills from a clean entry-tier
@@ -8524,7 +8524,7 @@ void llama_kv_cache::vbr_full_reset() {
         }
     } capture_guard { this };
     // in-flight safety before ripping pages: settle the side streams and the devices once
-    // (session-boundary event — the sync cost is irrelevant)
+    // (session-boundary event â€” the sync cost is irrelevant)
     vbr_flush_deferred_unmaps();
     size_t undone = 0;
     size_t mapped = 0;
@@ -8552,7 +8552,7 @@ void llama_kv_cache::vbr_full_reset() {
                     undone++;
                 }
                 e.stash_valid  = 0;
-                e.promote_hops = 0; // fresh hop budget — the reset epoch starts clean
+                e.promote_hops = 0; // fresh hop budget â€” the reset epoch starts clean
                 const size_t slot = vbr_slot_span(e.t, pool.gran);
                 pool.be->vmm_pool_unmap(pool.vmm, e.byte_off, slot);
             }
@@ -8593,12 +8593,12 @@ void llama_kv_cache::vbr_full_reset() {
             }
         }
     }
-    LLAMA_LOG_INFO("%s: VBR full reset: cache empty — %zu tensors back at their entry tier, pools released "
+    LLAMA_LOG_INFO("%s: VBR full reset: cache empty â€” %zu tensors back at their entry tier, pools released "
             "(%.2f MiB mapped)\n", __func__, undone, mapped/1024.0/1024.0);
 }
 
 // Occupancy DROPPED (seq_rm trimmed a session): pull the mapped watermark back down and release
-// the tail pages. They are phantom cost against the budget (mapped but unreadable — attention
+// the tail pages. They are phantom cost against the budget (mapped but unreadable â€” attention
 // pads only to used+256), and both promotion's hysteresis and its re-encode row count follow
 // wm_cells, so leaving it at the old high-water lets a promotion map tiers back up at a stale
 // size. The rows shrunk away keep
@@ -8650,8 +8650,8 @@ void llama_kv_cache::vbr_shrink_watermark() {
 }
 
 // Container promotion: occupancy DROPPED (seq_rm trimmed a long session) and a higher tier now
-// fits with headroom. This restores NO information — the live rows are re-encoded from their
-// current recon (same quality, bigger container) — but every FUTURE row encodes at the higher
+// fits with headroom. This restores NO information â€” the live rows are re-encoded from their
+// current recon (same quality, bigger container) â€” but every FUTURE row encodes at the higher
 // tier, which the bathtub makes worth real quality. Walks the price cursor BACKWARDS one step
 // per call; the in-place transcode runs descending tiles (see vbr-transcode.cu) after the grown
 // extent is mapped up front.
@@ -8673,18 +8673,18 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
         ggml_tensor * t = st.is_v ? layers[ikv].v : layers[ikv].k; // canonical tensor: the type source of truth
         const auto & units = vbr_units_of(ikv, st.is_v != 0); // every VMM pool holding this unit
         if (t == nullptr || units.empty()) {
-            vbr_degrade_cursor_--; // this entry's degrade never applied (skipped no-op) — free rewind
+            vbr_degrade_cursor_--; // this entry's degrade never applied (skipped no-op) â€” free rewind
             continue;
         }
         if (!vbr_unit_movable(t->type, st.is_v != 0)) {
             // pinned unit: its degrades never applied, so its entries rewind for free. The
             // type-mismatch check below does NOT cover a side pinned AT a tier type (the entry
-            // type equals the step tier for its own order entries) — guard explicitly.
+            // type equals the step tier for its own order entries) â€” guard explicitly.
             vbr_degrade_cursor_--;
             continue;
         }
         if (t->type != vbr_tier_type(vbr_params_.codec, st.tier)) {
-            vbr_degrade_cursor_--; // this entry's degrade never applied (skipped no-op) — free rewind
+            vbr_degrade_cursor_--; // this entry's degrade never applied (skipped no-op) â€” free rewind
             continue;
         }
         // the tier this unit held BEFORE this step: its previous appearance in the order, else entry
@@ -8700,7 +8700,7 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
                 llama_vbr_codec_full_domain(vbr_params_.codec, type_B)) {
             // promotion CAPS below the tap boundary: sources under t8 store mean-subtracted
             // rows (V - mu_V), and neither t8 nor f16 decode restores the means (turbo_tap_mu
-            // gates t8 out of the tap; f16 has no add-back) — promoting across the boundary
+            // gates t8 out of the tap; f16 has no add-back) â€” promoting across the boundary
             // would serve mean-shifted values. Promotion still operates within the tapped
             // tiers (t4 <-> t3 <-> t2 <-> t1); the configured entry returns losslessly at full reset.
             return false;
@@ -8708,9 +8708,9 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
         for (const auto & u : units) {
             if (u.second->promote_hops >= 2) {
                 // hop cap: each promote with live rows re-encodes the aged rows from their degraded
-                // recon — error compounds per hop, and only FUTURE rows gain. Capping per extent
+                // recon â€” error compounds per hop, and only FUTURE rows gain. Capping per extent
                 // between resets bounds the damage; stopping the walk here is required anyway
-                // (promotion is LIFO along the price order — skipping past a capped top entry
+                // (promotion is LIFO along the price order â€” skipping past a capped top entry
                 // would re-order the ladder). Hops advance in lockstep across pools.
                 return false;
             }
@@ -8725,7 +8725,7 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
         }
 
         // hysteresis: promote only while the promoted layout keeps ~15% headroom of EVERY
-        // affected pool's LIVE-CLAMPED budget — churn costs a transcode each way AND an extra
+        // affected pool's LIVE-CLAMPED budget â€” churn costs a transcode each way AND an extra
         // quantization hop on the aged rows, and clamping only the degrade side made co-tenant
         // boundaries flap (promote on raw budget, re-degrade on the clamp). Basis =
         // max(projected watermark, mapped watermark): the transcode re-encodes and maps wm_cells
@@ -8758,7 +8758,7 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
         for (const auto & [pp, ep] : units) {
             const vbr_span sp = vbr_span_of(ep->t, type_B, pp->wm_cells, wm_next, pp->gran);
             if (!pp->be->vmm_pool_map(pp->vmm, ep->byte_off, sp.keep_pad)) {
-                return false; // physical memory tight — promotion is optional, just stop
+                return false; // physical memory tight â€” promotion is optional, just stop
             }
         }
 
@@ -8775,7 +8775,7 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
                     pp->be->sync_device(pp->device);
                 }
                 // reuse an existing sink stash (captured pristine at the first degrade) so the sink
-                // recovers toward single-hop error; do NOT capture here — a promote-time snapshot
+                // recovers toward single-hop error; do NOT capture here â€” a promote-time snapshot
                 // would lock in the DEGRADED recon as the reference
                 const void * stash_ptr  = nullptr;
                 int64_t      stash_rows = 0;
@@ -8796,7 +8796,7 @@ bool llama_kv_cache::vbr_promote_next(uint32_t wm_next) {
                 };
                 pp->be->kv_transcode(pp->backend, &tp);
                 pp->wave_pending = true;
-                e.promote_hops++; // only live-row re-encodes count — a 0-cell flip is free re-typing
+                e.promote_hops++; // only live-row re-encodes count â€” a 0-cell flip is free re-typing
             }
         }
         const ggml_type type_A = t->type;
@@ -8908,7 +8908,7 @@ llama_kv_cache::vbr_degrade_result llama_kv_cache::vbr_degrade_next(uint32_t wm_
         const int32_t ikv = it->second;
         ggml_tensor * t = st.is_v ? layers[ikv].v : layers[ikv].k; // canonical tensor: the type source of truth
         // every VMM pool holding this unit: one under -sm layer, one per device (each with its
-        // shard) under -sm tensor. The tier flip is a property of the UNIT — all pools move together.
+        // shard) under -sm tensor. The tier flip is a property of the UNIT â€” all pools move together.
         const auto & units = vbr_units_of(ikv, st.is_v != 0);
         if (t == nullptr || units.empty()) {
             retire_deferred();
@@ -8920,7 +8920,7 @@ llama_kv_cache::vbr_degrade_result llama_kv_cache::vbr_degrade_next(uint32_t wm_
         }
         const ggml_type type_B = vbr_tier_type(vbr_params_.codec, st.tier);
         {
-            // tier decision on the canonical tensor — relative row sizes are identical on every
+            // tier decision on the canonical tensor â€” relative row sizes are identical on every
             // instance (blocks never straddle the shard split)
             const size_t rA = ggml_row_size(t->type, t->ne[0]);
             const size_t rB = ggml_row_size(type_B,  t->ne[0]);
@@ -9039,16 +9039,16 @@ llama_kv_cache::vbr_degrade_result llama_kv_cache::vbr_degrade_next(uint32_t wm_
         for (auto & [pp, ep] : units) {
             vbr_extent  & e   = *ep;
 
-            // every mapped row must become a VALID tier-B row — reads pad n_kv past the used cells, and
+            // every mapped row must become a VALID tier-B row â€” reads pad n_kv past the used cells, and
             // stale tier-A bytes reinterpreted as B can carry NaN f16 block scales that poison V sums
             const int64_t n_cells = pp->wm_cells;
 
             // footprint bookkeeping (byte offsets within this tensor's fixed VA slot):
-            //   keep      — valid tier-B rows the transcode writes
-            //   keep_live — must STAY mapped through this batch: ensure_mapped backs the projected
+            //   keep      â€” valid tier-B rows the transcode writes
+            //   keep_live â€” must STAY mapped through this batch: ensure_mapped backs the projected
             //               watermark wm_next at the new tier before the wave's transcode completes
-            //   mapped_hi — current mapped high-water for this tensor (tier-A extent, page-rounded);
-            //               scrub stops here — pages past it are zero-filled fresh on map
+            //   mapped_hi â€” current mapped high-water for this tensor (tier-A extent, page-rounded);
+            //               scrub stops here â€” pages past it are zero-filled fresh on map
             const vbr_span sp = vbr_span_of(e.t, type_B, n_cells, wm_next, pp->gran);
             const size_t slot      = sp.slot;
             const size_t keep_live = sp.keep_live;
@@ -9065,14 +9065,14 @@ llama_kv_cache::vbr_degrade_result llama_kv_cache::vbr_degrade_next(uint32_t wm_
                     GGML_ASSERT(pp->backend != nullptr);
                 }
                 // first transcode of this wave on this device: make the previous graph's KV writes
-                // visible to the side stream — ONE host round-trip per (wave, device); later degrades
+                // visible to the side stream â€” ONE host round-trip per (wave, device); later degrades
                 // queue behind it stream-ordered
                 if (!pp->wave_pending) {
                     pp->be->sync_device(pp->device);
                 }
 
                 // f16 sink-stash: capture rows [0, stash_rows) from the first tapped-domain tier-A
-                // recon, then every later hop re-encodes those rows from the stash — the sink is
+                // recon, then every later hop re-encodes those rows from the stash â€” the sink is
                 // the only region both permanently hot and permanently old
                 const void * stash_ptr  = nullptr;
                 int64_t      stash_rows = 0;
@@ -9096,7 +9096,7 @@ llama_kv_cache::vbr_degrade_result llama_kv_cache::vbr_degrade_next(uint32_t wm_
 
                 // Transcode and scrub run asynchronously on the side stream; the end-of-wave fence
                 // (prepare()) makes the next decode graph GPU-wait on them. The scrub zeroes stale
-                // tier-A bytes on kept mapped pages past the new extent — attention pads reads up to
+                // tier-A bytes on kept mapped pages past the new extent â€” attention pads reads up to
                 // 256 rows past the used cells BEFORE those rows are rewritten, and old bytes read as
                 // tier B can carry NaN f16 block scales that poison V sums (0*NaN=NaN survives the
                 // softmax mask). Zero rows decode benign, matching a static cache.
@@ -9115,7 +9115,7 @@ llama_kv_cache::vbr_degrade_result llama_kv_cache::vbr_degrade_next(uint32_t wm_
                 pp->wave_pending = true;
             }
             // queue the tail release: pages wholly past keep_live return to the pool at the NEXT decode
-            // boundary — the in-flight transcode still READS the tier-A extent, which reaches into them
+            // boundary â€” the in-flight transcode still READS the tier-A extent, which reaches into them
             if (n_cells > 0 && slot > keep_live) {
                 pp->unmap_deferred.push_back({ e.byte_off + keep_live, slot - keep_live });
             }
@@ -9163,7 +9163,7 @@ llama_kv_cache::vbr_degrade_result llama_kv_cache::vbr_degrade_next(uint32_t wm_
     return vbr_degrade_result::exhausted;
 }
 
-// Permanent transcode oracle (env VBR_TRANSCODE_TEST, armed from apply_ubatch): SELF-CONTAINED —
+// Permanent transcode oracle (env VBR_TRANSCODE_TEST, armed from apply_ubatch): SELF-CONTAINED â€”
 // synthesize valid turbo8 by encoding a known f32 pattern, then (a) transcode A->A and byte-compare
 // the round-trip, (b) transcode A->B twice (separate-dst vs in-place) and require identical bytes
 // (the in-place trailing invariant). No live-KV dependency: on this hybrid arch the kv_cache
@@ -9292,7 +9292,7 @@ void llama_kv_cache::vbr_transcode_anchor_test() {
 
         // C) PROMOTE (grow, in-place DESCENDING tiles): the degrade cases above never exercise
         //    rB > rA. Degrade the synthetic t8 to t1_tcq (validated direction), then walk the
-        //    promote ladder t1 -> t2 -> t3 -> t4 — every hop run twice, separate-dst vs in-place,
+        //    promote ladder t1 -> t2 -> t3 -> t4 â€” every hop run twice, separate-dst vs in-place,
         //    which must produce IDENTICAL bytes. K and V variants: separate codebooks, and the V
         //    dequant carries the decode-alpha epilogue. Each hop's in-place result feeds the next,
         //    so later hops double as the multi-hop chain from the live promote-burst repro.
@@ -9423,7 +9423,7 @@ void llama_kv_cache::vbr_transcode_anchor_test() {
                             same == bytesTo ? -1LL : (long long) (first_bad / ggml_row_size(tto, ne0)));
                     if (same != bytesTo) {
                         // TCQ trellis blocks carry trailing don't-care bits the decode never reads, so a
-                        // byte diff is not yet corruption — adjudicate on DEQUANTIZED values instead
+                        // byte diff is not yet corruption â€” adjudicate on DEQUANTIZED values instead
                         const size_t          fb = (size_t) N * ne0 * sizeof(uint16_t);
                         ggml_backend_buffer_t f1 =
                             ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(bk), fb);
@@ -9594,7 +9594,7 @@ llama_memory_vbr_state_data_v2 llama_kv_cache::memory_vbr_state_v2(
     const uint32_t wm_next = vbr_watermark_cells(n_tokens_extra);
 
     // deficits: max over pools, exactly like the degrade trigger. raw = configured budget only
-    // (page-exact, deterministic — the policy input); clamped = the live budget_eff (telemetry).
+    // (page-exact, deterministic â€” the policy input); clamped = the live budget_eff (telemetry).
     int64_t deficit_raw     = INT64_MIN;
     int64_t deficit_clamped = INT64_MIN;
     std::vector<int64_t> pool_proj(vbr_pools_.size(), 0);
@@ -9608,13 +9608,13 @@ llama_memory_vbr_state_data_v2 llama_kv_cache::memory_vbr_state_v2(
         deficit_clamped = std::max(deficit_clamped, pool_proj[pi] - (int64_t) vbr_budget_eff(p));
     }
     if (deficit_raw == INT64_MIN) {
-        return result; // no VMM pools — controller effectively inert
+        return result; // no VMM pools â€” controller effectively inert
     }
     st.deficit_raw     = deficit_raw;
     st.deficit_clamped = deficit_clamped;
 
     // bpv_if_degraded: walk the ladder from the CURRENT cursor with the same skip rules as
-    // vbr_degrade_next until every pool's RAW projection fits (or the floor clamp stops it) —
+    // vbr_degrade_next until every pool's RAW projection fits (or the floor clamp stops it) â€”
     // the aggregate the controller would land at if the deficit were paid by tiers alone.
     // Mirrors the vbr_floor_clamp_order simulation; aggregate basis = VMM-pooled units.
     std::vector<ggml_type> sim;
@@ -10307,11 +10307,11 @@ bool llama_kv_cache::vbr_presence_quiet() const {
 
 // Runtime-growth demand, demander side. Publishes a phase=runtime claim when this
 // resident spent its own consent window and is still over budget (the try_map-failed case
-// arrives here at the NEXT boundary — the map failure fails that batch recoverably first);
+// arrives here at the NEXT boundary â€” the map failure fails that batch recoverably first);
 // the est carries projected - budget_eff with est_partial=0 so donors apply the shed-sizing
 // formula unchanged (an explicit-cap demander whose shortage free VRAM covers nets
 // shortfall <= 0 at every donor and draws no shed). CLEAR unlinks at the first boundary
-// where the recomputed shortage is gone — the donors' lift signal. Skipped entirely while
+// where the recomputed shortage is gone â€” the donors' lift signal. Skipped entirely while
 // a load-phase claim is still live (satisfied pre-claim-complete: one claim per process).
 void llama_kv_cache::vbr_runtime_demand_update(uint32_t wm_next, bool was_over) {
     vbr_runtime_wm_ = wm_next;
@@ -10393,7 +10393,7 @@ void llama_kv_cache::vbr_runtime_demand_update(uint32_t wm_next, bool was_over) 
     }
 }
 
-// promote gate shared by the boundary path and the tick (one env read, one gate — the
+// promote gate shared by the boundary path and the tick (one env read, one gate â€” the
 // co-tenancy freeze terms live here exactly once)
 void llama_kv_cache::vbr_maybe_promote(uint32_t wm_next) {
     static const bool vbr_promote_on = [] {
@@ -10432,7 +10432,7 @@ size_t llama_kv_cache::vbr_total_grant_decrement() const {
     return total;
 }
 
-// recompute each pool's decrement sum from the grant rows and bust the budget memos —
+// recompute each pool's decrement sum from the grant rows and bust the budget memos â€”
 // called only on grant mutation / amortization change (scan events), never per boundary
 void llama_kv_cache::vbr_apply_grant_decrements() {
     for (auto & p : vbr_pools_) {
@@ -10448,7 +10448,7 @@ void llama_kv_cache::vbr_apply_grant_decrements() {
     }
 }
 
-// dir-mtime pre-check, every boundary OUTSIDE the stable gate (~1µs stat): a rename in the
+// dir-mtime pre-check, every boundary OUTSIDE the stable gate (~1Âµs stat): a rename in the
 // ledger (new claim, phase flip, peer offer) forces the full controller path this boundary
 void llama_kv_cache::vbr_ledger_precheck() {
     llama_kv_cache * root = vbr_tree_root();
@@ -10463,7 +10463,7 @@ void llama_kv_cache::vbr_ledger_precheck() {
     }
 }
 
-// full ledger pass: grant upkeep (lift / amortize), demand service (rank-0 shed sizing →
+// full ledger pass: grant upkeep (lift / amortize), demand service (rank-0 shed sizing â†’
 // decrement + capped waves), marker publish/beat. Runs inside the !vbr_stable branch after
 // the pool's own degrade loop and before the existing fence-arm (a demand wave queued here
 // is fenced by that same loop).
@@ -10524,7 +10524,7 @@ void llama_kv_cache::vbr_presence_census(const std::vector<llama_vram_peer_marke
 }
 
 // Census, grant upkeep, demand service, and hygiene: the four phases of the full
-// ledger pass, split for readability — vbr_ledger_scan_service composes them.
+// ledger pass, split for readability â€” vbr_ledger_scan_service composes them.
 bool llama_kv_cache::vbr_grants_upkeep(const std::vector<llama_vram_peer_claim> & claims, uint64_t now) {
     // lift on claim-disappearance-with-live-pid / pid-death /
     // heartbeat-stall; amortize surviving demanded-device rows by the claim's bytes_now ----
@@ -10547,7 +10547,7 @@ bool llama_kv_cache::vbr_grants_upkeep(const std::vector<llama_vram_peer_claim> 
         } else if (!any_claim_of_owner) {
             lift = true; // claim-complete or runtime CLEAR: disappearance with live pid
         } else if (claim != nullptr) {
-            // heartbeat-stall (flat 3·BEAT rule): the ≤BEAT writer thread makes cadence
+            // heartbeat-stall (flat 3Â·BEAT rule): the â‰¤BEAT writer thread makes cadence
             // decode-independent, so a stalled beat means a wedged demander
             if (llama_vram_hb_observe(vbr_claim_obs_, g.busid + "-" + std::to_string(g.pid),
                                        claim->hb_counter, now)
@@ -10569,7 +10569,7 @@ bool llama_kv_cache::vbr_grants_upkeep(const std::vector<llama_vram_peer_claim> 
                 }
             }
         }
-        // collateral rows: delta_i = 0 — decrement holds in full until the lift event
+        // collateral rows: delta_i = 0 â€” decrement holds in full until the lift event
         if (lift) {
             it = vbr_grants_.erase(it);
             grants_changed = true;
@@ -10639,7 +10639,7 @@ bool llama_kv_cache::vbr_tx_reprice(vbr_shed_tx & tx, bool actual) const {
         child.final_cursor = child.start_cursor;
     }
     // Selection-coherence rule mirrors the downward projection's apply in
-    // vbr_downward_project_policy_prefix — keep the two in sync.
+    // vbr_downward_project_policy_prefix â€” keep the two in sync.
     for (const auto & selected : tx.policy_prefix) {
         if (selected.child_index >= tx.children.size()) {
             return false;
@@ -11713,7 +11713,7 @@ bool llama_kv_cache::vbr_service_demands(const std::vector<llama_vram_peer_claim
     // one band per donor per session-generation is enforced by the band cursor itself
     // (monotone: once spent, shed_available stays 0 until vbr_full_reset)
     // idleness for runtime-demand donation: decode-based, evaluated here (a boundary
-    // caller has just stamped last_prepare, so it is never idle — active-vs-active
+    // caller has just stamped last_prepare, so it is never idle â€” active-vs-active
     // residents self-serve via their own ladders; only the tick path can qualify)
     const bool donor_idle = vbr_last_prepare_ns_ != 0 &&
         now - vbr_last_prepare_ns_ >= (uint64_t) LLAMA_VRAM_LEDGER_IDLE_MS * 1000000ull;
@@ -11748,7 +11748,7 @@ bool llama_kv_cache::vbr_service_demands(const std::vector<llama_vram_peer_claim
             continue;
         }
         const uint64_t self_created_ts = own_ts->second;
-        // rank-0 among FRESH offering markers on the demanded device (created_ts, pid) —
+        // rank-0 among FRESH offering markers on the demanded device (created_ts, pid) â€”
         // both sides use the marker registry's preserved first-publish timestamp
         bool rank0 = true;
         for (const auto & m : peers) {
@@ -11759,7 +11759,7 @@ bool llama_kv_cache::vbr_service_demands(const std::vector<llama_vram_peer_claim
             if (llama_vram_hb_observe(vbr_claim_obs_, "m-" + m.busid + "-" + std::to_string(m.pid),
                                        m.hb_counter, now)
                     >= (uint64_t) LLAMA_VRAM_LEDGER_LONG_MS/2 * 1000000ull) {
-                continue; // stale offer — not a competitor
+                continue; // stale offer â€” not a competitor
             }
             if (m.created_ts_ns < self_created_ts ||
                 (m.created_ts_ns == self_created_ts && m.pid < llama_vram_ledger_self_pid())) {
@@ -11770,10 +11770,10 @@ bool llama_kv_cache::vbr_service_demands(const std::vector<llama_vram_peer_claim
         if (!rank0) {
             continue;
         }
-        // shortfall = est − (free − headroom) − Σ peers' grant_pending (bridges shed→flush)
+        // shortfall = est âˆ’ (free âˆ’ headroom) âˆ’ Î£ peers' grant_pending (bridges shedâ†’flush)
         size_t free_b = 0, total_b = 0;
         demanded_pool->be->get_device_memory(demanded_pool->device, &free_b, &total_b);
-        // headroom_eff = base x N_live (spec normative — flat base would undershed by
+        // headroom_eff = base x N_live (spec normative â€” flat base would undershed by
         // (N_live-1) x base exactly when the census matters)
         const size_t headroom_eff = llama_vram_headroom_bytes() *
                 demanded.child->vbr_pool_n_live(*demanded_pool);
@@ -11788,7 +11788,7 @@ bool llama_kv_cache::vbr_service_demands(const std::vector<llama_vram_peer_claim
                 __func__, c.pid, c.fields.bytes_total_remaining_est/1048576.0,
                 free_b/1048576.0, headroom_eff/1048576.0, (our_offer + sib_offer)/1048576.0);
         if (c.fields.bytes_total_remaining_est <= covered) {
-            continue; // shortfall ≤ 0: free (or peers' in-flight sheds) already cover it
+            continue; // shortfall â‰¤ 0: free (or peers' in-flight sheds) already cover it
         }
         const uint64_t shortfall = c.fields.bytes_total_remaining_est - covered;
         const uint64_t target    = std::min<uint64_t>(our_offer + sib_offer, shortfall);
@@ -11895,7 +11895,7 @@ void llama_kv_cache::vbr_markers_publish(std::set<std::string> * changed) {
 }
 
 void llama_kv_cache::vbr_ledger_scan_service(uint32_t n_tokens) {
-    // explicit budgets still run the pass — they publish markers (shed_available = 0,
+    // explicit budgets still run the pass â€” they publish markers (shed_available = 0,
     // demand service skipped) so the demander's presence census stays complete
     if (!vbr_ledger_owner_ || !vbr_vmm_active() || !llama_vram_ledger_armed()) {
         return;
@@ -11956,7 +11956,7 @@ void llama_kv_cache::vbr_cotenancy_accum(uint64_t & decrement, uint32_t & grants
 }
 
 bool llama_kv_cache::get_can_shift() const {
-    // VBR VMM v1: build_graph_shift views the FULL kv_size cells — executing it would touch
+    // VBR VMM v1: build_graph_shift views the FULL kv_size cells â€” executing it would touch
     // unmapped VA. TODO(S6+): bound the shift views to the mapped watermark instead.
     if (vbr_vmm_active()) {
         return false;
@@ -12055,6 +12055,18 @@ bool llama_kv_cache::get_has_shift() const {
     }
 
     return result;
+}
+
+void llama_kv_cache::set_kpool_dirty() {
+    kpool_dirty = true;
+}
+
+bool llama_kv_cache::get_kpool_dirty() const {
+    return kpool_dirty;
+}
+
+void llama_kv_cache::clear_kpool_dirty() const {
+    kpool_dirty = false;
 }
 
 ggml_type llama_kv_cache::type_k() const {
@@ -12217,6 +12229,29 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     return ggml_set_rows(ctx, k, k_cur, k_idxs);
 }
 
+ggml_tensor * llama_kv_cache::cpy_k_part(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il,
+        int64_t n_embd, int64_t i_off) const {
+    const int32_t ikv = map_layer_ids.at(il);
+
+    ggml_tensor * k = layers[ikv].k;
+
+    const int64_t n_embd_gqa = k->ne[0];
+    const int64_t kv_size    = get_size();
+    const int64_t n_stream   = k->ne[2];
+
+    GGML_ASSERT(i_off >= 0 && i_off + n_embd <= n_embd_gqa);
+    GGML_ASSERT(k_cur->ne[0] == n_embd);
+
+    // merge the streams: k_idxs are global, exactly as in cpy_k
+    ggml_tensor * k2 = ggml_reshape_2d(ctx, k, n_embd_gqa, kv_size*n_stream);
+
+    // a row-slice view of every cell. ggml_set_rows needs contiguous rows in the DEST,
+    // which ggml_is_contiguous_rows() grants for a view whose ne[0] slice is contiguous.
+    ggml_tensor * dst = ggml_view_2d(ctx, k2, n_embd, kv_size*n_stream,
+            k2->nb[1], ggml_row_size(k2->type, i_off));
+
+    return ggml_set_rows(ctx, dst, k_cur, k_idxs);
+}
 
 ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
     GGML_UNUSED(sinfo);
@@ -12945,7 +12980,7 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 void llama_kv_cache::state_write_prepare() const {
     if (vbr_vmm_active()) {
         // Settle in-flight degrade waves: the wave fence orders graph_compute, not the
-        // tensor_get path io.write_tensor uses — an unsettled wave would serialize torn bytes
+        // tensor_get path io.write_tensor uses â€” an unsettled wave would serialize torn bytes
         // under the already-flipped type
         for (const auto & p : vbr_pools_) {
             if (p.backend != nullptr) {
@@ -12956,7 +12991,7 @@ void llama_kv_cache::state_write_prepare() const {
             }
         }
         // a degraded-tier snapshot can never restore (state_read requires the fresh context's
-        // entry tiers) — refuse at SAVE time instead of failing the user at load time
+        // entry tiers) â€” refuse at SAVE time instead of failing the user at load time
         for (const auto & p : vbr_pools_) {
             if (p.vmm == nullptr) {
                 continue;
@@ -12967,7 +13002,7 @@ void llama_kv_cache::state_write_prepare() const {
                     const ggml_tensor * t = side ? layers[ikv].v : layers[ikv].k;
                     if (e.t != nullptr && t != nullptr && t->type != e.type0) {
                         throw std::runtime_error(
-                            "cannot serialize a dynamic-VBR KV cache after tier degrades — the "
+                            "cannot serialize a dynamic-VBR KV cache after tier degrades â€” the "
                             "snapshot could never restore; save before the budget triggers, or "
                             "run without dynamic VBR");
                     }
@@ -13431,7 +13466,7 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
         if (v && ggml_type_is_turbo_tcq(v->type)) { has_tcq = true; break; }
     }
     if (has_tcq) {
-        const uint32_t magic = 0x54514346; // "TQCF" — TurboQuant Cache Fingerprint
+        const uint32_t magic = 0x54514346; // "TQCF" â€” TurboQuant Cache Fingerprint
         const uint32_t fp    = turbo_tcq_fingerprint();
         io.write(&magic, sizeof(magic));
         io.write(&fp,    sizeof(fp));
@@ -13811,7 +13846,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         uint32_t magic_ref = 0;
         io.read(&magic_ref, sizeof(magic_ref));
         if (magic_ref != 0x54514346) { // "TQCF"
-            LLAMA_LOG_ERROR("%s: turbo TCQ cache file missing codebook fingerprint — "
+            LLAMA_LOG_ERROR("%s: turbo TCQ cache file missing codebook fingerprint â€” "
                             "file may have been saved by an older build without TCQ safety checks\n", __func__);
             return false;
         }
@@ -13819,7 +13854,7 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         io.read(&fp_ref, sizeof(fp_ref));
         const uint32_t fp_now = turbo_tcq_fingerprint();
         if (fp_ref != fp_now) {
-            LLAMA_LOG_ERROR("%s: turbo TCQ codebook mismatch — cache was saved with fingerprint "
+            LLAMA_LOG_ERROR("%s: turbo TCQ codebook mismatch â€” cache was saved with fingerprint "
                             "0x%08X but current TURBO_TCQ_CB/CB2 gives 0x%08X. "
                             "Set the same codebook env vars as when the cache was created.\n",
                             __func__, fp_ref, fp_now);
@@ -13950,6 +13985,22 @@ ggml_type llama_kv_cache_context::type_v() const {
     return kv->type_v();
 }
 
+uint32_t llama_kv_cache_context::get_n_stream() const {
+    return sinfos[i_cur].s1 - sinfos[i_cur].s0 + 1;
+}
+
+uint32_t llama_kv_cache_context::get_strm(uint32_t s) const {
+    const auto & sinfo = sinfos[i_cur];
+
+    GGML_ASSERT(s < sinfo.strm.size());
+
+    return sinfo.strm[s];
+}
+
+const llama_kv_cache * llama_kv_cache_context::get_kv() const {
+    return kv;
+}
+
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
     return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
 }
@@ -13981,6 +14032,11 @@ ggml_tensor * llama_kv_cache_context::get_turbo_rot_inverse() const {
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
     return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::cpy_k_part(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il,
+        int64_t n_embd, int64_t i_off) const {
+    return kv->cpy_k_part(ctx, k_cur, k_idxs, il, n_embd, i_off);
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const {
