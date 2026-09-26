@@ -15,6 +15,7 @@ struct vbr_occupied_replacement_guard::map {
     vbr_occupied_replacement_strategy strategy =
         vbr_occupied_replacement_strategy::_count;
     bool incoming_transformed = false;
+    bool recycle_requested = false;
     bool absent_destination = false;
     uint64_t packed_rows_expanded = 0;
     uint64_t incoming_prefix_tokens = 0;
@@ -741,7 +742,11 @@ vbr_occupied_replacement_guard_status occupied_guard_validate(
     }
 
     const size_t free_cells = observation.cell_capacity-observation.cell_count;
-    const auto strategy = incoming_tokens <= free_cells
+    const auto strategy = map_authority && map_authority->recycle_requested
+        ? (!absent && incoming_tokens <= recovery_tokens
+            ? vbr_occupied_replacement_strategy::recycle_incumbent_cells
+            : vbr_occupied_replacement_strategy::_count)
+        : incoming_tokens <= free_cells
         ? vbr_occupied_replacement_strategy::provisional_free_cells
         : incoming_tokens <= recovery_tokens
             ? vbr_occupied_replacement_strategy::recycle_incumbent_cells
@@ -1083,6 +1088,7 @@ vbr_prepare_occupied_replacement_guard(
         auto shared = std::make_shared<vbr_occupied_replacement_guard::map>();
         shared->incoming_transformed =
             incoming_status != vbr_import_schedule_status::exact;
+        shared->recycle_requested = incoming_authority->destination().recycle_incumbent;
         shared->mappings.reserve(
             incoming.manifest().stream_placements.front().cells.size());
         shared->relocation_runs.reserve(std::min<size_t>(
@@ -1187,6 +1193,7 @@ vbr_prepare_occupied_prefix_replacement_guard(
         shared->incoming_transformed =
             incoming_status != vbr_import_schedule_status::exact;
         shared->incoming_prefix_tokens = prefix_tokens;
+        shared->recycle_requested = authenticated_incoming.destination().recycle_incumbent;
         shared->incoming_prefix_runs = prefix_runs;
         shared->mappings.reserve(size_t(prefix_tokens));
         shared->relocation_runs.reserve(std::min<size_t>(

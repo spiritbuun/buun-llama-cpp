@@ -4092,11 +4092,12 @@ uint32_t llama_kv_cache::vbr_watermark_cells(uint32_t extra_tokens) const {
 
 uint32_t llama_kv_cache::vbr_import_watermark_cells(
         uint32_t incoming_cells, uint32_t prefix_cells, uint32_t source_high_water,
-        llama_seq_id destination, uint32_t source_backing) const {
-    if (other) { return other->vbr_import_watermark_cells(incoming_cells, prefix_cells, source_high_water, destination, source_backing); }
+        llama_seq_id destination, uint32_t source_backing, bool recycle_incumbent) const {
+    if (other) { return other->vbr_import_watermark_cells(incoming_cells, prefix_cells, source_high_water, destination, source_backing, recycle_incumbent); }
     if (destination < 0 || size_t(destination) >= seq_to_stream.size()) { return 0; }
     const auto & cells = v_cells[seq_to_stream[destination]];
     if (cells.get_used() == 0) {
+        if (recycle_incumbent) { return 0; }
         if (source_high_water == 0) { return vbr_watermark_cells(incoming_cells); }
         // Whole imports preserve source physical placements, including holes
         // left by earlier provisional replacements. Prefix projections pass
@@ -4117,7 +4118,10 @@ uint32_t llama_kv_cache::vbr_import_watermark_cells(
     // The guard prefers provisional free cells, leaving the incumbent's old
     // physical range behind the resumed head. Credit reuse only when the
     // guard must recycle the incumbent (and the prefix fits those rows).
-    if (source_high_water != 0 &&
+    if (recycle_incumbent && (prefix_cells == 0 || prefix_cells > incumbent)) {
+        return 0; // no independently owned incumbent range can hold this prefix
+    }
+    if (!recycle_incumbent && source_high_water != 0 &&
         (prefix_cells <= cells.size()-cells.get_used() || prefix_cells > incumbent)) {
         incumbent = 0;
     }

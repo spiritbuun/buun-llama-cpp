@@ -667,7 +667,8 @@ private:
     // the installed rows plus suffix, retaining source_backing independently.
     uint32_t vbr_import_watermark_cells(uint32_t incoming_cells, uint32_t prefix_cells,
                                         uint32_t source_high_water, llama_seq_id destination,
-                                        uint32_t source_backing = 0) const;
+                                        uint32_t source_backing = 0,
+                                        bool recycle_incumbent = false) const;
     struct vbr_import_destination_pricing {
         struct pool_row {
             const ggml_vbr_backend_iface * be = nullptr;

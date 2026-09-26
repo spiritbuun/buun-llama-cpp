@@ -163,6 +163,10 @@ struct vbr_import_destination_projection {
     uint64_t physical_growth_available = 0;
     int64_t max_deficit = 0;
 
+    // Budgeted occupied import must reuse the destination's authenticated
+    // incumbent rows instead of allocating provisional free cells.
+    bool recycle_incumbent = false;
+
     bool feasible() const noexcept {
         return status == vbr_import_destination_status::feasible_current ||
                status == vbr_import_destination_status::feasible_degraded;

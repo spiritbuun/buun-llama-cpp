@@ -2501,6 +2501,44 @@ static void test_dependency_scoped_projected_catalog_publication() {
               occupied_guard, occupied.target, occupied.observation) ==
           vbr_occupied_replacement_guard_status::ready);
 
+    // Spare virtual cells can exceed the VBR backing budget. An authenticated
+    // destination quote may select the existing recycle strategy even though
+    // the ordinary unpriced guard would choose provisional placement.
+    vbr_import_schedule_quote budget_quote;
+    CHECK(vbr_quote_import_schedule(occupied.target, occupied_view, budget_quote));
+    vbr_import_destination_projection budget_destination;
+    budget_destination.status = vbr_import_destination_status::feasible_current;
+    budget_destination.recycle_incumbent = true;
+    for (const auto & child : occupied.target.children) {
+        std::vector<ggml_type> types;
+        for (const auto & unit : child.units) {
+            types.push_back(static_cast<ggml_type>(unit.current_type));
+        }
+        budget_destination.initial_types.push_back(types);
+        budget_destination.final_types.push_back(std::move(types));
+        budget_destination.initial_cursors.push_back(child.controller_policy.cursor);
+        budget_destination.final_cursors.push_back(child.controller_policy.cursor);
+        budget_destination.child_type_digests.push_back(child.controller_policy.current_type_vector_digest);
+    }
+    budget_destination.tree_digest = vbr_type_tree_digest(
+        budget_destination.child_type_digests, VBR_DOWNWARD_RECIPE_VERSION);
+    CHECK(vbr_rebind_import_schedule_quote(
+        occupied.target, occupied_view, budget_destination, budget_quote));
+    vbr_occupied_replacement_guard budget_guard;
+    CHECK(vbr_prepare_occupied_replacement_guard(
+        occupied.target, occupied_view, occupied_view, occupied.observation,
+        budget_guard, &budget_quote) == vbr_occupied_replacement_guard_status::ready);
+    CHECK(budget_guard.strategy() == vbr_occupied_replacement_strategy::recycle_incumbent_cells);
+    CHECK(budget_guard.recovery_runs().size() == 1);
+    CHECK(!budget_guard.cell_mapping().empty());
+    if (!budget_guard.cell_mapping().empty()) {
+        CHECK(budget_guard.cell_mapping().front().destination_physical_cell == 0);
+    }
+    CHECK(vbr_recheck_occupied_replacement_guard(
+        budget_guard, occupied.target, occupied.observation) ==
+        vbr_occupied_replacement_guard_status::ready);
+    budget_guard.reset();
+
     occupied_guard_fixture full_pool;
     CHECK(make_occupied_guard_fixture(
         occupied_view, 92, 8, full_pool));

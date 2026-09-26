@@ -1411,6 +1411,7 @@ public:
             struct child_state {
                 llama_kv_cache * cache = nullptr;
                 uint32_t restore_watermark = 0;
+                uint32_t recycle_watermark = 0;
                 vbr_import_destination_child input;
                 llama_kv_cache::vbr_import_destination_pricing pricing;
                 std::vector<llama_memory_vbr_physical_growth> physical;
@@ -1466,6 +1467,9 @@ public:
                 state.restore_watermark = state.cache->vbr_import_watermark_cells(
                     uint32_t(occupancy), uint32_t(prefix_cells), uint32_t(source_high_water),
                     destination, uint32_t(frontier));
+                state.recycle_watermark = state.cache->vbr_import_watermark_cells(
+                    uint32_t(occupancy), uint32_t(prefix_cells), uint32_t(source_high_water),
+                    destination, uint32_t(frontier), true);
                 if (!state.cache->vbr_import_destination_input(
                         uint32_t(wm), state.input) ||
                     !state.cache->vbr_import_destination_pricing_begin(
@@ -1574,6 +1578,25 @@ public:
                 }
                 if (!actual.build()) { return false; }
                 if (!actual.preflight().fits) {
+                    // Logical free cells need not be affordable VBR backing.
+                    // Try the existing single-attention occupied recycle route
+                    // at the SAME selected precision, never a lower tier to pay
+                    // for temporary placement. The guard proves ownership and
+                    // recovery before it can consume this strategy.
+                    if (children.size() == 1 && children.front().recycle_watermark != 0) {
+                        auto & child = children.front();
+                        const auto recycled = child.cache->vbr_import_destination_preflight(
+                            output.final_types.front(), child.recycle_watermark, &child.physical);
+                        if (recycled.active && recycled.fits) {
+                            output.recycle_incumbent = true;
+                            output.logical_bytes_needed = recycled.bytes_needed;
+                            output.logical_bytes_available = recycled.bytes_available;
+                            output.physical_growth_needed = recycled.physical_growth_needed;
+                            output.physical_growth_available = recycled.physical_growth_available;
+                            output.max_deficit = recycled.max_deficit;
+                            return vbr_import_destination_projection_coherent(inputs, output);
+                        }
+                    }
                     output.status = vbr_import_destination_status::exhausted;
                     output.max_deficit = actual.preflight().max_deficit;
                 }
