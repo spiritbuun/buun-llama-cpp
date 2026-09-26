@@ -4063,6 +4063,9 @@ void test_recurrent_reusable_prefix() {
     CHECK(reusable(4, 5) == 4); // boundary is inclusive in token count
     checkpoint.checkpoint_epoch = 1;
     CHECK(reusable(4, 5) == 0);
+    context.vbr_state.checkpoint_epoch = 1;
+    CHECK(reusable(4, 5) == 4); // dynamic VBR uses the live lineage, not zeros
+    context.vbr_state = {};
     checkpoint.checkpoint_epoch = 0;
     context.frontier_required = true;
     CHECK(reusable(4, 5) == 0); // missing sealed frontier
@@ -4118,6 +4121,13 @@ void test_recurrent_reusable_prefix() {
     const server_tokens append(llama_tokens { 1, 2, 3, 4, 5, 6, 7 }, false);
     CHECK(server_prompt_cache_reusable_prefix(
         prompt, append, 6, 5, context, "adapter") == 6);
+    context.exact_frontier_logits = true;
+    CHECK(server_prompt_cache_reusable_prefix(
+        prompt, prompt.tokens, 6, 5, context, "adapter") == 6);
+    CHECK(server_prompt_cache_reusable_prefix(
+        prompt, prompt.tokens, 6, -1, context, "adapter") == 0);
+    CHECK(server_prompt_cache_reusable_prefix(
+        prompt, exact, 4, 5, context, "adapter") == 0); // no logits shortcut on rewind
 }
 
 void test_recurrent_selection_survives_displacement_save(bool accounted) {

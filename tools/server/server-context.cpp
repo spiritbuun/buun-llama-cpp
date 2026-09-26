@@ -12803,6 +12803,17 @@ private:
         GGML_ABORT("invalid slot prompt admission");
     }
 
+    bool can_reuse_live_frontier_logits(
+            const server_slot & slot, const server_task & task, size_t prefix) const {
+        auto * memory = llama_get_memory(ctx_tgt);
+        return prefix > 0 && prefix == size_t(task.n_tokens()) &&
+            prefix == slot.prompt.tokens.size() &&
+            memory->seq_pos_min(slot.id) >= 0 &&
+            memory->seq_pos_max(slot.id) == slot.prompt.tokens.pos_next(prefix)-1 &&
+            server_slot_exact_prompt_action_resolve(prefix, task.need_sampling(),
+                slot.diff_self_spec, slot.frontier_logits_matches()).use_frontier_logits;
+    }
+
     // what every host payload import into a slot shares; the caller adds its publication
     server_vbr_artifact_import_target vbr_import_target_for(
             server_slot & slot, llama_memory_i * memory, uint64_t incoming_cells, const std::string & adapter) {
@@ -13209,6 +13220,19 @@ private:
                 }
             }
             if (occupied_candidate && !cleared_for_empty_handoff) {
+                server_prompt_cache_reuse_context reuse;
+                reuse.live_pos_min = memory->seq_pos_min(slot.id);
+                reuse.n_swa = n_swa;
+                reuse.frontier_required = slot.frontier_ratchet_flipped;
+                reuse.execution_identity = frontier_execution_identity;
+                reuse.vbr_state = llama_memory_vbr_state(memory, slot.id, 0);
+                const size_t lcp = slot.prompt.tokens.get_common_prefix(task.tokens);
+                reuse.exact_frontier_logits = can_reuse_live_frontier_logits(slot, task, lcp);
+                const size_t reusable = server_prompt_cache_reusable_prefix(
+                    slot.prompt, task.tokens, lcp, reuse.live_pos_min, reuse, adapter_identity);
+                if (candidate.prefix_tokens() <= reusable) {
+                    return false;
+                }
                 if (!ensure_vbr_replacement_recovery(slot)) {
                     vbr_automatic_restore_occupied_fallbacks++;
                     return false;
@@ -13220,7 +13244,7 @@ private:
                         std::move(candidate), slot.prompt, slot.cache_family,
                         incoming_family, slot.id,
                         frontier_execution_identity, adapter_identity,
-                        ticket, &replacement_diagnostics)) {
+                        ticket, &replacement_diagnostics, reusable)) {
                     vbr_automatic_restore_occupied_fallbacks++;
                     SLT_DBG(
                         slot,
@@ -20058,7 +20082,12 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (!complete_vbr_import && pos_min >= pos_min_thold) {
+                                // An exact hit with authenticated, position-aligned
+                                // logits needs no rewind just to decode the last
+                                // prompt token again. Use the same proof as selection.
+                                if (!complete_vbr_import &&
+                                    !can_reuse_live_frontier_logits(slot, *slot.task, size_t(n_past)) &&
+                                    pos_min >= pos_min_thold) {
                                     // Current attention-content lineage epoch(s). A recurrent-only
                                     // checkpoint remains valid across a lossless in-place retier, but not
                                     // across occupied-cell reuse, clear/reset, or state adoption. All-zero

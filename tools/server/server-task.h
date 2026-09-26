@@ -1355,13 +1355,15 @@ struct server_prompt_checkpoint_reuse {
 server_prompt_checkpoint_reuse server_prompt_checkpoint_reuse_geometry(
     const server_tokens & tokens, const common_prompt_checkpoint & checkpoint, llama_pos pos_next);
 
-// Read-only geometry for fixed-state recurrent/hybrid host selection. Dynamic
-// VBR artifacts have their own restore feasibility/representation negotiation.
+// Read-only live/checkpoint reuse geometry. Artifact import feasibility and
+// representation negotiation remain separate from this live-state quote.
 struct server_prompt_cache_reuse_context {
     llama_pos live_pos_min = -1;
     int32_t n_swa = 0;
     bool frontier_required = false;
     std::string execution_identity;
+    llama_memory_vbr_state_data vbr_state = {};
+    bool exact_frontier_logits = false;
 };
 
 size_t server_prompt_cache_reusable_prefix(
@@ -1571,7 +1573,8 @@ public:
 
     // CPU-only preparation for an occupied destination. The incoming
     // candidate must be exact (not a parent projection) and must improve the
-    // live common prefix. Preparation clones all replacement metadata into a
+    // usable live prefix (raw LCP when no scheduler quote is supplied).
+    // Preparation clones all replacement metadata into a
     // private provisional launch association without mutating or retiring the
     // incumbent slot. The occupied importer consumes the ticket through its
     // allocation-free composite KV/prompt/retention publication callback.
@@ -1585,7 +1588,8 @@ public:
         const std::string & adapter_config_key,
         server_prompt_cache_vbr_replacement_ticket & ticket,
         server_prompt_cache_vbr_replacement_diagnostics * diagnostics =
-            nullptr) noexcept;
+            nullptr,
+        size_t reusable_live_prefix = SIZE_MAX) noexcept;
     // The scheduler calls the fallible read half before entering the adopter's
     // no-fail terminal. Publication swaps the already-existing sidecar
     // association and prompt storage without first clearing the incumbent.

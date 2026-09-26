@@ -8074,7 +8074,8 @@ bool server_prompt_cache::prepare_vbr_occupied_replacement(
         const std::string & execution_identity,
         const std::string & adapter_config_key,
         server_prompt_cache_vbr_replacement_ticket & ticket,
-        server_prompt_cache_vbr_replacement_diagnostics * diagnostics) noexcept {
+        server_prompt_cache_vbr_replacement_diagnostics * diagnostics,
+        size_t reusable_live_prefix) noexcept {
     ticket = {};
     if (diagnostics) {
         *diagnostics = {};
@@ -8096,8 +8097,8 @@ bool server_prompt_cache::prepare_vbr_occupied_replacement(
         return false;
     }
     const uint64_t incumbent_tokens = uint64_t(incumbent.n_tokens());
-    const uint64_t live_lcp = incumbent.tokens.get_common_prefix(
-        incoming.source_->prompt.tokens);
+    const uint64_t live_lcp = std::min(reusable_live_prefix,
+        incumbent.tokens.get_common_prefix(incoming.source_->prompt.tokens));
     if (incoming.prefix_tokens_ <= live_lcp) {
         return false;
     }
@@ -8644,20 +8645,23 @@ size_t server_prompt_cache_reusable_prefix(
         return 0;
     }
     const llama_pos pos_next = prompt.tokens.pos_next(lcp);
+    if (context.exact_frontier_logits && lcp == incoming.size() && lcp == prompt.tokens.size()) {
+        return lcp;
+    }
     // Match the executor, including the final-token evaluation on exact hits.
     const llama_pos threshold = server_prompt_checkpoint_reuse_threshold(
         pos_next, context.n_swa, lcp < incoming.size());
     if (pos_min < threshold) {
         return lcp;
     }
-    // Fixed KV has zero VBR epochs. Use the same reverse selection and
+    // Fixed KV uses zero epochs; dynamic KV supplies its live lineage.
+    // Use the same reverse selection and
     // frontier/lineage guards as execution, without transferring any state.
-    const llama_memory_vbr_state_data fixed_state = {};
     for (auto it = prompt.checkpoints.rbegin(); it != prompt.checkpoints.rend(); ++it) {
         const auto & checkpoint = *it;
         const auto evaluation = server_cache_plan_evaluate_checkpoint(
             !checkpoint.empty(), true, true,
-            common_prompt_checkpoint_lineage_matches(checkpoint, fixed_state),
+            common_prompt_checkpoint_lineage_matches(checkpoint, context.vbr_state),
             checkpoint.pos_min, checkpoint.pos_max, pos_next, threshold, 0);
         if (!server_cache_plan_viable(evaluation.reason)) {
             continue;

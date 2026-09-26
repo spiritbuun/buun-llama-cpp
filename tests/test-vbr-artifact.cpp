@@ -6838,6 +6838,29 @@ static void test_prompt_cache_vbr_atomic_logical_publication() {
     CHECK(recovery_logical->payload.vbr_compact_owner()->reference_artifact() ==
           recovery_published.reference_artifact);
 
+    // Equal token ledgers are not necessarily equally reusable recurrent
+    // states. Keep the default no-op rejection, but allow a scheduler quote
+    // of zero usable live tokens through the full recovery/lease checks.
+    for (const bool live_usable : { true, false }) {
+        server_prompt_cache_vbr_restore_candidate same_prefix;
+        CHECK(cache.prepare_vbr_restore(
+            incumbent_prompt.tokens,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            same_prefix));
+        server_prompt_cache_vbr_replacement_ticket same_ticket;
+        CHECK(cache.prepare_vbr_occupied_replacement(
+            std::move(same_prefix), incumbent_prompt, incumbent_family,
+            incumbent_family, replacement_slot,
+            fixture.package.manifest.identity.execution_identity,
+            fixture.package.manifest.identity.adapter_config_identity,
+            same_ticket, nullptr, live_usable ? SIZE_MAX : 0) == !live_usable);
+        if (!live_usable) {
+            CHECK(same_ticket.ready());
+            CHECK(same_ticket.incumbent_live_lcp() == 0);
+        }
+    }
+
     // A state prompt cannot launder a different sealed token block into a
     // recovery capability. This simulates a corrupted host association while
     // retaining the real incumbent publication for the positive path below.
