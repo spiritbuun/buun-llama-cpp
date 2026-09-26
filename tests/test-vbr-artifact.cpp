@@ -1220,6 +1220,19 @@ static void test_validation_and_ordering() {
           vbr_artifact_status::ok);
 }
 
+struct vector_sink {
+    std::vector<uint8_t> bytes;
+
+    static bool write(
+            void * context,
+            const uint8_t * data,
+            size_t size) noexcept {
+        auto & out = static_cast<vector_sink *>(context)->bytes;
+        out.insert(out.end(), data, data + size);
+        return true;
+    }
+};
+
 static void test_companion_payload() {
     fixture_storage storage;
     auto package = make_package(storage);
@@ -1280,9 +1293,16 @@ static void test_companion_payload() {
           decoded.manifest.companions[1].payload_digest);
 
     auto parallel = package;
-    CHECK(vbr_artifact_prepare(parallel, 4) == vbr_artifact_status::ok);
-    CHECK(parallel.manifest.manifest_digest == package.manifest.manifest_digest);
-    CHECK(vbr_artifact_validate_prepared_package(parallel, 4) == vbr_artifact_status::ok);
+    for (uint32_t workers : { 0u, 1u, 2u, 3u, 4u, 8u, 64u }) {
+        parallel = package;
+        CHECK(vbr_artifact_prepare(parallel, workers) == vbr_artifact_status::ok);
+        CHECK(parallel.manifest.manifest_digest == package.manifest.manifest_digest);
+        CHECK(vbr_artifact_validate_prepared_package(parallel, workers) == vbr_artifact_status::ok);
+        vector_sink sink;
+        CHECK(vbr_artifact_encode(parallel, { &sink, vector_sink::write },
+                  1024*1024, nullptr, workers) == vbr_artifact_status::ok);
+        CHECK(sink.bytes == encoded);
+    }
     // Parallel validation still reads the bytes, including stash/companions.
     for (auto * source : { &storage.payload0, &storage.stash0, &storage.recurrent, &frontier_logits }) {
         source->bytes[0] ^= 1;
@@ -1308,19 +1328,6 @@ struct discard_writer {
     }
 };
 
-struct vector_sink {
-    std::vector<uint8_t> bytes;
-
-    static bool write(
-            void * context,
-            const uint8_t * data,
-            size_t size) noexcept {
-        auto & out = static_cast<vector_sink *>(context)->bytes;
-        out.insert(out.end(), data, data + size);
-        return true;
-    }
-};
-
 // Several hash workers (immutable sources) must write the same bytes.
 static void test_parallel_encode_matches_serial() {
     fixture_storage storage;
@@ -1328,11 +1335,16 @@ static void test_parallel_encode_matches_serial() {
     std::vector<uint8_t> serial;
     CHECK(vbr_artifact_encode_vector(package, serial, 1024*1024) ==
           vbr_artifact_status::ok);
-    vector_sink parallel;
-    const vbr_artifact_stream_writer sink { &parallel, vector_sink::write };
-    CHECK(vbr_artifact_encode(package, sink, 1024*1024, nullptr, 4) ==
-          vbr_artifact_status::ok);
-    CHECK(!serial.empty() && parallel.bytes == serial);
+    // Worker count and work-claim order must not affect canonical bytes,
+    // including zero (serial fallback) and more workers than work items.
+    for (uint32_t workers : { 0u, 1u, 2u, 3u, 4u, 8u, 64u }) {
+        auto copy = package;
+        vector_sink parallel;
+        const vbr_artifact_stream_writer sink { &parallel, vector_sink::write };
+        CHECK(vbr_artifact_encode(copy, sink, 1024*1024, nullptr, workers) ==
+              vbr_artifact_status::ok);
+        CHECK(!serial.empty() && parallel.bytes == serial);
+    }
 }
 
 static void test_stream_larger_than_capture_ring() {

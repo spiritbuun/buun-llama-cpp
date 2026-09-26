@@ -5,6 +5,7 @@
 #include "llama-sha256.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <future>
 #include <limits>
@@ -2046,16 +2047,20 @@ size_t hash_worker_count(size_t count, uint32_t max_workers) {
         { count, max_workers, 8, std::thread::hardware_concurrency() }));
 }
 
-// Worker w takes every workers-th index from w. Futures join even if thread
-// creation or fn throws; no worker may outlive the caller's data.
+// Companions follow attention units and can contain a large recurrent image.
+// Start at that end and let free workers claim more work rather than assigning
+// the companion and a fixed share of units to one worker. Results still land
+// at their canonical indices. Futures join even if thread creation or fn
+// throws; no worker may outlive the caller's data.
 template <typename F>
 void for_each_index_parallel(size_t count, size_t workers, const F & fn) {
+    std::atomic<size_t> next { 0 };
     std::vector<std::future<void>> pending;
     pending.reserve(workers);
     for (size_t w = 0; w < workers; ++w) {
-        pending.push_back(std::async(std::launch::async, [&, w] {
-            for (size_t i = w; i < count; i += workers) {
-                fn(i);
+        pending.push_back(std::async(std::launch::async, [&] {
+            for (size_t i; (i = next.fetch_add(1, std::memory_order_relaxed)) < count;) {
+                fn(count - 1 - i);
             }
         }));
     }
