@@ -13478,6 +13478,14 @@ private:
             const auto make_request = [&]() {
                 auto request = vbr_import_target_for(slot, memory, task.n_tokens(), adapter_identity);
                 request.pack_rows       = pack_rows;
+                // An empty sequence in a live unified pool is not a whole-tree
+                // empty import. Use the same ownership-preserving insertion
+                // contract as slot-file restore, not the global empty check.
+                request.absent_insertion = !candidate.requires_prefix_projection() &&
+                    std::any_of(slots.begin(), slots.end(), [&](const server_slot & other) {
+                        return other.id != slot.id && memory->seq_pos_min(other.id) >= 0;
+                    });
+                request.previously_observed = request.absent_insertion;
                 request.publish_context = &state;
                 request.prepare_publish = [](
                     void * opaque,
