@@ -364,7 +364,10 @@ bool vbr_artifact_project_capture_union(
                 }
             }
             manifest_ids.push_back(manifest.manifest_id);
-            std::vector<std::pair<llama_seq_id, llama_pos>> logical_positions;
+            // Media cells may share a temporal position. Uniqueness is per
+            // child/sequence and full temporal/spatial coordinate, as in the
+            // exact artifact validator.
+            std::vector<std::tuple<uint32_t, llama_seq_id, llama_pos, llama_pos, llama_pos>> logical_positions;
             for (const auto & placement : manifest.placements) {
                 if (placement.child_id == UINT32_MAX ||
                     placement.stream_index == UINT32_MAX ||
@@ -394,8 +397,11 @@ bool vbr_artifact_project_capture_union(
                         return false;
                     }
                     logical_positions.push_back({
+                        placement.child_id,
                         placement.source_sequence,
                         cell.logical_position,
+                        cell.ext_x,
+                        cell.ext_y,
                     });
                 }
             }

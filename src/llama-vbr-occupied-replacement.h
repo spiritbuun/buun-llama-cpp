@@ -109,7 +109,14 @@ struct vbr_occupied_replacement_relocation_run {
     uint32_t cell_count = 0;
 };
 
-// Packed payload row of each placement cell, indexed by logical position.
+// Canonical cell order is (temporal position, y, x), not temporal position
+// alone: M-RoPE media has multiple spatial cells at the same position. This
+// preserves Qwen's row-major image order so contiguous rows stay one copy run.
+bool vbr_order_placement_cells(
+        const vbr_artifact_stream_placement & placement,
+        std::vector<const vbr_artifact_cell_placement *> & cells);
+
+// Packed payload row of each placement cell, in canonical cell order.
 // A projected package maps its physical cells, in order, onto the rows its
 // range proofs select; a dense image keeps each row at its physical cell.
 bool vbr_projected_packed_rows(

@@ -17,6 +17,7 @@
 #include <vector>
 
 #define SERVER_RESUME_MANIFEST_VERSION 1
+#define SERVER_RESUME_MEDIA_MANIFEST_VERSION 2
 #define SERVER_RESUME_OBJECT_VERSION   1
 
 enum class server_resume_reason : uint8_t {
@@ -40,6 +41,7 @@ enum class server_resume_object_kind : uint32_t {
     tail_state = 2, // partial state taken when the sequence ended at p0; p1 is 0
     artifact   = 3, // one self-verifying envelope of the whole sequence [0, p1), streamed
     placement  = 4, // where the sequence [0, p1) lies in the pool image of another entry's artifact
+    sequence   = 5, // complete fixed-KV sequence with explicit cell positions (M-RoPE media)
 };
 
 // bounds of a manifest, checked before anything is allocated from its numbers
@@ -113,11 +115,12 @@ struct server_resume_manifest {
     int64_t saved_unix_ms     = 0;
     int64_t last_used_unix_ms = 0;
     int32_t slot_hint         = -1;
+    bool shared_positions    = false; // v2: cell counts and temporal positions are distinct
 
     // Either the chunks tile [0, n_tokens), or one object holds the whole sequence and there are
-    // no chunks. That object is an artifact, with no tail states, or a placement: the sequence
-    // is a co-resident of the pool image in the artifact of `pool_entry`, and only its frontier
-    // tail state is its own.
+    // no chunks. That object is a VBR artifact, a full fixed-KV sequence, or a placement
+    // in the artifact of `pool_entry`. Whole objects may also carry early/turn checkpoints;
+    // a placement carries its own recurrent frontier when needed.
     std::vector<server_resume_object_record> chunks;
     std::vector<server_resume_object_record> tail_states;
     std::optional<server_resume_object_record> artifact;
@@ -129,6 +132,7 @@ struct server_resume_manifest {
     uint64_t    pool_xxh3       = 0;
 
     bool placed() const { return artifact && artifact->kind == server_resume_object_kind::placement; }
+    bool whole_sequence() const { return artifact && artifact->kind == server_resume_object_kind::sequence; }
 
     // the rows are in the image `pool` is, as the entry `id` holds it now
     bool placed_in(const std::string & id, const server_resume_object_record & pool) const {

@@ -41,6 +41,8 @@ server_committed_decode_reset_test_result
 server_committed_decode_reset_for_test();
 
 bool server_active_prefix_retention_for_test();
+bool server_vbr_media_publish_for_test(const server_tokens & ledger);
+bool server_resume_media_placement_for_test(const server_tokens & ledger);
 
 struct server_slot_frontier_logits_test_result {
     bool round_trip = false;

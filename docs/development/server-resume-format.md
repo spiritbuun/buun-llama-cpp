@@ -11,7 +11,8 @@ Scope of v1: fixed-type KV (f16, q8_0, turbo, TCQ), dense, hybrid-recurrent and
 SWA/iSWA models, one entry per conversation, direct install into a slot. Images
 and audio are stored on models where a media chunk of n cells takes n consecutive
 positions (§4a). Dynamic VBR takes its own route through the same entries (§11,
-P3). Out of scope and refused with a reason: media under M-RoPE, drafter state
+P3). The v2 extension adds shared-position (M-RoPE/IMROPE/VISION) media using
+whole-sequence objects and position-aware checkpoint metadata (§4a). Out of scope: drafter state
 on the fixed route (never saved), adapter changes between producer and consumer
 (P4).
 
@@ -51,6 +52,7 @@ any integrity unit smaller than the whole file.
         c-<p0>-<p1>-<gen>    base-state chunk for token positions [p0, p1)
         t-<pos>-<gen>        tail state (recurrent / SWA part) taken at <pos>
         v-<gen>              dynamic VBR artifact of the whole sequence (§11)
+        s-<gen>              complete fixed-KV sequence for shared-position media (§4a)
         tmp-*                staging; removed by the next writer
 ```
 
@@ -82,7 +84,7 @@ open an entry at all: given a manifest by name they fail the library magic check
 | 0 | 8 | magic `BUUNRSMO` |
 | 8 | 4 | object format version = 1 |
 | 12 | 4 | header size = 64 |
-| 16 | 4 | kind: 1 = base chunk, 2 = tail state |
+| 16 | 4 | kind: 1 = base chunk, 2 = tail state, 3 = VBR artifact, 4 = placement, 5 = whole fixed-KV sequence |
 | 20 | 4 | flags = 0 (unknown bits refuse the object) |
 | 24 | 8 | payload bytes |
 | 32 | 8 | XXH3-64 of the payload |
@@ -119,7 +121,7 @@ different things on disk:
 
 | Part | Content |
 |---|---|
-| Header, 64 bytes LE | magic `BUUNRSMM`, manifest format version = 1, header size, flags = 0, JSON bytes, ledger bytes, generation, XXH3-64 of JSON + ledger, XXH3-64 of the header |
+| Header, 64 bytes LE | magic `BUUNRSMM`, manifest format version = 1 (ordinary positions) or 2 (shared-position media), header size, flags = 0, JSON bytes, ledger bytes, generation, XXH3-64 of JSON + ledger, XXH3-64 of the header |
 | JSON document | records below; UTF-8, at most 1 MiB, parsed with a depth limit |
 | Ledger | `BUUNSLOT` envelope **version 3**: the v2 layout, flag `RESUME_KEY_BOUND` (bit 2) set, `RUNTIME_FAMILY_BOUND` and `HAS_LOGITS` clear, the identity field holding the resume compatibility key (§5). The v3 parser accepts v2 only on the legacy route and v3 only on the resume route |
 
@@ -242,7 +244,7 @@ Per nonempty slot, most recently used first:
    that was generating is saved "one behind": the sampled-but-undecoded token is
    simply not part of the entry. No decode, no draft-sequence change, no ring
    reset, no logits.
-2. Skip with a reason: media under M-RoPE or without a content id (§4a), a Qwen4 QSA
+2. Skip with a reason: media without a content id (§4a), a Qwen4 QSA
    index (the index image is outside the partial state; unverified), positions
    that are not the identity, or a memory whose `pos_max + 1` differs from the
    ledger length on a model with a partial part (`frontier_inconsistent`). On a
@@ -343,13 +345,44 @@ and go into the token ranges like any other.
 - **Positions.** A token range names cells by position and requires
   `pos[i] == p0 + i`. That holds where a chunk of n cells takes n consecutive
   positions (Gemma 3/4, SmolVLM, LLaVA-style). Under M-RoPE the cells of a chunk
-  share positions: a slot with media on a model whose RoPE type is MROPE, IMROPE
-  or VISION is skipped with `unsupported_positions`, at capture and at install.
-  Text-only conversations on such a model are stored as before.
+  share temporal positions and carry spatial coordinates. Such conversations use
+  manifest v2 (`shared_positions: true`); text-only conversations still use v1.
+  VBR preserves the coordinates already present in its artifact placements and
+  requires uniqueness of the complete `(position, x, y)` tuple per sequence.
+  Fixed KV uses a kind-5 `sequence` object: the existing full sequence serializer,
+  including attention coordinates and recurrent state. This object is installed
+  whole or refused when the destination lacks cell capacity; it cannot be
+  truncated to a smaller context. Saves rewrite the whole object rather than
+  retaining incremental chunks and currently stage one full object in host RAM
+  (bounded by the existing 8 GiB object limit).
+  Publication retains the previous committed whole object until the new
+  generation is durable, so replacement temporarily needs space for both.
+  Older builds refuse v2 at the manifest version check, without misinterpreting
+  media positions as token counts or deleting an unsupported entry.
 - **Identity.** Media cells are `LLAMA_TOKEN_NULL` in the ledger, so ids alone
   would make two images equal. The prefix digest adds, at the first cell of a
   chunk, the chunk's cell count and its content id. A chunk without an id is
   `unsupported_media`.
+- **Dynamic VBR.** The exact artifact route supports both consecutive- and shared-position
+  media. Restore checks the artifact's media identity, cell count and next position
+  against the integrity-checked ledger, then publishes that ledger with its media
+  placeholders intact. It does not reconstruct images from null token ids or run
+  the projector again for the reused prefix. Automatic host capture and restore
+  also support complete media prefixes and sealed checkpoint frontiers. Lookup
+  checks each complete-media identity scope, so adding another image does not
+  hide a saved earlier prefix. Arbitrary truncation of a larger host artifact is
+  still text-only: the media path never cuts through an image or invents a
+  recurrent checkpoint. Occupied-slot replacement retains its lease, ownership
+  and rollback checks, with recovery identity including media content ids.
+  This is in-process host caching. The shutdown pass that persists conversations
+  held **only** in host memory still skips media (§11); media in live slots is
+  persisted. A displaced image conversation must be live again before shutdown
+  to be included in the current resume store.
+- **Checkpoints.** A shared-position checkpoint records its logical cell count
+  separately from its temporal `pos_min`/`pos_max`. Restore verifies the latter
+  against the media ledger before importing it through the normal checkpoint
+  authority. This is necessary for Qwen chat-template rewinds on the first turn
+  after restart; saving only the terminal image would otherwise cold-prefill.
 - **Boundaries.** A chunk boundary may fall inside a media chunk: objects are
   data, and the digest of a boundary inside an image already covers the image. A
   restore never stops inside one. A checkpoint whose frontier lies inside a
@@ -378,10 +411,23 @@ restarted under `-np 1` with a host cache, on SmolVLM2: one `installed_host`,
 both continue identically. On Gemma 4 the stream count is part of the resume
 key (§5), so that restart installs nothing (`resume_key_mismatch`) and both
 conversations prefill cold: identical to the one-process run under f16 KV, one
-of the two second turns in other words under TCQ 3-bit. Qwen3.5-4B with a projector: media slots skipped with
+of the two second turns in other words under TCQ 3-bit. Before the v2 extension,
+Qwen3.5-4B with a projector had media slots skipped with
 `unsupported_positions`, a text-only conversation identical across restarts.
 Before this change `--resume` with a projector loaded hit an assert at the first
 save, with or without media in the slot.
+
+The v2 Qwen image regression on the 3090 covers Qwen3.5-4B and Qwen3.8-27B
+with fixed Turbo3 and dynamic VBR, including two successive restarts and
+recurrent checkpoint rewinds. All three replies match uninterrupted controls,
+and restored turns reuse the prefixes rather than silently replaying them.
+The 27B also passes with native MTP and through the slot-file route. A ~4k
+text-plus-image run forces F16-to-T8 transitions and reuses 4344/4514 cells
+after the two restarts. Video and Qwen audio are not covered by this test.
+At 140 MiB the same run reaches 62 degradation steps, including mixed lower
+TCQ tiers, and still restores both prefixes with identical replies. A fixed
+Turbo3 + MTP run also passes; restarting it with a 512-cell context explicitly
+refuses `context_too_small` without installing a partial media image.
 
 ## 5. Resume compatibility key
 
@@ -532,8 +578,9 @@ One log line and one `/slots` field per entry. The string
 | `host_restore_refused` | save side, dynamic VBR: the VBR host cache's restore did not bring a hosted conversation into the staging slot (§11); an entry it had from an earlier pass is kept |
 | `entry_in_use` | the restore action named an entry another slot was restored from or saved as; two slots never write one entry |
 | `state_rejected` | the library refused a blob (type, shape, TCQ fingerprint) |
+| `state_too_large` | a whole fixed-KV media sequence exceeds the bounded object size; capture is skipped |
 | `unsupported_media` | a media chunk without a content id (§4a); capture-side skip, logged at save |
-| `unsupported_positions` | cells that do not take consecutive positions: media under M-RoPE (§4a). At capture, and at install when the ledger has media and the loaded model shares positions |
+| `unsupported_positions` | invalid position geometry (shared-position media uses the v2 route, §4a) |
 | `unsupported_qsa`, `frontier_inconsistent` | capture-side skips, logged at save |
 | `unsupported_artifact`, `capture_refused`, `slot_busy`, `cache_shared`, `tier_mismatch`, `slot_not_empty`, `precision_refused`, `execution_identity_unavailable` | dynamic VBR route (§11). On a slot-file restore beside other slots `cache_shared` and `tier_mismatch` are a 400 (§8.1) |
 | `store_locked`, `store_unwritable`, `no_space`, `io_error` | store level; the server runs without persistence |
@@ -732,9 +779,9 @@ Properties and limits of v1, as measured:
   save (P4 closes that).
 - Conversations that live only in the host prompt cache at shutdown are not
   saved (P4).
-- Slots with media under M-RoPE and a QSA index are skipped with a reason; so
-  is media under dynamic VBR (§11). Not measured for media: audio chunks, a
-  chunk without a content id, and a turn made after a prefix restore that ended
+- Slots with a QSA index are skipped with a reason.
+  Dynamic VBR supports consecutive- and shared-position media (§11). Not measured for media:
+  a chunk without a content id, and a turn made after a prefix restore that ended
   at an image.
 
 ## 11. Dynamic VBR route (P3, as built)
@@ -896,7 +943,18 @@ of its own:
 
 **Needs the artifact store.** The store exists with the VBR host cache. Under
 `--cache-ram 0` a save is `unsupported_artifact` and the server warns at start
-that nothing is persisted. Media is `unsupported_media` on this route.
+that nothing is persisted. Media is supported by the exact live-slot artifact
+route and automatic host capture/restore (§4a), including its media ledger.
+
+Media regression coverage on RTX 3090: Gemma 4 E2B image conversations over two
+restarts, both below and above the sliding window, including an ~11k-token
+mixed-tier F16/T4 layout at an 80 MiB budget. All continuations matched the
+uninterrupted control, with the full saved prefix reused. An audio transcription
+and two follow-ups also matched across restarts. Two image conversations saved
+and restored together under `-np 2 --kv-unified` preserved both the primary
+artifact ledger and its placed co-resident. The short-window reuse boundary has
+a unit regression: `pos_min == 0` must not trigger a cold replay before the
+sliding window fills.
 
 Measured (RTX 3090, NVMe; 0.6B dense, 4B hybrid, 27B with MTP): restart ×2,
 sleep/wake ×2, rewind, live restore through the slot action and a degraded

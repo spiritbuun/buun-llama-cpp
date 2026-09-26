@@ -31,11 +31,11 @@ server_vbr_prompt_cache_support_status
 server_vbr_prompt_cache_support_for(
         bool has_draft_context,
         bool speculative_slot,
-        bool media_prompt,
+        bool unverifiable_media,
         bool alora_invocation) noexcept {
     (void) has_draft_context;
     (void) speculative_slot;
-    if (media_prompt) {
+    if (unverifiable_media) {
         return server_vbr_prompt_cache_support_status::
             media_prompt_unsupported;
     }

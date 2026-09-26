@@ -158,6 +158,10 @@ static bool object_record_valid(const server_resume_object_record & record, size
 }
 
 bool server_resume_manifest_validate(const server_resume_manifest & manifest, std::string & error) {
+    if (manifest.shared_positions && !manifest.artifact) {
+        error = "shared positions require a whole sequence object";
+        return false;
+    }
     using limits = server_resume_limits;
 
     if (manifest.n_tokens <= 0 || manifest.n_tokens > limits::max_tokens) {
@@ -194,7 +198,8 @@ bool server_resume_manifest_validate(const server_resume_manifest & manifest, st
             n_frontier += frontier;
             roles_hold = roles_hold && frontier == (tail.role == "frontier");
         }
-        if ((artifact.kind != server_resume_object_kind::artifact && !manifest.placed()) ||
+        if ((artifact.kind != server_resume_object_kind::artifact && !manifest.placed() && !manifest.whole_sequence()) ||
+            (manifest.whole_sequence() && !manifest.shared_positions) ||
             artifact.p0 != 0 || artifact.p1 != manifest.n_tokens ||
             artifact.gen == 0 || artifact.gen > manifest.generation || !roles_hold ||
             n_frontier > (manifest.placed() ? 1u : 0u) || manifest.tail_states.size() - n_frontier > 2) {
@@ -211,7 +216,7 @@ bool server_resume_manifest_validate(const server_resume_manifest & manifest, st
         return false;
     }
     // an artifact is bound to its epoch and chunks have none; a placement may carry one
-    const bool needs_epoch = manifest.artifact && !manifest.placed();
+    const bool needs_epoch = manifest.artifact && !manifest.placed() && !manifest.whole_sequence();
     if (manifest.sequence_epoch != 0 ? !manifest.artifact : needs_epoch) {
         error = "sequence epoch and artifact do not go together";
         return false;
@@ -237,7 +242,8 @@ bool server_resume_manifest_validate(const server_resume_manifest & manifest, st
     std::set<int32_t> positions;
     for (const auto & tail : manifest.tail_states) {
         if (tail.kind != server_resume_object_kind::tail_state || tail.p1 != 0 || tail.p0 <= 0 ||
-            tail.p0 > manifest.n_tokens || tail.n_tokens != tail.p0 || tail.pos_max != tail.p0 - 1 ||
+            tail.p0 > manifest.n_tokens || tail.n_tokens != tail.p0 ||
+            (manifest.shared_positions ? tail.pos_max >= tail.p0 : tail.pos_max != tail.p0 - 1) ||
             tail.pos_min < 0 || tail.pos_min > tail.pos_max || tail.gen == 0 || tail.gen > manifest.generation ||
             !positions.insert(tail.p0).second) {
             error = "tail state position is invalid";
@@ -352,8 +358,11 @@ std::vector<uint8_t> server_resume_manifest_encode(const server_resume_manifest 
         doc["tail_states"].push_back(object_record_to_json(tail));
     }
     if (manifest.artifact) {
-        doc[manifest.placed() ? "placement" : "artifact"] = object_record_to_json(*manifest.artifact);
+        doc[manifest.placed() ? "placement" : manifest.whole_sequence() ? "sequence" : "artifact"] = object_record_to_json(*manifest.artifact);
         doc["sequence_epoch"] = manifest.sequence_epoch;
+    }
+    if (manifest.shared_positions) {
+        doc["shared_positions"] = true;
     }
     if (manifest.placed()) {
         doc["pool_entry"]      = manifest.pool_entry;
@@ -383,7 +392,7 @@ std::vector<uint8_t> server_resume_manifest_encode(const server_resume_manifest 
 
     uint8_t * header = out.data();
     std::memcpy(header, MANIFEST_MAGIC, 8);
-    put_u32(header +  8, SERVER_RESUME_MANIFEST_VERSION);
+    put_u32(header +  8, manifest.shared_positions ? SERVER_RESUME_MEDIA_MANIFEST_VERSION : SERVER_RESUME_MANIFEST_VERSION);
     put_u32(header + 12, HEADER_SIZE);
     put_u32(header + 16, 0); // flags
     put_u32(header + 20, 0);
@@ -410,7 +419,8 @@ server_resume_reason server_resume_manifest_decode(
         error = "manifest header checksum";
         return server_resume_reason::manifest_corrupt;
     }
-    if (get_u32(data + 8) != SERVER_RESUME_MANIFEST_VERSION || get_u32(data + 12) != HEADER_SIZE ||
+    const uint32_t version = get_u32(data + 8);
+    if ((version != SERVER_RESUME_MANIFEST_VERSION && version != SERVER_RESUME_MEDIA_MANIFEST_VERSION) || get_u32(data + 12) != HEADER_SIZE ||
         get_u32(data + 16) != 0 || get_u32(data + 20) != 0) {
         error = "manifest version or flags";
         return server_resume_reason::format_unsupported;
@@ -451,6 +461,11 @@ server_resume_reason server_resume_manifest_decode(
         manifest.saved_unix_ms     = get_int<int64_t>(doc, "saved_unix_ms");
         manifest.last_used_unix_ms = get_int<int64_t>(doc, "last_used_unix_ms");
         manifest.slot_hint         = get_int<int32_t>(doc, "slot_hint");
+        manifest.shared_positions  = doc.value("shared_positions", false);
+        if (manifest.shared_positions != (version == SERVER_RESUME_MEDIA_MANIFEST_VERSION)) {
+            error = "position mode does not match manifest version";
+            return server_resume_reason::manifest_corrupt;
+        }
 
         const json & chunks      = doc.at("chunks");
         const json & tail_states = doc.at("tail_states");
@@ -470,6 +485,9 @@ server_resume_reason server_resume_manifest_decode(
         }
         if (doc.contains("artifact")) {
             manifest.artifact       = object_record_from_json(doc.at("artifact"), server_resume_object_kind::artifact);
+            manifest.sequence_epoch = get_int<uint64_t>(doc, "sequence_epoch");
+        } else if (doc.contains("sequence")) {
+            manifest.artifact = object_record_from_json(doc.at("sequence"), server_resume_object_kind::sequence);
             manifest.sequence_epoch = get_int<uint64_t>(doc, "sequence_epoch");
         } else if (doc.contains("placement")) {
             manifest.artifact        = object_record_from_json(doc.at("placement"), server_resume_object_kind::placement);
@@ -554,6 +572,8 @@ static std::string object_name(const server_resume_object_record & record) {
         std::snprintf(name, sizeof(name), "v-%" PRIu64, record.gen);
     } else if (record.kind == server_resume_object_kind::placement) {
         std::snprintf(name, sizeof(name), "p-%" PRIu64, record.gen);
+    } else if (record.kind == server_resume_object_kind::sequence) {
+        std::snprintf(name, sizeof(name), "s-%" PRIu64, record.gen);
     } else {
         std::snprintf(name, sizeof(name), "t-%" PRId32 "-%" PRIu64, record.p0, record.gen);
     }

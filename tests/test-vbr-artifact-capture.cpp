@@ -1878,7 +1878,8 @@ static bool publish_occupied_guard_package(
         uint64_t source_capacity_override = 0,
         uint32_t proof_count = 1,
         uint8_t payload_salt = 0,
-        ggml_type representation_type = GGML_TYPE_F16) {
+        ggml_type representation_type = GGML_TYPE_F16,
+        bool shared_positions = false) {
     reference = {};
     view.reset();
     if (token_count == 0 || proof_count == 0 || proof_count > 4096) {
@@ -1924,6 +1925,21 @@ static bool publish_occupied_guard_package(
     manifest.token_block.tokens.resize(token_count);
     for (uint32_t i = 0; i < token_count; ++i) {
         manifest.token_block.tokens[i] = llama_token(i + 1);
+    }
+    if (shared_positions) {
+        manifest.identity.next_position = (token_count + 3)/4;
+        auto & placement = manifest.placements.front();
+        placement.computation_frontier = manifest.identity.next_position;
+        for (size_t i = 0; i < placement.cells.size(); ++i) {
+            placement.cells[i].logical_position = llama_pos(i/4);
+            placement.cells[i].ext_x = llama_pos(i%2);
+            placement.cells[i].ext_y = llama_pos((i/2)%2);
+        }
+        for (auto & controller : manifest.generation.controllers) {
+            for (auto & stream : controller.streams) {
+                stream.computation_frontier = manifest.identity.next_position;
+            }
+        }
     }
     vbr_capture_projection projection;
     if (!vbr_artifact_project_capture_union(
@@ -2461,6 +2477,37 @@ static void test_dependency_scoped_projected_catalog_publication() {
     // provisional source rows.  This model-free publication reaches the same
     // immutable catalog view used by production rather than constructing a
     // mutable package facade in the test.
+    // Qwen-style cells share temporal positions but retain distinct spatial
+    // coordinates. Both provisional placement and recycling use every row,
+    // and changing even one coordinate invalidates the recovery witness.
+    {
+        llama_cache_acct_artifact_id media_reference;
+        vbr_artifact_package_view media_view;
+        CHECK(publish_occupied_guard_package(catalog, topology, budget, 93, 8, false,
+            media_reference, media_view, 0, 0, 1, 0, GGML_TYPE_F16, true));
+        if (media_view) {
+            std::vector<uint64_t> rows;
+            CHECK(vbr_projected_packed_rows(media_view,
+                media_view.manifest().stream_placements.front(), rows));
+            CHECK((rows == std::vector<uint64_t> {0, 1, 2, 3, 4, 5, 6, 7}));
+            for (const uint32_t capacity : {8u, 16u}) {
+                occupied_guard_fixture media;
+                CHECK(make_occupied_guard_fixture(media_view, 93, capacity, media));
+                vbr_occupied_replacement_guard guard;
+                CHECK(vbr_prepare_occupied_replacement_guard(media.target, media_view,
+                    media_view, media.observation, guard) == vbr_occupied_replacement_guard_status::ready);
+                CHECK(guard.cell_mapping().size() == 8);
+                CHECK(guard.relocation_runs().size() == 1);
+                CHECK(vbr_recheck_occupied_replacement_guard(guard, media.target, media.observation) ==
+                    vbr_occupied_replacement_guard_status::ready);
+                media.cells[1].ext_x++;
+                CHECK(vbr_recheck_occupied_replacement_guard(guard, media.target, media.observation) !=
+                    vbr_occupied_replacement_guard_status::ready);
+            }
+        }
+        media_view.reset();
+        CHECK(catalog.retire(media_reference) == vbr_artifact_retire_status::retired);
+    }
     llama_cache_acct_artifact_id occupied_reference;
     vbr_artifact_package_view occupied_view;
     CHECK(publish_occupied_guard_package(

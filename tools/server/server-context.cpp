@@ -3611,6 +3611,8 @@ static void server_wire_standalone_retention_metadata(
 }
 
 struct server_context_impl {
+    friend bool server_vbr_media_publish_for_test(const server_tokens & ledger);
+    friend bool server_resume_media_placement_for_test(const server_tokens & ledger);
     friend struct server_swa_window_selection_test;
     friend struct server_context;
     friend server_rejected_prompt_preservation_result
@@ -5203,8 +5205,8 @@ private:
         SRV_INF("RESUME %s\n", status.dump().c_str());
     }
 
-    // Under M-RoPE the cells of a media chunk share positions, and a token range names cells by
-    // position. Media is stored only where a chunk of n cells takes n consecutive positions.
+    // M-RoPE media needs position-aware objects rather than the incremental
+    // one-cell-per-position range format.
     bool resume_media_positions_shared() const {
         const auto rope = llama_model_rope_type(model_tgt);
         return rope == LLAMA_ROPE_TYPE_MROPE || rope == LLAMA_ROPE_TYPE_IMROPE ||
@@ -5241,7 +5243,7 @@ private:
             : cp.checkpoint_epoch == 0 && cp.checkpoint_epoch_swa == 0;
         return lineage && !cp.data_tgt.empty() &&
             cp.n_tokens > 0 && cp.n_tokens < n_tokens &&
-            cp.pos_max + 1 == cp.n_tokens &&
+            cp.pos_max + 1 == slot.prompt.tokens.pos_next(size_t(cp.n_tokens)) &&
             !resume_cuts_media(slot.prompt.tokens, size_t(cp.n_tokens)) &&
             checkpoint_frontier_is_current(slot, cp, adapter);
     }
@@ -5779,6 +5781,7 @@ private:
             (slot.t_last_used > 0 ? std::max<int64_t>(0, ggml_time_us() - slot.t_last_used)/1000 : 0);
         next.slot_hint         = slot.id;
         next.producers         = old.producers;
+        next.shared_positions  = slot.prompt.tokens.has_media() && resume_media_positions_shared();
     }
 
     bool resume_ledger_build(
@@ -5803,7 +5806,8 @@ private:
         const int64_t t_start = ggml_time_us();
         const auto & tokens = slot.prompt.tokens;
         const int32_t n_tokens = int32_t(tokens.size());
-        if (tokens.pos_next() != n_tokens || (tokens.has_media() && resume_media_positions_shared())) {
+        if (tokens.pos_next() <= 0 ||
+            (tokens.pos_next() != n_tokens && !tokens.has_media())) {
             return skipped("unsupported_positions");
         }
         if (tokens.has_media()) {
@@ -5813,8 +5817,8 @@ private:
                 return skipped("unsupported_media");
             }
         }
-        if (resume_vbr() && (tokens.has_media() || !vbr_artifact_store)) {
-            return skipped(tokens.has_media() ? "unsupported_media" : "unsupported_artifact");
+        if (resume_vbr() && !vbr_artifact_store) {
+            return skipped("unsupported_artifact");
         }
         {
             std::vector<llama_memory_tree_child> tree;
@@ -5833,7 +5837,7 @@ private:
         auto * mem = llama_get_memory(ctx_tgt);
         const llama_pos pos_min = llama_memory_seq_pos_min(mem, slot.id);
         const llama_pos pos_max = llama_memory_seq_pos_max(mem, slot.id);
-        if (pos_max + 1 != n_tokens) {
+        if (pos_max + 1 != tokens.pos_next()) {
             return skipped("frontier_inconsistent");
         }
         if (!resume_has_partial && pos_min != 0 && llama_model_n_swa(model_tgt) == 0) {
@@ -5877,6 +5881,9 @@ private:
             return group.pool_entry.empty()
                 ? resume_capture_artifact(slot, old, have_old, adapter, adapter_hex, t_start, group)
                 : resume_capture_placement(slot, old, have_old, adapter, adapter_hex, t_start, group);
+        }
+        if (tokens.has_media() && resume_media_positions_shared()) {
+            return resume_capture_sequence(slot, old, have_old, adapter, adapter_hex, t_start);
         }
 
         // The same tokens can stand over another state: a cold refill, another model of the family,
@@ -6143,10 +6150,66 @@ private:
         };
     }
 
+    // Fixed-KV M-RoPE media cannot be represented by consecutive-position
+    // chunks. Store the existing full sequence format, including its explicit
+    // cell coordinates and recurrent state, under a distinct object kind.
+    json resume_capture_sequence(
+            server_slot & slot, const server_resume_manifest & old, bool have_old,
+            const std::string & adapter, const std::string & adapter_hex, int64_t t_start) {
+        const size_t size = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (size == 0) { return resume_skipped("state_rejected"); }
+        if (size > server_resume_limits::max_object_bytes) {
+            return resume_skipped("state_too_large");
+        }
+        const auto ring = resume_ring_tails(slot, adapter, slot.prompt.n_tokens());
+        if (!have_old) { resume_prune(1); }
+        if (resume_store->free_bytes() < size + resume_ring_bytes(ring) + 1024*1024) {
+            return resume_failed(server_resume_reason::no_space, "whole media sequence");
+        }
+        std::vector<uint8_t> data(size);
+        if (llama_state_seq_get_data_ext(ctx_tgt, data.data(), data.size(), slot.id,
+                LLAMA_STATE_SEQ_FLAGS_NONE) != size) {
+            return resume_skipped("state_rejected");
+        }
+        server_resume_manifest next;
+        resume_manifest_head(next, old, slot, adapter_hex);
+        next.retain_producers({});
+        const uint32_t producer = next.producer_index(resume_producer());
+        if (!resume_ledger_build(slot.prompt.tokens, adapter, next.ledger)) {
+            return resume_skipped("ledger_invalid");
+        }
+        const std::string id = have_old ? slot.resume_entry_id : server_resume_store::new_entry_id();
+        server_resume_object_record rec;
+        rec.kind = server_resume_object_kind::sequence;
+        rec.p1 = next.n_tokens;
+        rec.gen = next.generation;
+        rec.producer = producer;
+        rec.prefix_digest = server_resume_prefix_hasher(slot.prompt.tokens).at(size_t(next.n_tokens));
+        std::string error;
+        auto reason = resume_store->write_object(id, rec, data.data(), data.size(), error);
+        std::vector<uint8_t>().swap(data);
+        uint64_t bytes = rec.bytes;
+        next.artifact = rec;
+        if (reason == server_resume_reason::ok) {
+            reason = resume_write_ring_tails(slot, id, next, ring, producer, bytes, error);
+        }
+        if (reason == server_resume_reason::ok) { reason = resume_store->commit(id, next, error); }
+        if (reason != server_resume_reason::ok) {
+            if (!have_old) { resume_store->remove_entry(id); }
+            return resume_failed(reason, error);
+        }
+        resume_store->sweep(id, next);
+        resume_entry_take(slot, id);
+        resume_unslotted.erase(id);
+        return json {{"outcome", "saved"}, {"entry", id}, {"n_tokens", next.n_tokens},
+            {"whole_sequence", true}, {"tail_states", next.tail_states.size()},
+            {"bytes_written", bytes}, {"t_ms", (ggml_time_us() - t_start)/1000.0}};
+    }
+
     // a slot whose rows a save of a dynamic cache can record
     static bool resume_vbr_storable(const server_slot & slot) {
         const auto & tokens = slot.prompt.tokens;
-        return !tokens.empty() && tokens.pos_next() == llama_pos(tokens.size()) && !tokens.has_media() &&
+        return !tokens.empty() && tokens.pos_next() > 0 &&
             slot.state == SLOT_STATE_IDLE && !slot.is_processing() && !slot.hard_lease_blocks_live_prefix();
     }
 
@@ -6478,11 +6541,52 @@ private:
         return at == in.size();
     }
 
+    using resume_row_coordinate = std::array<llama_pos, 3>; // t, y, x (decoder row order)
+
+    static std::vector<resume_row_coordinate> resume_expected_rows(const server_tokens & tokens, bool mrope) {
+        std::vector<mtmd_decoder_pos> coordinates;
+        const auto positions = tokens.prefix_row_positions(tokens.size(), mrope ? &coordinates : nullptr);
+        std::vector<resume_row_coordinate> expected;
+        expected.reserve(positions.size());
+        for (size_t i = 0; i < positions.size(); ++i) {
+            expected.push_back({positions[i], mrope ? llama_pos(coordinates[i].y) : 0,
+                                             mrope ? llama_pos(coordinates[i].x) : 0});
+        }
+        if (!std::is_sorted(expected.begin(), expected.end())) {
+            std::sort(expected.begin(), expected.end());
+        }
+        return expected;
+    }
+
+    static bool resume_placement_rows_match(const vbr_artifact_stream_placement & placement,
+                                            const std::vector<resume_row_coordinate> & expected) {
+        std::vector<const vbr_artifact_cell_placement *> held;
+        if (placement.cells.empty() || placement.cells.size() > expected.size() ||
+            !vbr_order_placement_cells(placement, held)) {
+            return false;
+        }
+        auto suffix = expected.end() - held.size();
+        auto coordinate = expected.begin();
+        for (const auto * cell : held) {
+            // Window reclamation may retain any subset of a masked image's
+            // shared temporal rows, not only its lexicographically last pixels.
+            if (cell->logical_position != (*suffix++)[0]) { return false; }
+            const resume_row_coordinate row{cell->logical_position, cell->ext_y, cell->ext_x};
+            while (coordinate != expected.end() && *coordinate < row) { ++coordinate; }
+            if (coordinate == expected.end() || *coordinate != row) { return false; }
+            ++coordinate;
+        }
+        return true;
+    }
+
     // Whether the placements are the whole of a sequence of `n_tokens`: one for each attention
-    // child of the tree, in its order, with its frontier at the end and one row for each position
-    // of [0, n_tokens), or of a suffix of it for a window child. The import admits fewer rows, as a
+    // child of the tree, in its order, with its frontier at the end and the ledger's row positions,
+    // or a suffix of them for a window child. The import admits fewer rows, as a
     // checkpoint may hold them; a resumed conversation with a hole in it would read as whole.
-    bool resume_placement_whole(const std::vector<vbr_artifact_stream_placement> & placements, int32_t n_tokens) const {
+    bool resume_placement_whole(const std::vector<vbr_artifact_stream_placement> & placements, const server_tokens & tokens) const {
+        const int32_t n_tokens = int32_t(tokens.size());
+        const llama_pos next_position = tokens.pos_next();
+        const auto expected = resume_expected_rows(tokens, resume_media_positions_shared());
         std::vector<llama_memory_tree_child> tree;
         if (!llama_memory_tree_collect(llama_get_memory(ctx_tgt), tree)) {
             return false;
@@ -6496,19 +6600,13 @@ private:
                 return false;
             }
             const auto & placement = placements[i++];
-            if (placement.child_id != node.child_id || placement.computation_frontier != n_tokens ||
+            if (placement.child_id != node.child_id || placement.computation_frontier != next_position ||
                 placement.cells.empty() || placement.cells.size() > size_t(n_tokens) ||
                 (!node.window && placement.cells.size() != size_t(n_tokens))) {
                 return false;
             }
-            const llama_pos first = n_tokens - llama_pos(placement.cells.size());
-            std::vector<bool> held(placement.cells.size(), false);
-            for (const auto & cell : placement.cells) {
-                if (cell.logical_position < first || cell.logical_position >= n_tokens ||
-                    held[cell.logical_position - first]) {
-                    return false;
-                }
-                held[cell.logical_position - first] = true;
+            if (!resume_placement_rows_match(placement, expected)) {
+                return false;
             }
         }
         return i == placements.size();
@@ -6595,7 +6693,7 @@ private:
             tail.kind = server_resume_object_kind::tail_state;
             tail.p0 = n_tokens;
             tail.n_tokens = n_tokens;
-            tail.pos_max = n_tokens - 1;
+            tail.pos_max = tokens.pos_next() - 1;
             // the window rows are placed, so the partial state here is a recurrent one
             tail.pos_min = tail.pos_max;
             tail.role = "frontier";
@@ -7117,6 +7215,10 @@ private:
         if (const char * why = resume_ledger_restore(slot, manifest, adapter, restored)) {
             return skipped(why);
         }
+        if (manifest.whole_sequence()) {
+            if (resume_vbr()) { return skipped("unsupported_artifact"); }
+            return resume_install_sequence(slot, id, manifest, std::move(restored), t_start);
+        }
         if (manifest.artifact || resume_vbr()) {
             // the key keeps the two routes apart; an entry that crosses them anyway is not read
             if (!manifest.artifact || !resume_vbr() || !vbr_artifact_store) {
@@ -7163,15 +7265,13 @@ private:
         } catch (const std::exception &) {
             return skipped("ledger_invalid");
         }
-        if (restored.has_media() && resume_media_positions_shared()) {
-            return skipped("unsupported_positions");
-        }
         const int32_t n_tokens = manifest.n_tokens;
         std::array<uint8_t, 32> token_digest = {};
         if (restored.size() != size_t(n_tokens) ||
             envelope.token_count != uint64_t(n_tokens) ||
-            envelope.next_position != int64_t(n_tokens) ||
-            restored.pos_next() != n_tokens ||
+            envelope.next_position != restored.pos_next() ||
+            manifest.shared_positions != (restored.has_media() && resume_media_positions_shared()) ||
+            (!manifest.shared_positions && restored.pos_next() != n_tokens) ||
             !restored.validate(ctx_tgt) ||
             !restored.retention_token_digest(token_digest) ||
             token_digest != envelope.token_digest) {
@@ -7190,7 +7290,9 @@ private:
             });
             server_resume_prefix_hasher tail_hasher(restored);
             for (const auto & rec : tails) {
-                if (rec.prefix_digest != tail_hasher.at(size_t(rec.pos()))) {
+                if (rec.pos_max + 1 != restored.pos_next(size_t(rec.n_tokens)) ||
+                    resume_cuts_media(restored, size_t(rec.n_tokens)) ||
+                    rec.prefix_digest != tail_hasher.at(size_t(rec.pos()))) {
                     return skipped("ledger_invalid");
                 }
             }
@@ -7200,6 +7302,35 @@ private:
             return skipped("ledger_invalid");
         }
         return nullptr;
+    }
+
+    json resume_install_sequence(
+            server_slot & slot, const std::string & id, const server_resume_manifest & manifest,
+            server_tokens restored, int64_t t_start) {
+        // Whole media images are all-or-nothing. Capacity is in cells, not the
+        // smaller temporal position count. No partial image is installed.
+        if (manifest.n_tokens > slot.n_ctx - 1) { return resume_skipped("context_too_small"); }
+        std::vector<uint8_t> data;
+        std::string error;
+        const auto reason = resume_store->read_object(id, *manifest.artifact, data, error);
+        if (reason != server_resume_reason::ok) { return resume_failed(reason, error); }
+        const size_t bytes = data.size();
+        slot.prompt_clear();
+        if (llama_state_seq_set_data_ext(ctx_tgt, data.data(), data.size(), slot.id,
+                LLAMA_STATE_SEQ_FLAGS_NONE) != data.size() ||
+            llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) + 1 != restored.pos_next()) {
+            slot.mandatory_recovery_reset(server_cache_destruction_reason::restore_failure);
+            return resume_skipped("state_rejected");
+        }
+        std::vector<uint8_t>().swap(data);
+        resume_establish(slot, std::move(restored));
+        resume_entry_take(slot, id);
+        slot.t_last_used = resume_last_used(manifest);
+        const auto ring = resume_import_ring(slot, id, manifest, manifest.n_tokens);
+        return json {{"outcome", "installed_full"}, {"entry", id}, {"p", manifest.n_tokens},
+            {"n_tokens", manifest.n_tokens}, {"whole_sequence", true},
+            {"checkpoints", ring.n_imported}, {"checkpoints_dropped", ring.n_dropped},
+            {"bytes_read", bytes + ring.bytes_read}, {"t_ms", (ggml_time_us() - t_start)/1000.0}};
     }
 
     // The fixed route of an install: the chunks up to the largest position that fits, and the
@@ -7404,8 +7535,8 @@ private:
     // what keeps a sequence out of an import, whichever object it comes in
     static const char * resume_vbr_inadmissible(
             const server_tokens & tokens, const server_resume_manifest & manifest, const server_slot & slot) {
-        if (tokens.has_media()) {
-            return "unsupported_media";
+        if (tokens.pos_next() <= 0) {
+            return "unsupported_positions";
         }
         return manifest.n_tokens > slot.n_ctx - 1 ? "context_too_small" : nullptr;
     }
@@ -7440,7 +7571,7 @@ private:
         if (reason != server_resume_reason::ok) {
             return resume_failed(reason, error);
         }
-        if (!resume_placement_decode(payload, placements) || !resume_placement_whole(placements, manifest.n_tokens)) {
+        if (!resume_placement_decode(payload, placements) || !resume_placement_whole(placements, co.tokens)) {
             return json {{"outcome", "failed"}, {"reason", "state_rejected"}, {"error", "placement"}};
         }
         return nullptr;
@@ -7454,7 +7585,7 @@ private:
         auto & slot = *co.slot;
         if ((resume_has_partial && llama_state_seq_set_data_ext(
                 ctx_tgt, tail.data(), tail.size(), slot.id, RESUME_PLACED_TAIL_FLAGS) != tail.size()) ||
-            llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) != manifest.n_tokens - 1) {
+            llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) != co.tokens.pos_next() - 1) {
             const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
             slot.mandatory_recovery_reset(server_cache_destruction_reason::restore_failure);
             return json {
@@ -7562,6 +7693,17 @@ private:
             };
         }
 
+        // The token ids alone cannot distinguish two equally sized media chunks.
+        // Bind the artifact to the authenticated ledger before installing any KV.
+        std::string media_identity;
+        const auto & artifact_identity = payload->package().manifest().identity;
+        if (!restored.media_content_identity(restored.size(), media_identity) ||
+            artifact_identity.media_content_identity != media_identity ||
+            artifact_identity.token_count != int64_t(restored.size()) ||
+            artifact_identity.next_position != restored.pos_next()) {
+            return resume_skipped("ledger_invalid");
+        }
+
         // the other conversations of the image, each into an empty slot of its own
         std::vector<resume_co_install *> ready;
         std::vector<vbr_import_co_resident> residents;
@@ -7591,6 +7733,7 @@ private:
             vbr_import_publish_state publish_state;
             publish_state.slot          = &slot;
             publish_state.expect_tokens = &ids;
+            publish_state.expect_ledger = &restored;
             publish_state.expect_epoch  = manifest.sequence_epoch;
 
             auto target = vbr_import_target_for(slot, memory, uint64_t(manifest.n_tokens), adapter);
@@ -12956,6 +13099,7 @@ private:
         bool ready = false;
         // set by a caller that knows what the artifact has to hold
         const llama_tokens * expect_tokens = nullptr;
+        const server_tokens * expect_ledger = nullptr;
         uint64_t expect_epoch = 0;
     };
 
@@ -12980,8 +13124,16 @@ private:
             // rather than replacing it with a default-constructed one. In particular, has_mtmd
             // is slot configuration, not artifact payload. Prepare its value off-side so the
             // no-fail composite publication remains allocation-free.
-            state->prompt.tokens.has_mtmd = state->slot->prompt.tokens.has_mtmd;
-            state->prompt.tokens.insert(tokens);
+            if (state->expect_ledger) {
+                if (state->expect_ledger->retention_token_ids() != tokens ||
+                    state->expect_ledger->has_mtmd != state->slot->prompt.tokens.has_mtmd) {
+                    return false;
+                }
+                state->prompt.tokens = state->expect_ledger->clone();
+            } else {
+                state->prompt.tokens.has_mtmd = state->slot->prompt.tokens.has_mtmd;
+                state->prompt.tokens.insert(tokens);
+            }
             state->prompt.sequence_epoch = sequence_epoch;
             state->ready = state->prompt.n_tokens() == int(tokens.size());
             return state->ready;
@@ -13057,7 +13209,6 @@ private:
                 slot.prompt.sequence_epoch == 0;
             const bool occupied_candidate =
                 !slot.prompt.tokens.empty() &&
-                !slot.prompt.tokens.has_media() &&
                 slot.prompt.sequence_epoch != 0;
             if (!construction_empty && !occupied_candidate) {
                 return false;
@@ -15058,11 +15209,19 @@ private:
             const server_tokens & tokens,
             const std::vector<common_adapter_lora_info> & lora,
             bool speculative_slot) noexcept {
-        // Media and aLoRA still need their own frontier authority. Draft-model
-        // and DFlash state are exact companion payloads in the same adoption
-        // transaction as target KV, so speculative slots are supported.
+        // Media is eligible only at a complete, content-identified frontier.
+        // Draft state remains an exact companion in the target KV transaction.
+        bool unsupported_media = false;
+        if (tokens.has_media()) {
+            try {
+                std::string identity;
+                unsupported_media = !tokens.media_content_identity(tokens.size(), identity);
+            } catch (...) {
+                unsupported_media = true;
+            }
+        }
         return server_vbr_prompt_cache_support_for(
-            false, speculative_slot, tokens.has_media(),
+            false, speculative_slot, unsupported_media,
             lora_all_alora(lora));
     }
 
@@ -23492,6 +23651,69 @@ bool server_active_prefix_retention_for_test() {
         check(store.snapshot().lineages.empty() && store.live_bytes() == 0, "no retained lineage or geometry");
     }
     return passed;
+}
+
+bool server_resume_media_placement_for_test(const server_tokens & ledger) {
+    const auto expected = server_context_impl::resume_expected_rows(ledger, true);
+    if (expected.size() < 4) { return false; }
+    vbr_artifact_stream_placement placement;
+    placement.computation_frontier = ledger.pos_next();
+    for (size_t i = 0; i < expected.size(); ++i) {
+        const auto & p = expected[i];
+        placement.cells.push_back({uint32_t(i), p[0], p[2], p[1]});
+    }
+    const auto matches = [&]() { return server_context_impl::resume_placement_rows_match(placement, expected); };
+    if (!matches()) { return false; }
+    std::reverse(placement.cells.begin(), placement.cells.end());
+    if (!matches()) { return false; }
+    std::reverse(placement.cells.begin(), placement.cells.end());
+    // Retain temporal counts and physical ownership, but duplicate an image coordinate.
+    size_t i = 1;
+    while (i < placement.cells.size() && placement.cells[i-1].logical_position != placement.cells[i].logical_position) { ++i; }
+    if (i == placement.cells.size()) { return false; }
+    const auto saved = placement.cells[i];
+    placement.cells[i].ext_x = placement.cells[i-1].ext_x;
+    placement.cells[i].ext_y = placement.cells[i-1].ext_y;
+    if (matches()) { return false; }
+    placement.cells[i] = saved;
+    placement.cells[i].ext_x += 100; // distinct, but not a coordinate in the ledger
+    if (matches()) { return false; }
+    placement.cells[i] = saved;
+    placement.cells.erase(placement.cells.begin() + i); // internal hole, not a suffix
+    if (matches()) { return false; }
+    placement.cells = {{0, expected[i-1][0], expected[i-1][2], expected[i-1][1]},
+                       {1, expected.back()[0], expected.back()[2], expected.back()[1]}};
+    if (!matches()) { return false; } // window may retain any pixel at its temporal boundary
+    placement.cells.erase(placement.cells.begin(), placement.cells.end() - 1);
+    return matches(); // legitimate window suffix
+}
+
+bool server_vbr_media_publish_for_test(const server_tokens & ledger) {
+    server_slot slot;
+    slot.prompt.tokens.has_mtmd = ledger.has_mtmd;
+    auto ids = ledger.retention_token_ids();
+    server_context_impl::vbr_import_publish_state state;
+    state.slot = &slot;
+    state.expect_tokens = &ids;
+    state.expect_ledger = &ledger;
+    state.expect_epoch = 7;
+    const auto prepare = [&](uint64_t epoch) {
+        return server_context_impl::vbr_import_prepare_publish(&state, ids, epoch);
+    };
+    // Rejected prepare must leave the destination empty; no partial ledger is published.
+    if (ids.empty() || prepare(8)) { return false; }
+    slot.prompt.tokens.has_mtmd = !ledger.has_mtmd;
+    if (prepare(7)) { return false; }
+    slot.prompt.tokens.has_mtmd = ledger.has_mtmd;
+    ids.push_back(1);
+    if (prepare(7)) { return false; }
+    ids.pop_back();
+    if (!slot.prompt.tokens.empty() || slot.prompt.sequence_epoch != 0 ||
+        !prepare(7) || prepare(7)) { return false; }
+    server_context_impl::vbr_import_publish(&state);
+    return !state.ready && slot.prompt.sequence_epoch == 7 &&
+        slot.prompt.tokens.serialize() == ledger.serialize() &&
+        slot.prompt.tokens.get_common_prefix(ledger) == ledger.size();
 }
 
 server_mmproj_lifecycle_test_result

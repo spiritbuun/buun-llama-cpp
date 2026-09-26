@@ -242,7 +242,7 @@ static void test_manifest_refusals() {
     const std::vector<uint8_t> good = server_resume_manifest_encode(base());
     const std::string text((const char *) good.data() + 64, good.size() - 64 - base().ledger.size());
     CHECK(decode(raw_manifest(text)) == server_resume_reason::ok);
-    CHECK(decode(raw_manifest(text, 2)) == server_resume_reason::format_unsupported);
+    CHECK(decode(raw_manifest(text, SERVER_RESUME_MEDIA_MANIFEST_VERSION + 1)) == server_resume_reason::format_unsupported);
     CHECK(decode(raw_manifest(text.substr(0, text.size() - 1) +
         ",\"unknown\":" + std::string(20, '[') + "0" + std::string(20, ']') + "}")) ==
         server_resume_reason::manifest_corrupt);
@@ -905,7 +905,42 @@ static void test_entry_file(const std::string & root) {
     CHECK(from && !fs::exists(taken));
 }
 
+static void test_shared_positions() {
+    auto manifest = manifest_of(20, 1);
+    manifest.shared_positions = true;
+    auto record = chunk_of(0, 20, 1);
+    record.kind = server_resume_object_kind::sequence;
+    manifest.artifact = record;
+    auto checkpoint = tail_of(15, 1, "turn");
+    checkpoint.pos_max = 6; // 15 cells but only 7 temporal positions
+    manifest.tail_states.push_back(checkpoint);
+    std::string error;
+    CHECK(server_resume_manifest_validate(manifest, error));
+    auto bytes = server_resume_manifest_encode(manifest);
+    server_resume_manifest decoded;
+    CHECK(server_resume_manifest_decode(bytes.data(), bytes.size(), decoded, error) == server_resume_reason::ok);
+    CHECK(decoded.shared_positions && decoded.whole_sequence());
+    CHECK(decoded.tail_states[0].pos_max == 6 && decoded.tail_states[0].n_tokens == 15);
+    // A valid header checksum cannot make shared-position semantics into v1.
+    auto wrong_version = bytes;
+    wrong_version[8] = SERVER_RESUME_MANIFEST_VERSION;
+    const auto seal = XXH3_64bits(wrong_version.data(), 56);
+    for (size_t i = 0; i < 8; ++i) { wrong_version[56 + i] = uint8_t(seal >> (8*i)); }
+    CHECK(server_resume_manifest_decode(wrong_version.data(), wrong_version.size(), decoded, error) ==
+        server_resume_reason::manifest_corrupt);
+    manifest.shared_positions = false;
+    CHECK(!server_resume_manifest_validate(manifest, error));
+    manifest.shared_positions = true;
+    manifest.tail_states[0].pos_max = 15;
+    CHECK(!server_resume_manifest_validate(manifest, error));
+    manifest.tail_states.clear();
+    manifest.artifact.reset();
+    manifest.chunks.push_back(chunk_of(0, 20, 1));
+    CHECK(!server_resume_manifest_validate(manifest, error));
+}
+
 int main() {
+    test_shared_positions();
     test_manifest_round_trip();
     test_manifest_refusals();
 

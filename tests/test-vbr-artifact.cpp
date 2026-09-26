@@ -19,6 +19,7 @@
 #include "server-retention-sidecar.h"
 #include "server-vbr-capture-readiness.h"
 #include "server-vbr-prompt-cache-support.h"
+#include "mtmd.h"
 #endif
 
 #include <algorithm>
@@ -1132,6 +1133,12 @@ static void test_validation_and_ordering() {
     auto duplicate_position = package;
     duplicate_position.manifest.stream_placements[0].cells[1]
         .logical_position = 0;
+    // A repeated temporal position with different spatial coordinates is a
+    // legitimate M-RoPE cell, including in a co-resident of a text capture.
+    CHECK(vbr_artifact_encode_vector(
+              duplicate_position, encoded, 1024*1024) == vbr_artifact_status::ok);
+    duplicate_position.manifest.stream_placements[0].cells[1].ext_x = 10;
+    duplicate_position.manifest.stream_placements[0].cells[1].ext_y = 20;
     CHECK(vbr_artifact_encode_vector(
               duplicate_position, encoded, 1024*1024) !=
           vbr_artifact_status::ok);
@@ -1170,6 +1177,8 @@ static void test_validation_and_ordering() {
     auto cross_stream_duplicate_position = cross_stream;
     cross_stream_duplicate_position.manifest.stream_placements[1]
         .cells[0].logical_position = 1;
+    cross_stream_duplicate_position.manifest.stream_placements[1].cells[0].ext_x = 11;
+    cross_stream_duplicate_position.manifest.stream_placements[1].cells[0].ext_y = 21;
     CHECK(vbr_artifact_encode_vector(
               cross_stream_duplicate_position, encoded, 1024*1024) !=
           vbr_artifact_status::ok);
@@ -5760,6 +5769,85 @@ private:
     std::shared_ptr<void> owner_ = std::make_shared<int>(1);
 };
 
+static void test_prompt_cache_vbr_media_lookup() {
+    catalog_fixture fixture;
+    const auto image = [](const char * id) {
+        server_tokens tokens(llama_tokens {}, true);
+        auto * chunk = mtmd_test_create_image_chunk(id, 2);
+        tokens.push_back(chunk);
+        mtmd_input_chunk_free(chunk);
+        return tokens;
+    };
+    server_prompt prompt;
+    prompt.tokens = image("image-a");
+    prompt.sequence_epoch = 3;
+    auto & identity = fixture.package.manifest.identity;
+    CHECK(prompt.tokens.media_content_identity(prompt.n_tokens(), identity.media_content_identity));
+    identity.next_position = prompt.tokens.pos_next();
+    fixture.package.manifest.token_block.tokens = prompt.tokens.retention_token_ids();
+    const auto published = publish_fixture(*fixture.catalog,
+        fixture.package, fixture.completions(), fixture.budget);
+    CHECK(published.status == llama_vbr_artifact_publish_status::published);
+    vbr_artifact_package_view view;
+    CHECK(fixture.catalog->resolve_reference(published.reference_artifact, view) == vbr_artifact_resolve_status::ok);
+    auto owner = server_prompt_cache_vbr_payload::adopt(std::move(view));
+    CHECK(owner);
+    if (!owner) { return; }
+
+    server_cache_authority authority;
+    server_retention_sidecar_store retention;
+    retention.configure(&fixture.ledger, fixture.host, &authority.leases);
+    CHECK(retention.enable_prefix_tracking());
+    constexpr int source_slot = 4;
+    const auto source_key = server_retention_instance_key::for_slot(source_slot);
+    common_chat_msg_spans spans;
+    spans.add(COMMON_CHAT_ROLE_USER, 0, prompt.n_tokens());
+    CHECK(retention.publish(source_key, common_retention_pool::attention,
+        spans, true, prompt.n_tokens(), prompt.n_tokens(), true));
+    CHECK(server_prompt_retention_publish_exact_prefix(retention, source_key,
+        prompt, identity.adapter_config_identity, prompt.n_tokens()));
+    server_prompt_cache cache(0, 0);
+    cache.acct = &fixture.ledger;
+    cache.retention_obs = &retention;
+    cache.lease_obs = &authority.leases;
+    cache.lease_execution_identity = &identity.execution_identity;
+    server_prompt_cache_vbr_publication_metadata metadata;
+    CHECK(cache.prepare_vbr_publication_metadata(prompt, identity.execution_identity,
+        identity.adapter_config_identity, source_slot, metadata));
+    CHECK(cache.publish_vbr(metadata, server_prompt_cache_payload::from_vbr(owner), {}, false));
+
+    const auto lookup = [&](const server_tokens & request, bool expected) {
+        server_prompt_cache_vbr_restore_candidate candidate;
+        CHECK(cache.prepare_vbr_restore(request, identity.execution_identity,
+            identity.adapter_config_identity, candidate, true) == expected);
+        if (expected && candidate.ready()) {
+            CHECK(candidate.prefix_tokens() == 2);
+            CHECK(!candidate.requires_prefix_projection());
+            server_prompt destination;
+            destination.tokens.has_mtmd = true;
+            CHECK(cache.prepare_vbr_restore_destination(candidate, destination, 7));
+            // Abandoning the prepared import leaves the live slot untouched.
+            CHECK(destination.tokens.empty());
+        }
+    };
+    lookup(prompt.tokens, true);
+    auto extended = prompt.tokens.clone();
+    extended.push_back(104);
+    lookup(extended, true);
+    auto * second = mtmd_test_create_image_chunk("image-b", 2);
+    extended.push_back(second);
+    mtmd_input_chunk_free(second);
+    extended.push_back(105);
+    CHECK((extended.media_prefix_boundaries() == std::vector<size_t> {0, 3, 6}));
+    lookup(extended, true); // full request scope differs from the saved prefix
+    lookup(image("image-c"), false); // same null token IDs, different content
+    lookup(image(""), false);
+    for (auto & state : cache.states) {
+        retention.retire(server_retention_instance_key::for_host_entry(&state));
+    }
+    cache.states.clear();
+}
+
 static void test_prompt_cache_vbr_atomic_logical_publication() {
     static_assert(!std::is_copy_constructible_v<
         server_prompt_cache_vbr_restore_candidate>);
@@ -9908,6 +9996,10 @@ static void test_sequence_projected_capture_union() {
     duplicate_logical.placements[0].cells[1].logical_position =
         duplicate_logical.placements[0].cells[0].logical_position;
     expect_refused({ 77, { duplicate_logical } }, limits);
+    duplicate_logical.placements[0].cells[1].ext_x = 1;
+    vbr_capture_projection media_positions;
+    CHECK(vbr_artifact_project_capture_union(
+        { 77, { duplicate_logical } }, limits, media_positions));
 
     vbr_capture_projection_manifest cross_placement;
     cross_placement.manifest_id = 30;
@@ -9915,6 +10007,11 @@ static void test_sequence_projected_capture_union() {
         0, 0, 5, 10, {{1, 2}}));
     cross_placement.placements.push_back(capture_placement(
         1, 0, 5, 10, {{2, 2}}));
+    vbr_capture_projection child_scoped;
+    CHECK(vbr_artifact_project_capture_union(
+        { 77, { cross_placement } }, limits, child_scoped));
+    cross_placement.placements[1].child_id = 0;
+    cross_placement.placements[1].stream_index = 1;
     expect_refused({ 77, { cross_placement } }, limits);
 
     // Logical positions are sequence-scoped, so two independent sequences
@@ -10053,6 +10150,7 @@ int main(int argc, char ** argv) {
     test_vbr_capture_readiness_contract();
     test_server_vbr_occupied_failure_terminal();
     test_prompt_cache_vbr_longest_feasible_restore_selection();
+    test_prompt_cache_vbr_media_lookup();
     test_prompt_cache_vbr_atomic_logical_publication();
     test_prompt_cache_vbr_pressure_without_turn_scores(false);
     test_prompt_cache_vbr_pressure_without_turn_scores(true);

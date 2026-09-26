@@ -3134,10 +3134,7 @@ bool server_prompt_cache::prepare_vbr_restore(
         const common_cache_family_binding * required_family,
         const server_vbr_artifact_store * projector) noexcept {
     candidate = {};
-    // The first automatic-import slice is text-only. A later-media suffix has
-    // a different exact DF scope from its cached media stem; fail closed until
-    // a dedicated frontier-media lookup authority is wired.
-    if (request_tokens.empty() || request_tokens.has_media() ||
+    if (request_tokens.empty() ||
         execution_identity.empty() ||
         adapter_config_key.empty() || !retention_obs ||
         !retention_obs->prefix_tracking_enabled() ||
@@ -3145,12 +3142,10 @@ bool server_prompt_cache::prepare_vbr_restore(
         return false;
     }
     try {
+        // Exact complete-media prefixes are supported. Arbitrary attention
+        // projection still uses a one-cell-per-position, text-only contract.
+        allow_prefix_projection &= !request_tokens.has_media();
         std::string scope;
-        if (!server_prompt_retention_exact_scope(
-                request_tokens, adapter_config_key,
-                int64_t(request_tokens.size()), scope)) {
-            return false;
-        }
         struct selection {
             server_prompt_cache_state * best;
             const server_tokens * request;
@@ -3164,6 +3159,8 @@ bool server_prompt_cache::prepare_vbr_restore(
             uint64_t artifact;
             bool projected;
             const server_vbr_artifact_store * projector;
+            uint64_t position_prefix = UINT64_MAX;
+            llama_pos position = -1;
         } exact {
             nullptr, &request_tokens, &execution_identity,
             &adapter_config_key, required_family,
@@ -3201,8 +3198,13 @@ bool server_prompt_cache::prepare_vbr_restore(
                     return true;
                 }
                 const auto & manifest = artifact->package().manifest();
-                const llama_pos selected_next =
-                    current.request->pos_next(int64_t(prefix));
+                // Terminal aliases are visited together. Resolve media geometry
+                // once per prefix, not once per owner of the same token block.
+                if (current.position_prefix != prefix) {
+                    current.position = current.request->pos_next(int64_t(prefix));
+                    current.position_prefix = prefix;
+                }
+                const llama_pos selected_next = current.position;
                 // The retention callback is reached through this state's
                 // immutable indexed token block, and stage_vbr authenticated
                 // that block against the sealed package before publication.
@@ -3251,14 +3253,22 @@ bool server_prompt_cache::prepare_vbr_restore(
                 current.artifact = artifact_id;
                 return true;
             };
-        const bool indexed_attention = retention_obs->visit_prefix_instances(
-            common_retention_pool::attention, scope,
-            request_tokens.retention_token_ids(), &exact, select);
-        const bool indexed_recurrent = retention_obs->visit_prefix_instances(
-            common_retention_pool::recurrent, scope,
-            request_tokens.retention_token_ids(), &exact, select);
-        if (!indexed_attention || !indexed_recurrent) {
-            return false;
+        // An added image changes the whole-request scope, not the identity of
+        // its earlier prefix. Query each complete-media scope in the existing
+        // index, rather than scanning all host entries or comparing null IDs.
+        for (const size_t boundary : request_tokens.media_prefix_boundaries()) {
+            if (!server_prompt_retention_exact_scope(
+                    request_tokens, adapter_config_key, int64_t(boundary), scope)) {
+                break; // unidentified media may not certify this or any later scope
+            }
+            if (!retention_obs->visit_prefix_instances(
+                    common_retention_pool::attention, scope,
+                    request_tokens.retention_token_ids(), &exact, select) ||
+                !retention_obs->visit_prefix_instances(
+                    common_retention_pool::recurrent, scope,
+                    request_tokens.retention_token_ids(), &exact, select)) {
+                return false;
+            }
         }
         selection projected {
             nullptr, &request_tokens, &execution_identity,
@@ -3287,6 +3297,14 @@ bool server_prompt_cache::prepare_vbr_restore(
             ? projected : exact;
         if (!selected.best) {
             return false;
+        }
+        if (request_tokens.has_media() || selected.best->prompt.tokens.has_media()) {
+            std::string media_identity;
+            if (selected.best->prompt.tokens.get_common_prefix(request_tokens) < selected.prefix ||
+                !request_tokens.media_content_identity(int64_t(selected.prefix), media_identity) ||
+                media_identity != selected.best->payload.vbr_artifact()->package().manifest().identity.media_content_identity) {
+                return false;
+            }
         }
         const auto * variants = selected.best->payload.vbr_variants();
         if (!variants || !variants->compact_current()) {
@@ -3536,8 +3554,6 @@ bool server_prompt_cache_vbr_replacement_ticket::ready() const noexcept {
         incumbent_->sequence_epoch != incumbent_sequence_epoch_ ||
         incumbent_->n_tokens() <= 0 ||
         uint64_t(incumbent_->n_tokens()) != incumbent_tokens_ ||
-        incumbent_->tokens.has_media() ||
-        replacement_prompt_->tokens.has_media() ||
         !replacement_prompt_->checkpoints.empty() ||
         replacement_prompt_->sequence_epoch !=
             incoming_.source_->prompt.sequence_epoch ||
@@ -3572,10 +3588,9 @@ bool server_prompt_cache_vbr_replacement_ticket::ready() const noexcept {
     common_retention_lineage_record lineage;
     const auto recovery_key =
         server_retention_instance_key::for_host_entry(recovery_source_);
-    if (!incumbent_->tokens.retention_token_digest(digest) ||
-        !replacement_prompt_->tokens.retention_token_digest(incoming_digest) ||
-        !recovery_source_->prompt.tokens.retention_token_digest(
-            recovery_digest)) {
+    if (!incumbent_->tokens.retention_content_digest(digest) ||
+        !replacement_prompt_->tokens.retention_content_digest(incoming_digest) ||
+        !recovery_source_->prompt.tokens.retention_content_digest(recovery_digest)) {
         return false;
     }
     const auto lease = cache_->lease_obs
@@ -8087,9 +8102,8 @@ bool server_prompt_cache::prepare_vbr_occupied_replacement(
         execution_identity.empty() || adapter_config_key.empty() ||
         !lease_execution_identity ||
         *lease_execution_identity != execution_identity ||
-        incumbent.tokens.empty() || incumbent.tokens.has_media() ||
+        incumbent.tokens.empty() ||
         incumbent.sequence_epoch == 0 ||
-        incoming.source_->prompt.tokens.has_media() ||
         !incoming.source_->prompt.checkpoints.empty() ||
         uint64_t(incoming.source_->prompt.n_tokens()) !=
             incoming.source_tokens_ ||
@@ -8121,7 +8135,7 @@ bool server_prompt_cache::prepare_vbr_occupied_replacement(
     std::array<uint8_t, 32> incumbent_digest = {};
     std::array<uint8_t, 32> incoming_digest = {};
     server_cache_lease_identity incumbent_lease_identity;
-    if (!incumbent.tokens.retention_token_digest(incumbent_digest) ||
+    if (!incumbent.tokens.retention_content_digest(incumbent_digest) ||
         !server_cache_lease_build_identity(
             execution_identity, adapter_config_key, incumbent.tokens,
             int64_t(incumbent_tokens), incumbent_lease_identity)) {
@@ -8145,13 +8159,12 @@ bool server_prompt_cache::prepare_vbr_occupied_replacement(
             current->cache_family != incumbent_family ||
             current->prompt.sequence_epoch != incumbent.sequence_epoch ||
             current->prompt.n_tokens() != incumbent.n_tokens() ||
-            current->prompt.tokens.has_media() ||
             !current->prompt.checkpoints.empty() ||
             !current->payload.vbr_artifact()) {
             continue;
         }
         std::array<uint8_t, 32> current_digest = {};
-        if (!current->prompt.tokens.retention_token_digest(current_digest) ||
+        if (!current->prompt.tokens.retention_content_digest(current_digest) ||
             current_digest != incumbent_digest) {
             continue;
         }
@@ -8227,11 +8240,11 @@ bool server_prompt_cache::prepare_vbr_occupied_replacement(
     } catch (...) {
         return false;
     }
-    if (!replacement || replacement->tokens.has_media() ||
+    if (!replacement ||
         !replacement->checkpoints.empty() ||
         uint64_t(replacement->n_tokens()) != incoming.prefix_tokens_ ||
         replacement->tokens.pos_next() != incoming.selected_next_position_ ||
-        !replacement->tokens.retention_token_digest(incoming_digest)) {
+        !replacement->tokens.retention_content_digest(incoming_digest)) {
         return false;
     }
 
@@ -8367,13 +8380,13 @@ void server_prompt_cache::commit_vbr_occupied_replacement(
         ticket.recovery_pin_ &&
         ticket.recovery_pin_->binds_exact(
             ticket.recovery_host_artifact_, ticket.recovery_ops_) &&
-        !destination.tokens.has_media() && destination.checkpoints.empty() &&
+        destination.checkpoints.empty() &&
         uint64_t(destination.n_tokens()) == ticket.incoming_prefix_tokens_ &&
         destination.sequence_epoch ==
             ticket.incoming_.source_->prompt.sequence_epoch;
     GGML_ASSERT(valid);
     std::array<uint8_t, 32> destination_digest = {};
-    GGML_ASSERT(destination.tokens.retention_token_digest(destination_digest));
+    GGML_ASSERT(destination.tokens.retention_content_digest(destination_digest));
     GGML_ASSERT(destination_digest == ticket.incoming_token_digest_);
     GGML_ASSERT(&destination_family == ticket.incumbent_family_current_);
     GGML_ASSERT(destination_family == ticket.incoming_family_);
@@ -8627,7 +8640,9 @@ llama_pos server_prompt_checkpoint_reuse_threshold(llama_pos pos_next, int32_t n
     // a window keeps key k for query p while p - k < n_swa (is_masked_swa), so the window of
     // `first` begins at first - n_swa + 1; a pos_min past it lacks a key. The cache prunes to
     // exactly that window, and an exact capture of it is complete.
-    return std::max(0, first - n_swa + 2);
+    // Callers compare pos_min < threshold: even before the window fills,
+    // position zero is a complete beginning, not a missing prefix.
+    return std::max(0, first - n_swa + 1) + 1;
 }
 
 server_prompt_checkpoint_reuse server_prompt_checkpoint_reuse_geometry(

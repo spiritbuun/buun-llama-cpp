@@ -4032,7 +4032,8 @@ void test_recurrent_reusable_prefix() {
     CHECK(server_prompt_checkpoint_reuse_threshold(4, 0, false) == 3);
     // a window of 2 at the final token 3 holds keys 2 and 3
     CHECK(server_prompt_checkpoint_reuse_threshold(4, 2, false) == 3);
-    CHECK(server_prompt_checkpoint_reuse_threshold(4, 8, true) == 0);
+    CHECK(server_prompt_checkpoint_reuse_threshold(4, 8, true) == 1);
+    CHECK(server_prompt_checkpoint_reuse_threshold(4, 8, false) == 1);
     // the window a live cache prunes to: query 3047 keeps keys 2536..3046
     CHECK(server_prompt_checkpoint_reuse_threshold(3047, 512, true) == 2537);
     server_prompt prompt;
@@ -4044,6 +4045,12 @@ void test_recurrent_reusable_prefix() {
         return server_prompt_cache_reusable_prefix(
             prompt, incoming, lcp, pos_min, context, "adapter");
     };
+    context.n_swa = 8;
+    CHECK(reusable(4, 0) == 4); // the window has not filled; all required keys exist
+    CHECK(reusable(4, 1) == 0); // key zero is missing
+    CHECK(server_prompt_cache_reusable_prefix(
+        prompt, prompt.tokens, prompt.tokens.size(), 0, context, "adapter") == prompt.tokens.size());
+    context.n_swa = 0;
     CHECK(reusable(0, 5) == 0);
     CHECK(reusable(4, -1) == 0); // token ledger without state
     CHECK(reusable(4, 3) == 4);  // directly appendable

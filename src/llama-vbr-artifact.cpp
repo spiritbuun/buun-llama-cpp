@@ -1184,7 +1184,9 @@ bool placement_valid(
     }
 
     size_t next = 0;
-    std::map<std::pair<uint32_t, llama_seq_id>, std::set<llama_pos>>
+    // M-RoPE media has more cells than temporal positions. Its spatial
+    // coordinates distinguish cells at the same temporal position.
+    std::map<std::pair<uint32_t, llama_seq_id>, std::set<std::array<llama_pos, 3>>>
         logical_positions;
     for (const auto & controller : manifest.generation.controllers) {
         if (!carries_placement(controller)) {
@@ -1226,7 +1228,7 @@ bool placement_valid(
                     cell.logical_position >= manifest.identity.token_count ||
                     (i != 0 && placement.cells[i - 1].physical_cell >=
                                    cell.physical_cell) ||
-                    !source_positions.insert(cell.logical_position).second) {
+                    !source_positions.insert({cell.logical_position, cell.ext_x, cell.ext_y}).second) {
                     return false;
                 }
             }

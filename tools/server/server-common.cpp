@@ -567,6 +567,16 @@ bool server_tokens::media_content_identity(int64_t n_tokens, std::string & out) 
     return true;
 }
 
+std::vector<size_t> server_tokens::media_prefix_boundaries() const {
+    std::vector<size_t> result;
+    result.reserve(map_idx_to_media.size() + 1);
+    for (const auto & entry : map_idx_to_media) {
+        result.push_back(entry.first);
+    }
+    result.push_back(tokens.size());
+    return result;
+}
+
 std::string server_tokens::str() const {
     std::ostringstream oss;
     oss << "tokens: ";
@@ -646,6 +656,7 @@ void server_tokens::push_back_placeholder(const mtmd_input_chunk * chunk) {
             tokens.emplace_back(LLAMA_TOKEN_NULL);
         }
         map_idx_to_media[start_idx] = std::move(new_chunk);
+        invalidate_retention_token_digest();
     } else {
         push_back(chunk);
     }
@@ -697,6 +708,28 @@ bool server_tokens::retention_token_digest(
         retention_token_digest_valid = true;
     }
     out = retention_token_digest_cache;
+    return true;
+}
+
+bool server_tokens::retention_content_digest(std::array<uint8_t, 32> & out) const noexcept {
+    if (!retention_token_digest(out)) { return false; }
+    if (!has_media()) { return true; }
+    if (!retention_content_digest_valid) {
+        try {
+            std::string identity;
+            if (!media_content_identity(tokens.size(), identity)) { return false; }
+            llama_sha256_writer hash;
+            static constexpr char domain[] = "buun.server.retention-content-identity/v1";
+            hash.string(domain, sizeof(domain) - 1);
+            hash.bytes(out.data(), out.size());
+            hash.string(identity.data(), identity.size());
+            retention_content_digest_cache = hash.finish();
+            retention_content_digest_valid = true;
+        } catch (...) {
+            return false;
+        }
+    }
+    out = retention_content_digest_cache;
     return true;
 }
 
@@ -967,6 +1000,8 @@ server_tokens server_tokens::clone() const {
     res.tokens   = tokens;
     res.retention_token_digest_cache = retention_token_digest_cache;
     res.retention_token_digest_valid = retention_token_digest_valid;
+    res.retention_content_digest_cache = retention_content_digest_cache;
+    res.retention_content_digest_valid = retention_content_digest_valid;
     for (auto it = map_idx_to_media.begin(); it != map_idx_to_media.end(); ++it) {
         size_t idx = it->first;
         const mtmd::input_chunk_ptr & chunk = it->second;
@@ -1003,17 +1038,23 @@ server_tokens server_tokens::clone_cached_prefix(size_t n) const {
     return res;
 }
 
-std::vector<llama_pos> server_tokens::prefix_row_positions(size_t n) const {
+std::vector<llama_pos> server_tokens::prefix_row_positions(size_t n, std::vector<mtmd_decoder_pos> * coordinates) const {
     std::string identity;
     if (n > tokens.size() || !media_content_identity(n, identity)) {
         throw std::invalid_argument("server_tokens prefix positions are unavailable");
     }
     std::vector<llama_pos> rows;
     rows.reserve(n);
+    if (coordinates) { coordinates->clear(); coordinates->reserve(n); }
+    const auto append = [&](const mtmd_decoder_pos & p) {
+        rows.push_back(p.t);
+        if (coordinates) { coordinates->push_back(p); }
+    };
     llama_pos pos = 0;
     for (size_t i = 0; i < n;) {
         if (tokens[i] != LLAMA_TOKEN_NULL) {
-            rows.push_back(pos++);
+            append({uint32_t(pos), uint32_t(pos), uint32_t(pos), 0});
+            ++pos;
             ++i;
             continue;
         }
@@ -1023,7 +1064,8 @@ std::vector<llama_pos> server_tokens::prefix_row_positions(size_t n) const {
         for (size_t j = 0; j < count; ++j) {
             // Same primary positions as mtmd_helper_decode_image_chunk. Audio
             // uses the sequential 1D mapping even with M-RoPE enabled.
-            rows.push_back(image ? mtmd_image_tokens_get_decoder_pos(image, pos, j).t : pos + j);
+            const uint32_t p = uint32_t(pos + j);
+            append(image ? mtmd_image_tokens_get_decoder_pos(image, pos, j) : mtmd_decoder_pos{p, p, p, 0});
         }
         i += count;
         pos += mtmd_input_chunk_get_n_pos(chunk.get());

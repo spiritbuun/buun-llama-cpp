@@ -239,9 +239,10 @@ bool projected_source_runs(
     }
     std::vector<std::pair<uint32_t, uint64_t>> rows;
     rows.reserve(placements.front().cells.size());
-    for (const auto & cell : placements.front().cells) {
-        rows.push_back({
-            cell.physical_cell, packed_rows[size_t(cell.logical_position)] });
+    std::vector<const vbr_artifact_cell_placement *> ordered;
+    if (!vbr_order_placement_cells(placements.front(), ordered)) { return false; }
+    for (size_t i = 0; i < ordered.size(); ++i) {
+        rows.push_back({ordered[i]->physical_cell, packed_rows[i]});
     }
     std::sort(rows.begin(), rows.end());
     runs.clear();
@@ -317,7 +318,7 @@ uint64_t unit_capacity(const vbr_target_unit_snapshot & target) {
 // When they still overflow, the oldest cells the window already masks are
 // dropped, as a live cache of that size would have pruned them. A projected
 // package has packed its rows already: a cell then reads the row its range
-// proofs select, source_rows[logical_position].
+// proofs select, in canonical temporal/spatial cell order.
 bool pack_placement(
         std::vector<vbr_artifact_stream_placement> & placements,
         std::vector<vbr_authorized_cell_run> & runs,
@@ -327,6 +328,17 @@ bool pack_placement(
         return false;
     }
     auto & cells = placements.front().cells;
+    std::vector<std::pair<uint32_t, uint64_t>> physical_rows;
+    if (source_rows) {
+        std::vector<const vbr_artifact_cell_placement *> ordered;
+        if (source_rows->size() != cells.size() ||
+            !vbr_order_placement_cells(placements.front(), ordered)) { return false; }
+        physical_rows.reserve(cells.size());
+        for (size_t i = 0; i < ordered.size(); ++i) {
+            physical_rows.push_back({ordered[i]->physical_cell, (*source_rows)[i]});
+        }
+        std::sort(physical_rows.begin(), physical_rows.end());
+    }
     if (cells.size() > capacity) {
         std::vector<llama_pos> masked;
         for (const auto & cell : cells) {
@@ -361,9 +373,14 @@ bool pack_placement(
         return false;
     }
     runs.clear();
+    size_t source_index = 0;
     for (size_t i = 0; i < cells.size(); ++i) {
+        while (source_rows && source_index < physical_rows.size() &&
+               physical_rows[source_index].first < cells[i].physical_cell) { ++source_index; }
+        if (source_rows && (source_index == physical_rows.size() ||
+            physical_rows[source_index].first != cells[i].physical_cell)) { return false; }
         append_cell_run(runs, uint32_t(i), source_rows
-            ? (*source_rows)[size_t(cells[i].logical_position)]
+            ? physical_rows[source_index].second
             : cells[i].physical_cell);
         cells[i].physical_cell = uint32_t(i);
     }
@@ -2056,13 +2073,13 @@ vbr_manifest_validation_result vbr_validate_unit_manifest_snapshot(
                 return terminal_result(
                     vbr_manifest_validation_status::geometry_mismatch);
             }
-            for (const auto & source : placement.cells) {
-                if (source.logical_position < 0 ||
-                    size_t(source.logical_position) >= mappings.size()) {
-                    return terminal_result(
-                        vbr_manifest_validation_status::ownership_mismatch);
-                }
-                const auto & mapping = mappings[size_t(source.logical_position)];
+            std::vector<const vbr_artifact_cell_placement *> ordered;
+            if (!vbr_order_placement_cells(placement, ordered)) {
+                return terminal_result(vbr_manifest_validation_status::ownership_mismatch);
+            }
+            for (size_t i = 0; i < ordered.size(); ++i) {
+                const auto & source = *ordered[i];
+                const auto & mapping = mappings[i];
                 if (mapping.source_stream != placement.stream_index ||
                     mapping.logical_position != source.logical_position ||
                     mapping.source_physical_cell != source.physical_cell ||

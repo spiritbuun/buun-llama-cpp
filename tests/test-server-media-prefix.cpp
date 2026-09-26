@@ -1,7 +1,9 @@
 #include "server-common.h"
+#include "server-context.h"
 #include "mtmd.h"
 
 #include <cstdio>
+#include <cstring>
 #include <stdexcept>
 #include <vector>
 
@@ -73,6 +75,45 @@ int main() {
         fails += check("text clone refuses media", refused, true);
     }
 
+    // Recovery identity must distinguish media hidden behind identical null token ids.
+    {
+        auto a = make("image-a", 3, lead);
+        auto b = make("image-b", 3, lead);
+        std::array<uint8_t, 32> da, db, appended;
+        fails += check("legacy token digest A", a.retention_token_digest(da), true);
+        fails += check("legacy token digest B", b.retention_token_digest(db) && da == db, true);
+        fails += check("media digest A", a.retention_content_digest(da), true);
+        fails += check("media digest B", b.retention_content_digest(db), true);
+        fails += check("distinct media digests", da != db, true);
+        auto swapped_a = a.clone();
+        auto swapped_b = b.clone();
+        swap(swapped_a, swapped_b);
+        fails += check("swap moves media identity A", swapped_a.retention_content_digest(appended) && appended == db, true);
+        fails += check("swap moves media identity B", swapped_b.retention_content_digest(appended) && appended == da, true);
+        server_tokens moved(std::move(swapped_b));
+        fails += check("move preserves media identity", moved.retention_content_digest(appended) && appended == da, true);
+        auto clone = a.clone_cached_prefix(a.size());
+        fails += check("clone media digest", clone.retention_content_digest(db) && da == db, true);
+        auto * next = mtmd_test_create_image_chunk("image-c", 2);
+        clone.push_back_placeholder(next);
+        mtmd_input_chunk_free(next);
+        fails += check("placeholder invalidates digest", clone.retention_content_digest(appended) && da != appended, true);
+        fails += check("media lookup boundaries", clone.media_prefix_boundaries() == std::vector<size_t>({2, 5, 7}), true);
+        auto unknown = make("", 3, lead);
+        fails += check("unknown media digest refused", unknown.retention_content_digest(db), false);
+    }
+    // Resume publication preserves the deserialized media chunk map.
+    {
+        auto original = make("sha:resume-image", 3, lead);
+        original.push_back(12);
+        const auto bytes = original.serialize();
+        llama_tokens serialized(bytes.size()/sizeof(llama_token));
+        std::memcpy(serialized.data(), bytes.data(), bytes.size());
+        auto restored = server_tokens::deserialize(serialized, true);
+        fails += check("VBR media ledger publication", server_vbr_media_publish_for_test(restored), true);
+        server_tokens text(lead, true);
+        fails += check("VBR text ledger publication", server_vbr_media_publish_for_test(text), true);
+    }
     // U3 repro: two empty-id ("video frame") chunks of identical shape must diverge AT the media
     // (prefix = 2), never past it. HEAD/fixed = 2; parent/buggy = 5 (crosses). This is the red/green.
     {
@@ -151,6 +192,8 @@ int main() {
         const auto cached = original.clone_cached_prefix(7);
         fails += check("M-RoPE logical tokens", cached.size(), 7);
         fails += check("M-RoPE next position", cached.pos_next(), 5);
+        fails += check("M-RoPE placement coordinates", server_resume_media_placement_for_test(cached), true);
+        fails += check("M-RoPE publication ledger", server_vbr_media_publish_for_test(cached), true);
         fails += check("M-RoPE repeated rows/gap", cached.prefix_row_positions(7) ==
             std::vector<llama_pos>({0, 1, 2, 2, 2, 2, 4}), true);
         fails += check("M-RoPE placeholder rows", cached.prefix_row_positions(7) ==
