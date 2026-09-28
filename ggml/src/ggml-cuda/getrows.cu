@@ -500,6 +500,32 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src1->nb[0] == ggml_type_size(src1->type));
     GGML_ASSERT(dst->nb[0]  == ggml_type_size(dst->type));
 
+    // Diagnostic: verify gather indices are within src0's rows (GGML_CUDA_GETROWS_CHECK=1, device 1 only).
+    static const bool getrows_check = getenv("GGML_CUDA_GETROWS_CHECK") != nullptr;
+    if (getrows_check && ctx.device == 1) {
+        const int64_t n_ids = ne10 * ne11 * ne12;
+        static int32_t h_ids[1 << 16];
+        if (n_ids > 0 && n_ids <= (1 << 16)) {
+            ggml_cuda_set_device(ctx.device);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            CUDA_CHECK(cudaMemcpy(h_ids, src1->data, n_ids * sizeof(int32_t), cudaMemcpyDeviceToHost));
+            int64_t bad = 0;
+            int32_t mn = h_ids[0], mx = h_ids[0];
+            for (int64_t i = 0; i < n_ids; ++i) {
+                if (h_ids[i] < mn) mn = h_ids[i];
+                if (h_ids[i] > mx) mx = h_ids[i];
+                if (h_ids[i] < 0 || h_ids[i] >= ne00) ++bad;
+            }
+            if (bad > 0) {
+                fprintf(stderr, "GETROWS-CHECK dev=%d BAD=%lld/%lld src0='%s'(%s) ne00=%lld | ids='%s' ne=[%lld,%lld,%lld] min=%d max=%d | dst='%s'\n",
+                        (int) ctx.device, (long long) bad, (long long) n_ids,
+                        src0->name, ggml_type_name(src0->type), (long long) ne00,
+                        src1->name, (long long) ne10, (long long) ne11, (long long) ne12,
+                        (int) mn, (int) mx, dst->name);
+            }
+        }
+    }
+
     get_rows_cuda(src0->data, src0->type, (const int32_t *) src1->data, dst->data, dst->type,
         ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
 }
