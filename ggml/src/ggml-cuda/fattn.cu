@@ -7,6 +7,7 @@
 #include "fattn-vec.cuh"
 #include "fattn-wmma-f16.cuh"
 #include "fattn.cuh"
+#include "tckv-sim.cuh"
 #include "ggml-backend-impl.h"
 
 #include <atomic>
@@ -1783,6 +1784,8 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
     bool mat_k = false;
     bool mat_v = false;
     ggml_vbr_kv_dequant_sides(K->type, V->type, &mat_k, &mat_v);
+    // EXPERIMENT: int8 tensor-core fake-quant simulator wants K in the rotated domain for every turbo type.
+    const bool tckv_sim = tckv_sim_applicable(dst);
 
     int device;
     CUDA_CHECK(cudaGetDevice(&device));
@@ -1832,6 +1835,12 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
             }
             k_turbo2_tcq_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
                 (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], d_tcq_decode_alpha_k);
+        } else if (tckv_sim && K->type == GGML_TYPE_TURBO4_0) {
+            k_turbo4_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
+                (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
+        } else if (tckv_sim && K->type == GGML_TYPE_TURBO8_0) {
+            k_turbo8_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
+                (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
         } else if (K->type == GGML_TYPE_TURBO4_0) {
             // turbo4 K: inverse FWHT dequant → produces K in original domain (no Q rotation needed)
             k_turbo4_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
@@ -1956,8 +1965,7 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
     const ggml_tensor * Q = dst->src[0];
     float * q_rotated = nullptr;
     if (turbo_k &&
-            K->type != GGML_TYPE_TURBO4_0 &&
-            K->type != GGML_TYPE_TURBO8_0 &&
+            (tckv_sim || (K->type != GGML_TYPE_TURBO4_0 && K->type != GGML_TYPE_TURBO8_0)) &&
             K->type != GGML_TYPE_TURBO3_TCQ &&
             K->type != GGML_TYPE_TURBO2_TCQ &&
             K->type != GGML_TYPE_TURBO1_TCQ &&
@@ -1984,6 +1992,14 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
     dst->src[1] = k_fp16 ? &K_f16 : orig_k;
     dst->src[2] = v_fp16 ? &V_f16 : orig_v;
     std::atomic_signal_fence(std::memory_order_seq_cst);
+
+    if (tckv_sim) {
+        tckv_sim_attend(ctx, dst);
+        dst->src[0] = orig_q;
+        dst->src[1] = orig_k;
+        dst->src[2] = orig_v;
+        return;
+    }
 
     // Re-select the native attention kernel after materialization. The original Turbo tensors
     // select this wrapper, but the temporary tensors are ordinary F16 and must follow the same
