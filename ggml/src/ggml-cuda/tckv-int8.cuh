@@ -10,23 +10,13 @@ static constexpr __host__ __device__ int tckv_int8_row_bytes(int D) { return D +
 
 // C3 V scratch: one tile per (kv head, nbatch_fa keys), channel-major (V^T): D rows of nbatch_fa
 // key bytes + 16 pad bytes. Keys in each 32-group are stored in P-fragment order (tckv_int8_pv),
-// the pads hold the per-(key, 128-channel block) scales, slot b*nbatch_fa + key, or with a
-// tile-wide V scale (vtile) one scale per 128-channel block, slot b.
+// the pads hold the per-(key, 128-channel block) scales, slot b*nbatch_fa + key.
 static constexpr __host__ __device__ int tckv_int8_v_tile_bytes(int D, int nbatch_fa) { return D*(nbatch_fa + 16); }
 
 static bool tckv_int8_pv_enabled() {
     static const bool enabled = [] {
         const char * s = getenv("TCKV_INT8_PV");
         return s && atoi(s) == 1;
-    }();
-    return enabled;
-}
-
-// Tile-wide V scales on the PV path (default on, TCKV_INT8_VTILE=0 keeps per-key scales).
-static bool tckv_int8_vtile_enabled() {
-    static const bool enabled = [] {
-        const char * s = getenv("TCKV_INT8_VTILE");
-        return !s || atoi(s) != 0;
     }();
     return enabled;
 }
@@ -208,90 +198,74 @@ static __device__ __forceinline__ void tckv_mma_u8s8(
 // to u8 per query row (absmax/255, the TCKV_P=8 sim), multiplied by the int8 V^T tile, and the
 // int32 result is scaled into the f16 accumulators. half_off: V codes are native turbo8
 // (value = sV*(code + 0.5)); the +0.5 term is 0.5*sum(W codes), folded into the epilogue bias.
-// vtile: one V scale per (key tile, 128-channel block) in pad slot b, so W = P is quantized once per
-// tile and each block only rescales the int32 result.
-template<int DV, int nbatch_fa, bool half_off, bool vtile, typename TC, typename TV>
+template<int DV, int nbatch_fa, bool half_off, typename TC, typename TV>
 static __device__ __forceinline__ void tckv_int8_pv(const int * tile_V, const TC * P, TV * VKQ_C) {
 #ifdef TURING_MMA_AVAILABLE
     using namespace ggml_cuda_mma;
     static_assert(TC::I == 16 && TC::J == 16 && TV::I == 16 && TV::J == 8, "bad tiles");
-    static_assert(!(half_off && vtile), "tile-scaled V is re-quantized, no native codes");
     constexpr int stride  = (nbatch_fa + 16)/4;
     constexpr int ngroups = nbatch_fa/32;
     const int q = threadIdx.x % 4;
-    float s[2];
-    float bias[2];
-    tile<16, 8, int> pa[ngroups];
 #pragma unroll
     for (int b = 0; b < DV/128; ++b) {
-        if (!vtile || b == 0) {
-            float w[ngroups][2][8];
-            float amax[2] = {0.0f, 0.0f};
+        float w[ngroups][2][8];
+        float amax[2] = {0.0f, 0.0f};
 #pragma unroll
-            for (int g = 0; g < ngroups; ++g) {
+        for (int g = 0; g < ngroups; ++g) {
 #pragma unroll
-                for (int t = 0; t < 2; ++t) {
+            for (int t = 0; t < 2; ++t) {
 #pragma unroll
-                    for (int l = 0; l < 8; l += 2) {
-                        float2 sv = make_float2(1.0f, 1.0f);
-                        if constexpr (!vtile) {
-                            // Keys l and l+1 are adjacent pad slots (even slot, slot%4 in {0, 2}).
-                            const int slot = b*nbatch_fa + g*32 + t*16 + (l/4)*8 + 2*q;
-                            sv = *(const float2 *) (tile_V + (slot/4)*stride + nbatch_fa/4 + slot%4);
-                        }
-                        w[g][t][l + 0] = P[2*g + t].x[l + 0] * sv.x;
-                        w[g][t][l + 1] = P[2*g + t].x[l + 1] * sv.y;
-                        amax[(l/2)%2] = fmaxf(amax[(l/2)%2], fmaxf(w[g][t][l], w[g][t][l + 1]));
-                    }
-                }
-            }
-            float inv[2];
-#pragma unroll
-            for (int r = 0; r < 2; ++r) {
-                amax[r] = fmaxf(amax[r], __shfl_xor_sync(0xffffffff, amax[r], 1));
-                amax[r] = fmaxf(amax[r], __shfl_xor_sync(0xffffffff, amax[r], 2));
-                s[r]    = amax[r] * (1.0f/255.0f);
-                inv[r]  = amax[r] > 0.0f ? 255.0f/amax[r] : 0.0f;
-                bias[r] = -12582912.0f * s[r];
-            }
-#pragma unroll
-            for (int g = 0; g < ngroups; ++g) {
-#pragma unroll
-                for (int t = 0; t < 2; ++t) {
-#pragma unroll
-                    for (int r = 0; r < 2; ++r) {
-                        // Adding 1.5*2^23 rounds to nearest even and leaves the u8 code in the low byte.
-                        int c[4];
-#pragma unroll
-                        for (int j = 0; j < 4; ++j) {
-                            c[j] = __float_as_int(fmaf(w[g][t][(j/2)*4 + 2*r + (j%2)], inv[r], 12582912.0f));
-                        }
-                        pa[g].x[2*t + r] = __byte_perm(__byte_perm(c[0], c[1], 0x0040), __byte_perm(c[2], c[3], 0x0040), 0x5410);
-                    }
-                }
-            }
-            if constexpr (half_off) {
-#pragma unroll
-                for (int r = 0; r < 2; ++r) {
-                    unsigned int wsum = 0;
-#pragma unroll
-                    for (int g = 0; g < ngroups; ++g) {
-                        wsum = __dp4a((unsigned int) pa[g].x[r],     0x01010101u, wsum);
-                        wsum = __dp4a((unsigned int) pa[g].x[2 + r], 0x01010101u, wsum);
-                    }
-                    wsum += __shfl_xor_sync(0xffffffff, wsum, 1);
-                    wsum += __shfl_xor_sync(0xffffffff, wsum, 2);
-                    bias[r] = (0.5f*float(wsum) - 12582912.0f) * s[r];
+                for (int l = 0; l < 8; l += 2) {
+                    // Keys l and l+1 are adjacent pad slots (even slot, slot%4 in {0, 2}).
+                    const int slot = b*nbatch_fa + g*32 + t*16 + (l/4)*8 + 2*q;
+                    const float2 sv = *(const float2 *) (tile_V + (slot/4)*stride + nbatch_fa/4 + slot%4);
+                    w[g][t][l + 0] = P[2*g + t].x[l + 0] * sv.x;
+                    w[g][t][l + 1] = P[2*g + t].x[l + 1] * sv.y;
+                    amax[(l/2)%2] = fmaxf(amax[(l/2)%2], fmaxf(w[g][t][l], w[g][t][l + 1]));
                 }
             }
         }
-        float sb[2];
-        float biasb[2];
+        float s[2];
+        float inv[2];
+        float bias[2];
 #pragma unroll
         for (int r = 0; r < 2; ++r) {
-            const float st = vtile ? __int_as_float(tile_V[nbatch_fa/4 + b]) : 1.0f;
-            sb[r]    = s[r] * st;
-            biasb[r] = bias[r] * st;
+            amax[r] = fmaxf(amax[r], __shfl_xor_sync(0xffffffff, amax[r], 1));
+            amax[r] = fmaxf(amax[r], __shfl_xor_sync(0xffffffff, amax[r], 2));
+            s[r]    = amax[r] * (1.0f/255.0f);
+            inv[r]  = amax[r] > 0.0f ? 255.0f/amax[r] : 0.0f;
+            bias[r] = -12582912.0f * s[r];
+        }
+        tile<16, 8, int> pa[ngroups];
+#pragma unroll
+        for (int g = 0; g < ngroups; ++g) {
+#pragma unroll
+            for (int t = 0; t < 2; ++t) {
+#pragma unroll
+                for (int r = 0; r < 2; ++r) {
+                    // Adding 1.5*2^23 rounds to nearest even and leaves the u8 code in the low byte.
+                    int c[4];
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        c[j] = __float_as_int(fmaf(w[g][t][(j/2)*4 + 2*r + (j%2)], inv[r], 12582912.0f));
+                    }
+                    pa[g].x[2*t + r] = __byte_perm(__byte_perm(c[0], c[1], 0x0040), __byte_perm(c[2], c[3], 0x0040), 0x5410);
+                }
+            }
+        }
+        if constexpr (half_off) {
+#pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                unsigned int wsum = 0;
+#pragma unroll
+                for (int g = 0; g < ngroups; ++g) {
+                    wsum = __dp4a((unsigned int) pa[g].x[r],     0x01010101u, wsum);
+                    wsum = __dp4a((unsigned int) pa[g].x[2 + r], 0x01010101u, wsum);
+                }
+                wsum += __shfl_xor_sync(0xffffffff, wsum, 1);
+                wsum += __shfl_xor_sync(0xffffffff, wsum, 2);
+                bias[r] = (0.5f*float(wsum) - 12582912.0f) * s[r];
+            }
         }
 #pragma unroll
         for (int n = 0; n < 8; ++n) {
@@ -318,8 +292,8 @@ static __device__ __forceinline__ void tckv_int8_pv(const int * tile_V, const TC
 #pragma unroll
                 for (int r = 0; r < 2; ++r) {
                     VKQ_C[b*8 + n].x[2*hc + r] += make_half2(
-                        fmaf(__int_as_float(acc[hc].x[2*r + 0]), sb[r], biasb[r]),
-                        fmaf(__int_as_float(acc[hc].x[2*r + 1]), sb[r], biasb[r]));
+                        fmaf(__int_as_float(acc[hc].x[2*r + 0]), s[r], bias[r]),
+                        fmaf(__int_as_float(acc[hc].x[2*r + 1]), s[r], bias[r]));
                 }
             }
         }
