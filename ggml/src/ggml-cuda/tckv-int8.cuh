@@ -273,19 +273,24 @@ static __device__ __forceinline__ void tckv_int8_pv(const int * tile_V, const TC
 #pragma unroll
             for (int t = 0; t < 2; ++t) {
 #pragma unroll
-                for (int l = 0; l < 8; ++l) {
-                    const int slot = b*nbatch_fa + g*32 + t*16 + (l/4)*8 + 2*q + (l%2);
-                    w[g][t][l] = P[2*g + t].x[l] * __int_as_float(tile_V[(slot/4)*stride + nbatch_fa/4 + slot%4]);
-                    amax[(l/2)%2] = fmaxf(amax[(l/2)%2], w[g][t][l]);
+                for (int l = 0; l < 8; l += 2) {
+                    // Keys l and l+1 are adjacent pad slots (even slot, slot%4 in {0, 2}).
+                    const int slot = b*nbatch_fa + g*32 + t*16 + (l/4)*8 + 2*q;
+                    const float2 sv = *(const float2 *) (tile_V + (slot/4)*stride + nbatch_fa/4 + slot%4);
+                    w[g][t][l + 0] = P[2*g + t].x[l + 0] * sv.x;
+                    w[g][t][l + 1] = P[2*g + t].x[l + 1] * sv.y;
+                    amax[(l/2)%2] = fmaxf(amax[(l/2)%2], fmaxf(w[g][t][l], w[g][t][l + 1]));
                 }
             }
         }
         float s[2];
+        float inv[2];
 #pragma unroll
         for (int r = 0; r < 2; ++r) {
             amax[r] = fmaxf(amax[r], __shfl_xor_sync(0xffffffff, amax[r], 1));
             amax[r] = fmaxf(amax[r], __shfl_xor_sync(0xffffffff, amax[r], 2));
-            s[r] = amax[r] / 255.0f;
+            s[r]   = amax[r] * (1.0f/255.0f);
+            inv[r] = amax[r] > 0.0f ? 255.0f/amax[r] : 0.0f;
         }
         tile<16, 8, int> pa[ngroups];
 #pragma unroll
@@ -294,11 +299,10 @@ static __device__ __forceinline__ void tckv_int8_pv(const int * tile_V, const TC
             for (int t = 0; t < 2; ++t) {
 #pragma unroll
                 for (int r = 0; r < 2; ++r) {
-                    int packed = 0;
+                    unsigned int packed = 0;
 #pragma unroll
                     for (int j = 0; j < 4; ++j) {
-                        const float x = w[g][t][(j/2)*4 + 2*r + (j%2)];
-                        packed |= (s[r] > 0.0f ? (int) rintf(x / s[r]) : 0) << (8*j);
+                        packed |= __float2uint_rn(w[g][t][(j/2)*4 + 2*r + (j%2)] * inv[r]) << (8*j);
                     }
                     pa[g].x[2*t + r] = packed;
                 }
