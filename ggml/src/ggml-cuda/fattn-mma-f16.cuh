@@ -1234,8 +1234,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         }
     }
 
+    // int8 PV folds the rescale into its epilogue (one HFMA2 per accumulator).
+    float KQ_max_scale[cols_per_thread];
     {
-        float KQ_max_scale[cols_per_thread];
 #pragma unroll
         for (int col = 0; col < cols_per_thread; ++col) {
             const float KQ_max_diff = KQ_max[col] - KQ_max_new[col];
@@ -1249,7 +1250,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         }
 
 #if defined(TURING_MMA_AVAILABLE)
-        if constexpr (cols_per_warp == 8) {
+        if constexpr (use_int8_pv) {
+        } else if constexpr (cols_per_warp == 8) {
             const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale[0], KQ_max_scale[cols_per_thread - 1]);
 #pragma unroll
             for (int i = 0; i < DV/T_C_VKQ::I; ++i) {
@@ -1337,7 +1339,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
 
     if constexpr (use_int8_pv) {
-        tckv_int8_pv<DV, nbatch_fa, int8_half_off>((const int *) tile_V, KQ_C, VKQ_C);
+        tckv_int8_pv<DV, nbatch_fa, int8_half_off>((const int *) tile_V, KQ_C, KQ_max_scale, VKQ_C);
     } else {
     // Calculate VKQ tile, need to use logical rather than physical elements for i0 due to transposition of V:
 #pragma unroll

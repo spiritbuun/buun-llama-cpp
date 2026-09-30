@@ -212,14 +212,16 @@ static __device__ __forceinline__ void tckv_mma_u8s8(
 // to u8 per query row (absmax/255, the TCKV_P=8 sim), multiplied by the int8 V^T tile, and the
 // int32 result is scaled into the f16 accumulators. half_off: V codes are native turbo8
 // (value = sV*(code + 0.5)); the +0.5 term is 0.5*sum(W codes), folded into the epilogue bias.
+// VKQ_scale is the per-row online-softmax rescale of the previous accumulators, applied in the epilogue.
 template<int DV, int nbatch_fa, bool half_off, typename TC, typename TV>
-static __device__ __forceinline__ void tckv_int8_pv(const int * tile_V, const TC * P, TV * VKQ_C) {
+static __device__ __forceinline__ void tckv_int8_pv(const int * tile_V, const TC * P, const float * VKQ_scale, TV * VKQ_C) {
 #ifdef TURING_MMA_AVAILABLE
     using namespace ggml_cuda_mma;
     static_assert(TC::I == 16 && TC::J == 16 && TV::I == 16 && TV::J == 8, "bad tiles");
     constexpr int stride  = (nbatch_fa + 16)/4;
     constexpr int ngroups = nbatch_fa/32;
     const int q = threadIdx.x % 4;
+    const half2 vscale[2] = {__float2half2_rn(VKQ_scale[0]), __float2half2_rn(VKQ_scale[1])};
 #pragma unroll
     for (int b = 0; b < DV/128; ++b) {
         float w[ngroups][2][8];
@@ -302,15 +304,15 @@ static __device__ __forceinline__ void tckv_int8_pv(const int * tile_V, const TC
             for (int hc = 0; hc < 2; ++hc) {
 #pragma unroll
                 for (int r = 0; r < 2; ++r) {
-                    VKQ_C[b*8 + n].x[2*hc + r] += make_half2(
+                    VKQ_C[b*8 + n].x[2*hc + r] = __hfma2(VKQ_C[b*8 + n].x[2*hc + r], vscale[r], make_half2(
                         fmaf(__int_as_float(acc[hc].x[2*r + 0]), s[r], bias[r]),
-                        fmaf(__int_as_float(acc[hc].x[2*r + 1]), s[r], bias[r]));
+                        fmaf(__int_as_float(acc[hc].x[2*r + 1]), s[r], bias[r])));
                 }
             }
         }
     }
 #else
-    GGML_UNUSED_VARS(tile_V, P, VKQ_C);
+    GGML_UNUSED_VARS(tile_V, P, VKQ_scale, VKQ_C);
     NO_DEVICE_CODE;
 #endif
 }
