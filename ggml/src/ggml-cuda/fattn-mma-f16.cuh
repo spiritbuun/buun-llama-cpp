@@ -1260,14 +1260,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     VKQ_C[i].x[l] *= KQ_max_scale_h2;
                 }
             }
-        } else if constexpr (std::is_same_v<decltype(T_C_VKQ::x), float[T_C_VKQ::ne]>) {
-#pragma unroll
-            for (int i = 0; i < DV/T_C_VKQ::J; ++i) {
-#pragma unroll
-                for (int l = 0; l < T_C_VKQ::ne; ++l) {
-                    VKQ_C[i].x[l] *= KQ_max_scale[(l/2) % 2];
-                }
-            }
         } else {
 #pragma unroll
             for (int col = 0; col < cols_per_thread; ++col) {
@@ -1600,8 +1592,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     using     T_C_KQ    = typename mma_tile_sizes<DKQ, ncols>::T_C_KQ;
     using     T_A_VKQ   = typename mma_tile_sizes<DKQ, ncols>::T_A_VKQ;
     using     T_B_VKQ   = typename mma_tile_sizes<DKQ, ncols>::T_B_VKQ;
-    // int8 PV accumulates VKQ in f32 (same C layout as T_C_KQ).
-    using     T_C_VKQ   = std::conditional_t<(int8_mode & 2) != 0, T_C_KQ, typename mma_tile_sizes<DKQ, ncols>::T_C_VKQ>;
+    using     T_C_VKQ   = typename mma_tile_sizes<DKQ, ncols>::T_C_VKQ;
 
     constexpr int  cols_per_warp   = T_B_KQ::I;
     constexpr int  cols_per_thread = get_cols_per_thread();
@@ -1660,7 +1651,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
     T_B_KQ    Q_B[(Q_in_reg ? DKQ/(2*T_B_KQ::J) : 1)];
 #if defined(TURING_MMA_AVAILABLE)
-    T_C_VKQ VKQ_C[cols_per_warp == 8 ? DV/T_C_VKQ::I : (int8_mode & 2) != 0 ? DV/T_C_VKQ::J : DV/(2*T_C_VKQ::J)];
+    T_C_VKQ VKQ_C[cols_per_warp == 8 ? DV/T_C_VKQ::I : DV/(2*T_C_VKQ::J)];
 #elif defined(AMD_WMMA_AVAILABLE) && defined(RDNA3)
     T_C_VKQ VKQ_C[DV % 32 != 0       ? DV/T_C_VKQ::J : DV/(2*T_C_VKQ::J)];
 #elif defined(AMD_MFMA_AVAILABLE)
@@ -1949,14 +1940,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                     VKQ_C[i].x[l] *= KQ_max_scale_h2;
                 }
             }
-        } else if constexpr (std::is_same_v<decltype(T_C_VKQ::x), float[T_C_VKQ::ne]>) {
-#pragma unroll
-            for (int i = 0; i < DV/T_C_VKQ::J; ++i) {
-#pragma unroll
-                for (int l = 0; l < T_C_VKQ::ne; ++l) {
-                    VKQ_C[i].x[l] *= KQ_max_scale[(l/2) % 2];
-                }
-            }
         } else {
 #pragma unroll
             for (int col = 0; col < cols_per_thread; ++col) {
@@ -2038,9 +2021,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         // KQ_cmr = KQ combine max rowsum
         // Use the 16 bytes of padding in each Q column to store the meta data: KQ max, KQ rowsum, KQ max scale.
 #if defined(TURING_MMA_AVAILABLE)
-        // Rows of the f32 16x16 VKQ tile (int8 PV) step every 2 elements, half2 16x4 every element.
-        constexpr int l_row = std::is_same_v<decltype(T_C_VKQ::x), float[T_C_VKQ::ne]> ? 2 : 1;
-        const int jc_cwm = threadIdx.y*cols_per_warp + T_C_VKQ::get_i(l_row*(threadIdx.x % 4));
+        const int jc_cwm = threadIdx.y*cols_per_warp + T_C_VKQ::get_i(threadIdx.x % 4);
         const float2 KQ_cmr = make_float2(KQ_max[threadIdx.x % cols_per_thread], KQ_rowsum[threadIdx.x % cols_per_thread]);
         const bool thread_should_write = threadIdx.x % 4 < cols_per_thread;
 #elif defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
