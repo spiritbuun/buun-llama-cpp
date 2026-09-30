@@ -1870,12 +1870,17 @@ static __device__ __forceinline__ float tckv_turbo_quant_block(const char * row,
 }
 
 // Lever 1: int8 K rows (tckv_int8_row_bytes format) straight from the turbo cache, no f16 materialize.
-// Grid (token, head, stream), one warp per 128-channel block; rows in materialized order.
+// Grid (token block, head, stream), block (32, D/128, tokens), one warp per 128-channel block;
+// rows in materialized order.
 template<int D, ggml_type type, bool native>
-static __global__ void tckv_int8_prep_k_turbo(const char * src, char * dst, size_t nb1, size_t nb2, size_t nb3) {
+static __global__ void tckv_int8_prep_k_turbo(const char * src, char * dst, int ne1, size_t nb1, size_t nb2, size_t nb3) {
     const int b = threadIdx.y;
-    const char * row = src + blockIdx.z*nb3 + blockIdx.y*nb2 + blockIdx.x*nb1;
-    char * out = dst + (((int64_t) blockIdx.z*gridDim.x + blockIdx.x)*gridDim.y + blockIdx.y)*tckv_int8_row_bytes(D);
+    const int t = blockIdx.x*blockDim.z + threadIdx.z;
+    if (t >= ne1) {
+        return;
+    }
+    const char * row = src + blockIdx.z*nb3 + blockIdx.y*nb2 + t*nb1;
+    char * out = dst + (((int64_t) blockIdx.z*ne1 + t)*gridDim.y + blockIdx.y)*tckv_int8_row_bytes(D);
     const float s = tckv_turbo_quant_block<type, false, native>(row, b, (int8_t *) out + b*128);
     if (threadIdx.x == 0) {
         ((float *) (out + D))[b] = s;
@@ -1926,8 +1931,9 @@ static void tckv_int8_prep_turbo(const ggml_tensor * T, char * dst, bool is_v, c
         tckv_int8_prep_v_turbo<D, nbf, type, native><<<dim3(T->ne[1]/nbf, T->ne[2]), 256, 0, stream>>>(
             (const char *) T->data, dst, T->nb[1], T->nb[2]);
     } else {
-        tckv_int8_prep_k_turbo<D, type, native><<<dim3(T->ne[1], T->ne[2], T->ne[3]), dim3(32, D/128), 0, stream>>>(
-            (const char *) T->data, dst, T->nb[1], T->nb[2], T->nb[3]);
+        constexpr int ntok = 1024/D; // 8 warps per block
+        tckv_int8_prep_k_turbo<D, type, native><<<dim3((T->ne[1] + ntok - 1)/ntok, T->ne[2], T->ne[3]), dim3(32, D/128, ntok), 0, stream>>>(
+            (const char *) T->data, dst, T->ne[1], T->nb[1], T->nb[2], T->nb[3]);
     }
     CUDA_CHECK(cudaGetLastError());
 }
