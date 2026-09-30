@@ -116,6 +116,21 @@ static __device__ __forceinline__ void tckv_int8_load_q(
 #endif
 }
 
+// Loads a 16x8 int tile as its two 8x8 row halves. The lane addresses order the ldmatrix matrices
+// so each half lands in a consecutive register pair, the layout of an MMA B operand (no MOVs).
+static __device__ __forceinline__ void tckv_ldmatrix_halves(
+        ggml_cuda_mma::tile<8, 8, int> & lo, ggml_cuda_mma::tile<8, 8, int> & hi, const int * xs0, const int stride) {
+#ifdef TURING_MMA_AVAILABLE
+    const int * xs = xs0 + (threadIdx.x % 8 + (threadIdx.x / 16)*8)*stride + ((threadIdx.x / 8) % 2)*4;
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0, %1, %2, %3}, [%4];"
+        : "=r"(lo.x[0]), "=r"(lo.x[1]), "=r"(hi.x[0]), "=r"(hi.x[1])
+        : "l"(xs));
+#else
+    GGML_UNUSED_VARS(lo, hi, xs0, stride);
+    NO_DEVICE_CODE;
+#endif
+}
+
 // preloaded: the multi-stage pipeline already cp.async'd the K rows into smem.
 // half_off: K codes are native turbo8 (value = sK*(code + 0.5)); q_offs holds 0.5*sum(Q codes).
 template<int D, int nwarps, int nbatch, int cols_per_warp, int np, bool oob, bool preloaded, bool half_off, typename TC>
@@ -143,17 +158,16 @@ static __device__ __forceinline__ void tckv_int8_qk(
             tile<16, 8, int> acc[cols_per_warp == 8 ? 1 : 2];
 #pragma unroll
             for (int k = 0; k < 4; ++k) {
-                tile<16, 8, int> kt;
-                load_ldmatrix(kt, smem + i0*stride + b*32 + k*8, stride);
                 if constexpr (cols_per_warp == 8) {
+                    tile<16, 8, int> kt;
+                    load_ldmatrix(kt, smem + i0*stride + b*32 + k*8, stride);
                     tile<8, 8, int> q;
                     q.x[0] = qb[b*4 + k].x[0];
                     q.x[1] = qb[b*4 + k].x[1];
                     mma(acc[0], kt, q);
                 } else {
                     tile<8, 8, int> lo, hi;
-                    lo.x[0] = kt.x[0]; lo.x[1] = kt.x[2];
-                    hi.x[0] = kt.x[1]; hi.x[1] = kt.x[3];
+                    tckv_ldmatrix_halves(lo, hi, smem + i0*stride + b*32 + k*8, stride);
                     mma(acc[0], qb[b*4 + k], lo);
                     mma(acc[1], qb[b*4 + k], hi);
                 }
@@ -279,11 +293,8 @@ static __device__ __forceinline__ void tckv_int8_pv(const int * tile_V, const TC
             }
 #pragma unroll
             for (int g = 0; g < ngroups; ++g) {
-                tile<16, 8, int> vt;
-                load_ldmatrix(vt, tile_V + (b*128 + n*16)*stride + g*8, stride);
                 tile<8, 8, int> lo, hi;
-                lo.x[0] = vt.x[0]; lo.x[1] = vt.x[2];
-                hi.x[0] = vt.x[1]; hi.x[1] = vt.x[3];
+                tckv_ldmatrix_halves(lo, hi, tile_V + (b*128 + n*16)*stride + g*8, stride);
                 tckv_mma_u8s8(acc[0], pa[g], lo);
                 tckv_mma_u8s8(acc[1], pa[g], hi);
             }
