@@ -8,6 +8,19 @@
 // no generic F16 operation may consume this buffer.
 static constexpr __host__ __device__ int tckv_int8_row_bytes(int D) { return D + 16; }
 
+// C3 V scratch: one tile per (kv head, nbatch_fa keys), channel-major (V^T): D rows of nbatch_fa
+// key bytes + 16 pad bytes. Keys in each 32-group are stored in P-fragment order (tckv_int8_pv),
+// the pads hold the per-(key, 128-channel block) scales, slot b*nbatch_fa + key.
+static constexpr __host__ __device__ int tckv_int8_v_tile_bytes(int D, int nbatch_fa) { return D*(nbatch_fa + 16); }
+
+static bool tckv_int8_pv_enabled() {
+    static const bool enabled = [] {
+        const char * s = getenv("TCKV_INT8_PV");
+        return s && atoi(s) == 1;
+    }();
+    return enabled;
+}
+
 static bool tckv_int8_applicable(const ggml_tensor * dst, int cc) {
     static const bool enabled = [] {
         const char * s = getenv("TCKV_INT8_QK");
@@ -54,6 +67,67 @@ static __global__ void tckv_int8_prep_k(const half * src, char * dst) {
     }
     if (lane == 0) {
         ((float *) (out + D))[b] = s;
+    }
+}
+
+// Logical byte L of a V^T tile row -> key within the tile. Inverse of the P A-fragment order:
+// thread (lane%4 == q) holds keys 16t + 8h + 2q + e of a 32-group, packed as byte 16t + 4q + 2h + e.
+static __device__ __forceinline__ int tckv_int8_v_key(int L) {
+    const int j = L % 4;
+    return (L/32)*32 + ((L%32)/16)*16 + (j/2)*8 + 2*((L%16)/4) + (j%2);
+}
+
+// One block per (key tile, kv head). f16 V (strides in halfs) -> int8 V^T tile, per-(key, 128-block)
+// absmax/127 scales (TCKV_P=8 sim V quantizer).
+template<int D, int nbatch_fa>
+static __global__ void tckv_int8_prep_v(const half * src, char * dst, int64_t s1, int64_t s2) {
+    __shared__ half  v[nbatch_fa][D];
+    __shared__ float sc[D/128][nbatch_fa];
+    const int tile = blockIdx.x;
+    const int h    = blockIdx.y;
+    const int tid  = threadIdx.x;
+    for (int x = tid; x < nbatch_fa*D/8; x += blockDim.x) {
+        const int k = x / (D/8);
+        ((int4 *) v[k])[x % (D/8)] = ((const int4 *) (src + (int64_t) (tile*nbatch_fa + k)*s1 + h*s2))[x % (D/8)];
+    }
+    __syncthreads();
+    const int lane = tid % 32;
+    for (int p = tid/32; p < nbatch_fa*(D/128); p += blockDim.x/32) {
+        const int k = p % nbatch_fa;
+        const int b = p / nbatch_fa;
+        float amax = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            amax = fmaxf(amax, fabsf(__half2float(v[k][b*128 + i*32 + lane])));
+        }
+#pragma unroll
+        for (int o = 16; o; o >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
+        }
+        if (lane == 0) {
+            sc[b][k] = amax / 127.0f;
+        }
+    }
+    __syncthreads();
+    constexpr int stride = (nbatch_fa + 16)/4;
+    int * out = (int *) (dst + ((int64_t) h*gridDim.x + tile)*tckv_int8_v_tile_bytes(D, nbatch_fa));
+    for (int x = tid; x < D*stride; x += blockDim.x) {
+        const int c = x / stride;
+        const int w = x % stride;
+        int packed = 0;
+        if (w < nbatch_fa/4) {
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int key = tckv_int8_v_key(4*w + j);
+                const float s = sc[c/128][key];
+                const int code = s > 0.0f ? (int) rintf(__half2float(v[key][c]) / s) : 0;
+                packed |= (code & 0xFF) << (8*j);
+            }
+        } else {
+            const int slot = 4*c + w - nbatch_fa/4;
+            packed = __float_as_int(slot < (D/128)*nbatch_fa ? sc[slot / nbatch_fa][slot % nbatch_fa] : 0.0f);
+        }
+        out[x] = packed;
     }
 }
 
@@ -163,5 +237,97 @@ static __device__ __forceinline__ void tckv_int8_qk(
     if constexpr (!preloaded) {
         __syncthreads(); // K scratch is reused by the unchanged f16 PV loader.
     }
+#endif
+}
+
+static __device__ __forceinline__ void tckv_mma_u8s8(
+        ggml_cuda_mma::tile<16, 8, int> & D, const ggml_cuda_mma::tile<16, 8, int> & A, const ggml_cuda_mma::tile<8, 8, int> & B) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+    asm("mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+        : "+r"(D.x[0]), "+r"(D.x[1]), "+r"(D.x[2]), "+r"(D.x[3])
+        : "r"(A.x[0]), "r"(A.x[1]), "r"(A.x[2]), "r"(A.x[3]), "r"(B.x[0]), "r"(B.x[1]));
+#else
+    GGML_UNUSED_VARS(D, A, B);
+    NO_DEVICE_CODE;
+#endif
+}
+
+// C3: VKQ += P V with int8 tensor cores (cols_per_warp == 16, np == 1). P is the f32 softmax
+// numerator in tile<16,16,float> C layout. Per 128-channel block b, W = P*sV[key, b] is quantized
+// to u8 per query row (absmax/255, the TCKV_P=8 sim), multiplied by the int8 V^T tile, and the
+// int32 result is scaled into the f16 accumulators.
+template<int DV, int nbatch_fa, typename TC, typename TV>
+static __device__ __forceinline__ void tckv_int8_pv(const int * tile_V, const TC * P, TV * VKQ_C) {
+#ifdef TURING_MMA_AVAILABLE
+    using namespace ggml_cuda_mma;
+    static_assert(TC::I == 16 && TC::J == 16 && TV::I == 16 && TV::J == 8, "bad tiles");
+    constexpr int stride  = (nbatch_fa + 16)/4;
+    constexpr int ngroups = nbatch_fa/32;
+    const int q = threadIdx.x % 4;
+#pragma unroll
+    for (int b = 0; b < DV/128; ++b) {
+        float w[ngroups][2][8];
+        float amax[2] = {0.0f, 0.0f};
+#pragma unroll
+        for (int g = 0; g < ngroups; ++g) {
+#pragma unroll
+            for (int t = 0; t < 2; ++t) {
+#pragma unroll
+                for (int l = 0; l < 8; ++l) {
+                    const int slot = b*nbatch_fa + g*32 + t*16 + (l/4)*8 + 2*q + (l%2);
+                    w[g][t][l] = P[2*g + t].x[l] * __int_as_float(tile_V[(slot/4)*stride + nbatch_fa/4 + slot%4]);
+                    amax[(l/2)%2] = fmaxf(amax[(l/2)%2], w[g][t][l]);
+                }
+            }
+        }
+        float s[2];
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            amax[r] = fmaxf(amax[r], __shfl_xor_sync(0xffffffff, amax[r], 1));
+            amax[r] = fmaxf(amax[r], __shfl_xor_sync(0xffffffff, amax[r], 2));
+            s[r] = amax[r] / 255.0f;
+        }
+        tile<16, 8, int> pa[ngroups];
+#pragma unroll
+        for (int g = 0; g < ngroups; ++g) {
+#pragma unroll
+            for (int t = 0; t < 2; ++t) {
+#pragma unroll
+                for (int r = 0; r < 2; ++r) {
+                    int packed = 0;
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const float x = w[g][t][(j/2)*4 + 2*r + (j%2)];
+                        packed |= (s[r] > 0.0f ? (int) rintf(x / s[r]) : 0) << (8*j);
+                    }
+                    pa[g].x[2*t + r] = packed;
+                }
+            }
+        }
+#pragma unroll
+        for (int n = 0; n < 8; ++n) {
+            tile<16, 8, int> acc[2];
+#pragma unroll
+            for (int g = 0; g < ngroups; ++g) {
+                tile<16, 8, int> vt;
+                load_ldmatrix(vt, tile_V + (b*128 + n*16)*stride + g*8, stride);
+                tile<8, 8, int> lo, hi;
+                lo.x[0] = vt.x[0]; lo.x[1] = vt.x[2];
+                hi.x[0] = vt.x[1]; hi.x[1] = vt.x[3];
+                tckv_mma_u8s8(acc[0], pa[g], lo);
+                tckv_mma_u8s8(acc[1], pa[g], hi);
+            }
+#pragma unroll
+            for (int hc = 0; hc < 2; ++hc) {
+#pragma unroll
+                for (int r = 0; r < 2; ++r) {
+                    VKQ_C[b*8 + n].x[2*hc + r] += make_half2(float(acc[hc].x[2*r])*s[r], float(acc[hc].x[2*r + 1])*s[r]);
+                }
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(tile_V, P, VKQ_C);
+    NO_DEVICE_CODE;
 #endif
 }

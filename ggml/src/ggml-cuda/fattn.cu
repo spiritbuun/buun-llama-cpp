@@ -1770,7 +1770,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(int device, const ggml_tensor * dst);
 
 // C2a uses the native stream-K scheduler and MMA tile tuning, with synchronous int8 K loads.
-template<int D, int ncols1, int ncols2>
+template<int D, int ncols1, int ncols2, int int8_mode = 1>
 static void tckv_int8_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     const auto cfg = ggml_cuda_fattn_mma_get_config(D, D, ncols1*ncols2, cc);
@@ -1784,7 +1784,7 @@ static void tckv_int8_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     const size_t combine_bytes = nwarps*cols_per_warp*(cfg.nbatch_combine + 4)*sizeof(half2);
     const size_t smem = std::max(combine_bytes, std::max(q_bytes, kv_bytes + mask_bytes));
     auto kernel = flash_attn_ext_f16<D, D, ncols1, ncols2, false, false, false,
-                                   GGML_TYPE_F16, GGML_TYPE_F16, false, true>;
+                                   GGML_TYPE_F16, GGML_TYPE_F16, false, int8_mode>;
     static bool raised[GGML_CUDA_MAX_DEVICES] = {};
     if (!raised[ctx.device]) {
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
@@ -1812,6 +1812,27 @@ static void tckv_int8_attend(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     if (dst->src[3] && K->ne[1] % FATTN_KQ_STRIDE == 0) {
         if (dst->src[0]->ne[1] <= 8) {
             tckv_int8_launch<D, 1, 8>(ctx, dst);
+        } else if (tckv_int8_pv_enabled()) {
+            // C3: int8 PV from per-(head, key tile) V^T tiles, 8x8 configuration only.
+            constexpr int nbf = D == 256 ? 32 : 64;
+            GGML_ASSERT(ggml_cuda_fattn_mma_get_config(D, D, 64, ggml_cuda_info().devices[ctx.device].cc).nbatch_fa == nbf);
+            const ggml_tensor * V = dst->src[2];
+            GGML_ASSERT(V->type == GGML_TYPE_F16 && V->ne[3] == 1);
+            const int n_tiles = V->ne[1]/nbf;
+            constexpr int tile_bytes = tckv_int8_v_tile_bytes(D, nbf);
+            ggml_cuda_pool_alloc<char> v8(ctx.pool(), (size_t) n_tiles*V->ne[2]*tile_bytes);
+            tckv_int8_prep_v<D, nbf><<<dim3(n_tiles, V->ne[2]), 256, 0, ctx.stream()>>>(
+                (const half *) V->data, v8.get(), V->nb[1]/sizeof(half), V->nb[2]/sizeof(half));
+            CUDA_CHECK(cudaGetLastError());
+            ggml_tensor packed_v = *V;
+            packed_v.data = v8.get();
+            packed_v.nb[1] = tile_bytes/nbf;
+            packed_v.nb[2] = packed_v.nb[1]*V->ne[1];
+            packed_v.nb[3] = packed_v.nb[2]*V->ne[2];
+            ggml_tensor * original_v = dst->src[2];
+            dst->src[2] = &packed_v;
+            tckv_int8_launch<D, 8, 8, 2>(ctx, dst);
+            dst->src[2] = original_v;
         } else {
             tckv_int8_launch<D, 8, 8>(ctx, dst);
         }
