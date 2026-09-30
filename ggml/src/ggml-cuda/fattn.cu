@@ -1836,13 +1836,40 @@ static __device__ __forceinline__ float tckv_turbo_value(const char * row, int j
     }
 }
 
-// Quantize one 128-channel block (one warp, lane holds channels k*32 + lane) of a turbo row.
+// One 128-channel block of a turbo row in f32 (one warp, lane holds channels k*32 + lane); returns
+// the block absmax, reduced over the warp.
+template<ggml_type type, bool is_v>
+static __device__ __forceinline__ float tckv_turbo_block_values(const char * row, int b, float * v) {
+    const int lane = threadIdx.x % 32;
+    float amax = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        v[k] = tckv_turbo_value<type, is_v>(row, b*128 + k*32 + lane);
+        amax = fmaxf(amax, fabsf(v[k]));
+    }
+#pragma unroll
+    for (int o = 16; o; o >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
+    }
+    return amax;
+}
+
+// Round a block's f32 values to int8 codes with scale s, round-to-nearest-even, zero scale -> zeros.
+static __device__ __forceinline__ void tckv_int8_store_block(const float * v, float s, int8_t * out) {
+    const int lane = threadIdx.x % 32;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        out[k*32 + lane] = s > 0.0f ? (int8_t) rintf(v[k]/s) : 0;
+    }
+}
+
+// Quantize one 128-channel block of a turbo row.
 // native: turbo8 codes as-is, value = s*((code ^ 0x80) + 0.5), s = norm/127.5 (exact).
-// Otherwise absmax/127 of the f32 values, round-to-nearest-even, zero block -> zero scale.
+// Otherwise absmax/127 of the f32 values.
 template<ggml_type type, bool is_v, bool native>
 static __device__ __forceinline__ float tckv_turbo_quant_block(const char * row, int b, int8_t * out) {
-    const int lane = threadIdx.x % 32;
     if constexpr (native) {
+        const int lane = threadIdx.x % 32;
         const block_turbo8_0 * blk = (const block_turbo8_0 *) row + b;
 #pragma unroll
         for (int k = 0; k < 4; ++k) {
@@ -1850,21 +1877,9 @@ static __device__ __forceinline__ float tckv_turbo_quant_block(const char * row,
         }
         return __half2float(blk->norm) / 127.5f;
     } else {
-        float v[4], amax = 0.0f;
-#pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            v[k] = tckv_turbo_value<type, is_v>(row, b*128 + k*32 + lane);
-            amax = fmaxf(amax, fabsf(v[k]));
-        }
-#pragma unroll
-        for (int o = 16; o; o >>= 1) {
-            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
-        }
-        const float s = amax / 127.0f;
-#pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            out[k*32 + lane] = s > 0.0f ? (int8_t) rintf(v[k]/s) : 0;
-        }
+        float v[4];
+        const float s = tckv_turbo_block_values<type, is_v>(row, b, v) / 127.0f;
+        tckv_int8_store_block(v, s, out);
         return s;
     }
 }
@@ -1887,24 +1902,61 @@ static __global__ void tckv_int8_prep_k_turbo(const char * src, char * dst, int 
     }
 }
 
-// Lever 1: int8 V^T tiles (tckv_int8_prep_v format) straight from the turbo cache.
-template<int D, int nbatch_fa, ggml_type type, bool native>
+// Lever 1: int8 V^T tiles (tckv_int8_v_tile_bytes format) straight from the turbo cache.
+// vtile: one scale per 128-channel block for the whole tile (the max of the per-key absmax / 127).
+template<int D, int nbatch_fa, ggml_type type, bool native, bool vtile>
 static __global__ void tckv_int8_prep_v_turbo(const char * src, char * dst, size_t nb1, size_t nb2) {
+    static_assert(!(native && vtile), "tile-scaled V is re-quantized");
     __shared__ int8_t v[nbatch_fa][D + 4]; // +4: the transposing reads below walk keys, not channels
     __shared__ float sc[D/128][nbatch_fa];
     const int tile = blockIdx.x;
     const int h    = blockIdx.y;
     const int tid  = threadIdx.x;
-    for (int p = tid/32; p < nbatch_fa*(D/128); p += blockDim.x/32) {
+    constexpr int nwarps = 8; // 256 threads, see tckv_int8_prep_turbo
+    constexpr int nper   = nbatch_fa*(D/128)/nwarps;
+    static_assert(nper*nwarps == nbatch_fa*(D/128), "bad V prep split");
+    float vals[vtile ? nper : 1][4]; // vtile: keep the values until the tile scale is known
+#pragma unroll
+    for (int i = 0; i < nper; ++i) {
+        const int p = i*nwarps + tid/32;
         const int k = p % nbatch_fa;
         const int b = p / nbatch_fa;
         const char * row = src + (int64_t) (tile*nbatch_fa + k)*nb1 + h*nb2;
-        const float s = tckv_turbo_quant_block<type, true, native>(row, b, v[k] + b*128);
+        float s;
+        if constexpr (vtile) {
+            s = tckv_turbo_block_values<type, true>(row, b, vals[i]);
+        } else {
+            s = tckv_turbo_quant_block<type, true, native>(row, b, v[k] + b*128);
+        }
         if (tid % 32 == 0) {
             sc[b][k] = s;
         }
     }
     __syncthreads();
+    if constexpr (vtile) {
+        if (tid/32 < D/128) {
+            const int b = tid/32;
+            float m = 0.0f;
+            for (int k = tid % 32; k < nbatch_fa; k += 32) {
+                m = fmaxf(m, sc[b][k]);
+            }
+#pragma unroll
+            for (int o = 16; o; o >>= 1) {
+                m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
+            }
+            if (tid % 32 == 0) {
+                sc[b][0] = m / 127.0f;
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < nper; ++i) {
+            const int p = i*nwarps + tid/32;
+            const int b = p / nbatch_fa;
+            tckv_int8_store_block(vals[i], sc[b][0], v[p % nbatch_fa] + b*128);
+        }
+        __syncthreads();
+    }
     constexpr int stride = (nbatch_fa + 16)/4;
     int * out = (int *) (dst + ((int64_t) h*gridDim.x + tile)*tckv_int8_v_tile_bytes(D, nbatch_fa));
     for (int x = tid; x < D*stride; x += blockDim.x) {
@@ -1918,17 +1970,21 @@ static __global__ void tckv_int8_prep_v_turbo(const char * src, char * dst, size
             }
         } else {
             const int slot = 4*c + w - nbatch_fa/4;
-            packed = __float_as_int(slot < (D/128)*nbatch_fa ? sc[slot / nbatch_fa][slot % nbatch_fa] : 0.0f);
+            if constexpr (vtile) {
+                packed = __float_as_int(slot < D/128 ? sc[slot][0] : 0.0f);
+            } else {
+                packed = __float_as_int(slot < (D/128)*nbatch_fa ? sc[slot / nbatch_fa][slot % nbatch_fa] : 0.0f);
+            }
         }
         out[x] = packed;
     }
 }
 
-template<int D, ggml_type type, bool native = false>
+template<int D, ggml_type type, bool native = false, bool vtile = false>
 static void tckv_int8_prep_turbo(const ggml_tensor * T, char * dst, bool is_v, cudaStream_t stream) {
     if (is_v) {
         constexpr int nbf = D == 256 ? 32 : 64;
-        tckv_int8_prep_v_turbo<D, nbf, type, native><<<dim3(T->ne[1]/nbf, T->ne[2]), 256, 0, stream>>>(
+        tckv_int8_prep_v_turbo<D, nbf, type, native, vtile><<<dim3(T->ne[1]/nbf, T->ne[2]), 256, 0, stream>>>(
             (const char *) T->data, dst, T->nb[1], T->nb[2]);
     } else {
         constexpr int ntok = 1024/D; // 8 warps per block
@@ -1938,19 +1994,29 @@ static void tckv_int8_prep_turbo(const ggml_tensor * T, char * dst, bool is_v, c
     CUDA_CHECK(cudaGetLastError());
 }
 
+// native: turbo8 codes as-is (K, and V unless vtile). vtile: V with tile-wide scales.
+template<int D, ggml_type type>
+static void tckv_int8_prep_type(const ggml_tensor * T, char * dst, bool is_v, bool native, bool vtile, cudaStream_t stream) {
+    if (is_v && vtile) {
+        tckv_int8_prep_turbo<D, type, false, true>(T, dst, true, stream);
+        return;
+    }
+    if constexpr (type == GGML_TYPE_TURBO8_0) {
+        if (native) {
+            tckv_int8_prep_turbo<D, type, true>(T, dst, is_v, stream);
+            return;
+        }
+    }
+    tckv_int8_prep_turbo<D, type>(T, dst, is_v, stream);
+}
+
 template<int D>
-static void tckv_int8_prep(const ggml_tensor * T, char * dst, bool is_v, bool native, cudaStream_t stream) {
+static void tckv_int8_prep(const ggml_tensor * T, char * dst, bool is_v, bool native, bool vtile, cudaStream_t stream) {
     switch (T->type) {
-        case GGML_TYPE_TURBO2_0: tckv_int8_prep_turbo<D, GGML_TYPE_TURBO2_0>(T, dst, is_v, stream); break;
-        case GGML_TYPE_TURBO3_0: tckv_int8_prep_turbo<D, GGML_TYPE_TURBO3_0>(T, dst, is_v, stream); break;
-        case GGML_TYPE_TURBO4_0: tckv_int8_prep_turbo<D, GGML_TYPE_TURBO4_0>(T, dst, is_v, stream); break;
-        case GGML_TYPE_TURBO8_0:
-            if (native) {
-                tckv_int8_prep_turbo<D, GGML_TYPE_TURBO8_0, true>(T, dst, is_v, stream);
-            } else {
-                tckv_int8_prep_turbo<D, GGML_TYPE_TURBO8_0>(T, dst, is_v, stream);
-            }
-            break;
+        case GGML_TYPE_TURBO2_0: tckv_int8_prep_type<D, GGML_TYPE_TURBO2_0>(T, dst, is_v, native, vtile, stream); break;
+        case GGML_TYPE_TURBO3_0: tckv_int8_prep_type<D, GGML_TYPE_TURBO3_0>(T, dst, is_v, native, vtile, stream); break;
+        case GGML_TYPE_TURBO4_0: tckv_int8_prep_type<D, GGML_TYPE_TURBO4_0>(T, dst, is_v, native, vtile, stream); break;
+        case GGML_TYPE_TURBO8_0: tckv_int8_prep_type<D, GGML_TYPE_TURBO8_0>(T, dst, is_v, native, vtile, stream); break;
         default: GGML_ABORT("tckv int8: not a plain turbo type");
     }
 }
@@ -1964,8 +2030,9 @@ static void tckv_int8_attend(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     // Native turbo8 codes need the +0.5 terms of the PV kernel instance; a TURBO_CB_T8 book is not a uniform grid.
     static const bool t8_override = getenv("TURBO_CB_T8") != nullptr;
     const bool native = cfg == TCKV_INT8_8x8_PV && K->type == GGML_TYPE_TURBO8_0 && V->type == GGML_TYPE_TURBO8_0 && !t8_override;
+    const bool vtile  = cfg == TCKV_INT8_8x8_PV && tckv_int8_vtile_enabled();
     ggml_cuda_pool_alloc<char> k8(ctx.pool(), K->ne[1]*K->ne[2]*K->ne[3]*tckv_int8_row_bytes(D));
-    tckv_int8_prep<D>(K, k8.get(), false, native, ctx.stream());
+    tckv_int8_prep<D>(K, k8.get(), false, native, false, ctx.stream());
     ggml_tensor packed = *K;
     packed.type = GGML_TYPE_F16;
     packed.data = k8.get();
@@ -1986,7 +2053,7 @@ static void tckv_int8_attend(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
             GGML_ASSERT(V->ne[3] == 1 && V->ne[1] % nbf == 0);
             constexpr int tile_bytes = tckv_int8_v_tile_bytes(D, nbf);
             ggml_cuda_pool_alloc<char> v8(ctx.pool(), (size_t) (V->ne[1]/nbf)*V->ne[2]*tile_bytes);
-            tckv_int8_prep<D>(V, v8.get(), true, native, ctx.stream());
+            tckv_int8_prep<D>(V, v8.get(), true, native, vtile, ctx.stream());
             ggml_tensor packed_v = *V;
             packed_v.type = GGML_TYPE_F16;
             packed_v.data = v8.get();
@@ -1996,7 +2063,13 @@ static void tckv_int8_attend(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
             packed_v.nb[3] = packed_v.nb[2]*V->ne[2];
             ggml_tensor * original_v = dst->src[2];
             dst->src[2] = &packed_v;
-            if (native) {
+            if (vtile) {
+                if (native) {
+                    tckv_int8_launch<D, 8, 8, 14>(ctx, dst);
+                } else {
+                    tckv_int8_launch<D, 8, 8, 10>(ctx, dst);
+                }
+            } else if (native) {
                 tckv_int8_launch<D, 8, 8, 6>(ctx, dst);
             } else {
                 tckv_int8_launch<D, 8, 8, 2>(ctx, dst);

@@ -912,11 +912,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr int stride_tile_V = V_is_K_view ? stride_tile_K : nbatch_V2 + 4;
 
     // int8_mode: 1 = int8 QK, 2 = int8 QK + int8 PV (packed V^T tiles, see tckv_int8_prep_v_turbo),
-    // | 4 = native turbo8 K/V codes (+0.5 offset terms, see tckv_int8_qk/tckv_int8_pv).
+    // | 4 = native turbo8 K/V codes (+0.5 offset terms, see tckv_int8_qk/tckv_int8_pv),
+    // | 8 = tile-wide V scales (V re-quantized, so native codes apply to K only).
     constexpr bool use_int8_qk   = int8_mode != 0;
     constexpr bool use_int8_pv   = (int8_mode & 2) != 0;
     constexpr bool int8_half_off = (int8_mode & 4) != 0;
-    static_assert(!int8_half_off || use_int8_pv, "native turbo8 codes only on the int8 PV path");
+    constexpr bool int8_vtile    = (int8_mode & 8) != 0;
+    static_assert(!(int8_half_off || int8_vtile) || use_int8_pv, "native codes and tile V scales only on the int8 PV path");
     static_assert(!use_int8_pv || (nstages > 1 && cols_per_warp == 16 && np == 1), "int8 PV needs the 8x8 pipeline");
 
     // int8 K rows (codes + scales) are copied verbatim; see tckv_int8_row_bytes.
@@ -1345,7 +1347,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
 
     if constexpr (use_int8_pv) {
-        tckv_int8_pv<DV, nbatch_fa, int8_half_off>((const int *) tile_V, KQ_C, VKQ_C);
+        tckv_int8_pv<DV, nbatch_fa, int8_half_off && !int8_vtile, int8_vtile>((const int *) tile_V, KQ_C, VKQ_C);
     } else {
     // Calculate VKQ tile, need to use logical rather than physical elements for i0 due to transposition of V:
 #pragma unroll
