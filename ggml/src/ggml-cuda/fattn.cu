@@ -1777,7 +1777,9 @@ static void tckv_int8_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     const int nwarps = cfg.nthreads / 32;
     const int cols_per_warp = ncols1*ncols2 == 8 ? 8 : 16;
     const size_t q_bytes = ncols1*ncols2*(D/4 + 4)*sizeof(int);
-    const size_t kv_bytes = cfg.nbatch_fa*(cfg.nbatch_V2 + 4)*sizeof(half2);
+    // Same carve as the f16 kernel: the 2-stage K region keeps its f16 stride (tile_V offset).
+    const int nstages = ggml_cuda_fattn_mma_get_nstages(D, D, ncols1, ncols2, cc);
+    const size_t kv_bytes = cfg.nbatch_fa*(nstages > 1 ? cfg.nbatch_K2 + 4 + cfg.nbatch_V2 + 4 : cfg.nbatch_V2 + 4)*sizeof(half2);
     const size_t mask_bytes = ncols1*(cfg.nbatch_fa + 8)*sizeof(half);
     const size_t combine_bytes = nwarps*cols_per_warp*(cfg.nbatch_combine + 4)*sizeof(half2);
     const size_t smem = std::max(combine_bytes, std::max(q_bytes, kv_bytes + mask_bytes));

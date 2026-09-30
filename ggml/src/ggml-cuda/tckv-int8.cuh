@@ -107,25 +107,24 @@ static __device__ __forceinline__ void tckv_int8_load_q(
 #endif
 }
 
-template<int D, int nwarps, int nbatch, int cols_per_warp, int np, bool oob, typename TC>
+// preloaded: the multi-stage pipeline already cp.async'd the K rows into smem.
+template<int D, int nwarps, int nbatch, int cols_per_warp, int np, bool oob, bool preloaded, typename TC>
 static __device__ __forceinline__ void tckv_int8_qk(
         const half2 * K, int stride_K, int * smem, const ggml_cuda_mma::tile<16, 8, int> * qb,
         const float * q_scales, TC * scores, int nkeys) {
 #ifdef TURING_MMA_AVAILABLE
     using namespace ggml_cuda_mma;
-    constexpr int stride = D/4 + 4;
+    // smem rows are verbatim copies of the scratch rows: D codes, then D/128 float scales in the pad.
+    constexpr int stride = tckv_int8_row_bytes(D)/4;
     constexpr int blocks = D/128;
-    float * ks = (float *) (smem + nbatch*stride);
-    const int tid = threadIdx.y*32 + threadIdx.x;
-    for (int x = tid; x < nbatch*(D/4); x += nwarps*32) {
-        const int i = x/(D/4), k = x%(D/4);
-        smem[i*stride + k] = !oob || i < nkeys ? ((const int *) K)[i*stride_K + k] : 0;
+    if constexpr (!preloaded) {
+        const int tid = threadIdx.y*32 + threadIdx.x;
+        for (int x = tid; x < nbatch*stride; x += nwarps*32) {
+            const int i = x/stride, k = x%stride;
+            smem[i*stride + k] = !oob || i < nkeys ? ((const int *) K)[i*stride_K + k] : 0;
+        }
+        __syncthreads();
     }
-    for (int x = tid; x < nbatch*blocks; x += nwarps*32) {
-        const int i = x/blocks, b = x%blocks;
-        ks[x] = !oob || i < nkeys ? ((const float *) (K + i*stride_K + D/4))[b] : 0.0f;
-    }
-    __syncthreads();
 #pragma unroll
     for (int i00 = 0; i00 < nbatch; i00 += np*16) {
         const int i0 = i00 + (threadIdx.y % np)*16;
@@ -152,7 +151,7 @@ static __device__ __forceinline__ void tckv_int8_qk(
 #pragma unroll
             for (int l = 0; l < TC::ne; ++l) {
                 const int key = i0 + (cols_per_warp == 8 ? TC::get_i(l) : TC::get_j(l));
-                scores[i00/(np*16)].x[l] += float(acc[l/4].x[l%4])*ks[key*blocks + b];
+                scores[i00/(np*16)].x[l] += float(acc[l/4].x[l%4])*((const float *) (smem + key*stride + D/4))[b];
             }
         }
 #pragma unroll
@@ -161,6 +160,8 @@ static __device__ __forceinline__ void tckv_int8_qk(
             scores[i00/(np*16)].x[l] *= q_scales[q];
         }
     }
-    __syncthreads(); // K scratch is reused by the unchanged f16 PV loader.
+    if constexpr (!preloaded) {
+        __syncthreads(); // K scratch is reused by the unchanged f16 PV loader.
+    }
 #endif
 }

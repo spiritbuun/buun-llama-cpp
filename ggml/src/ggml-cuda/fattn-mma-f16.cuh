@@ -905,11 +905,15 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr bool is_turbo_k      = (type_K != GGML_TYPE_F16);
     constexpr bool is_turbo_v      = (type_V != GGML_TYPE_F16);
     constexpr bool is_turbo_kv     = is_turbo_k || is_turbo_v;
-    constexpr int  nstages         = (is_turbo_kv || use_int8_qk) ? 0 : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, use_sparse);
+    constexpr int  nstages         = is_turbo_kv ? 0 : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, use_sparse);
 
     constexpr int stride_tile_K = nbatch_K2 + 4;
 
     constexpr int stride_tile_V = V_is_K_view ? stride_tile_K : nbatch_V2 + 4;
+
+    // int8 K rows (codes + scales) are copied verbatim; see tckv_int8_row_bytes.
+    constexpr int stride_tile_K_ld = use_int8_qk ? tckv_int8_row_bytes(DKQ)/4 : stride_tile_K;
+    constexpr int nbatch_K2_ld     = use_int8_qk ? tckv_int8_row_bytes(DKQ)/4 : nbatch_K2;
 
     const int k_VKQ_0 = kb0 * nbatch_fa;
 
@@ -940,7 +944,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
     if constexpr (use_int8_qk) {
         static_assert(!use_sparse && !V_is_K_view && DKQ == DV && (DKQ == 128 || DKQ == 256));
-        tckv_int8_qk<DKQ, nwarps, nbatch_fa, cols_per_warp, np, oob_check>(
+        tckv_int8_qk<DKQ, nwarps, nbatch_fa, cols_per_warp, np, oob_check, (nstages > 1)>(
             K_h2 + int64_t(k_VKQ_0)*stride_K, stride_K, (int *) tile_K, Q8_B, q_scales, KQ_C, k_VKQ_sup);
     } else {
     // For MLA K and V have the same data.
@@ -1310,8 +1314,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check>
                     (mask_h + k_VKQ_0 + nbatch_fa, tile_mask, stride_mask, k_VKQ_sup, jt*ncols1, ne01);
             }
-            flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
-                (K_h2 + int64_t(k_VKQ_0 + nbatch_fa)*stride_K, tile_K, nbatch_K2, stride_K, k_VKQ_sup);
+            flash_attn_ext_f16_load_tile<stride_tile_K_ld, nwarps, nbatch_fa, use_cp_async, oob_check>
+                (K_h2 + int64_t(k_VKQ_0 + nbatch_fa)*stride_K, tile_K, nbatch_K2_ld, stride_K, k_VKQ_sup);
         }
     }
 
@@ -1577,7 +1581,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int  nbatch_combine  = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols);
     constexpr bool is_turbo_kv     = (type_K != GGML_TYPE_F16 || type_V != GGML_TYPE_F16);
-    constexpr int  nstages         = (is_turbo_kv || use_int8_qk) ? 0 : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, use_sparse);
+    constexpr int  nstages         = is_turbo_kv ? 0 : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, use_sparse);
 
     if (cols_per_warp > ncols) {
         NO_DEVICE_CODE;
@@ -1720,8 +1724,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check>
                 (mask_h + kb0*nbatch_fa, tile_mask, stride_mask, k_VKQ_sup, jt*ncols1, ne01);
         }
-        flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
-            (K_h2 + int64_t(kb0)*nbatch_fa*stride_K, tile_K, nbatch_K2, stride_K, k_VKQ_sup);
+        constexpr int stride_tile_K_ld = use_int8_qk ? tckv_int8_row_bytes(DKQ)/4 : stride_tile_K;
+        constexpr int nbatch_K2_ld     = use_int8_qk ? tckv_int8_row_bytes(DKQ)/4 : nbatch_K2;
+        flash_attn_ext_f16_load_tile<stride_tile_K_ld, nwarps, nbatch_fa, use_cp_async, oob_check>
+            (K_h2 + int64_t(kb0)*nbatch_fa*stride_K, tile_K, nbatch_K2_ld, stride_K, k_VKQ_sup);
     }
 
     // kb0_start is always < kb0_stop so the last iter can be executed unconditionally.
