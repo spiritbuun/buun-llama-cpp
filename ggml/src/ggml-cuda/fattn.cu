@@ -1769,6 +1769,56 @@ enum best_fattn_kernel {
 static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(int device, const ggml_tensor * dst);
 
+// C2a uses the native stream-K scheduler and MMA tile tuning, with synchronous int8 K loads.
+template<int D, int ncols1, int ncols2>
+static void tckv_int8_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    const auto cfg = ggml_cuda_fattn_mma_get_config(D, D, ncols1*ncols2, cc);
+    const int nwarps = cfg.nthreads / 32;
+    const int cols_per_warp = ncols1*ncols2 == 8 ? 8 : 16;
+    const size_t q_bytes = ncols1*ncols2*(D/4 + 4)*sizeof(int);
+    const size_t kv_bytes = cfg.nbatch_fa*(cfg.nbatch_V2 + 4)*sizeof(half2);
+    const size_t mask_bytes = ncols1*(cfg.nbatch_fa + 8)*sizeof(half);
+    const size_t combine_bytes = nwarps*cols_per_warp*(cfg.nbatch_combine + 4)*sizeof(half2);
+    const size_t smem = std::max(combine_bytes, std::max(q_bytes, kv_bytes + mask_bytes));
+    auto kernel = flash_attn_ext_f16<D, D, ncols1, ncols2, false, false, false,
+                                   GGML_TYPE_F16, GGML_TYPE_F16, false, true>;
+    static bool raised[GGML_CUDA_MAX_DEVICES] = {};
+    if (!raised[ctx.device]) {
+        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+        raised[ctx.device] = true;
+    }
+    launch_fattn<D, ncols1, ncols2>(ctx, dst, kernel, nwarps, smem, cfg.nbatch_fa, false, true, true, false, 32);
+}
+
+template<int D>
+static void tckv_int8_attend(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * K = dst->src[1];
+    const int64_t nrows = K->ne[1]*K->ne[2]*K->ne[3];
+    ggml_cuda_pool_alloc<char> k8(ctx.pool(), nrows*tckv_int8_row_bytes(D));
+    tckv_int8_prep_k<D><<<nrows, dim3(32, D/128), 0, ctx.stream()>>>((const half *) K->data, k8.get());
+    CUDA_CHECK(cudaGetLastError());
+    ggml_tensor packed = *K;
+    packed.data = k8.get();
+    packed.nb[2] = tckv_int8_row_bytes(D);
+    packed.nb[1] = packed.nb[2]*K->ne[2];
+    packed.nb[3] = packed.nb[1]*K->ne[1];
+    ggml_tensor * original = dst->src[1];
+    dst->src[1] = &packed;
+    // ncols2>1 assumes a mask and padded KV rows in the existing MMA loop.
+    // The 8x1 fallback retains its OOB handling and also covers maskless attention.
+    if (dst->src[3] && K->ne[1] % FATTN_KQ_STRIDE == 0) {
+        if (dst->src[0]->ne[1] <= 8) {
+            tckv_int8_launch<D, 1, 8>(ctx, dst);
+        } else {
+            tckv_int8_launch<D, 8, 8>(ctx, dst);
+        }
+    } else {
+        tckv_int8_launch<D, 8, 1>(ctx, dst);
+    }
+    dst->src[1] = original;
+}
+
 static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     load_tcq_decode_alpha(ctx.device);
     cudaStream_t stream = ctx.stream();
@@ -1786,6 +1836,9 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
     ggml_vbr_kv_dequant_sides(K->type, V->type, &mat_k, &mat_v);
     // EXPERIMENT: int8 tensor-core fake-quant simulator wants K in the rotated domain for every turbo type.
     const bool tckv_sim = tckv_sim_applicable(dst);
+    // Explicit int8 gate wins if both experiment switches are set.
+    const bool tckv_int8 = tckv_int8_applicable(dst, ggml_cuda_info().devices[ctx.device].cc);
+    const bool tckv_rotated = tckv_sim || tckv_int8;
 
     int device;
     CUDA_CHECK(cudaGetDevice(&device));
@@ -1835,10 +1888,10 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
             }
             k_turbo2_tcq_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
                 (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], d_tcq_decode_alpha_k);
-        } else if (tckv_sim && K->type == GGML_TYPE_TURBO4_0) {
+        } else if (tckv_rotated && K->type == GGML_TYPE_TURBO4_0) {
             k_turbo4_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
                 (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
-        } else if (tckv_sim && K->type == GGML_TYPE_TURBO8_0) {
+        } else if (tckv_rotated && K->type == GGML_TYPE_TURBO8_0) {
             k_turbo8_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
                 (const char *)K->data, k_fp16, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
         } else if (K->type == GGML_TYPE_TURBO4_0) {
@@ -1965,7 +2018,7 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
     const ggml_tensor * Q = dst->src[0];
     float * q_rotated = nullptr;
     if (turbo_k &&
-            (tckv_sim || (K->type != GGML_TYPE_TURBO4_0 && K->type != GGML_TYPE_TURBO8_0)) &&
+            (tckv_rotated || (K->type != GGML_TYPE_TURBO4_0 && K->type != GGML_TYPE_TURBO8_0)) &&
             K->type != GGML_TYPE_TURBO3_TCQ &&
             K->type != GGML_TYPE_TURBO2_TCQ &&
             K->type != GGML_TYPE_TURBO1_TCQ &&
@@ -1993,8 +2046,16 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
     dst->src[2] = v_fp16 ? &V_f16 : orig_v;
     std::atomic_signal_fence(std::memory_order_seq_cst);
 
-    if (tckv_sim) {
-        tckv_sim_attend(ctx, dst);
+    if (tckv_int8 || tckv_sim) {
+        if (tckv_int8) {
+            if (K->ne[0] == 128) {
+                tckv_int8_attend<128>(ctx, dst);
+            } else {
+                tckv_int8_attend<256>(ctx, dst);
+            }
+        } else {
+            tckv_sim_attend(ctx, dst);
+        }
         dst->src[0] = orig_q;
         dst->src[1] = orig_k;
         dst->src[2] = orig_v;
