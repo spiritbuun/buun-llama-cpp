@@ -911,9 +911,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
     constexpr int stride_tile_V = V_is_K_view ? stride_tile_K : nbatch_V2 + 4;
 
-    // int8_mode: 1 = int8 QK, 2 = int8 QK + int8 PV (packed V^T tiles, see tckv_int8_prep_v).
-    constexpr bool use_int8_qk = int8_mode != 0;
-    constexpr bool use_int8_pv = int8_mode == 2;
+    // int8_mode: 1 = int8 QK, 2 = int8 QK + int8 PV (packed V^T tiles, see tckv_int8_prep_v_turbo),
+    // | 4 = native turbo8 K/V codes (+0.5 offset terms, see tckv_int8_qk/tckv_int8_pv).
+    constexpr bool use_int8_qk   = int8_mode != 0;
+    constexpr bool use_int8_pv   = (int8_mode & 2) != 0;
+    constexpr bool int8_half_off = (int8_mode & 4) != 0;
+    static_assert(!int8_half_off || use_int8_pv, "native turbo8 codes only on the int8 PV path");
     static_assert(!use_int8_pv || (nstages > 1 && cols_per_warp == 16 && np == 1), "int8 PV needs the 8x8 pipeline");
 
     // int8 K rows (codes + scales) are copied verbatim; see tckv_int8_row_bytes.
@@ -956,8 +959,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
     if constexpr (use_int8_qk) {
         static_assert(!use_sparse && !V_is_K_view && DKQ == DV && (DKQ == 128 || DKQ == 256));
-        tckv_int8_qk<DKQ, nwarps, nbatch_fa, cols_per_warp, np, oob_check, (nstages > 1)>(
-            K_h2 + int64_t(k_VKQ_0)*stride_K, stride_K, (int *) tile_K, Q8_B, q_scales, KQ_C, k_VKQ_sup);
+        tckv_int8_qk<DKQ, nwarps, nbatch_fa, cols_per_warp, np, oob_check, (nstages > 1), int8_half_off>(
+            K_h2 + int64_t(k_VKQ_0)*stride_K, stride_K, (int *) tile_K, Q8_B, q_scales, q_scales + ncols1*ncols2, KQ_C, k_VKQ_sup);
     } else {
     // For MLA K and V have the same data.
     // Therefore, iterate over K in reverse and later re-use the data if possible.
@@ -1334,7 +1337,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
 
     if constexpr (use_int8_pv) {
-        tckv_int8_pv<DV, nbatch_fa>((const int *) tile_V, KQ_C, VKQ_C);
+        tckv_int8_pv<DV, nbatch_fa, int8_half_off>((const int *) tile_V, KQ_C, VKQ_C);
     } else {
     // Calculate VKQ tile, need to use logical rather than physical elements for i0 due to transposition of V:
 #pragma unroll
@@ -1664,11 +1667,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         KQ_max[col] = -FLT_MAX/2.0f;
     }
 
-    constexpr bool use_int8_qk = int8_mode != 0;
+    constexpr bool use_int8_qk   = int8_mode != 0;
+    constexpr bool int8_half_off = (int8_mode & 4) != 0;
     tile<16, 8, int> Q8_B[use_int8_qk ? DKQ/32 : 1];
-    __shared__ float q_scales[use_int8_qk ? ncols : 1];
+    // Row scales, then (half_off) 0.5*sum(Q codes) per (column, 128-block).
+    __shared__ float q_scales[use_int8_qk ? ncols*(int8_half_off ? 1 + DKQ/128 : 1) : 1];
     if constexpr (use_int8_qk) {
-        tckv_int8_load_q<DKQ, ncols1, ncols2, nwarps, cols_per_warp, np>(
+        tckv_int8_load_q<DKQ, ncols1, ncols2, nwarps, cols_per_warp, np, int8_half_off>(
             Q_f2, (int *) tile_Q, Q8_B, q_scales, scale, stride_Q1, stride_Q2, jt, zt_gqa, ne01.z, gqa_ratio);
     } else {
     // Load Q data into tile_Q, either temporarily or permanently.

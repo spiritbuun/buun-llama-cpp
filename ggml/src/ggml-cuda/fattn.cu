@@ -1793,51 +1793,210 @@ static void tckv_int8_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     launch_fattn<D, ncols1, ncols2>(ctx, dst, kernel, nwarps, smem, cfg.nbatch_fa, false, true, true, false, 32);
 }
 
+// Kernel configuration of an int8 call. ncols2>1 assumes a mask and padded KV rows in the existing
+// MMA loop; the 8x1 fallback retains its OOB handling and also covers maskless attention.
+// Only 8x8 PV consumes V as packed int8 tiles, every other configuration reads materialized f16 V.
+enum tckv_int8_cfg { TCKV_INT8_8x1, TCKV_INT8_1x8, TCKV_INT8_8x8, TCKV_INT8_8x8_PV };
+
+static tckv_int8_cfg tckv_int8_config(const ggml_tensor * dst) {
+    if (!dst->src[3] || dst->src[1]->ne[1] % FATTN_KQ_STRIDE != 0) {
+        return TCKV_INT8_8x1;
+    }
+    if (dst->src[0]->ne[1] <= 8) {
+        return TCKV_INT8_1x8;
+    }
+    return tckv_int8_pv_enabled() ? TCKV_INT8_8x8_PV : TCKV_INT8_8x8;
+}
+
+// Element j of a plain turbo row in f32: the value the f16 materialize kernels round.
+template<ggml_type type, bool is_v>
+static __device__ __forceinline__ float tckv_turbo_value(const char * row, int j) {
+    if constexpr (type == GGML_TYPE_TURBO2_0) {
+        const block_turbo2_0 * blk = (const block_turbo2_0 *) row + j/QK_TURBO2;
+        const int t = j % QK_TURBO2;
+        return d_turbo_centroids_2bit_fattn[(blk->qs[t/4] >> ((t%4)*2)) & 0x3] * __half2float(blk->norm);
+    } else if constexpr (type == GGML_TYPE_TURBO3_0) {
+        const block_turbo3_0 * blk = (const block_turbo3_0 *) row + j/QK_TURBO3;
+        const int t = j % QK_TURBO3;
+        const int idx = ((blk->qs[t/4] >> ((t%4)*2)) & 0x3) | (((blk->signs[t/8] >> (t%8)) & 0x1) << 2);
+#if TURBO3_SKEW_EXP >= 2
+        return d_turbo_centroids_3bit_fattn[idx] * (is_v ? d_turbo3_ss_v_fattn[j % 128] : d_turbo3_ss_k_fattn[j % 128])
+            * __half2float(blk->norm);
+#else
+        return d_turbo_centroids_3bit_fattn[idx] * __half2float(blk->norm);
+#endif
+    } else if constexpr (type == GGML_TYPE_TURBO4_0) {
+        const block_turbo4_0 * blk = (const block_turbo4_0 *) row + j/QK_TURBO4;
+        const int t = j % QK_TURBO4;
+        return d_turbo_centroids_4bit_fattn[(blk->qs[t/2] >> ((t%2)*4)) & 0xF] * __half2float(blk->norm);
+    } else {
+        static_assert(type == GGML_TYPE_TURBO8_0, "plain turbo types only");
+        const block_turbo8_0 * blk = (const block_turbo8_0 *) row + j/QK_TURBO8;
+        return d_turbo_centroids_8bit_fattn[blk->qs[j % QK_TURBO8]] * __half2float(blk->norm);
+    }
+}
+
+// Quantize one 128-channel block (one warp, lane holds channels k*32 + lane) of a turbo row.
+// native: turbo8 codes as-is, value = s*((code ^ 0x80) + 0.5), s = norm/127.5 (exact).
+// Otherwise absmax/127 of the f32 values, round-to-nearest-even, zero block -> zero scale.
+template<ggml_type type, bool is_v, bool native>
+static __device__ __forceinline__ float tckv_turbo_quant_block(const char * row, int b, int8_t * out) {
+    const int lane = threadIdx.x % 32;
+    if constexpr (native) {
+        const block_turbo8_0 * blk = (const block_turbo8_0 *) row + b;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            out[k*32 + lane] = (int8_t) (blk->qs[k*32 + lane] ^ 0x80);
+        }
+        return __half2float(blk->norm) / 127.5f;
+    } else {
+        float v[4], amax = 0.0f;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            v[k] = tckv_turbo_value<type, is_v>(row, b*128 + k*32 + lane);
+            amax = fmaxf(amax, fabsf(v[k]));
+        }
+#pragma unroll
+        for (int o = 16; o; o >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
+        }
+        const float s = amax / 127.0f;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            out[k*32 + lane] = s > 0.0f ? (int8_t) rintf(v[k]/s) : 0;
+        }
+        return s;
+    }
+}
+
+// Lever 1: int8 K rows (tckv_int8_row_bytes format) straight from the turbo cache, no f16 materialize.
+// Grid (token, head, stream), one warp per 128-channel block; rows in materialized order.
+template<int D, ggml_type type, bool native>
+static __global__ void tckv_int8_prep_k_turbo(const char * src, char * dst, size_t nb1, size_t nb2, size_t nb3) {
+    const int b = threadIdx.y;
+    const char * row = src + blockIdx.z*nb3 + blockIdx.y*nb2 + blockIdx.x*nb1;
+    char * out = dst + (((int64_t) blockIdx.z*gridDim.x + blockIdx.x)*gridDim.y + blockIdx.y)*tckv_int8_row_bytes(D);
+    const float s = tckv_turbo_quant_block<type, false, native>(row, b, (int8_t *) out + b*128);
+    if (threadIdx.x == 0) {
+        ((float *) (out + D))[b] = s;
+    }
+}
+
+// Lever 1: int8 V^T tiles (tckv_int8_prep_v format) straight from the turbo cache.
+template<int D, int nbatch_fa, ggml_type type, bool native>
+static __global__ void tckv_int8_prep_v_turbo(const char * src, char * dst, size_t nb1, size_t nb2) {
+    __shared__ int8_t v[nbatch_fa][D + 4]; // +4: the transposing reads below walk keys, not channels
+    __shared__ float sc[D/128][nbatch_fa];
+    const int tile = blockIdx.x;
+    const int h    = blockIdx.y;
+    const int tid  = threadIdx.x;
+    for (int p = tid/32; p < nbatch_fa*(D/128); p += blockDim.x/32) {
+        const int k = p % nbatch_fa;
+        const int b = p / nbatch_fa;
+        const char * row = src + (int64_t) (tile*nbatch_fa + k)*nb1 + h*nb2;
+        const float s = tckv_turbo_quant_block<type, true, native>(row, b, v[k] + b*128);
+        if (tid % 32 == 0) {
+            sc[b][k] = s;
+        }
+    }
+    __syncthreads();
+    constexpr int stride = (nbatch_fa + 16)/4;
+    int * out = (int *) (dst + ((int64_t) h*gridDim.x + tile)*tckv_int8_v_tile_bytes(D, nbatch_fa));
+    for (int x = tid; x < D*stride; x += blockDim.x) {
+        const int c = x / stride;
+        const int w = x % stride;
+        uint32_t packed = 0;
+        if (w < nbatch_fa/4) {
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                packed |= (uint32_t) (uint8_t) v[tckv_int8_v_key(4*w + j)][c] << (8*j);
+            }
+        } else {
+            const int slot = 4*c + w - nbatch_fa/4;
+            packed = __float_as_int(slot < (D/128)*nbatch_fa ? sc[slot / nbatch_fa][slot % nbatch_fa] : 0.0f);
+        }
+        out[x] = packed;
+    }
+}
+
+template<int D, ggml_type type, bool native = false>
+static void tckv_int8_prep_turbo(const ggml_tensor * T, char * dst, bool is_v, cudaStream_t stream) {
+    if (is_v) {
+        constexpr int nbf = D == 256 ? 32 : 64;
+        tckv_int8_prep_v_turbo<D, nbf, type, native><<<dim3(T->ne[1]/nbf, T->ne[2]), 256, 0, stream>>>(
+            (const char *) T->data, dst, T->nb[1], T->nb[2]);
+    } else {
+        tckv_int8_prep_k_turbo<D, type, native><<<dim3(T->ne[1], T->ne[2], T->ne[3]), dim3(32, D/128), 0, stream>>>(
+            (const char *) T->data, dst, T->nb[1], T->nb[2], T->nb[3]);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template<int D>
+static void tckv_int8_prep(const ggml_tensor * T, char * dst, bool is_v, bool native, cudaStream_t stream) {
+    switch (T->type) {
+        case GGML_TYPE_TURBO2_0: tckv_int8_prep_turbo<D, GGML_TYPE_TURBO2_0>(T, dst, is_v, stream); break;
+        case GGML_TYPE_TURBO3_0: tckv_int8_prep_turbo<D, GGML_TYPE_TURBO3_0>(T, dst, is_v, stream); break;
+        case GGML_TYPE_TURBO4_0: tckv_int8_prep_turbo<D, GGML_TYPE_TURBO4_0>(T, dst, is_v, stream); break;
+        case GGML_TYPE_TURBO8_0:
+            if (native) {
+                tckv_int8_prep_turbo<D, GGML_TYPE_TURBO8_0, true>(T, dst, is_v, stream);
+            } else {
+                tckv_int8_prep_turbo<D, GGML_TYPE_TURBO8_0>(T, dst, is_v, stream);
+            }
+            break;
+        default: GGML_ABORT("tckv int8: not a plain turbo type");
+    }
+}
+
+// K (and V on the 8x8 PV path) arrive as the raw turbo cache tensors.
 template<int D>
 static void tckv_int8_attend(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * K = dst->src[1];
-    const int64_t nrows = K->ne[1]*K->ne[2]*K->ne[3];
-    ggml_cuda_pool_alloc<char> k8(ctx.pool(), nrows*tckv_int8_row_bytes(D));
-    tckv_int8_prep_k<D><<<nrows, dim3(32, D/128), 0, ctx.stream()>>>((const half *) K->data, k8.get());
-    CUDA_CHECK(cudaGetLastError());
+    const ggml_tensor * V = dst->src[2];
+    const tckv_int8_cfg cfg = tckv_int8_config(dst);
+    // Native turbo8 codes need the +0.5 terms of the PV kernel instance; a TURBO_CB_T8 book is not a uniform grid.
+    static const bool t8_override = getenv("TURBO_CB_T8") != nullptr;
+    const bool native = cfg == TCKV_INT8_8x8_PV && K->type == GGML_TYPE_TURBO8_0 && V->type == GGML_TYPE_TURBO8_0 && !t8_override;
+    ggml_cuda_pool_alloc<char> k8(ctx.pool(), K->ne[1]*K->ne[2]*K->ne[3]*tckv_int8_row_bytes(D));
+    tckv_int8_prep<D>(K, k8.get(), false, native, ctx.stream());
     ggml_tensor packed = *K;
+    packed.type = GGML_TYPE_F16;
     packed.data = k8.get();
+    packed.nb[0] = sizeof(half);
     packed.nb[2] = tckv_int8_row_bytes(D);
     packed.nb[1] = packed.nb[2]*K->ne[2];
     packed.nb[3] = packed.nb[1]*K->ne[1];
     ggml_tensor * original = dst->src[1];
     dst->src[1] = &packed;
-    // ncols2>1 assumes a mask and padded KV rows in the existing MMA loop.
-    // The 8x1 fallback retains its OOB handling and also covers maskless attention.
-    if (dst->src[3] && K->ne[1] % FATTN_KQ_STRIDE == 0) {
-        if (dst->src[0]->ne[1] <= 8) {
-            tckv_int8_launch<D, 1, 8>(ctx, dst);
-        } else if (tckv_int8_pv_enabled()) {
+    switch (cfg) {
+        case TCKV_INT8_8x1: tckv_int8_launch<D, 8, 1>(ctx, dst); break;
+        case TCKV_INT8_1x8: tckv_int8_launch<D, 1, 8>(ctx, dst); break;
+        case TCKV_INT8_8x8: tckv_int8_launch<D, 8, 8>(ctx, dst); break;
+        case TCKV_INT8_8x8_PV: {
             // C3: int8 PV from per-(head, key tile) V^T tiles, 8x8 configuration only.
             constexpr int nbf = D == 256 ? 32 : 64;
             GGML_ASSERT(ggml_cuda_fattn_mma_get_config(D, D, 64, ggml_cuda_info().devices[ctx.device].cc).nbatch_fa == nbf);
-            const ggml_tensor * V = dst->src[2];
-            GGML_ASSERT(V->type == GGML_TYPE_F16 && V->ne[3] == 1);
-            const int n_tiles = V->ne[1]/nbf;
+            GGML_ASSERT(V->ne[3] == 1 && V->ne[1] % nbf == 0);
             constexpr int tile_bytes = tckv_int8_v_tile_bytes(D, nbf);
-            ggml_cuda_pool_alloc<char> v8(ctx.pool(), (size_t) n_tiles*V->ne[2]*tile_bytes);
-            tckv_int8_prep_v<D, nbf><<<dim3(n_tiles, V->ne[2]), 256, 0, ctx.stream()>>>(
-                (const half *) V->data, v8.get(), V->nb[1]/sizeof(half), V->nb[2]/sizeof(half));
-            CUDA_CHECK(cudaGetLastError());
+            ggml_cuda_pool_alloc<char> v8(ctx.pool(), (size_t) (V->ne[1]/nbf)*V->ne[2]*tile_bytes);
+            tckv_int8_prep<D>(V, v8.get(), true, native, ctx.stream());
             ggml_tensor packed_v = *V;
+            packed_v.type = GGML_TYPE_F16;
             packed_v.data = v8.get();
+            packed_v.nb[0] = sizeof(half);
             packed_v.nb[1] = tile_bytes/nbf;
             packed_v.nb[2] = packed_v.nb[1]*V->ne[1];
             packed_v.nb[3] = packed_v.nb[2]*V->ne[2];
             ggml_tensor * original_v = dst->src[2];
             dst->src[2] = &packed_v;
-            tckv_int8_launch<D, 8, 8, 2>(ctx, dst);
+            if (native) {
+                tckv_int8_launch<D, 8, 8, 6>(ctx, dst);
+            } else {
+                tckv_int8_launch<D, 8, 8, 2>(ctx, dst);
+            }
             dst->src[2] = original_v;
-        } else {
-            tckv_int8_launch<D, 8, 8>(ctx, dst);
-        }
-    } else {
-        tckv_int8_launch<D, 8, 1>(ctx, dst);
+        } break;
     }
     dst->src[1] = original;
 }
@@ -1862,6 +2021,11 @@ static void ggml_cuda_turbo_prefill_attend(ggml_backend_cuda_context & ctx, ggml
     // Explicit int8 gate wins if both experiment switches are set.
     const bool tckv_int8 = tckv_int8_applicable(dst, ggml_cuda_info().devices[ctx.device].cc);
     const bool tckv_rotated = tckv_sim || tckv_int8;
+    // The int8 path quantizes K (and V on 8x8 PV) straight from the turbo blocks.
+    if (tckv_int8) {
+        mat_k = false;
+        mat_v = mat_v && tckv_int8_config(dst) != TCKV_INT8_8x8_PV;
+    }
 
     int device;
     CUDA_CHECK(cudaGetDevice(&device));

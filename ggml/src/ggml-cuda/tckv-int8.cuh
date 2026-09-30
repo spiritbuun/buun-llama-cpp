@@ -1,5 +1,5 @@
 #pragma once
-// C2a experiment: materialized rotated K, int8 QK, unchanged f16 PV.
+// Tensor-core int8 prefill attention for plain turbo KV (experimental): int8 QK (C2), int8 PV (C3).
 #include "common.cuh"
 #include "mma.cuh"
 
@@ -42,34 +42,6 @@ static bool tckv_int8_applicable(const ggml_tensor * dst, int cc) {
         (K->ne[0] == 128 || K->ne[0] == 256) && dst->src[4] == nullptr && max_bias == 0.0f && softcap == 0.0f;
 }
 
-// One warp per 128-channel block. Match k_tckv_prep: f16 input, absmax/127,
-// round-to-nearest-even, zero block -> zero scale and codes.
-template<int D>
-static __global__ void tckv_int8_prep_k(const half * src, char * dst) {
-    const int lane = threadIdx.x;
-    const int b = threadIdx.y;
-    const int64_t row = blockIdx.x;
-    float v[4], amax = 0.0f;
-#pragma unroll
-    for (int k = 0; k < 4; ++k) {
-        v[k] = __half2float(src[row*D + b*128 + k*32 + lane]);
-        amax = fmaxf(amax, fabsf(v[k]));
-    }
-#pragma unroll
-    for (int o = 16; o; o >>= 1) {
-        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
-    }
-    const float s = amax / 127.0f;
-    char * out = dst + row*tckv_int8_row_bytes(D);
-#pragma unroll
-    for (int k = 0; k < 4; ++k) {
-        ((int8_t *) out)[b*128 + k*32 + lane] = s > 0.0f ? (int8_t) rintf(v[k]/s) : 0;
-    }
-    if (lane == 0) {
-        ((float *) (out + D))[b] = s;
-    }
-}
-
 // Logical byte L of a V^T tile row -> key within the tile. Inverse of the P A-fragment order:
 // thread (lane%4 == q) holds keys 16t + 8h + 2q + e of a 32-group, packed as byte 16t + 4q + 2h + e.
 static __device__ __forceinline__ int tckv_int8_v_key(int L) {
@@ -77,63 +49,11 @@ static __device__ __forceinline__ int tckv_int8_v_key(int L) {
     return (L/32)*32 + ((L%32)/16)*16 + (j/2)*8 + 2*((L%16)/4) + (j%2);
 }
 
-// One block per (key tile, kv head). f16 V (strides in halfs) -> int8 V^T tile, per-(key, 128-block)
-// absmax/127 scales (TCKV_P=8 sim V quantizer).
-template<int D, int nbatch_fa>
-static __global__ void tckv_int8_prep_v(const half * src, char * dst, int64_t s1, int64_t s2) {
-    __shared__ half  v[nbatch_fa][D];
-    __shared__ float sc[D/128][nbatch_fa];
-    const int tile = blockIdx.x;
-    const int h    = blockIdx.y;
-    const int tid  = threadIdx.x;
-    for (int x = tid; x < nbatch_fa*D/8; x += blockDim.x) {
-        const int k = x / (D/8);
-        ((int4 *) v[k])[x % (D/8)] = ((const int4 *) (src + (int64_t) (tile*nbatch_fa + k)*s1 + h*s2))[x % (D/8)];
-    }
-    __syncthreads();
-    const int lane = tid % 32;
-    for (int p = tid/32; p < nbatch_fa*(D/128); p += blockDim.x/32) {
-        const int k = p % nbatch_fa;
-        const int b = p / nbatch_fa;
-        float amax = 0.0f;
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            amax = fmaxf(amax, fabsf(__half2float(v[k][b*128 + i*32 + lane])));
-        }
-#pragma unroll
-        for (int o = 16; o; o >>= 1) {
-            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
-        }
-        if (lane == 0) {
-            sc[b][k] = amax / 127.0f;
-        }
-    }
-    __syncthreads();
-    constexpr int stride = (nbatch_fa + 16)/4;
-    int * out = (int *) (dst + ((int64_t) h*gridDim.x + tile)*tckv_int8_v_tile_bytes(D, nbatch_fa));
-    for (int x = tid; x < D*stride; x += blockDim.x) {
-        const int c = x / stride;
-        const int w = x % stride;
-        int packed = 0;
-        if (w < nbatch_fa/4) {
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const int key = tckv_int8_v_key(4*w + j);
-                const float s = sc[c/128][key];
-                const int code = s > 0.0f ? (int) rintf(__half2float(v[key][c]) / s) : 0;
-                packed |= (code & 0xFF) << (8*j);
-            }
-        } else {
-            const int slot = 4*c + w - nbatch_fa/4;
-            packed = __float_as_int(slot < (D/128)*nbatch_fa ? sc[slot / nbatch_fa][slot % nbatch_fa] : 0.0f);
-        }
-        out[x] = packed;
-    }
-}
-
 // Quantize unscaled rotated f32 Q. Fold attention scale into the stored row scale
 // AFTER quantization, matching TCKV_Q=8 TCKV_QB=D (no f16 rounding of Q).
-template<int D, int ncols1, int ncols2, int nwarps, int cols_per_warp, int np>
+// half_off: also store 0.5*sum(codes) per (column, 128-block) at scales[ncols + jc*(D/128) + b],
+// the +0.5 term of native turbo8 K codes (value = s*(code + 0.5)).
+template<int D, int ncols1, int ncols2, int nwarps, int cols_per_warp, int np, bool half_off = false>
 static __device__ __forceinline__ void tckv_int8_load_q(
         const float2 * Q, int * smem, ggml_cuda_mma::tile<16, 8, int> * qb, float * scales,
         float scale, int stride1, int stride2, int jt, int zt_gqa, int nq, int gqa) {
@@ -156,12 +76,27 @@ static __device__ __forceinline__ void tckv_int8_load_q(
             amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
         }
         const float s = amax / 127.0f;
+        float bsum[D/128] = {};
 #pragma unroll
         for (int k = 0; k < D/32; ++k) {
-            ((int8_t *) (smem + jc*stride))[k*32 + threadIdx.x] = s > 0.0f ? (int8_t) rintf(v[k]/s) : 0;
+            const float code = s > 0.0f ? rintf(v[k]/s) : 0.0f;
+            ((int8_t *) (smem + jc*stride))[k*32 + threadIdx.x] = (int8_t) code;
+            bsum[k/4] += code;
         }
         if (threadIdx.x == 0) {
             scales[jc] = s*scale;
+        }
+        if constexpr (half_off) {
+#pragma unroll
+            for (int b = 0; b < D/128; ++b) {
+#pragma unroll
+                for (int o = 16; o; o >>= 1) {
+                    bsum[b] += __shfl_xor_sync(0xffffffff, bsum[b], o);
+                }
+                if (threadIdx.x == 0) {
+                    scales[ncols1*ncols2 + jc*(D/128) + b] = 0.5f*bsum[b];
+                }
+            }
         }
     }
     __syncthreads();
@@ -182,10 +117,11 @@ static __device__ __forceinline__ void tckv_int8_load_q(
 }
 
 // preloaded: the multi-stage pipeline already cp.async'd the K rows into smem.
-template<int D, int nwarps, int nbatch, int cols_per_warp, int np, bool oob, bool preloaded, typename TC>
+// half_off: K codes are native turbo8 (value = sK*(code + 0.5)); q_offs holds 0.5*sum(Q codes).
+template<int D, int nwarps, int nbatch, int cols_per_warp, int np, bool oob, bool preloaded, bool half_off, typename TC>
 static __device__ __forceinline__ void tckv_int8_qk(
         const half2 * K, int stride_K, int * smem, const ggml_cuda_mma::tile<16, 8, int> * qb,
-        const float * q_scales, TC * scores, int nkeys) {
+        const float * q_scales, const float * q_offs, TC * scores, int nkeys) {
 #ifdef TURING_MMA_AVAILABLE
     using namespace ggml_cuda_mma;
     // smem rows are verbatim copies of the scratch rows: D codes, then D/128 float scales in the pad.
@@ -225,7 +161,12 @@ static __device__ __forceinline__ void tckv_int8_qk(
 #pragma unroll
             for (int l = 0; l < TC::ne; ++l) {
                 const int key = i0 + (cols_per_warp == 8 ? TC::get_i(l) : TC::get_j(l));
-                scores[i00/(np*16)].x[l] += float(acc[l/4].x[l%4])*((const float *) (smem + key*stride + D/4))[b];
+                float dot = float(acc[l/4].x[l%4]);
+                if constexpr (half_off) {
+                    const int q = (threadIdx.y / np)*cols_per_warp + (cols_per_warp == 8 ? TC::get_j(l) : TC::get_i(l));
+                    dot += q_offs[q*blocks + b];
+                }
+                scores[i00/(np*16)].x[l] += dot*((const float *) (smem + key*stride + D/4))[b];
             }
         }
 #pragma unroll
@@ -255,8 +196,9 @@ static __device__ __forceinline__ void tckv_mma_u8s8(
 // C3: VKQ += P V with int8 tensor cores (cols_per_warp == 16, np == 1). P is the f32 softmax
 // numerator in tile<16,16,float> C layout. Per 128-channel block b, W = P*sV[key, b] is quantized
 // to u8 per query row (absmax/255, the TCKV_P=8 sim), multiplied by the int8 V^T tile, and the
-// int32 result is scaled into the f16 accumulators.
-template<int DV, int nbatch_fa, typename TC, typename TV>
+// int32 result is scaled into the f16 accumulators. half_off: V codes are native turbo8
+// (value = sV*(code + 0.5)); the +0.5 term is 0.5*sum(W codes), folded into the epilogue bias.
+template<int DV, int nbatch_fa, bool half_off, typename TC, typename TV>
 static __device__ __forceinline__ void tckv_int8_pv(const int * tile_V, const TC * P, TV * VKQ_C) {
 #ifdef TURING_MMA_AVAILABLE
     using namespace ggml_cuda_mma;
@@ -309,6 +251,20 @@ static __device__ __forceinline__ void tckv_int8_pv(const int * tile_V, const TC
                     }
                     pa[g].x[2*t + r] = __byte_perm(__byte_perm(c[0], c[1], 0x0040), __byte_perm(c[2], c[3], 0x0040), 0x5410);
                 }
+            }
+        }
+        if constexpr (half_off) {
+#pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                unsigned int wsum = 0;
+#pragma unroll
+                for (int g = 0; g < ngroups; ++g) {
+                    wsum = __dp4a((unsigned int) pa[g].x[r],     0x01010101u, wsum);
+                    wsum = __dp4a((unsigned int) pa[g].x[2 + r], 0x01010101u, wsum);
+                }
+                wsum += __shfl_xor_sync(0xffffffff, wsum, 1);
+                wsum += __shfl_xor_sync(0xffffffff, wsum, 2);
+                bias[r] = (0.5f*float(wsum) - 12582912.0f) * s[r];
             }
         }
 #pragma unroll
