@@ -196,13 +196,13 @@ static __device__ __forceinline__ void tckv_mma_u8s8(
 // C3: VKQ += P V with int8 tensor cores (cols_per_warp == 16, np == 1). P is the f32 softmax
 // numerator in tile<16,16,float> C layout. Per 128-channel block b, W = P*sV[key, b] is quantized
 // to u8 per query row (absmax/255, the TCKV_P=8 sim), multiplied by the int8 V^T tile, and the
-// int32 result is scaled into the f16 accumulators. half_off: V codes are native turbo8
+// int32 result is scaled into the f32 accumulators (same C layout as P). half_off: V codes are native turbo8
 // (value = sV*(code + 0.5)); the +0.5 term is 0.5*sum(W codes), folded into the epilogue bias.
 template<int DV, int nbatch_fa, bool half_off, typename TC, typename TV>
 static __device__ __forceinline__ void tckv_int8_pv(const int * tile_V, const TC * P, TV * VKQ_C) {
 #ifdef TURING_MMA_AVAILABLE
     using namespace ggml_cuda_mma;
-    static_assert(TC::I == 16 && TC::J == 16 && TV::I == 16 && TV::J == 8, "bad tiles");
+    static_assert(TC::I == 16 && TC::J == 16 && std::is_same_v<TC, TV>, "bad tiles");
     constexpr int stride  = (nbatch_fa + 16)/4;
     constexpr int ngroups = nbatch_fa/32;
     const int q = threadIdx.x % 4;
@@ -290,10 +290,8 @@ static __device__ __forceinline__ void tckv_int8_pv(const int * tile_V, const TC
 #pragma unroll
             for (int hc = 0; hc < 2; ++hc) {
 #pragma unroll
-                for (int r = 0; r < 2; ++r) {
-                    VKQ_C[b*8 + n].x[2*hc + r] += make_half2(
-                        fmaf(__int_as_float(acc[hc].x[2*r + 0]), s[r], bias[r]),
-                        fmaf(__int_as_float(acc[hc].x[2*r + 1]), s[r], bias[r]));
+                for (int l = 0; l < 4; ++l) {
+                    VKQ_C[b*8 + n].x[4*hc + l] += fmaf(__int_as_float(acc[hc].x[l]), s[l/2], bias[l/2]);
                 }
             }
         }
