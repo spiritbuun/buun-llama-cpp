@@ -285,12 +285,14 @@ static __device__ __forceinline__ void tckv_int8_pv(const int * tile_V, const TC
         }
         float s[2];
         float inv[2];
+        float bias[2];
 #pragma unroll
         for (int r = 0; r < 2; ++r) {
             amax[r] = fmaxf(amax[r], __shfl_xor_sync(0xffffffff, amax[r], 1));
             amax[r] = fmaxf(amax[r], __shfl_xor_sync(0xffffffff, amax[r], 2));
-            s[r]   = amax[r] * (1.0f/255.0f);
-            inv[r] = amax[r] > 0.0f ? 255.0f/amax[r] : 0.0f;
+            s[r]    = amax[r] * (1.0f/255.0f);
+            inv[r]  = amax[r] > 0.0f ? 255.0f/amax[r] : 0.0f;
+            bias[r] = -12582912.0f * s[r];
         }
         tile<16, 8, int> pa[ngroups];
 #pragma unroll
@@ -299,18 +301,26 @@ static __device__ __forceinline__ void tckv_int8_pv(const int * tile_V, const TC
             for (int t = 0; t < 2; ++t) {
 #pragma unroll
                 for (int r = 0; r < 2; ++r) {
-                    unsigned int packed = 0;
+                    // Adding 1.5*2^23 rounds to nearest even and leaves the u8 code in the low byte.
+                    int c[4];
 #pragma unroll
                     for (int j = 0; j < 4; ++j) {
-                        packed |= __float2uint_rn(w[g][t][(j/2)*4 + 2*r + (j%2)] * inv[r]) << (8*j);
+                        c[j] = __float_as_int(fmaf(w[g][t][(j/2)*4 + 2*r + (j%2)], inv[r], 12582912.0f));
                     }
-                    pa[g].x[2*t + r] = packed;
+                    pa[g].x[2*t + r] = __byte_perm(__byte_perm(c[0], c[1], 0x0040), __byte_perm(c[2], c[3], 0x0040), 0x5410);
                 }
             }
         }
 #pragma unroll
         for (int n = 0; n < 8; ++n) {
+            // Accumulators start at the bits of 1.5*2^23: |P V| < 2^22, so the int32 sum reinterpreted
+            // as float is 1.5*2^23 + acc exactly and one FMA with bias converts and scales it.
             tile<16, 8, int> acc[2];
+#pragma unroll
+            for (int l = 0; l < acc[0].ne; ++l) {
+                acc[0].x[l] = 0x4B400000;
+                acc[1].x[l] = 0x4B400000;
+            }
 #pragma unroll
             for (int g = 0; g < ngroups; ++g) {
                 tile<16, 8, int> vt;
@@ -325,7 +335,9 @@ static __device__ __forceinline__ void tckv_int8_pv(const int * tile_V, const TC
             for (int hc = 0; hc < 2; ++hc) {
 #pragma unroll
                 for (int r = 0; r < 2; ++r) {
-                    VKQ_C[b*8 + n].x[2*hc + r] += make_half2(float(acc[hc].x[2*r])*s[r], float(acc[hc].x[2*r + 1])*s[r]);
+                    VKQ_C[b*8 + n].x[2*hc + r] += make_half2(
+                        fmaf(__int_as_float(acc[hc].x[2*r + 0]), s[r], bias[r]),
+                        fmaf(__int_as_float(acc[hc].x[2*r + 1]), s[r], bias[r]));
                 }
             }
         }
