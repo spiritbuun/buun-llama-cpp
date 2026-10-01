@@ -18,8 +18,9 @@
 
 namespace {
 
-constexpr size_t       QWEN_DRAFT_VOCAB_SIZE = 32768;
-constexpr size_t       QWEN_TOKENIZER_SIZE   = 248320;
+constexpr size_t       QWEN_DRAFT_VOCAB_SIZE   = 32768;
+constexpr size_t       QWEN65K_DRAFT_VOCAB_SIZE = 65536;
+constexpr size_t       QWEN_TOKENIZER_SIZE     = 248320;
 constexpr int64_t      QWEN_EMBEDDING_LENGTH = 5120;
 constexpr const char * MAP_VERSION           = "qwen27b-public-balanced-v2-i32-tokenizer-fbbabd";
 constexpr const char * TOKENIZER_DOMAIN      = "buun.qwen27b-tokenizer-tokens/v1";
@@ -30,6 +31,7 @@ constexpr const char * META_SOURCE_SIZE      = "buun.mtp_vocab_trim.source_size"
 constexpr const char * META_SOURCE_MTIME     = "buun.mtp_vocab_trim.source_mtime";
 
 #include "mtp-vocab-qwen27b-balanced.inc"
+#include "mtp-vocab-qwen27b-65k.inc"
 
 constexpr size_t bit_count(uint64_t value) {
     size_t count = 0;
@@ -50,6 +52,29 @@ constexpr size_t qwen27b_map_size() {
 
 static_assert(qwen27b_map_size() == QWEN_DRAFT_VOCAB_SIZE,
               "the embedded Qwen-27B public balanced vocabulary must contain exactly 32768 tokens");
+
+constexpr size_t qwen27b_65k_map_size() {
+    size_t count = 0;
+    for (uint64_t word : QWEN27B_65K_VOCAB) {
+        count += bit_count(word);
+    }
+    return count;
+}
+
+static_assert(qwen27b_65k_map_size() == QWEN65K_DRAFT_VOCAB_SIZE,
+              "the embedded Qwen-27B 65K vocabulary must contain exactly 65536 tokens");
+
+// Both maps cover the same 248320-token Qwen tokenizer, so a single array
+// type covers both sizes.
+const std::array<uint64_t, 3880> * qwen27b_vocab_map(size_t draft_vocab_size) {
+    if (draft_vocab_size == QWEN_DRAFT_VOCAB_SIZE) {
+        return &QWEN27B_BALANCED_VOCAB;
+    }
+    if (draft_vocab_size == QWEN65K_DRAFT_VOCAB_SIZE) {
+        return &QWEN27B_65K_VOCAB;
+    }
+    return nullptr;
+}
 
 using gguf_ptr = std::unique_ptr<gguf_context, decltype(&gguf_free)>;
 using ggml_ptr = std::unique_ptr<ggml_context, decltype(&ggml_free)>;
@@ -483,16 +508,17 @@ bool qwen27b_map(const std::string & source_path,
         return false;
     }
 
-    if (draft_vocab_size != QWEN_DRAFT_VOCAB_SIZE) {
-        reason = "the Qwen-27B public balanced map has exactly 32768 entries";
+    const std::array<uint64_t, 3880> * vocab_map = qwen27b_vocab_map(draft_vocab_size);
+    if (vocab_map == nullptr) {
+        reason = "the Qwen-27B vocabulary maps have exactly 32768 and 65536 entries";
         return false;
     }
     admission.map.clear();
-    admission.map.reserve(QWEN_DRAFT_VOCAB_SIZE);
+    admission.map.reserve(draft_vocab_size);
     for (int64_t token = 0; token < n_vocab; ++token) {
         const size_t word = static_cast<size_t>(token) / 64;
         const size_t bit  = static_cast<size_t>(token) % 64;
-        if (word < QWEN27B_BALANCED_VOCAB.size() && (QWEN27B_BALANCED_VOCAB[word] & (UINT64_C(1) << bit)) != 0) {
+        if (word < vocab_map->size() && ((*vocab_map)[word] & (UINT64_C(1) << bit)) != 0) {
             admission.map.push_back(token);
         }
     }
@@ -590,13 +616,14 @@ bool cached_file_valid(const std::string & path, const source_identity & identit
     input.seekg(
         static_cast<std::streamoff>(gguf_get_data_offset(cached.get()) + gguf_get_tensor_offset(cached.get(), d2t_id)));
     int64_t previous = -1;
+    const std::array<uint64_t, 3880> * vocab_map = qwen27b_vocab_map(draft_vocab_size);
     for (size_t i = 0; i < draft_vocab_size; ++i) {
         int32_t token = -1;
         input.read(reinterpret_cast<char *>(&token), sizeof(token));
-        const size_t word = token >= 0 ? static_cast<size_t>(token) / 64 : QWEN27B_BALANCED_VOCAB.size();
+        const size_t word = token >= 0 ? static_cast<size_t>(token) / 64 : vocab_map->size();
         const size_t bit  = token >= 0 ? static_cast<size_t>(token) % 64 : 0;
-        if (!input || token <= previous || word >= QWEN27B_BALANCED_VOCAB.size() ||
-            (QWEN27B_BALANCED_VOCAB[word] & (UINT64_C(1) << bit)) == 0) {
+        if (!input || token <= previous || word >= vocab_map->size() ||
+            ((*vocab_map)[word] & (UINT64_C(1) << bit)) == 0) {
             return false;
         }
         previous = token;
@@ -628,9 +655,9 @@ common_mtp_vocab_trim_result common_mtp_vocab_trim_prepare(const std::string & s
         }
 
         const size_t draft_vocab_size = requested_draft_vocab_size;
-        if (draft_vocab_size != QWEN_DRAFT_VOCAB_SIZE) {
+        if (draft_vocab_size != QWEN_DRAFT_VOCAB_SIZE && draft_vocab_size != QWEN65K_DRAFT_VOCAB_SIZE) {
             result.status = common_mtp_vocab_trim_status::failed;
-            result.detail = "draft vocabulary size must be 0 (disabled) or 32768";
+            result.detail = "draft vocabulary size must be 0 (disabled), 32768, or 65536";
             return result;
         }
 

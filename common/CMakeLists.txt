@@ -112,6 +112,8 @@ add_library(${TARGET}
     reasoning-budget.h
     sampling.cpp
     sampling.h
+    spec-defaults.cpp
+    spec-defaults.h
     speculative.cpp
     speculative.h
     speculative-dflash-adaptive.h

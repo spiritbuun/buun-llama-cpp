@@ -5,6 +5,7 @@
 #include "common-cache-plan.h" // Cache-plan observer row and accounting-ledger types.
 #include "llama.h"
 #include "server-cache-lifecycle.h"
+#include "server-cache-disk.h"
 #include "server-cache-lease.h"
 #include "server-cache-plan-preflight.h"
 #include "server-cache-control.h"
@@ -1423,6 +1424,14 @@ struct server_prompt_cache {
     size_t byte_deficit(size_t host_bytes) const noexcept;
     size_t effective_host_token_limit(size_t host_bytes, size_t host_tokens) const noexcept;
 
+    // Prompt-cache disk tier (P4 host-prompt-cache gap): parked host entries spill here and a
+    // restarted server restores a parked conversation's state bytes verbatim, skipping prefill.
+    // producer_identity must be stable for the life of the cache (it names the model this tier's
+    // objects belong to). Empty dir = the tier is off and every call is a no-op.
+    void set_cache_disk_tier(const std::string & dir, const std::string & producer_identity,
+                             uint64_t limit_bytes);
+    bool cache_disk_enabled() const { return disk_tier != nullptr; }
+
 private:
     struct active_storage_state;
     std::shared_ptr<active_storage_state> active_storage_;
@@ -1457,6 +1466,23 @@ public:
     bool quality_anchor_budget_enabled = false;
 
     int32_t cache_plan_next_source_id = 0;
+
+    // Disk tier internals: the tier object owns the directory and index; the cache owns the
+    // park/restore hooks below. A spill of an evicted entry and a restore that re-publishes a
+    // disk object are the only two mutation points, and both run on the scheduler thread.
+    std::unique_ptr<server_cache_disk_tier> disk_tier;
+    std::string disk_producer_identity;
+    // Park one entry's exact in-memory bytes (fixed-state entries only). The entry must be
+    // immutable at this point: the caller snapshots before any mutation. Returns true when the
+    // conversation is parked (including an exact duplicate that was already on disk).
+    bool disk_spill_entry(const server_prompt_cache_state & entry);
+    // Restore one parked object verbatim into the target (and draft) context. Restores the state
+    // bytes without touching `states`; the caller owns the sequence-reset semantics on failure.
+    bool disk_restore_entry(const server_cache_disk_entry & entry,
+                            server_prompt & prompt_out,
+                            llama_context * ctx_tgt, llama_context * ctx_dft,
+                            int32_t id_slot,
+                            server_prompt_cache_restore_shape & restore_shape);
 
     size_t size() const;
 

@@ -94,8 +94,9 @@ llama-server -m Qwen3.8-27B.gguf -md mtp-Qwen3.8-27B.gguf \
     --spec-type draft-mtp --spec-mtp-vocab-size 32768
 ```
 
-`--spec-mtp-vocab-size` defaults to the measured 32768 map. `0` disables automatic
-repacking. Smaller prefixes are intentionally not exposed: on Qwen3.8-27B with a
+`--spec-mtp-vocab-size` accepts 32768 (the public balanced map) and 65536 (the
+llamAmpere atx_65536 frequency-ranked map, same Qwen3.8 tokenizer). `0` disables
+automatic repacking. Smaller prefixes are intentionally not exposed: on Qwen3.8-27B with a
 Q4_K_M MTP head, 16K and 8K lost more draft acceptance than their smaller heads saved.
 Unsupported architectures, model sizes, split files, and already-trimmed sidecars
 fall back to their original behavior.
@@ -403,8 +404,8 @@ Use exactly one of these options:
                                         minimum number of draft tokens to use for speculative decoding (default: 0)
                                         (env: LLAMA_ARG_SPEC_DRAFT_N_MIN)
 --spec-mtp-vocab-size                   N
-                                        Qwen-27B MTP public balanced vocabulary; 0 disables, 32768 enables
-                                        (default: 32768)
+                                        Qwen-27B MTP draft vocabulary; 0 disables, 32768 and 65536 select a trim size
+                                        (default: 0)
                                         (env: LLAMA_ARG_SPEC_MTP_VOCAB_SIZE)
 --spec-draft-p-split, --draft-p-split   P
                                         speculative decoding split probability (default: 0.10)

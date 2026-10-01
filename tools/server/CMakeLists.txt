@@ -16,6 +16,8 @@ add_library(${TARGET} STATIC
     server-cache-control.h
     server-cache-destruction-quote.cpp
     server-cache-destruction-quote.h
+    server-cache-disk.cpp
+    server-cache-disk.h
     server-cache-plan-authority.cpp
     server-cache-plan-authority.h
     server-cache-plan-preflight.cpp
@@ -110,6 +112,14 @@ if (LLAMA_BUILD_TESTS)
     target_compile_features(test-server-media-prefix PRIVATE cxx_std_17)
     add_test(NAME test-server-media-prefix COMMAND test-server-media-prefix)
     set_property(TEST test-server-media-prefix PROPERTY LABELS main)
+
+    # Pure format round-trip of the prompt-cache disk tier (LCPC v1): park bytes, restart the
+    # index, read back verbatim, checksum, pruning. No model, context, or GPU.
+    add_executable(test-server-cache-disk ${CMAKE_SOURCE_DIR}/tests/test-server-cache-disk.cpp)
+    target_link_libraries(test-server-cache-disk PRIVATE server-context)
+    target_compile_features(test-server-cache-disk PRIVATE cxx_std_17)
+    add_test(NAME test-server-cache-disk COMMAND test-server-cache-disk)
+    set_property(TEST test-server-cache-disk PROPERTY LABELS main)
 
     add_executable(test-server-mmproj-lifecycle
         ${CMAKE_SOURCE_DIR}/tests/test-server-mmproj-lifecycle.cpp)

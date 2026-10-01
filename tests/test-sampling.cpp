@@ -503,7 +503,7 @@ static void test_speculative_coupling() {
 }
 
 static void test_mtp_adaptive() {
-    common_speculative_mtp_adaptive state;
+    common_speculative_mtp_adaptive state(2, 3);
     auto cycles = [&](int n, int accepted) {
         for (int i = 0; i < n; ++i) {
             state.accept(state.depth(), accepted, false);
@@ -577,21 +577,21 @@ static void test_mtp_adaptive() {
     cycles(1, 0); // even one-token requests cannot postpone periodic recovery
     GGML_ASSERT(state.depth() == 3);
 
-    common_speculative_mtp_adaptive slots[2];
+    common_speculative_mtp_adaptive slot0(2, 3), slot1(2, 3);
     for (int i = 0; i < 16; ++i) {
-        slots[0].accept(3, 0, false);
-        slots[1].accept(3, 3, false);
+        slot0.accept(3, 0, false);
+        slot1.accept(3, 3, false);
     }
-    GGML_ASSERT(slots[0].depth() == 2 && slots[1].depth() == 3);
+    GGML_ASSERT(slot0.depth() == 2 && slot1.depth() == 3);
     for (int i = 0; i < 8; ++i) {
         // Same prefix clamp as MTP's CopySpec-composition integration.
-        const int drafted = slots[0].depth();
-        slots[0].accept(drafted, std::min(3, drafted), false);
+        const int drafted = slot0.depth();
+        slot0.accept(drafted, std::min(3, drafted), false);
     }
-    GGML_ASSERT(slots[0].depth() == 3 && slots[1].depth() == 3);
+    GGML_ASSERT(slot0.depth() == 3 && slot1.depth() == 3);
 
     for (int minimum = 0; minimum <= 3; ++minimum) {
-        state = common_speculative_mtp_adaptive(minimum);
+        state = common_speculative_mtp_adaptive(minimum, 3);
         for (int i = 0; i < 1024; ++i) {
             if (i == 512) {
                 state.reset();

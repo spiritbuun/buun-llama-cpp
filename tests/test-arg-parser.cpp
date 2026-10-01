@@ -562,6 +562,10 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
     assert(params.speculative.draft.mtp_vocab_size == 32768);
 
+    argv = {"binary_name", "--spec-mtp-vocab-size", "65536"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.speculative.draft.mtp_vocab_size == 65536);
+
     argv = {"binary_name", "--spec-mtp-vocab-size", "0"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
     assert(params.speculative.draft.mtp_vocab_size == 0);

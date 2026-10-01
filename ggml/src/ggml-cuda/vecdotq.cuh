@@ -1553,25 +1553,54 @@ static __device__ __forceinline__ float vec_dot_iq4_nl_q8_1(
 #define VDR_IQ4_XS_Q8_1_MMVQ 4
 #define VDR_IQ4_XS_Q8_1_MMQ  4
 
+// Interleaved IQ4_XS nibble lookup: q4 holds 8 nibbles (bytes b0..b3, low nibble = element e,
+// high nibble = element e+16). Returns .x = {lo(b0), hi(b0), lo(b1), hi(b1)} and
+// .y = {lo(b2), hi(b2), lo(b3), hi(b3)} as table bytes, i.e. the order in which quantize_q8_1
+// stores the IQ4_XS activations (element k at byte 2*(k%16) + k/16). Four PRMT per int2 instead
+// of the 32 needed by get_int_from_table_16 for the same eight values.
+static __device__ __forceinline__ int2 get_int_from_table_16_interleaved(const int & q4, const int8_t * table) {
+    const uint32_t * values = (const uint32_t *) table;
+    const uint32_t q = (uint32_t) q4;
+    const uint32_t selectors = 0x32103210u | ((q & 0x88888888u) >> 1);
+    const uint32_t lo0 = __byte_perm(values[0], values[1], q);
+    const uint32_t hi0 = __byte_perm(values[2], values[3], q);
+    const uint32_t lo1 = __byte_perm(values[0], values[1], q >> 16);
+    const uint32_t hi1 = __byte_perm(values[2], values[3], q >> 16);
+    return make_int2(__byte_perm(lo0, hi0, selectors), __byte_perm(lo1, hi1, selectors >> 16));
+}
+
+// Integer part of the IQ4_XS x q8_1 dot for one 32-element sub-block: the same eight
+// (nibble value x int8 activation) products as the row-major layout, summed by dp4a.
+// The activation block must be in the swizzled layout written by quantize_q8_1 for IQ4_XS.
+static __device__ __forceinline__ int vec_dot_iq4_xs_q8_1_sumi(
+        const block_iq4_xs * __restrict__ bq4, const block_q8_1 * __restrict__ bq8, const int & iqs) {
+    int sumi = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int aux_q4 = get_int_b4(bq4->qs, iqs + j);
+        const int2 v = get_int_from_table_16_interleaved(aux_q4, kvalues_iq4nl);
+
+        const int u0 = get_int_b4(bq8->qs, 2*j + 0);
+        const int u1 = get_int_b4(bq8->qs, 2*j + 1);
+
+        sumi = ggml_cuda_dp4a(v.x, u0, sumi);
+        sumi = ggml_cuda_dp4a(v.y, u1, sumi);
+    }
+    return sumi;
+}
+
+static __device__ __forceinline__ int vec_dot_iq4_xs_q8_1_scale(const block_iq4_xs * __restrict__ bq4, const int & iqs) {
+    return ((bq4->scales_l[iqs/8] >> (iqs & 0x04)) & 0x0F) | (((bq4->scales_h >> (iqs/2)) & 0x03) << 4);
+}
+
 static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
     const block_iq4_xs * bq4 = (const block_iq4_xs *) vbq + kbx;
 
-    int sumi = 0;
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const int aux_q4 = get_int_b4(bq4->qs, iqs + j);
-        const int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
+    int sumi = vec_dot_iq4_xs_q8_1_sumi(bq4, &bq8_1[iqs/4], iqs);
 
-        const int u0 = get_int_b4(bq8_1[iqs/4].qs, j + 0);
-        const int u1 = get_int_b4(bq8_1[iqs/4].qs, j + 4);
-
-        sumi = ggml_cuda_dp4a(v.x, u0, sumi);
-        sumi = ggml_cuda_dp4a(v.y, u1, sumi);
-    }
-
-    const int ls = ((bq4->scales_l[iqs/8] >> (iqs & 0x04)) & 0x0F) | (((bq4->scales_h >> (iqs/2)) & 0x03) << 4);
+    const int ls = vec_dot_iq4_xs_q8_1_scale(bq4, iqs);
     sumi *= ls - 32;
 
     const float d = __half2float(bq4->d) * __low2float(bq8_1[iqs/4].ds);
