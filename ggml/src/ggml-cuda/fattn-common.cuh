@@ -2113,9 +2113,12 @@ void launch_fattn(
         const int tiles_nwaves = (ntiles_dst + max_blocks - 1) / max_blocks;
         const int tiles_efficiency_percent = 100 * ntiles_dst / (max_blocks*tiles_nwaves);
 
-        const bool use_stream_k =
+        // GGML_CUDA_FA_KSPLIT=k forces a k-way KV split instead of stream-k (0 = whole tiles). Callers with their own
+        // split rule (ksplit2_min_kv) skip stream-k too: its scattered KV offsets measured negative on the int8 path.
+        static const int ksplit_env = getenv("GGML_CUDA_FA_KSPLIT") ? atoi(getenv("GGML_CUDA_FA_KSPLIT")) : -1;
+        const bool use_stream_k = ksplit_env < 0 && ksplit2_min_kv == 0 && (
             (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_ADA_LOVELACE) ||
-            (amd_wmma_available(cc) && Q->ne[0] == 64) || tiles_efficiency_percent < 75;
+            (amd_wmma_available(cc) && Q->ne[0] == 64) || tiles_efficiency_percent < 75);
 
         blocks_num.x = ntiles_dst;
         blocks_num.y = 1;
@@ -2140,8 +2143,6 @@ void launch_fattn(
             // resident blocks still walk the same KV fronts (L2 reuse) while the tail wave shrinks. Each part keeps
             // >= 8k tokens, below that the fixup costs more than the tail. Faster kernels (int8) pass ksplit2_min_kv:
             // a plain 2-way split from that length on, since k=3 and short-KV splits measured negative for them.
-            // GGML_CUDA_FA_KSPLIT=k forces k (0 = off).
-            static const int ksplit_env = getenv("GGML_CUDA_FA_KSPLIT") ? atoi(getenv("GGML_CUDA_FA_KSPLIT")) : -1;
             int ksplit = ksplit_env;
             if (ksplit < 0 && ksplit2_min_kv > 0) {
                 ksplit = n_kv >= ksplit2_min_kv ? 2 : 1;

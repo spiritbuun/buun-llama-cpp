@@ -1790,7 +1790,10 @@ static void tckv_int8_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
         raised[ctx.device] = true;
     }
-    launch_fattn<D, ncols1, ncols2>(ctx, dst, kernel, nwarps, smem, cfg.nbatch_fa, false, true, true, false, 32, 65536);
+    // 64-column tiles: 2-way KV split from 64k; 32x2 has 192 tiles for 164 slots (vs 256), so it already pays
+    // from 16k. The small fallback configs keep stream-k (few tiles).
+    const int ksplit2_min_kv = ncols1*ncols2 != 64 ? 0 : ncols2 == 2 ? 16384 : 65536;
+    launch_fattn<D, ncols1, ncols2>(ctx, dst, kernel, nwarps, smem, cfg.nbatch_fa, false, true, true, false, 32, ksplit2_min_kv);
 }
 
 // Kernel configuration of an int8 call. ncols2>1 assumes a mask and padded KV rows in the existing
@@ -1996,10 +1999,26 @@ static void tckv_int8_attend(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
             packed_v.nb[3] = packed_v.nb[2]*V->ne[2];
             ggml_tensor * original_v = dst->src[2];
             dst->src[2] = &packed_v;
-            if (native) {
-                tckv_int8_launch<D, 8, 8, 6>(ctx, dst);
-            } else {
-                tckv_int8_launch<D, 8, 8, 2>(ctx, dst);
+            // GQA 6 in 8-head tiles wastes 2 of 8 columns; 32 tokens x 2 heads is the same 64-column tile without padding.
+            static const bool gqa2_env = !getenv("TCKV_INT8_32x2") || atoi(getenv("TCKV_INT8_32x2"));
+            const int gqa = dst->src[0]->ne[2] / K->ne[2];
+            bool gqa2 = false;
+            if constexpr (D == 256) {
+                gqa2 = gqa2_env && gqa % 8 != 0 && gqa % 2 == 0;
+                if (gqa2) {
+                    if (native) {
+                        tckv_int8_launch<D, 32, 2, 6>(ctx, dst);
+                    } else {
+                        tckv_int8_launch<D, 32, 2, 2>(ctx, dst);
+                    }
+                }
+            }
+            if (!gqa2) {
+                if (native) {
+                    tckv_int8_launch<D, 8, 8, 6>(ctx, dst);
+                } else {
+                    tckv_int8_launch<D, 8, 8, 2>(ctx, dst);
+                }
             }
             dst->src[2] = original_v;
         } break;
