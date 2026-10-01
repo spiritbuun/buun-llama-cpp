@@ -1790,7 +1790,7 @@ static void tckv_int8_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
         raised[ctx.device] = true;
     }
-    launch_fattn<D, ncols1, ncols2>(ctx, dst, kernel, nwarps, smem, cfg.nbatch_fa, false, true, true, false, 32);
+    launch_fattn<D, ncols1, ncols2>(ctx, dst, kernel, nwarps, smem, cfg.nbatch_fa, false, true, true, false, 32, 65536);
 }
 
 // Kernel configuration of an int8 call. ncols2>1 assumes a mask and padded KV rows in the existing

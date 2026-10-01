@@ -1919,7 +1919,7 @@ template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
-    const int warp_size = WARP_SIZE
+    const int warp_size = WARP_SIZE, const int ksplit2_min_kv = 0
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -2135,6 +2135,30 @@ void launch_fattn(
                 : nblocks_stream_k_raw;
 
             blocks_num.x = nblocks_stream_k;
+        } else {
+            // Long KV: split each tile's KV range into k contiguous parts. Consecutive blocks share a tile, so the
+            // resident blocks still walk the same KV fronts (L2 reuse) while the tail wave shrinks. Each part keeps
+            // >= 8k tokens, below that the fixup costs more than the tail. Faster kernels (int8) pass ksplit2_min_kv:
+            // a plain 2-way split from that length on, since k=3 and short-KV splits measured negative for them.
+            // GGML_CUDA_FA_KSPLIT=k forces k (0 = off).
+            static const int ksplit_env = getenv("GGML_CUDA_FA_KSPLIT") ? atoi(getenv("GGML_CUDA_FA_KSPLIT")) : -1;
+            int ksplit = ksplit_env;
+            if (ksplit < 0 && ksplit2_min_kv > 0) {
+                ksplit = n_kv >= ksplit2_min_kv ? 2 : 1;
+            } else if (ksplit < 0) {
+                int eff_best = tiles_efficiency_percent;
+                ksplit = 1;
+                for (int k = 2; k <= 8 && n_kv/k >= 8192; ++k) {
+                    const int nwaves = (k*ntiles_dst + max_blocks - 1) / max_blocks;
+                    const int eff    = 100 * k*ntiles_dst / (max_blocks*nwaves);
+                    if (eff > eff_best + 5) {
+                        eff_best = eff;
+                        ksplit   = k;
+                    }
+                }
+            }
+            ksplit = std::max(1, std::min(ksplit, ntiles_KV));
+            blocks_num.x = ksplit*ntiles_dst;
         }
 
         if (ntiles_dst % blocks_num.x != 0) { // Fixup is only needed if the SMs work on fractional tiles.
