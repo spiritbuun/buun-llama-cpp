@@ -1140,6 +1140,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             }
         }
     } else { // not Turing mma or T_B_KQ::I > 8
+        // int8 QK leaves the Q row scale to this point, it is applied with the mask FMA (max_bias == 0, slope == 1).
+        float q_scale[cols_per_thread];
+        if constexpr (use_int8_qk) {
+#pragma unroll
+            for (int col = 0; col < cols_per_thread; ++col) {
+                q_scale[col] = q_scales[(threadIdx.y / np)*cols_per_warp + T_C_KQ::get_i(2*col)];
+            }
+        }
         if (ncols2 > 1 || mask_h) {
 #pragma unroll
             for (int i00 = 0; i00 < nbatch_fa; i00 += np*T_C_KQ::J) {
@@ -1162,15 +1170,34 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     const int j = ((threadIdx.y / np)*cols_per_warp + T_C_KQ::get_i(l0)) / ncols2;
 
                     const float2 tmp = __half22float2(((const half2 *)tile_mask)[j*(nbatch_fa/2 + 4) + i]);
-                    KQ_C[i00/(np*T_C_KQ::J)].x[l0 + 0] += slope*tmp.x;
-                    KQ_C[i00/(np*T_C_KQ::J)].x[l0 + 1] += slope*tmp.y;
+                    if constexpr (use_int8_qk) {
+                        KQ_C[i00/(np*T_C_KQ::J)].x[l0 + 0] = fmaf(KQ_C[i00/(np*T_C_KQ::J)].x[l0 + 0], q_scale[(l0/2) % 2], tmp.x);
+                        KQ_C[i00/(np*T_C_KQ::J)].x[l0 + 1] = fmaf(KQ_C[i00/(np*T_C_KQ::J)].x[l0 + 1], q_scale[(l0/2) % 2], tmp.y);
+                    } else {
+                        KQ_C[i00/(np*T_C_KQ::J)].x[l0 + 0] += slope*tmp.x;
+                        KQ_C[i00/(np*T_C_KQ::J)].x[l0 + 1] += slope*tmp.y;
+                    }
                 }
 #endif // RDNA3
+            }
+        } else if (use_int8_qk) {
+#pragma unroll
+            for (int k = 0; k < nbatch_fa/(np*T_C_KQ::J); ++k) {
+#pragma unroll
+                for (int l = 0; l < T_C_KQ::ne; ++l) {
+                    KQ_C[k].x[l] *= q_scale[(l/2) % 2];
+                }
             }
         }
 
         // Calculate softmax for each KQ column using the current max. value.
         // The divisor is stored in KQ_rowsum and will be applied at the end.
+        // The max offset is added once after the reduction (exact, rounding is monotonic).
+        float KQ_max_tile[cols_per_thread];
+#pragma unroll
+        for (int col = 0; col < cols_per_thread; ++col) {
+            KQ_max_tile[col] = -FLT_MAX/2.0f;
+        }
         static_assert(nbatch_fa % (np*T_C_KQ::J) == 0, "bad loop size");
 #pragma unroll
         for (int k0 = 0; k0 < nbatch_fa; k0 += np*T_C_KQ::J) {
@@ -1183,7 +1210,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     // Turing + Volta:
                     const int KQ_idx = (l/2) % 2;
 #endif // defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
-                    KQ_max_new[KQ_idx] = fmaxf(KQ_max_new[KQ_idx], KQ_C[(k0/(np*T_C_KQ::J))].x[l] + FATTN_KQ_MAX_OFFSET);
+                    KQ_max_tile[KQ_idx] = fmaxf(KQ_max_tile[KQ_idx], KQ_C[(k0/(np*T_C_KQ::J))].x[l]);
                 }
             }
         }
@@ -1209,8 +1236,16 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 #endif // defined(TURING_MMA_AVAILABLE)
 #pragma unroll
             for (int offset = offset_first; offset >= offset_last; offset >>= 1) {
-                KQ_max_new[col] = fmaxf(KQ_max_new[col], __shfl_xor_sync(0xFFFFFFFFULL, KQ_max_new[col], offset, warp_size));
+                KQ_max_tile[col] = fmaxf(KQ_max_tile[col], __shfl_xor_sync(0xFFFFFFFFULL, KQ_max_tile[col], offset, warp_size));
             }
+            KQ_max_new[col] = fmaxf(KQ_max_new[col], KQ_max_tile[col] + FATTN_KQ_MAX_OFFSET);
+        }
+
+        // int8: exp(x - max) as one FMA + ex2.
+        float KQ_max_log2[cols_per_thread];
+#pragma unroll
+        for (int col = 0; col < cols_per_thread; ++col) {
+            KQ_max_log2[col] = -KQ_max_new[col]*1.4426950408889634f;
         }
 
         static_assert(nbatch_fa % (np*T_C_KQ::J) == 0, "bad loop size");
@@ -1225,7 +1260,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     // Turing + Volta:
                     const int KQ_idx = (l/2) % 2;
 #endif // defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
-                    KQ_C[(k0/(np*T_C_KQ::J))].x[l] = expf(KQ_C[(k0/(np*T_C_KQ::J))].x[l] - KQ_max_new[KQ_idx]);
+                    if constexpr (use_int8_qk) {
+                        KQ_C[(k0/(np*T_C_KQ::J))].x[l] = exp2f(fmaf(KQ_C[(k0/(np*T_C_KQ::J))].x[l], 1.4426950408889634f, KQ_max_log2[KQ_idx]));
+                    } else {
+                        KQ_C[(k0/(np*T_C_KQ::J))].x[l] = expf(KQ_C[(k0/(np*T_C_KQ::J))].x[l] - KQ_max_new[KQ_idx]);
+                    }
                     KQ_rowsum_add[KQ_idx] += KQ_C[(k0/(np*T_C_KQ::J))].x[l];
                 } else {
                     KQ_C[(k0/(np*T_C_KQ::J))].x[l] = 0.0f;

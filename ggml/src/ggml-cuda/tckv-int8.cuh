@@ -133,6 +133,8 @@ static __device__ __forceinline__ void tckv_ldmatrix_halves(
 
 // preloaded: the multi-stage pipeline already cp.async'd the K rows into smem.
 // half_off: K codes are native turbo8 (value = sK*(code + 0.5)); q_offs holds 0.5*sum(Q codes).
+// With cols_per_warp == 16 the scores are left without the Q row scale, the softmax applies it
+// together with the mask.
 template<int D, int nwarps, int nbatch, int cols_per_warp, int np, bool oob, bool preloaded, bool half_off, typename TC>
 static __device__ __forceinline__ void tckv_int8_qk(
         const half2 * K, int stride_K, int * smem, const ggml_cuda_mma::tile<16, 8, int> * qb,
@@ -155,7 +157,13 @@ static __device__ __forceinline__ void tckv_int8_qk(
         const int i0 = i00 + (threadIdx.y % np)*16;
 #pragma unroll
         for (int b = 0; b < blocks; ++b) {
+            // Accumulators start at the bits of 1.5*2^23 (|dot| < 2^21), read back as float without I2F.
             tile<16, 8, int> acc[cols_per_warp == 8 ? 1 : 2];
+#pragma unroll
+            for (int l = 0; l < acc[0].ne; ++l) {
+                acc[0].x[l] = 0x4B400000;
+                acc[cols_per_warp == 8 ? 0 : 1].x[l] = 0x4B400000;
+            }
 #pragma unroll
             for (int k = 0; k < 4; ++k) {
                 if constexpr (cols_per_warp == 8) {
@@ -175,18 +183,17 @@ static __device__ __forceinline__ void tckv_int8_qk(
 #pragma unroll
             for (int l = 0; l < TC::ne; ++l) {
                 const int key = i0 + (cols_per_warp == 8 ? TC::get_i(l) : TC::get_j(l));
-                float dot = float(acc[l/4].x[l%4]);
-                if constexpr (half_off) {
-                    const int q = (threadIdx.y / np)*cols_per_warp + (cols_per_warp == 8 ? TC::get_j(l) : TC::get_i(l));
-                    dot += q_offs[q*blocks + b];
-                }
+                const int q = (threadIdx.y / np)*cols_per_warp + (cols_per_warp == 8 ? TC::get_j(l) : TC::get_i(l));
+                const float off = half_off ? q_offs[q*blocks + b] - 12582912.0f : -12582912.0f;
+                const float dot = __int_as_float(acc[l/4].x[l%4]) + off;
                 scores[i00/(np*16)].x[l] += dot*((const float *) (smem + key*stride + D/4))[b];
             }
         }
+        if constexpr (cols_per_warp == 8) {
 #pragma unroll
-        for (int l = 0; l < TC::ne; ++l) {
-            const int q = (threadIdx.y / np)*cols_per_warp + (cols_per_warp == 8 ? TC::get_j(l) : TC::get_i(l));
-            scores[i00/(np*16)].x[l] *= q_scales[q];
+            for (int l = 0; l < TC::ne; ++l) {
+                scores[i00/(np*16)].x[l] *= q_scales[(threadIdx.y / np)*cols_per_warp + TC::get_j(l)];
+            }
         }
     }
     if constexpr (!preloaded) {
