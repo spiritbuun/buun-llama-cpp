@@ -12311,6 +12311,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32, 509, 2112, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 32, 509, 2112, {1, 1}, {1, 1}));
 
+    // mmvf short rows (ncols <= 1536 run one warp per row, 2 rows per block, on pre-Volta NVIDIA): an odd row count
+    // for the last block's tail, the batch widths the vector kernel serves, a strided k view, broadcast, MUL_MAT_ID
+    // and gate/bias fusion
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_F32}) {
+        for (int64_t n : {1, 2, 3, 4, 8}) {
+            for (int64_t k : {64, 320, 1536}) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 1001, n, k, {1, 1}, {1, 1}));
+            }
+        }
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 1001, 1, 320, {1, 1}, {1, 1}, {0, 1, 2, 3}, 384));
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 1001, 1, 320, {2, 3}, {2, 2}));
+        for (bool b : {false, true}) {
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 16, 4, b, 1001, 4, 320));
+        }
+        for (bool with_bias : {false, true}) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 1001, 320,
+                false, 1, 1, false, with_bias, true, false, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 4, 1001, 320,
+                true, 16, 4, false, with_bias, true, false, {1, 1}));
+        }
+    }
+
 #if 0
     {
         // Test paths in OpenCL
@@ -13844,6 +13866,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 16416, 1, 128, {8,  1}, {4, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 1, 16416, {8,  1}, {4, 1}, {0, 1, 2, 3}, 2*16416));
+
+    // mmvf short rows (one warp per row on pre-Volta NVIDIA), plus a long-row control on the unchanged path
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_F32}) {
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 10240, 1, 320, {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32,  4096, 1,  448, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32, 32000, 2,  192, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32,  8192, 8,  640, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32,  4096, 1, 4096, {1, 1}, {1, 1}));
 
     // FWHT tests
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1, 128));
