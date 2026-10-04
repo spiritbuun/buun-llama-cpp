@@ -2,21 +2,22 @@
 
 #include <algorithm>
 
-// Keep the established conservative full-depth -> 2 decision, but make it reversible
-// within a request. Depth 1 did not earn its exploration cost in serving tests.
+// Reversible per-request draft-depth control between the two bounds. The depth
+// starts at the maximum and drops to the minimum when full-depth probing stops
+// paying for itself; learned depths persist across requests, periodic probes
+// and a matching streak recover the full depth.
 class common_speculative_mtp_adaptive {
 public:
-    explicit common_speculative_mtp_adaptive(int minimum = 1, int maximum = 3)
-        : maximum_depth(std::max(2, maximum)),
-          minimum_depth(std::max(2, std::min(maximum_depth, minimum))), cap(maximum_depth) {}
+    explicit common_speculative_mtp_adaptive(int minimum, int maximum)
+        : minimum_depth(std::max(1, std::min(minimum, maximum))), maximum_depth(maximum), cap(maximum) {}
 
     int depth() const { return cap; }
 
     void reset() { *this = common_speculative_mtp_adaptive(minimum_depth, maximum_depth); }
 
     // Keep a learned depth across requests, but treat the new prefix as an
-    // opportunity to recover. Restarting every request at full depth repeats
-    // the losing probe on a stream of low-match prose requests.
+    // opportunity to recover. Restarting every request at the full depth
+    // needlessly repeats the losing probe on a stream of low-match requests.
     void begin() {
         attempts = full = prefix_full = full_streak = 0;
         // Preserve the periodic countdown too: many short requests must not
@@ -31,8 +32,8 @@ public:
         }
 
         if (cap == minimum_depth) {
-            full_streak = accepted == cap ? full_streak + 1 : 0;
-            // A matching streak signals a phase change only if the retained
+            full_streak = accepted == minimum_depth ? full_streak + 1 : 0;
+            // A matching streak signals a phase change only if the leading
             // positions were not already near-perfect in the full-depth probe.
             // Periodic probes also recover when no such streak is observed.
             if (--hold == 0 || (prefix_full < 12 && full_streak >= 8)) {
@@ -42,7 +43,7 @@ public:
         }
 
         full += accepted == cap;
-        prefix_full += accepted >= minimum_depth;
+        prefix_full += accepted >= cap - 1;
         if (++attempts == 16) {
             if (full < 8) {
                 cap = minimum_depth;
@@ -55,8 +56,8 @@ public:
     }
 
 private:
-    int maximum_depth;
     int minimum_depth;
+    int maximum_depth;
     int cap;
     int attempts = 0;
     int full = 0;

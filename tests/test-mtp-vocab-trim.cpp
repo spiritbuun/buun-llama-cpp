@@ -179,7 +179,7 @@ int main() {
     assert(disabled.path == "missing.gguf");
     const auto unsupported_size = common_mtp_vocab_trim_prepare("missing.gguf", 16384);
     assert(unsupported_size.status == common_mtp_vocab_trim_status::failed);
-    assert(unsupported_size.detail == "draft vocabulary size must be 0 (disabled) or 32768");
+    assert(unsupported_size.detail == "draft vocabulary size must be 0 (disabled), 32768, or 65536");
 
     const auto                  nonce   = std::chrono::high_resolution_clock::now().time_since_epoch().count();
     const std::filesystem::path source  = "test-mtp-vocab-trim-source-" + std::to_string(nonce) + ".gguf";

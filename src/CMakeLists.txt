@@ -51,6 +51,7 @@ set(LLAMA_CORE_SOURCES
             llama-model-saver.cpp
             llama-model.cpp
             llama-quant.cpp
+            llama-mtp-vocab.cpp
             llama-sampler.cpp
             llama-sha256.cpp
             llama-safetensors.cpp

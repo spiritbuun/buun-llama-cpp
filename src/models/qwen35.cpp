@@ -736,10 +736,26 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
     ggml_tensor * head_in_s = layer.nextn.shared_head_head ?
         layer.nextn.shared_head_head_in_s : model.output_in_s;
+
+    // Runtime compact draft head (llama-mtp-vocab): when building for the DRAFT
+    // context (embeddings_nextn_masked) and the model has no sidecar d2t, score
+    // against the 65K-row gather of the LM head. The d2t scatter below maps the
+    // ids back to the full-vocab domain, so downstream verify/sampling never has
+    // to know about the trim.
+    ggml_tensor * d2t_eff = model.d2t;
+    if (d2t_eff == nullptr && cparams.embeddings_nextn_masked &&
+            model.mtp_draft_vocab.compact != nullptr &&
+            layer.nextn.shared_head_head == nullptr) {
+        head_w    = model.mtp_draft_vocab.compact;
+        head_s    = nullptr;
+        head_in_s = nullptr;
+        d2t_eff   = model.mtp_draft_vocab.ids;
+    }
+
     cur = build_lora_mm(head_w, cur, head_s, head_in_s);
     cb(cur, "result_output", -1);
 
-    if (model.d2t) {
+    if (d2t_eff) {
         // FR-Spec-style draft-vocab trim: scatter the compressed logits back into a
         // full-vocab-shaped tensor (rest filled -inf) so downstream verify/sampling
         // code never has to know the draft scored a reduced vocab. Same pattern as
@@ -748,17 +764,17 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
         const int64_t n_outputs     = cur->ne[1];
         const int64_t n_vocab_full  = (int64_t) model.vocab.n_tokens();
 
-        GGML_ASSERT(model.d2t->ne[0] == n_draft_vocab);
+        GGML_ASSERT(d2t_eff->ne[0] == n_draft_vocab);
 
         const bool compact_backend_sampling =
-                model.d2t->type == GGML_TYPE_I32 &&
+                d2t_eff->type == GGML_TYPE_I32 &&
                 !samplers.empty() &&
                 llm_graph_all_outputs_have_samplers(ubatch, samplers, true);
         if (compact_backend_sampling) {
             // Backend samplers already support an explicit candidate-id domain.
             // Keep the 32K logits compact and let filtering map only its winners
             // to target token ids, avoiding a full-vocab fill/scatter and scan.
-            res->t_logits_candidates = model.d2t;
+            res->t_logits_candidates = d2t_eff;
         } else {
             // Raw-logits consumers, mixed backend/CPU batches, and legacy I64
             // mappings retain the exact dense representation.
@@ -766,7 +782,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
                     ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab_full, n_outputs), -INFINITY);
             cur = ggml_set_rows(ctx0, logits,
                     ggml_reshape_3d(ctx0, cur,       1,             n_draft_vocab, n_outputs),
-                    ggml_reshape_3d(ctx0, model.d2t, n_draft_vocab, 1,             1));
+                    ggml_reshape_3d(ctx0, d2t_eff,    n_draft_vocab, 1,             1));
             cur = ggml_reshape_2d(ctx0, cur, n_vocab_full, n_outputs);
             cb(cur, "result_output_d2t", -1);
         }

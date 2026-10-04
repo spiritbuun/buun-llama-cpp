@@ -1,6 +1,10 @@
 #include "llama-context.h"
 #include "llama-vbr-codec.h"
 
+// minimum number of output rows reserved at context creation (covers MTP verification widths);
+// growing the pinned output buffer mid-decode costs a cudaFreeHost/cudaMallocHost pair (~60 ms)
+#define LLAMA_OUTPUT_RESERVE_MIN 8
+
 #include "ggml.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
@@ -584,7 +588,10 @@ llama_context::llama_context(
 
         // graph outputs buffer
         {
-            if (output_reserve(params.n_seq_max) < params.n_seq_max) {
+            // reserve room for speculative verification batches up front: growing the pinned output
+            // buffer later costs a cudaFreeHost/cudaMallocHost pair (~60 ms) in the middle of decoding
+            const int32_t n_outputs_init = std::min<int32_t>(std::max<int32_t>(params.n_seq_max, LLAMA_OUTPUT_RESERVE_MIN), cparams.n_outputs_max);
+            if (output_reserve(n_outputs_init) < (uint32_t) n_outputs_init) {
                 throw std::runtime_error("failed to reserve initial output buffer");
             }
 

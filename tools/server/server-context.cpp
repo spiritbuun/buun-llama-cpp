@@ -3,6 +3,7 @@
 #include "server-common.h"
 #include "server-http.h"
 #include "server-cache-authority.h"
+#include "server-cache-disk.h"
 #include "server-cache-destruction-quote.h"
 #include "server-cache-plan-authority.h"
 #include "server-cache-plan-preflight-internal.h"
@@ -21,6 +22,7 @@
 #include "common.h"
 #include "common-cache-plan.h"
 #include "mtp-vocab-trim.h"
+#include "spec-defaults.h"
 #include "fit.h"
 #include "gguf.h"
 #include "llama.h"
@@ -438,6 +440,27 @@ std::string server_resume_hex(const uint8_t * data, size_t size) {
         out.push_back(digits[data[i] & 15]);
     }
     return out;
+}
+
+// Producer identity for the prompt-cache disk tier: what the parked state bytes depend on and
+// nothing else. It reuses the resume-compat key — the same model/runtime contract a saved
+// conversation must match to restore — plus the format version. Objects written under a
+// different identity are a foreign model or cache configuration and are dropped at scan time.
+std::string server_cache_disk_producer_identity(
+        const llama_model * model,
+        const common_params & params) {
+    if (!model) {
+        return std::string();
+    }
+    const auto key = server_resume_key_build(model, params);
+    if (!key.family_compatible) {
+        return std::string();
+    }
+    llama_sha256_writer writer;
+    static constexpr char domain[] = "buun.server.cache-disk-producer/v1";
+    writer.string(domain, sizeof(domain) - 1);
+    writer.bytes(key.digest.data(), key.digest.size());
+    return server_resume_hex(writer.finish().data(), 32);
 }
 
 // SHA-256, domain buun.server.resume-prefix/v1, over the ledger's token ids [0, p) as LE u32.
@@ -1803,6 +1826,10 @@ struct server_slot {
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
 
+    // per-slot exact p/q verification counters, printed in print_timings
+    uint64_t n_spec_pq_pos = 0;  // draft positions verified with the full q rows
+    uint64_t n_spec_pq_rows = 0; // verification rounds that used any q rows
+
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
     std::unique_ptr<const server_task> task;
@@ -2635,6 +2662,8 @@ struct server_slot {
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
         n_accepted_per_pos.clear();
+        n_spec_pq_pos = 0;
+        n_spec_pq_rows = 0;
 
         n_predict_max = -1;
 
@@ -3160,6 +3189,12 @@ struct server_slot {
             SLT_INF(*this,
                     "draft acceptance = %0.5f (%5d accepted / %5d generated), mean len = %5.2f\n",
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
+            if (n_spec_pq_rows > 0) {
+                const uint64_t n_id = n_draft_total - n_spec_pq_pos;
+                SLT_INF(*this,
+                        "     spec pq = %zu positions verified by p/q (%zu rounds) + %zu by id-match\n",
+                        n_spec_pq_pos, n_spec_pq_rows, n_id);
+            }
             SLT_TRC(*this,
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
 
@@ -7956,6 +7991,7 @@ private:
             if (type == COMMON_SPECULATIVE_TYPE_NONE) { continue; }
             if (selected != COMMON_SPECULATIVE_TYPE_NONE ||
                 (type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP &&
+                 type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE &&
                  type != COMMON_SPECULATIVE_TYPE_DFLASH &&
                  type != COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)) { return {}; }
             selected = type;
@@ -8027,7 +8063,8 @@ private:
         }
         const auto draft_type = active_prefix_draft_type();
         if (!draft_type) { return; }
-        const bool mtp = *draft_type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+        const bool mtp = *draft_type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP ||
+                         *draft_type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE;
         const bool dflash = *draft_type == COMMON_SPECULATIVE_TYPE_DFLASH;
         const bool shared_dflash = *draft_type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
         const bool drafting = mtp || dflash || shared_dflash;
@@ -9515,6 +9552,12 @@ private:
             vbr_prompt_cache_mode ==
                 common_vbr_prompt_cache_mode::enabled_explicit;
 
+        // A target model that ships a built-in MTP head gets the MTP drafter on by default
+        // (GGUF header probe, no tensor data). Runs before the vocab-trim and DFlash
+        // preflights so the first launch accounts the drafter like an explicit --spec-type
+        // would. An explicit --spec-type (including none) wins.
+        common_speculative_apply_model_default(params_base);
+
         // Qwen-27B external MTP sidecars can derive and reuse a frequency-prior
         // vocabulary-trimmed copy. This runs before fit/placement so the first
         // launch also accounts the smaller LM head. The source GGUF is immutable;
@@ -9550,7 +9593,8 @@ private:
         const bool has_draft = params_base.speculative.has_dft();
         const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                         params_base.speculative.types.end(),
-                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end()
+                            || params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE);
         const bool has_spec = has_draft || spec_mtp;
         const server_shared_draft_device_config shared_draft_devices = server_prepare_shared_draft_devices(params_base);
 
@@ -9730,6 +9774,7 @@ private:
         const bool speculative_target_active =
             params_base.speculative.has_dft() ||
             params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) ||
+            params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) ||
             params_base.speculative.has_model_free_type();
         bool target_uses_rs_plane = false;
         if (speculative_target_active && params_base.speculative.need_n_rs_seq() > 0) {
@@ -10407,7 +10452,8 @@ private:
                     params_base.speculative.draft.ctx_mtp = ctx_mtp.get();
                 }
             }
-        } else if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP)) {
+        } else if (params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP)
+                || params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE)) {
             // no new model load, so we simply report 0.0 and 1.0 progress
             load_progress_callback(0.0f, &load_progress_spec);
             load_progress_spec.t_last_load_progress_ms = 0;  // reset so internal cbs aren't delayed
@@ -10928,6 +10974,16 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            if (!params_base.cache_disk_path.empty()) {
+                const auto producer_identity = server_cache_disk_producer_identity(model_tgt, params_base);
+                if (producer_identity.empty()) {
+                    SRV_WRN("%s", "prompt cache disk tier disabled: model identity is not buildable\n");
+                } else {
+                    const uint64_t limit_bytes = params_base.cache_disk_limit_mib <= 0
+                        ? 0 : uint64_t(params_base.cache_disk_limit_mib)*1024*1024;
+                    prompt_cache->set_cache_disk_tier(params_base.cache_disk_path, producer_identity, limit_bytes);
+                }
+            }
             if (params_base.vbr_prompt_cache &&
                 params_base.vbr_anchor_cache_mib > 0) {
                 const uint64_t anchor_bytes =
@@ -19855,6 +19911,7 @@ private:
             params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE) ||
             params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) ||
             params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) ||
+            params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) ||
             params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) ||
             params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK);
         const bool shared_block_diffusion =
@@ -22995,6 +23052,10 @@ private:
                         proposal->top_k, proposal->candidate_ids, proposal->q_rows,
                         q_covered, ids);
                     if (accepted_from_proposal) {
+                        // exact p/q positions verified this round; the rest of the
+                        // draft (and any other rounds) were verified by id-match
+                        slot.n_spec_pq_pos += q_covered;
+                        slot.n_spec_pq_rows += 1;
                         SLT_DBG(slot, "verified %zu-token draft with %zu exact q rows\n",
                             slot.spec_draft.size(), q_covered);
                     }

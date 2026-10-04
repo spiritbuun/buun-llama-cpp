@@ -270,3 +270,10 @@ LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_mode
 // if out is nullptr, returns the number of tokens without writing to out
 // caller must allocate enough memory for out before calling
 LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out);
+
+// Build the runtime compact MTP draft head (llamAmpere 65K shortlist) for a
+// built-in nextn-head model without a sidecar d2t. Idempotent; a logged no-op
+// when the model is ineligible (sidecar d2t, tokenizer mismatch, LoRA adapters,
+// speculative-scale head, split/host head buffer, LLAMA_MTP_VOCAB_MAP=0).
+// See src/llama-mtp-vocab.h.
+LLAMA_API bool llama_model_init_mtp_draft_vocab(const struct llama_model * model);

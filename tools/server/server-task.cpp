@@ -1842,6 +1842,97 @@ server_prompt_cache::server_prompt_cache(
     this->limit_tokens = limit_tokens;
 }
 
+//
+// disk tier (P4): park/restore of host prompt-cache conversations on disk
+//
+void server_prompt_cache::set_cache_disk_tier(const std::string & dir,
+                                              const std::string & producer_identity,
+                                              uint64_t limit_bytes) {
+    disk_tier.reset();
+    disk_producer_identity.clear();
+    if (dir.empty()) {
+        return;
+    }
+    server_cache_disk_status status = server_cache_disk_status::ok;
+    std::string error;
+    auto tier = server_cache_disk_tier::open(dir, producer_identity, limit_bytes, status, error);
+    if (!tier) {
+        SRV_ERR("prompt cache disk tier: %s (%s) - the tier is disabled\n",
+                server_cache_disk_status_name(status), error.c_str());
+        return;
+    }
+    disk_tier = std::move(tier);
+    disk_producer_identity = producer_identity;
+    SRV_INF("prompt cache disk tier: %s, %zu conversations parked, %.1f MiB (limit: %s)\n",
+            disk_tier->dir().c_str(),
+            disk_tier->entries().size(),
+            disk_tier->total_size() / (1024.0 * 1024.0),
+            limit_bytes == 0 ? "unlimited" : std::to_string(limit_bytes / (1024.0 * 1024.0)).c_str());
+}
+
+bool server_prompt_cache::disk_spill_entry(const server_prompt_cache_state & entry) {
+    if (!disk_tier) {
+        return false;
+    }
+    if (entry.prompt.tokens.has_mtmd) {
+        SRV_WRN("%s", " - not spilling multimodal prompt to the disk tier\n");
+        return false;
+    }
+    const auto * fixed = entry.payload.fixed_state();
+    if (!fixed || !entry.payload.fixed_state_restorable() || fixed->main.empty()) {
+        return false;
+    }
+    const llama_tokens tokens = entry.prompt.tokens.get_text_tokens();
+    SRV_INF(" - spilling prompt with %zu tokens and %zu checkpoints to the disk tier (%.1f MiB)\n",
+            tokens.size(), entry.prompt.checkpoints.size(),
+            (fixed->main.size() + fixed->drft.size()) / (1024.0 * 1024.0));
+    return disk_tier->spill(tokens, entry.adapter_config_key,
+                            fixed->main.data(), fixed->main.size(),
+                            fixed->drft.data(), fixed->drft.size(),
+                            entry.prompt.checkpoints, entry.prompt.sequence_epoch);
+}
+
+bool server_prompt_cache::disk_restore_entry(
+        const server_cache_disk_entry & entry,
+        server_prompt & prompt_out,
+        llama_context * ctx_tgt, llama_context * ctx_dft,
+        int32_t id_slot,
+        server_prompt_cache_restore_shape & restore_shape) {
+    if (!disk_tier) {
+        return false;
+    }
+    server_cache_disk_image image;
+    if (!disk_tier->read(entry, image)) {
+        SRV_WRN(" - disk tier: failed to read %s (checksum or read error)\n", entry.file.c_str());
+        return false;
+    }
+    const size_t n_tgt = llama_state_seq_set_data_ext(
+        ctx_tgt, image.main.data(), image.main.size(), id_slot, 0);
+    if (n_tgt != image.main.size()) {
+        SRV_ERR(" - disk tier: failed to restore target state (%zu != %zu bytes)\n",
+                n_tgt, image.main.size());
+        return false;
+    }
+    bool draft_restored = false;
+    if (ctx_dft && !image.drft.empty()) {
+        const size_t n_dft = llama_state_seq_set_data_ext(
+            ctx_dft, image.drft.data(), image.drft.size(), id_slot, 0);
+        if (n_dft != image.drft.size()) {
+            SRV_WRN(" - disk tier: failed to restore draft state (%zu != %zu bytes)\n",
+                    n_dft, image.drft.size());
+            return false;
+        }
+        draft_restored = true;
+    }
+    prompt_out.tokens = server_tokens(image.tokens, false);
+    prompt_out.checkpoints = image.checkpoints;
+    prompt_out.sequence_epoch = image.sequence_epoch;
+    restore_shape = draft_restored
+        ? server_prompt_cache_restore_shape::target_and_draft
+        : server_prompt_cache_restore_shape::target_only;
+    return true;
+}
+
 bool server_prompt_cache::enable_retention_shadow() noexcept {
     if (!retention_shadow_rows) {
         retention_shadow_rows.reset(new (std::nothrow)
@@ -4574,6 +4665,15 @@ static server_prompt_cache::iterator server_prompt_cache_destroy_entry_impl(
 server_prompt_cache::iterator server_prompt_cache::destroy_entry(
         iterator it,
         server_cache_destruction_reason reason) {
+    // Park the entry before it is erased: eviction (capacity/token limit/dedup) is the moment a
+    // host conversation leaves RAM. The snapshot is the entry's current immutable bytes; restore
+    // later writes them back verbatim. Shutdown and consumed-restore are terminal — nothing to
+    // park (the object is gone forever in the first case, and the bytes just landed in a slot).
+    if (disk_tier &&
+        reason != server_cache_destruction_reason::host_shutdown &&
+        reason != server_cache_destruction_reason::host_consumed_restore) {
+        disk_spill_entry(*it);
+    }
     return destroy_entry_impl(it, reason, states.end());
 }
 
@@ -7069,6 +7169,12 @@ bool server_prompt_cache::evict_front_under_pressure(
             " - removing fallback host entry source_id=%d (size = %.3f MiB)\n",
             legacy_floor->cache_plan_source_id,
             legacy_floor->size() / (1024.0 * 1024.0));
+        // Legacy (lifecycle-off) capacity floor: park the victim's bytes before the raw erase so
+        // a restart can restore this conversation. The lifecycle-authority floor goes through
+        // destroy_entry(), which spills on its own.
+        if (disk_tier && reason != server_cache_destruction_reason::host_shutdown) {
+            disk_spill_entry(*legacy_floor);
+        }
         bool floor_evicted = false;
         if (legacy_floor->payload.kind() ==
                 server_prompt_cache_payload_kind::vbr_artifact) {
@@ -9091,6 +9197,53 @@ bool server_prompt_cache::load_impl(
     restore_shape = server_prompt_cache_restore_shape::none;
     const auto selected = select_impl<Observed>(prompt, tokens_new, adapter_config_key, rec, reuse);
     if (selected.source == states.end()) {
+        // The RAM cache has nothing better. The disk tier may hold a parked conversation that
+        // matches the incoming tokens: restore its state verbatim into the (empty) slot so the
+        // prefill below skips the restored prefix. A disk miss leaves the slot untouched.
+        if (disk_tier && !tokens_new.has_mtmd) {
+            const llama_tokens incoming = tokens_new.get_text_tokens();
+            auto best = disk_tier->entries().end();
+            int best_lcp = 0;
+            for (auto it = disk_tier->entries().begin(); it != disk_tier->entries().end(); ++it) {
+                if (it->adapter_config_key != adapter_config_key) {
+                    continue;
+                }
+                size_t lcp = 0;
+                for (; lcp < it->tokens.size() && lcp < incoming.size() && it->tokens[lcp] == incoming[lcp]; ++lcp) {}
+                // a parked entry must retain enough of itself to be worth reading
+                if (int(lcp) < 0 || float(lcp) / float(it->tokens.size()) < 0.25f) {
+                    continue;
+                }
+                if (lcp > size_t(best_lcp)) {
+                    best = it;
+                    best_lcp = int(lcp);
+                }
+            }
+            if (best != disk_tier->entries().end()) {
+                SRV_INF(" - disk tier: restoring parked conversation %s (%zu tokens, %.1f MiB, lcp %d)\n",
+                        best->file.c_str(), best->tokens.size(),
+                        best->size / (1024.0 * 1024.0), best_lcp);
+                const int64_t t_start = ggml_time_us();
+                server_prompt_cache_restore_shape disk_shape = server_prompt_cache_restore_shape::none;
+                if (disk_restore_entry(*best, prompt, ctx_tgt, ctx_dft, id_slot, disk_shape)) {
+                    SRV_INF(" - disk tier: restored %zu tokens in %.2f ms, skipping prefill for them\n",
+                            best->tokens.size(), (ggml_time_us() - t_start) / 1000.0);
+                    // the object is consumed: it is now live in the slot and will be reparked by
+                    // the next eviction through the ordinary destroy path
+                    disk_tier->remove(*best);
+                    restore_shape = disk_shape;
+                    return true;
+                }
+                // a read/restore failure means the object is useless too
+                disk_tier->remove(*best);
+                if constexpr (Observed) {
+                    if (auto * sel = rec->selected_row(common_cache_plan_provider::host_cache_entry)) {
+                        sel->note_reject(COMMON_CACHE_PLAN_REASON_PAYLOAD_SHORT);
+                    }
+                }
+                return false;
+            }
+        }
         // nothing better than the slot's current state; leave the slot as-is
         return true;
     }

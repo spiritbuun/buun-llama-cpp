@@ -737,6 +737,19 @@ struct llama_model {
     struct ggml_tensor * fc_in_s = nullptr;
     struct ggml_tensor * d2t = nullptr;  // draft to target vocabulary mapping
 
+    // runtime compact MTP draft head for built-in nextn models without a sidecar
+    // d2t (built by llama_model_init_mtp_draft_vocab, src/llama-mtp-vocab.cpp;
+    // consumed by arch graph builds under cparams.embeddings_nextn_masked, i.e.
+    // draft decodes only). ids: I32 [n_sel]; compact: [n_embd, n_sel] in the
+    // output head's own quant type (bit-identical row gather).
+    struct mtp_draft_vocab_state {
+        ggml_context_ptr        ctx;
+        ggml_backend_buffer_ptr buf;
+        struct ggml_tensor * ids     = nullptr;
+        struct ggml_tensor * compact = nullptr;
+        bool                   attempted = false;
+    } mtp_draft_vocab;
+
     // dspark
     struct ggml_tensor * dspark_markov_w1   = nullptr;
     struct ggml_tensor * dspark_markov_w2   = nullptr;

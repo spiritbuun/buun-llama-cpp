@@ -5,6 +5,13 @@
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 bool ggml_cuda_q8_0_mmv_post_silu_supported(int cc, int64_t ncols_x);
 
+// Shared-quantize cache (q8_cache in common.cuh): ggml_cuda_q8_cacheable says whether a q8_1
+// activation of q8_bytes may be cached on the current stream; ggml_cuda_q8_cache_claim keys the
+// cache on (src1 tensor, data pointer, src0 type layout, size, ne10_padded, graph epoch).
+bool   ggml_cuda_q8_cacheable(const ggml_backend_cuda_context & ctx, size_t q8_bytes);
+char * ggml_cuda_q8_cache_claim(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, ggml_type type_src0,
+                                size_t q8_bytes, int64_t ne10_padded);
+
 void ggml_cuda_mul_mat_vec_q_fwht(ggml_backend_cuda_context & ctx,
     const ggml_tensor * input, const ggml_tensor * signs, ggml_tensor * dst);
 

@@ -183,6 +183,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,  // standalone draft model speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,  // Eagle3 speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_MTP,     // Multi-token prediction
+    COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, // Multi-token prediction with adaptive draft depth
     COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,  // DFlash speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,  // DSpark speculative decoding (DFlash + Markov head)
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding based on n-grams
@@ -337,8 +338,9 @@ struct common_params_model {
 
 // draft-model-based speculative decoding parameters
 struct common_params_speculative_draft {
-    int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
+    int32_t n_max = 4; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
+    int32_t n_min_adaptive = 3; // minimum adaptive MTP draft depth (--spec-type draft-mtp-adaptive)
     bool n_max_set = false; // true when the user explicitly overrides the draft depth
 
     // Qwen-27B MTP-only sidecars: 32768 enables the experimental public
@@ -365,6 +367,9 @@ struct common_params_speculative_draft {
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    bool cache_type_k_explicit = false; // -ctkd was given (beats --spec-draft-cache-follow)
+    bool cache_type_v_explicit = false; // -ctvd was given (beats --spec-draft-cache-follow)
+    bool draft_cache_follow = false; // inherit the main model -ctk/-ctv when -ctkd/-ctvd are unset
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
@@ -400,6 +405,7 @@ struct common_params_speculative_ngram_cache {
 
 struct common_params_speculative {
     std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
+    bool spec_type_set = false; // true when the user explicitly set --spec-type (including none)
 
     double synth_len = -1.0;
     std::vector<double> synth_rates;
@@ -459,7 +465,8 @@ struct common_params_speculative {
     }
 
     bool uses_mtp_as_primary_drafter() const {
-        return has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) &&
+        return (has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) ||
+                has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE)) &&
                !has_non_mtp_model_drafter();
     }
 
@@ -477,7 +484,7 @@ struct common_params_speculative {
 
     uint32_t need_n_rs_seq() const {
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
         return needs_rs_seq ? draft.n_max : 0u;
@@ -950,6 +957,11 @@ struct common_params {
     bool log_json = false;
 
     std::string slot_save_path;
+    // Prompt-cache disk tier (P4): parked host-prompt-cache conversations spill to this
+    // directory so they survive a server restart. Empty = the tier is off.
+    std::string cache_disk_path;
+    // Byte limit for the disk tier; 0 = unlimited.
+    int32_t cache_disk_limit_mib = 0;
     bool        resume = false; // save the slots' conversations at shutdown and sleep, restore them at startup and wake
     std::string resume_path;    // root of the resume store, empty: the cache directory
     bool        resume_no_host_cache = false; // save and restore the slots only, not the host prompt cache

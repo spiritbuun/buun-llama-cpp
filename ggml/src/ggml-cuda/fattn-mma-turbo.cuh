@@ -41,9 +41,23 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
 
     const size_t nbytes_shared_KV = nbytes_shared_KV_1stage; // nstages=0 → 1-stage layout
 
-    const size_t nbytes_shared_total = std::max(nbytes_shared_combine, Q_in_reg ?
+    size_t nbytes_shared_total = std::max(nbytes_shared_combine, Q_in_reg ?
         std::max(nbytes_shared_Q,  nbytes_shared_KV + nbytes_shared_mask) :
                  nbytes_shared_Q + nbytes_shared_KV + nbytes_shared_mask);
+    if constexpr (ggml_cuda_fattn_turbo_stage<DKQ, DV, ncols1, ncols2, type_K, type_V>()) {
+        // raw compressed-tile staging buffers after the Q/KV/mask region (offset mirrored
+        // in flash_attn_ext_f16_process_tile). Rows are copied with 16-byte cp.async where
+        // the layout allows it, else 4-byte; both need 4-byte-aligned sources. Compile-time
+        // per instance so nbytes_shared_total - and the once-raised shared-memory attribute
+        // below - stay constant for the lifetime of the instance.
+        const size_t stage_off = ggml_cuda_fattn_align16((int) (Q_in_reg ?
+            std::max(nbytes_shared_Q, nbytes_shared_KV + nbytes_shared_mask) :
+            nbytes_shared_Q + nbytes_shared_KV + nbytes_shared_mask));
+        GGML_ASSERT(dst->src[1]->nb[1] % 4 == 0 && dst->src[1]->nb[2] % 4 == 0 && ((uintptr_t) dst->src[1]->data) % 4 == 0);
+        GGML_ASSERT(dst->src[2]->nb[1] % 4 == 0 && dst->src[2]->nb[2] % 4 == 0 && ((uintptr_t) dst->src[2]->data) % 4 == 0);
+        nbytes_shared_total = std::max(nbytes_shared_total,
+            stage_off + (size_t) ggml_cuda_fattn_turbo_stage_bytes<DKQ, DV, ncols2, type_K, type_V>(nbatch_fa));
+    }
 
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
@@ -240,3 +254,7 @@ DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_TURBO3_0,   GGML_TYPE_TURBO3_0)
 DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO3_0,   GGML_TYPE_TURBO3_0)
 DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_TURBO2_0,   GGML_TYPE_TURBO2_0)
 DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO2_0,   GGML_TYPE_TURBO2_0)
+// q8_0 K (original domain, no WHT rotation) over turbo3 / q8_0 V, D=256: the Qwen q8_0-K
+// fused verify path reads K straight from the q8_0 cache and dequants V in-tile.
+DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_Q8_0,       GGML_TYPE_TURBO3_0)
+DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_Q8_0,       GGML_TYPE_Q8_0)

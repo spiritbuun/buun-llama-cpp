@@ -44,6 +44,7 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"draft-simple",  COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
     {"draft-eagle3",  COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3},
     {"draft-mtp",     COMMON_SPECULATIVE_TYPE_DRAFT_MTP},
+    {"draft-mtp-adaptive", COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE},
     {"draft-dflash",  COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH},
     {"draft-dspark",  COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK},
     {"ngram-simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
@@ -56,7 +57,8 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"recycle",       COMMON_SPECULATIVE_TYPE_RECYCLE},
     {"dflash",        COMMON_SPECULATIVE_TYPE_DFLASH},
     {"draft",         COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
-    {"mtp",           COMMON_SPECULATIVE_TYPE_DRAFT_MTP}
+    {"mtp",           COMMON_SPECULATIVE_TYPE_DRAFT_MTP},
+    {"mtp-adaptive",  COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE}
 };
 
 bool common_speculative_mtp_carry_lifecycle::draft_ready() const noexcept {
@@ -2464,39 +2466,105 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
-    struct proposal_policy {
-        int top_k = 0; // zero retains legacy greedy drafting
-        float temp = 1;
-        float top_p = 1;
-    };
-    std::vector<proposal_policy> proposal_sampling;
-    std::vector<std::mt19937> proposal_rngs;
+    // Exact p/q drafting (PQ1): a drafter-side sampler that mirrors the request's
+    // top-k / top-p / min-p / temperature over the full candidate distribution.
+    // Each draft token is drawn from it and the resulting row (its complete
+    // normalized output) is recorded so the target verifies by rejection
+    // sampling. LLAMA_SPEC_PQ=0 restores identity-match drafting.
+    bool pq_enabled = true;
+    bool pq_backend_warned = false;
+    std::vector<common_sampler_ptr> q_smpls;
+    // The mirror params each q_smpls entry was built from (rebuild on change).
+    std::vector<common_params_sampling> q_params;
+
     std::vector<common_speculative_proposal> proposals;
 
+    // The q row width is the request's top-k (or the full vocabulary). This
+    // is the drafter-side candidate count recorded per draft position; it is
+    // NOT the legacy drafter top-k=10 slice.
     void configure_sampling(llama_seq_id seq_id, const common_params_sampling & sampling) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
-        // The proposal may differ from the target's filtered distribution: the
-        // verifier uses the actual q and the full target sampling chain. Keep
-        // threshold confidence and unqualified MTP architectures unchanged.
-        const bool eligible = !is_mem_shared && !chain_heads && params.p_min == 0 &&
+        // Structural exclusions: shared-KV and chained-head MTP architectures
+        // plus a non-zero drafter p_min keep the legacy greedy proposal path.
+        const bool structural = is_mem_shared || chain_heads || params.p_min != 0;
+        // The target must sample with a bounded, finite distribution the drafter
+        // can mirror. Mirostat/adaptive-p update persistent state and are
+        // handled by the verifier's id-match fallback.
+        const bool target_ok =
             std::isfinite(sampling.temp) && sampling.temp > 0 &&
-            sampling.top_k > 0 && sampling.top_k <= 64 &&
-            sampling.top_p > 0 && sampling.top_p <= 1 && sampling.mirostat == 0 &&
+            sampling.top_k > 0 &&
+            sampling.top_p > 0 && sampling.top_p <= 1 &&
+            sampling.mirostat == 0 &&
             std::find(sampling.samplers.begin(), sampling.samplers.end(),
                 COMMON_SAMPLER_TYPE_ADAPTIVE_P) == sampling.samplers.end();
-        const int top_k = eligible ? sampling.top_k : 0;
-        const int old_width = proposal_sampling[seq_id].top_k ? proposal_sampling[seq_id].top_k : 10;
-        const int width = top_k ? top_k : 10;
-        proposal_sampling[seq_id] = { top_k, sampling.temp, sampling.top_p };
-        proposal_rngs[seq_id].seed(sampling.seed ^ 0x85ebca6bU);
-        proposals[seq_id].clear();
-        if (width != old_width) {
-            configure_candidates(seq_id, width);
+        const bool eligible = !structural && target_ok;
+        if (pq_enabled && eligible) {
+            pq_sampler(seq_id, sampling);
         }
-        SPC_TRC("MTP seq=%d proposal=%s top_k=%d temp=%.3f top_p=%.3f\n",
-                seq_id, top_k ? "sampled" : "greedy", width, sampling.temp, sampling.top_p);
+        SPC_TRC("MTP seq=%d pq=%s top_k=%d temp=%.3f top_p=%.3f\n",
+                seq_id, (pq_enabled && eligible) ? "on" : "off", sampling.top_k, sampling.temp, sampling.top_p);
+    }
+
+    // Build (or rebuild) the drafter-side q sampler that mirrors the request's
+    // top-k / top-p / min-p / temperature over the full candidate distribution.
+    // Only the distribution-shaping samplers are mirrored; penalties, DRY, XTC,
+    // typical-p, top-n-sigma and adaptive-p are dropped (q then differs a little
+    // from p, which the verifier's rejection sampling absorbs).
+    common_sampler * pq_sampler(llama_seq_id seq_id, const common_params_sampling & tgt) {
+        auto & smpl = q_smpls[seq_id];
+        auto & cur  = q_params[seq_id];
+        const bool same = smpl &&
+            cur.temp == tgt.temp && cur.top_k == tgt.top_k && cur.top_p == tgt.top_p &&
+            cur.min_p == tgt.min_p && cur.min_keep == tgt.min_keep &&
+            cur.dynatemp_range == tgt.dynatemp_range &&
+            cur.dynatemp_exponent == tgt.dynatemp_exponent &&
+            cur.seed == tgt.seed && cur.samplers == tgt.samplers;
+        if (same) {
+            return smpl.get();
+        }
+
+        common_params_sampling sp;
+        sp.no_perf           = false;
+        sp.temp              = tgt.temp;
+        sp.top_k             = tgt.top_k;
+        sp.top_p             = tgt.top_p;
+        sp.min_p             = tgt.min_p;
+        sp.min_keep          = tgt.min_keep;
+        sp.dynatemp_range    = tgt.dynatemp_range;
+        sp.dynatemp_exponent = tgt.dynatemp_exponent;
+        // A different stream than the target chain's draw.
+        sp.seed              = tgt.seed == LLAMA_DEFAULT_SEED ? LLAMA_DEFAULT_SEED : (tgt.seed ^ 0x27d4eb2fU);
+        sp.backend_sampling  = false;
+        sp.samplers.clear();
+        bool has_temp = false;
+        for (const auto t : tgt.samplers) {
+            switch (t) {
+                case COMMON_SAMPLER_TYPE_TOP_K:
+                case COMMON_SAMPLER_TYPE_TOP_P:
+                case COMMON_SAMPLER_TYPE_MIN_P:
+                    sp.samplers.push_back(t);
+                    break;
+                case COMMON_SAMPLER_TYPE_TEMPERATURE:
+                    sp.samplers.push_back(t);
+                    has_temp = true;
+                    break;
+                default:
+                    break; // penalties / DRY / XTC / typical / top-n-sigma / adaptive-p
+            }
+        }
+        if (!has_temp) {
+            sp.samplers.push_back(COMMON_SAMPLER_TYPE_TEMPERATURE);
+        }
+
+        smpl.reset(common_sampler_init(llama_get_model(params.ctx_dft), sp));
+        cur = tgt;
+
+        SPC_INF("seq %d: p/q draft sampler rebuilt: temp=%.2f top_k=%d top_p=%.2f min_p=%.2f\n",
+                (int) seq_id, sp.temp, sp.top_k, sp.top_p, sp.min_p);
+
+        return smpl.get();
     }
 
     const common_speculative_proposal * get_proposal(llama_seq_id seq_id) const override {
@@ -2527,23 +2595,30 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
-    llama_token sample_proposal(llama_seq_id seq_id, const llama_token_data_array & candidates) {
-        const auto & sampling = proposal_sampling[seq_id];
-        auto row = candidates;
-        row.size = std::min((size_t) sampling.top_k, candidates.size);
-        const int k = row.size;
-        float q[64];
-        const llama_token token = common_sampler_proposal_row(row, sampling.temp, sampling.top_p,
-                std::generate_canonical<double, 53>(proposal_rngs[seq_id]), q);
-        if (token == LLAMA_TOKEN_NULL) {
-            return token;
+    // Draw one draft token from the request-matched q sampler and record its
+    // complete normalized output row for the verifier. Returns LLAMA_TOKEN_NULL
+    // when the position must fall back to identity-match (no usable row).
+    llama_token sample_proposal(llama_seq_id seq_id, common_sampler * q_smpl) {
+        const llama_token token = common_sampler_sample(q_smpl, params.ctx_dft, i_last[seq_id], true);
+        // A backend-sampled token means the recorded distribution is not the one
+        // it was drawn from, so this row cannot be verified by rejection.
+        if (llama_get_sampled_token_ith(params.ctx_dft, i_last[seq_id]) != LLAMA_TOKEN_NULL) {
+            if (!pq_backend_warned) {
+                SPC_WRN("%s", "draft backend sampler returns tokens; p/q drafting falls back to argmax\n");
+                pq_backend_warned = true;
+            }
+            return LLAMA_TOKEN_NULL;
+        }
+        const auto * q = common_sampler_get_candidates(q_smpl, false);
+        if (!q || q->size == 0) {
+            return LLAMA_TOKEN_NULL;
         }
         auto & proposal = proposals[seq_id];
         proposal.seq_id = seq_id;
-        proposal.top_k = k;
-        for (int i = 0; i < k; ++i) {
-            proposal.candidate_ids.push_back(candidates.data[i].id);
-            proposal.q_rows.push_back(q[i]);
+        proposal.top_k = (int32_t) q->size;
+        for (size_t r = 0; r < q->size; ++r) {
+            proposal.candidate_ids.push_back(q->data[r].id);
+            proposal.q_rows.push_back(q->data[r].p);
         }
         proposal.selected.push_back(token);
         proposal.q_covered_tokens = proposal.selected.size();
@@ -2625,10 +2700,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // TODO: fix, how to call without malloc
         batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
 
-        proposal_sampling.resize(n_seq);
-        proposal_rngs.resize(n_seq);
         proposals.resize(n_seq);
         smpls.resize(n_seq);
+        q_smpls.resize(n_seq);
+        q_params.resize(n_seq);
         backend_chains.assign(n_seq, nullptr);
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             configure_candidates(seq_id, 10);
@@ -2637,20 +2712,33 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
 
+        // Built-in-head models (no sidecar d2t): build the runtime compact 65K
+        // draft head once so every draft step scores ~272 MB of gathered head
+        // rows instead of the full-vocab LM head (~1 GB re-read per step).
+        // Idempotent; a no-op for derivative GGUFs, non-qwen35 archs, or
+        // tokenizer mismatches (LLAMA_MTP_VOCAB_MAP=0 disables).
+        llama_model_init_mtp_draft_vocab(llama_get_model(ctx_dft));
+
         // Every MTP context points at its target through ctx_other, but Qwen-family
         // MTP contexts own a separate filtered cache. Ask the memory about the cells
         // that the drafting algorithm actually depends on.
         is_mem_shared = llama_memory_has_shared_cells(llama_get_memory(ctx_dft));
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
-        const char * adaptive_env = getenv("GGML_MTP_DRAFT_ADAPTIVE");
-        // Qualified recursive caps retain backoff/recovery; a larger configured
-        // cap must not silently turn low-match prose into fixed-depth drafting.
-        adaptive_recursive_depth = n_mtp_layers == 1 && !is_mem_shared &&
-                                   this->params.n_max >= 3 && this->params.n_max <= 5 &&
-                                   !(adaptive_env && atoi(adaptive_env) == 0);
-        adaptive.assign(n_seq, common_speculative_mtp_adaptive(this->params.n_min, this->params.n_max));
+        // Adaptive draft depth: selected by the draft-mtp-adaptive type. The
+        // n_max==3 + GGML_MTP_DRAFT_ADAPTIVE probe is superseded by the explicit
+        // type; the fixed draft-mtp path keeps its given n_max untouched.
+        const bool adaptive_type = params.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE);
+        adaptive_recursive_depth = n_mtp_layers == 1 && !is_mem_shared && adaptive_type;
+        adaptive.assign(n_seq, common_speculative_mtp_adaptive(
+                std::max(1, std::min(this->params.n_min_adaptive, this->params.n_max)),
+                this->params.n_max));
         adaptive_last_draft_size.assign(n_seq, 0);
+        if (adaptive_recursive_depth) {
+            SPC_TRC("- adaptive draft depth: min %d, max %d\n",
+                    std::max(1, std::min(this->params.n_min_adaptive, this->params.n_max)),
+                    this->params.n_max);
+        }
 
         if (chain_heads) {
             this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
@@ -2671,6 +2759,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+
+        // Exact p/q drafting is on by default (PQ1 shipped); LLAMA_SPEC_PQ=0
+        // restores identity-match draft verification everywhere.
+        {
+            const char * env = getenv("LLAMA_SPEC_PQ");
+            pq_enabled = env == nullptr || std::strcmp(env, "0") != 0;
+            SPC_INF("%s", pq_enabled
+                    ? "exact p/q drafting enabled (default; LLAMA_SPEC_PQ=0 disables)\n"
+                    : "exact p/q drafting disabled (LLAMA_SPEC_PQ=0): drafts verified by identity match\n");
+        }
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -2916,6 +3014,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             n_drafting++;
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
+            // a fresh draft starts a fresh q draw stream (the q sampler has no
+            // token-history state to preserve, only its RNG)
+            if (q_smpls[seq_id]) {
+                common_sampler_reset(q_smpls[seq_id].get());
+            }
 
             common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, carry, row_bytes);
@@ -2976,21 +3079,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                             common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
                 }
 
-                // For separate-cache greedy MTP, confidence stops the next
-                // draft step. Keep the proposal already computed for target
-                // verification; shared, chained and sampled proposals retain
-                // their existing admission policy.
-                const bool stop_after_proposal = cur_p->data[0].p < params.p_min &&
-                    !is_mem_shared && !chain_heads && proposal_sampling[seq_id].top_k == 0;
-                if (cur_p->data[0].p < params.p_min && !stop_after_proposal) {
+                // only collect very high-confidence draft tokens
+                if (cur_p->data[0].p < params.p_min) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
                     continue;
                 }
 
-                const bool use_q = proposal_sampling[seq_id].top_k > 0;
-                const llama_token id = use_q ? sample_proposal(seq_id, *cur_p) : cur_p->data[0].id;
+                // Exact p/q: draw the draft token from the request-matched q sampler
+                // (full distribution) and record the row. Otherwise the drafter's
+                // argmax under its own top-k chain.
+                common_sampler * q_smpl = pq_enabled ? q_smpls[seq_id].get() : nullptr;
+                const llama_token id = q_smpl ? sample_proposal(seq_id, q_smpl) : cur_p->data[0].id;
                 if (id == LLAMA_TOKEN_NULL) {
                     drafting[seq_id] = false;
                     n_drafting--;
@@ -3010,7 +3111,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 if (dp.n_max > 0) {
                     n_max_eff = std::min(n_max_eff, dp.n_max);
                 }
-                if (stop_after_proposal || n_max_eff <= (int) result.size()) {
+                if (n_max_eff <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -3114,6 +3215,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return false;
         }
+        // A restored state changes the drafter's hidden state, so any recorded
+        // q rows no longer match it: drop the in-flight proposal (no replay).
         proposals[seq_id].clear();
         adaptive[seq_id].begin();
         return common_speculative_mtp_carry_state_load(
@@ -5220,6 +5323,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:  return "draft-simple";
         case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:  return "draft-eagle3";
         case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:     return "draft-mtp";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE: return "draft-mtp-adaptive";
         case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:  return "draft-dflash";
         case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:  return "draft-dspark";
         case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return "ngram-simple";
@@ -5312,6 +5416,7 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
             case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
             case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
                 n_max = std::max(n_max, std::max(0, spec->draft.n_max));
@@ -5484,6 +5589,18 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
+    if (params_spec.draft_cache_follow) {
+        if (params.vbr_cache_type_k || params.vbr_cache_type_v) {
+            LOG_WRN("speculative: --spec-draft-cache-follow is ignored with a VBR main model KV cache; keeping the static draft KV types\n");
+        } else {
+            if (!params_spec.cache_type_k_explicit) {
+                result.cache_type_k = params.cache_type_k;
+            }
+            if (!params_spec.cache_type_v_explicit) {
+                result.cache_type_v = params.cache_type_v;
+            }
+        }
+    }
     // Drafter caches are small and ephemeral — never arm dynamic VBR for them. The
     // wholesale copy above inherits the base params' default-on VBR flags, and a second
     // dynamic-VBR context trips the one-marker-per-process co-tenancy guard, failing
@@ -5558,7 +5675,8 @@ common_speculative_init_result::common_speculative_init_result(
     llama_context * ctx_tgt) :
     pimpl(new impl{}) {
     const bool has_draft = params.speculative.has_dft();
-    const bool spec_mtp = params.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
+    const bool spec_mtp = params.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP)
+                        || params.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE);
     const bool external_mtp_sidecar = params.speculative.has_external_mtp_sidecar();
     const bool combined_external_and_mtp = has_draft && spec_mtp && !external_mtp_sidecar;
 
@@ -5728,7 +5846,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         // SUFFIX/RECYCLE/legacy DFLASH remain per-slot. CopySpec is also hosted
         // here when paired with shared multi-seq DFlash2/MTP so both implementations
         // have one owner and one per-sequence acceptance lifecycle.
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 15);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 16);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
@@ -5747,6 +5865,8 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP,
+                common_speculative_mtp_context_available(params));
+        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE,
                 common_speculative_mtp_context_available(params));
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, params.draft.ctx_dft != nullptr);
@@ -5767,6 +5887,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
+                impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE: {
                 impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq));
                 break;
             }
@@ -6689,7 +6813,8 @@ void common_speculative_rollback_dft(common_speculative * spec, llama_seq_id seq
         return;
     }
     for (auto & impl : spec->impls) {
-        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP ||
+            impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) {
             auto * mtp = static_cast<common_speculative_impl_draft_mtp *>(impl.get());
             auto * ctx_dft = mtp->params.ctx_dft;
             llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, n_past, -1);
@@ -6930,6 +7055,7 @@ int32_t common_speculative_n_min(const common_speculative * spec, const common_p
     if (params.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE) ||
         params.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) ||
         params.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) ||
+        params.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) ||
         params.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) ||
         params.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)) {
         return params.draft.n_min;
