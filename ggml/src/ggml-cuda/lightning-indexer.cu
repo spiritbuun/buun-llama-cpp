@@ -595,12 +595,14 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // rows of its source through its index list, which skips the materialized copy
     const int32_t * k_idx_d = nullptr;
     size_t k_nb2 = nbk2;
+#if !defined(GGML_USE_HIP)
     if (k->op == GGML_OP_RESHAPE && k->src[0]->op == GGML_OP_GET_ROWS && ctx.lightning_deferred_k.erase(k->src[0]->data) != 0) {
         const ggml_tensor * gather = k->src[0];
         k       = gather->src[0];
         k_idx_d = (const int32_t *) gather->src[1]->data;
         k_nb2   = k->nb[1];
     }
+#endif
 
     const float *   q_d = (const float *)   q->data;
     const char  *   k_d = (const char  *)   k->data;

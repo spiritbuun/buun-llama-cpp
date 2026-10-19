@@ -39,6 +39,17 @@
 #define CU_CHECK(fn) {hipError_t err = fn; if(err != hipSuccess) { GGML_ABORT("HipVMM Failure: %s\n", hipGetErrorString(err)); }}
 #define __all_sync(mask, var) __all(var)
 #define __any_sync(mask, var) __any(var)
+// ROCm/HIP only provides __ldcg for the half types (see hip_fp16.h), while the
+// CUDA sources also call it on scalars (dsv4-hc.cu, topk-moe.cu). Map those to
+// an agent-scope cached load: that is what CUDA's __ldcg (read through L2,
+// bypass L1) means on AMDGPU, and it is the same idiom already used in
+// exl3-gemv-int8.cuh for cross-block published reads.
+inline __device__ unsigned int __ldcg(const unsigned int * ptr) {
+    return __hip_atomic_load(const_cast<unsigned int *>(ptr), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+}
+inline __device__ float __ldcg(const float * ptr) {
+    return __hip_atomic_load(const_cast<float *>(ptr), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+}
 #define cudaMemcpyToSymbol     hipMemcpyToSymbol
 #define cudaMemcpyFromSymbol   hipMemcpyFromSymbol
 #define cublasStrsmBatched hipblasStrsmBatched
@@ -105,6 +116,7 @@
 #define cudaMemcpyAsync ggml_hip_memcpy_async
 #define cudaMemcpyPeerAsync hipMemcpyPeerAsync
 #define cudaMemoryTypeDevice hipMemoryTypeDevice
+#define cudaMemoryTypeHost   hipMemoryTypeHost
 #define cudaPointerAttributes hipPointerAttribute_t
 #define cudaPointerGetAttributes hipPointerGetAttributes
 // CUDA-style masked warp shuffles -> plain HIP shuffles (#70). AMD has no independent thread

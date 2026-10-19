@@ -5270,6 +5270,14 @@ static int ggml_cuda_try_ordered_attention(ggml_backend_cuda_context & ctx,
 // A key gather (+ reshape) read only by a lightning indexer, as the k-pool indexers gather every
 // pooled key each step: skip the copy and let the indexer read the rows through the index list.
 static int ggml_cuda_defer_lightning_k_gather(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph, int first) {
+#if defined(GGML_USE_HIP)
+    // lightning_deferred_k lives in the CUDA-only section of common.cuh, so the
+    // deferred key gather does not exist on HIP; take the plain gather path.
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(graph);
+    GGML_UNUSED(first);
+    return 0;
+#else
     const ggml_tensor * gather = graph->nodes[first];
     if (gather->op != GGML_OP_GET_ROWS || first + 1 >= graph->n_nodes) return 0;
     const ggml_tensor * shape = graph->nodes[first + 1];
@@ -5304,6 +5312,7 @@ static int ggml_cuda_defer_lightning_k_gather(ggml_backend_cuda_context & ctx, c
     }
     ctx.lightning_deferred_k.insert(gather->data);
     return 1;
+#endif
 }
 
 static int32_t ggml_cuda_tensor_use_count(
