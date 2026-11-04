@@ -15060,6 +15060,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int64_t nt : {1, 4}) {
         test_cases.emplace_back(new test_dsv4_hc_pre_chain(4096, nt, 20, true, true));
     }
+    // DeepSeek-V4.1-Flash decode (n_embd 5120): every fold/norm variant the graph fuses
+    for (bool post_in : {false, true}) {
+        for (bool norm_out : {false, true}) {
+            test_cases.emplace_back(new test_dsv4_hc_pre_chain(5120, 1, 20, post_in, norm_out));
+        }
+    }
 
     // GLM-5 MLA per-head absorb (q -> kv_lora) and v_mla (kv_lora -> v), 16 heads per device
     for (int64_t nt : {1, 4}) {
@@ -15253,6 +15259,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (ggml_type type_a : all_types) {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
                 test_cases.emplace_back(new test_mul_mat(type_a, type_b, 4096, bs, 14336, {1,  1}, {1, 1}));
+            }
+        }
+    }
+
+    // MMVQ/MMQ crossover at small batches: n_embd-wide projections and the vocab head
+    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (int64_t m : {2560, 16384, 129280}) {
+            for (int bs : {1, 2, 3, 4, 5, 6, 8}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, bs, 4096, {1, 1}, {1, 1}));
             }
         }
     }

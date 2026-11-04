@@ -982,8 +982,10 @@ static bool run_fused_alias_fallbacks(ggml_backend_t cpu) {
             GGML_ASSERT(ggml_backend_graph_compute(cpu, graph.graph) == GGML_STATUS_SUCCESS);
             std::vector<float> actual(reference.size());
             ggml_backend_tensor_get(graph.out, actual.data(), 0, ggml_nbytes(graph.out));
+            // Down over the activations stays fully fused: the hits are dispatched
+            // before down is written and the activations restored for recovery.
             const bool cell_ok = std::memcmp(actual.data(), reference.data(), ggml_nbytes(graph.out)) == 0 &&
-                plans == (alias == 4 ? 0 : 1) && full_plans == (alias < 3 ? 1 : 0);
+                plans == (alias == 4 ? 0 : 1) && full_plans == (alias < 4 ? 1 : 0);
             printf("cache-fused-alias%d-mask%llx-failure%d: %s\n", alias,
                     (unsigned long long)mask, fail, cell_ok ? "OK" : "FAIL");
             ok &= cell_ok;
