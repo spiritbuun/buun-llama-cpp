@@ -691,7 +691,8 @@ namespace GGUFMeta {
         switch (arr_info.gt) {
             case GGUF_TYPE_UINT32:
             case GGUF_TYPE_INT32:   type_ok = (std::is_same<T,     int32_t>::value) ||
-                                              (std::is_same<T,    uint32_t>::value); break;
+                                              (std::is_same<T,    uint32_t>::value) ||
+                                              (std::is_same<T,    uint64_t>::value && arr_info.gt == GGUF_TYPE_UINT32); break;
             case GGUF_TYPE_UINT64:  type_ok = (std::is_same<T,    uint64_t>::value); break;
             case GGUF_TYPE_FLOAT32: type_ok = (std::is_same<T,       float>::value); break;
             case GGUF_TYPE_STRING:  type_ok = (std::is_same<T, std::string>::value); break;
@@ -710,6 +711,10 @@ namespace GGUFMeta {
                 const T value = gguf_get_arr_str(ctx, kid, i);
                 result.emplace_back(value);
             }
+        } else if (std::is_same<T, uint64_t>::value && arr_info.gt == GGUF_TYPE_UINT32) {
+            // u32 arrays widen losslessly into u64
+            const uint32_t * data = (const uint32_t *) arr_info.data;
+            result.assign(data, data + arr_info.length);
         } else {
             result.resize(arr_info.length);
             result.assign((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length);
@@ -2187,6 +2192,7 @@ void llama_model_loader::init_mappings(
             // --numa experts places the expert pages itself, so nothing may fault them in first, but
             // it keeps readahead: refaulting an evicted expert one page at a time stalls decode
             const bool mmap_numa = is_numa && !numa_experts;
+            populate_mapped = use_mmap && numa_experts;
             const size_t prefetch_size = prefetch && use_mmap && !numa_experts ? -1 : 0;
 
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, mmap_numa,
@@ -2421,6 +2427,8 @@ bool llama_model_loader::load_all_data(
         }
     }
 
+    size_t populated = 0;
+    int64_t t_populate = 0;
     for (struct ggml_tensor * cur : tensors) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (tensor_source && cur->data != nullptr) {
@@ -2471,6 +2479,15 @@ bool llama_model_loader::load_all_data(
                 if (lmlocks && !lazy.has(cur)) {
                     const auto & lmlock = lmlocks->at(weight->idx);
                     lmlock->grow_to(weight->offs + n_size);
+                }
+
+                // a first touch per page in decode costs a minor fault each, ~1M per 256 tokens
+                if (populate_mapped && !lazy.has(cur)) {
+                    const int64_t t_pop = ggml_time_us();
+                    if (mapping->populate(weight->offs, weight->offs + n_size)) {
+                        populated += n_size;
+                    }
+                    t_populate += ggml_time_us() - t_pop;
                 }
 
                 auto & mmap_used = mmaps_used[weight->idx];
@@ -2569,6 +2586,11 @@ bool llama_model_loader::load_all_data(
         ggml_backend_buffer_free(buf);
     }
     ggml_backend_free(upload_backend);
+
+    if (populated > 0) {
+        LLAMA_LOG_INFO("%s: mapped %.2f GiB of page-cached CPU tensors in %.1f s\n", __func__,
+                double(populated)/double(GiB), t_populate / 1e6);
+    }
 
     // check validation results
     bool validation_failed = false;

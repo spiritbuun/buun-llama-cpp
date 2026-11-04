@@ -622,6 +622,7 @@ struct llama_layer {
     // deepseek41
     struct ggml_tensor * engram_kv   = nullptr;
     struct ggml_tensor * engram_gate = nullptr; // q_weight*k_weight folded
+    struct ggml_tensor * engram_embd = nullptr; // this layer's n-gram table, when the tables are stored per layer
 
     // MSA
     struct ggml_tensor * index_q_proj = nullptr;

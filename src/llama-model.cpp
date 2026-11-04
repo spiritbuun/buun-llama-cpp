@@ -2580,10 +2580,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     ml.done_getting_tensors();
 
-    if (per_layer_tok_embd && ml.lazy.has(per_layer_tok_embd)) {
-        LLAMA_LOG_INFO("%s: enabling prefetch for '%s'\n", __func__, per_layer_tok_embd->name);
+    std::vector<ggml_tensor *> lookup_tables = { per_layer_tok_embd };
+    for (const auto & layer : layers) {
+        lookup_tables.push_back(layer.engram_embd);
+    }
+    for (ggml_tensor * t : lookup_tables) {
+        if (t && ml.lazy.has(t)) {
+            LLAMA_LOG_INFO("%s: enabling prefetch for '%s'\n", __func__, t->name);
 
-        can_prefetch.insert(per_layer_tok_embd);
+            can_prefetch.insert(t);
+        }
     }
 
     // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.
@@ -5186,9 +5192,9 @@ bool llama_model_has_host_moe_weights(const llama_model * model) {
     return false;
 }
 
-// token_embd, per_layer_token_embd (incl. Engram tables): read by row lookup, never multiplied
+// token_embd, per_layer_token_embd, Engram tables: read by row lookup, never multiplied
 static bool is_token_embd_table(const std::string & name) {
-    return name.find("token_embd") != std::string::npos;
+    return name.find("token_embd") != std::string::npos || name.find("engram_embd") != std::string::npos;
 }
 
 size_t llama_model_host_offload_weight_bytes(const llama_model * model) {
@@ -5222,7 +5228,7 @@ bool llama_model_largest_block_weight(
         const llama_model * model, ggml_type * type, int64_t * ne0, int64_t * ne1) {
     const ggml_tensor * best = nullptr;
     for (const auto & [name, tensor] : model->tensors_by_name) {
-        if (name.compare(0, 4, "blk.") == 0 && ggml_n_dims(tensor) == 2 &&
+        if (name.compare(0, 4, "blk.") == 0 && ggml_n_dims(tensor) == 2 && !is_token_embd_table(name) &&
                 (best == nullptr || ggml_nbytes(tensor) > ggml_nbytes(best))) {
             best = tensor;
         }

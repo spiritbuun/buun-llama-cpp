@@ -771,6 +771,30 @@ void llama_mmap::advise_random(size_t first, size_t last, bool enabled) const {
 #endif
 }
 
+bool llama_mmap::populate(size_t first, size_t last) const {
+#ifdef __linux__
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ 22
+#endif
+    const size_t page = sysconf(_SC_PAGESIZE);
+    first -= first % page;
+    last = std::min(last, size());
+    if (first >= last) return false;
+    char * beg = static_cast<char *>(addr()) + first;
+    // populating pages that are not cached would read them from disk
+    std::vector<unsigned char> vec((last - first + page - 1) / page);
+    if (mincore(beg, last - first, vec.data()) != 0) return false;
+    size_t n_cached = 0;
+    for (unsigned char v : vec) n_cached += v & 1;
+    if (n_cached * 10 < vec.size() * 9) return false;
+    return madvise(beg, last - first, MADV_POPULATE_READ) == 0;
+#else
+    GGML_UNUSED(first);
+    GGML_UNUSED(last);
+    return false;
+#endif
+}
+
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mmap::SUPPORTED  = true;
 #else

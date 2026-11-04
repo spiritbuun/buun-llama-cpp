@@ -68,6 +68,8 @@ struct llama_mmap {
     void unmap_fragment(size_t first, size_t last);
     // Best-effort hint over a live mapped range; false restores NORMAL.
     void advise_random(size_t first, size_t last, bool enabled) const;
+    // Best-effort: map [first, last) now if it is page-cached, so its first touch does not fault.
+    bool populate(size_t first, size_t last) const;
 
     static const bool SUPPORTED;
 

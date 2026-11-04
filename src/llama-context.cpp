@@ -316,6 +316,7 @@ llama_context::llama_context(
     cparams.cb_eval_user_data = params.cb_eval_user_data;
 
     cparams.ctx_other = nullptr;
+    threadpool_owner  = params.ctx_other;
 
     // Every MTP context may use ctx_other to identify its target, regardless of
     // whether its memory physically shares target cells. Storage sharing is a
@@ -6130,6 +6131,11 @@ ggml_status llama_context::graph_compute(
                    bool   batched) {
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
+    if (tp == nullptr && threadpool_owner != nullptr) {
+        // a drafter runs serially with its target: reuse the target's pool instead of
+        // spawning a disposable one per compute (CPU-resident drafter experts)
+        tp = batched ? threadpool_owner->threadpool_batch : threadpool_owner->threadpool;
+    }
 
     if (backend_cpu != nullptr) {
         auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));

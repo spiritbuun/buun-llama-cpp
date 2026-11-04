@@ -666,6 +666,7 @@ private:
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;
+    llama_context *   threadpool_owner = nullptr; // drafter: borrow the target's pools when none attached
 
     ggml_abort_callback abort_callback      = nullptr;
     void *              abort_callback_data = nullptr;

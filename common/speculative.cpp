@@ -1465,6 +1465,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         {
             gpu_sample = is_dflash2 || (this->params.backend_sampling && env_on("GGML_DFLASH_DRAFT_GPUSAMPLE"));
             if (gpu_sample) {
+                // DSpark reads only the top-1 id (its confidence comes from the nextn head),
+                // so skip the full-vocab top-K sort and use the plain argmax tail
+                if (is_dspark) {
+                    gpu_topk = 1;
+                }
                 if (!is_dflash2) {
                     llama_set_dflash_topk(ctx_dft, gpu_topk);
                 }
