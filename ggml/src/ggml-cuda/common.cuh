@@ -1446,6 +1446,9 @@ struct ggml_cuda_graph {
     // owning backend context's fattn scratch-allocation epoch at last capture
     unsigned long long fattn_scratch_epoch_at_capture = 0;
 
+    // the last evaluation waited on a deferred input (see ggml_backend_cuda_context::deferred_input)
+    bool deferred_input_wait = false;
+
     bool is_enabled() const {
         static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
         // the pre-Ampere disable is inherited upstream policy (regressions measured on
@@ -1740,6 +1743,11 @@ struct ggml_backend_cuda_context {
     // set while the meta backend records a whole tensor-parallel step on this context's stream:
     // graph_compute then launches plainly into that capture (no per-graph CUDA graph, no upload wait)
     bool external_capture = false;
+
+    // A split input uploaded on a side stream: the next graph waits on the event right before the
+    // input's first consumer, so earlier independent nodes overlap the upload.
+    const ggml_tensor * deferred_input = nullptr;
+    cudaEvent_t deferred_input_event = nullptr;
 
     // Persistent flash-attention scratch belongs to this backend context, not to the process or
     // physical device. Independent llama contexts therefore never alias Q/K/V work buffers.

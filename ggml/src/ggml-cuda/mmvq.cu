@@ -1413,21 +1413,21 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
         }
     }
     // Consumer Ampere (GA10x): MMQ's int8 tensor-core path is flat from n=2 to n=8 while MMVQ re-reads and
-    // re-decodes the weights per column. K-quants and IQ4_NL decode dearly, so MMQ wins from n=3 (n=2 for
-    // Q5_K); the cheap-to-decode types keep MMVQ to n=4 (its per-column cost there is within MMQ's fixed
-    // quantize/fixup overhead, which tensor-split shards feel most). Tuned on RTX 3090, m=4096 k=14336.
+    // re-decodes the weights per column. Q2_K/Q3_K decode dearest and cross over at n=3; the other K-quants
+    // and IQ4_NL reach parity at n=4 in isolation and win there under multi-stream load (speculative verify
+    // batches); the cheap-to-decode types keep MMVQ to n=5. Tuned on RTX 3090, k=4096/14336, m=2560..129280.
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc > GGML_CUDA_CC_AMPERE && cc < GGML_CUDA_CC_ADA_LOVELACE) {
         switch (type) {
-            case GGML_TYPE_Q5_K:
-                return ne11 <= 1;
             case GGML_TYPE_Q2_K:
             case GGML_TYPE_Q3_K:
+                return ne11 <= 2;
             case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q5_K:
             case GGML_TYPE_Q6_K:
             case GGML_TYPE_IQ4_NL:
-                return ne11 <= 2;
-            default:
                 return ne11 <= 4;
+            default:
+                return ne11 <= 5;
         }
     }
 #if !defined(GGML_USE_HIP)

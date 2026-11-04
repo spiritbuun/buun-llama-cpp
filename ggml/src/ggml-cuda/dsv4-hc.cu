@@ -210,11 +210,9 @@ static __global__ void dsv4_hc_params_f32(
 // blocks apply the norm without another grid barrier.
 static constexpr int DSV4_HC_PRE_FUSED_MAX_TOKENS = 4;
 
-// a single token takes smaller blocks so more SMs stream hc_fn; more tokens keep a warp per token for the
-// sinkhorn. The grid never exceeds the block size, so the last block reduces one partial row per thread.
-static constexpr __host__ __device__ int dsv4_hc_pre_fused_threads(int n_tokens) {
-    return n_tokens == 1 ? 64 : 128;
-}
+// a warp per token for the sinkhorn. The grid never exceeds the block size, so the last block reduces one
+// partial row per thread; 64-thread blocks would cap the grid below one pass over n_embd 5120
+static constexpr int DSV4_HC_PRE_FUSED_THREADS = 128;
 static constexpr int DSV4_HC_MIX = (2 + DSV4_HC)*DSV4_HC;
 static constexpr int DSV4_HC_GRAM = DSV4_HC*(DSV4_HC + 1)/2;
 
@@ -260,7 +258,7 @@ static __global__ void dsv4_hc_pre_fused_f32(
         int64_t sb0, int64_t sd1, float rms_eps, float eps, int32_t n_iter, const dsv4_hc_pre_apply_args ap,
         const dsv4_hc_post_fold_args hp, const dsv4_hc_pre_norm_args np) {
     static_assert(apply || !norm, "norm needs apply");
-    constexpr int nwarps = dsv4_hc_pre_fused_threads(n_tokens)/WARP_SIZE;
+    constexpr int nwarps = DSV4_HC_PRE_FUSED_THREADS/WARP_SIZE;
     // per token: the mixes, sum(x^2), and with norm the upper triangle of the streams' Gram matrix
     constexpr int nmix = DSV4_HC_MIX + 1 + (norm ? DSV4_HC_GRAM : 0);
     constexpr int nacc = n_tokens*nmix;
@@ -621,7 +619,7 @@ static int dsv4_hc_pre_fused_max_resident(int device, dsv4_hc_pre_fused_kernel_t
     static int occ[GGML_CUDA_MAX_DEVICES][DSV4_HC_PRE_FUSED_MAX_TOKENS][2][2] = {};
     int & o = occ[device][n_tokens - 1][fold][norm];
     if (o == 0) {
-        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&o, (const void *) kernel, dsv4_hc_pre_fused_threads(n_tokens), 0));
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&o, (const void *) kernel, DSV4_HC_PRE_FUSED_THREADS, 0));
     }
     return o * ggml_cuda_info().devices[device].nsm;
 }
@@ -639,7 +637,7 @@ void ggml_cuda_op_dsv4_hc_pre_fused(ggml_backend_cuda_context & ctx,
     const int     nt = (int) x->ne[1];
     const dsv4_hc_pre_fused_kernel_t kernel = dsv4_hc_pre_fused_kernel(nt, hc_pre, hc_post, norm);
     // a stream column per thread, at least two blocks: with apply, the last block computes params while the others mix
-    const int nthreads = dsv4_hc_pre_fused_threads(nt);
+    const int nthreads = DSV4_HC_PRE_FUSED_THREADS;
     int nblocks = (int) std::max<int64_t>(2, std::min<int64_t>(nthreads, k/DSV4_HC/nthreads));
     if (hc_pre) {
         nblocks = std::min(nblocks, dsv4_hc_pre_fused_max_resident(ctx.device, kernel, nt, hc_post, norm));

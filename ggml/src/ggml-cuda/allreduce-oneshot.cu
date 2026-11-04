@@ -734,10 +734,12 @@ bool ggml_cuda_ar_oneshot_allreduce_rank(ggml_cuda_ar_oneshot * st, ggml_backend
     // the single-block kernel and its token counter cover messages up to this size; beyond it the multi-block
     // kernel takes over (GGML_CUDA_AR1_MB_FROM=<bytes>; both kernels share the launch counter, which the
     // multi-block one advances by its block count, so the two must not interleave: the host serializes them)
-    static const size_t mb_from = getenv("GGML_CUDA_AR1_MB_FROM") != nullptr ? (size_t) atoll(getenv("GGML_CUDA_AR1_MB_FROM")) : (size_t) 256 * 1024;
+    static const size_t mb_from = getenv("GGML_CUDA_AR1_MB_FROM") != nullptr ? (size_t) atoll(getenv("GGML_CUDA_AR1_MB_FROM")) : (size_t) 1024 * 1024;
     const int multi_block = ggml_nbytes(tensors[0]) > mb_from && n4 >= st->n_ranks * AR1_MB_BLOCKS;
-    // LL lines up to this message size (GGML_CUDA_AR1_LL=<bytes>, 0 = never); a slot holds 16 bytes per 3 floats
-    static const size_t ll_max = getenv("GGML_CUDA_AR1_LL") != nullptr ? (size_t) atoll(getenv("GGML_CUDA_AR1_LL")) : (size_t) 64 * 1024;
+    // LL lines up to this message size (GGML_CUDA_AR1_LL=<bytes>, 0 = never); a slot holds 16 bytes per 3 floats.
+    // Covers speculative-verify widths (~20 KB per token at n_embd 5120): LL beat the flag-based and multi-block
+    // kernels there on 4x3090 (DSpark verify +11% over a 64 KB cutoff)
+    static const size_t ll_max = getenv("GGML_CUDA_AR1_LL") != nullptr ? (size_t) atoll(getenv("GGML_CUDA_AR1_LL")) : (size_t) 1024 * 1024;
     const int n  = n4 * 4;
     const int ll = !multi_block && ggml_nbytes(tensors[0]) <= ll_max && (size_t) (n + 2) / 3 * 16 <= st->max_bytes &&
                    st->n_ranks <= AR1_LL_MAX_RANKS;
