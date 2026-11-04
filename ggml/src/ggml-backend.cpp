@@ -1012,6 +1012,7 @@ struct ggml_backend_sched_split {
     int n_inputs;
     int inputs_capacity;
     int prefetch_input;
+    int prefetch_from; // split that first reserves and starts the weight prefetch, or -1
     int device_output_input;
     // graph view of this split
     struct ggml_cgraph graph;
@@ -1055,6 +1056,7 @@ struct ggml_backend_sched {
     ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
     ggml_backend_event_t fence_events[GGML_SCHED_MAX_BACKENDS]; // work queued before a fresh allocation
     bool fence_pending;    // copies into the freshly allocated graph must wait for fence_events
+    ggml_backend_event_t copy_events[GGML_SCHED_MAX_BACKENDS]; // without copy events: a peer copy's source waits on the split backend
     bool can_fence;        // every backend that can have work in flight has a fence event
     ggml_backend_buffer_t input_stage[GGML_SCHED_MAX_COPIES]; // host copies of the user inputs, uploaded asynchronously
     struct ggml_tensor ** graph_inputs;
@@ -1307,6 +1309,21 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
                 }
                 // check if a backend with higher prio wants to offload the op
                 if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
+                    // Prefer the device already running the layer, so each device streams
+                    // its own layers' weights over its own link and reads its own cache
+                    static const bool offload_local = [] {
+                        const char * v = getenv("GGML_SCHED_OFFLOAD_LOCAL");
+                        return v && atoi(v) != 0;
+                    }();
+                    if (offload_local && tensor->op == GGML_OP_MUL_MAT_ID) {
+                        const int b = ggml_backend_sched_input_backend_id(sched, tensor->src[1]);
+                        if (b >= 0 && b < src_backend_id &&
+                                ggml_backend_supports_op(sched->backends[b], tensor) &&
+                                ggml_backend_offload_op(sched->backends[b], tensor)) {
+                            SET_CAUSE(tensor, "1.offl");
+                            return b;
+                        }
+                    }
                     for (int b = 0; b < src_backend_id; b++) {
                         if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
                             SET_CAUSE(tensor, "1.off");
@@ -1398,6 +1415,42 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
         *node_backend_id = cur_backend_id;
         SET_CAUSE(node, "2.sup");
     }
+}
+
+// the previous split before split i that runs on the same backend, or -1
+static int ggml_backend_sched_prev_on_backend(ggml_backend_sched_t sched, int i) {
+    for (int j = i - 1; j >= 0; j--) {
+        if (sched->splits[j].backend_id == sched->splits[i].backend_id) {
+            return j;
+        }
+    }
+    return -1;
+}
+
+// the next split after split i that runs on the same backend, or -1
+static int ggml_backend_sched_next_on_backend(ggml_backend_sched_t sched, int i) {
+    for (int j = i + 1; j < sched->n_splits; j++) {
+        if (sched->splits[j].backend_id == sched->splits[i].backend_id) {
+            return j;
+        }
+    }
+    return -1;
+}
+
+// The splits whose expert weights are prefetched when split i starts: the next few on the same
+// backend, so a large upload can hide behind more than one shorter split
+// (GGML_SCHED_PREFETCH_DEPTH, default 2). A target can be returned again by a later split; callers
+// claim each target once.
+static int ggml_backend_sched_prefetch_targets(ggml_backend_sched_t sched, int i, int * targets, int max_targets) {
+    static const int depth = [] {
+        const char * v = getenv("GGML_SCHED_PREFETCH_DEPTH");
+        return v ? std::max(1, atoi(v)) : 2;
+    }();
+    int n = 0;
+    for (int d = 0, j = i; d < depth && (j = ggml_backend_sched_next_on_backend(sched, j)) >= 0; d++) {
+        if (sched->splits[j].prefetch_input >= 0 && n < max_targets) targets[n++] = j;
+    }
+    return n;
 }
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
@@ -1818,9 +1871,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
         ggml_backend_graph_optimize(sched->backends[split->backend_id], &split->graph, &opt_params);
         split->prefetch_input = -1;
+        split->prefetch_from = -1;
         split->device_output_input = -1;
-        if (i > 0 && !sched->callback_eval && sched->n_copies == 1 && sched->moe_cache_session &&
-                sched->splits[i - 1].backend_id == split->backend_id &&
+        // the weight copy is prefetched while the previous split on the same backend computes
+        const int prev_on_backend = ggml_backend_sched_prev_on_backend(sched, i);
+        if (prev_on_backend >= 0 && !sched->callback_eval && sched->n_copies == 1 && sched->moe_cache_session &&
                 ggml_moe_cache.prefetch_supported && ggml_moe_cache.prefetch_begin && ggml_moe_cache.prefetch_end &&
                 split->graph.n_nodes > 0) {
             const auto * node = split->graph.nodes[0];
@@ -1918,10 +1973,15 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             if (j != split->prefetch_input && j != split->device_output_input) add_input(split, j);
         }
         // Advance both dependencies, not just the upload. This keeps the next
-        // weight copy from aliasing anything the current GPU split still uses.
-        if (i + 1 < sched->n_splits && sched->splits[i + 1].prefetch_input >= 0) {
-            auto * next = &sched->splits[i + 1];
-            add_input(next, next->prefetch_input);
+        // weight copies from aliasing anything the current GPU split still uses.
+        int targets[64];
+        const int n_targets = ggml_backend_sched_prefetch_targets(sched, i, targets, (int) (sizeof(targets) / sizeof(targets[0])));
+        for (int t = 0; t < n_targets; t++) {
+            auto * next = &sched->splits[targets[t]];
+            if (next->prefetch_from < 0) {
+                next->prefetch_from = i;
+                add_input(next, next->prefetch_input);
+            }
         }
         // Cached hits may write this copy while the CPU computes its misses.
         // Reserve it now so it cannot alias storage still live in that split.
@@ -2199,23 +2259,32 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
     } cache_scope(sched->moe_cache_session);
 
+    // weight lookahead jobs, keyed by the split that consumes them
     struct prefetch_scope {
-        void * job = nullptr;
+        std::vector<void *> job;
         int (*end)(void *) = ggml_moe_cache.prefetch_end;
-        int finish() {
-            void * pending = job;
-            job = nullptr;
+        int finish(int split_id) {
+            void * pending = job[split_id];
+            job[split_id] = nullptr;
             return pending ? end(pending) : 0;
         }
-        ~prefetch_scope() { finish(); }
+        ~prefetch_scope() {
+            for (size_t i = 0; i < job.size(); i++) finish((int) i);
+        }
     } prefetch;
+    prefetch.job.resize(sched->n_splits);
 
-    ggml_tensor * prev_ids_tensor = nullptr;
-    int64_t prev_n_expert = 0;
-    int32_t prev_window_lo = 0;
-    int32_t prev_window_size = 0;
     std::vector<int32_t> ids;
+    const ggml_tensor * ids_route = nullptr; // the route ids holds
     std::vector<ggml_bitset_t> used_ids;
+    // routes already downloaded in this graph: expert-parallel stages revisit each device's route
+    struct collected_route {
+        const ggml_tensor * route;
+        int64_t n_expert;
+        int32_t lo, n_local;
+        std::vector<ggml_bitset_t> used;
+    };
+    std::vector<collected_route> collected;
 
     // One route can feed up, gate and down projections. Share its host bitmap
     // between ordinary copies and lookahead rather than downloading it again.
@@ -2223,11 +2292,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                      const ggml_tensor * node) {
         const int32_t lo = ggml_mmid_window_lo(node);
         const int32_t n_local = ggml_mmid_window_n_local(node);
-        if (route == prev_ids_tensor && n_expert == prev_n_expert &&
-                lo == prev_window_lo && n_local == prev_window_size) return;
-        ids.resize(ggml_nbytes(route) / sizeof(int32_t));
-        ggml_backend_tensor_get_async(backend, route, ids.data(), 0, ggml_nbytes(route));
-        ggml_backend_synchronize(backend);
+        for (const auto & c : collected) {
+            if (c.route == route && c.n_expert == n_expert && c.lo == lo && c.n_local == n_local) {
+                used_ids = c.used;
+                return;
+            }
+        }
+        // expert-parallel parts read one route through different windows: download it once
+        if (route != ids_route) {
+            ids.resize(ggml_nbytes(route) / sizeof(int32_t));
+            ggml_backend_tensor_get_async(backend, route, ids.data(), 0, ggml_nbytes(route));
+            ggml_backend_synchronize(backend);
+            ids_route = route;
+        }
         used_ids.assign(ggml_bitset_size(n_expert), 0);
         for (int64_t row = 0; row < route->ne[1]; ++row) {
             for (int64_t col = 0; col < route->ne[0]; ++col) {
@@ -2239,10 +2316,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_bitset_set(used_ids.data(), id);
             }
         }
-        prev_ids_tensor = route;
-        prev_n_expert = n_expert;
-        prev_window_lo = lo;
-        prev_window_size = n_local;
+        if (collected.size() >= 16) collected.clear();
+        collected.push_back({route, n_expert, lo, n_local, used_ids});
     };
 
     // user inputs are copied synchronously into this copy's buffers, which are free once the graph that last
@@ -2268,7 +2343,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
         bool host_reads[GGML_SCHED_MAX_BACKENDS] = {};
-        const bool prefetched = prefetch.finish() != 0;
+        const bool prefetched = prefetch.finish(split_id) != 0;
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -2320,9 +2395,27 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
+                // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
+                ggml_tensor * node = split->graph.nodes[0];
+                const bool expert_copy = split->graph.n_nodes > 0 &&
+                    ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                    ggml_backend_buffer_is_host(input->buffer) && (
+                    (node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID)
+                    //|| (node->src[1] == input_cpy && node->op == GGML_OP_ADD_ID) /* GGML_OP_ADD_ID weights are small and not worth splitting */
+                    );
+
                 // wait for the split backend to finish using the input before overwriting it
+                ggml_backend_event_t copy_event = sched->copy_events[split_backend_id];
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+                } else if (expert_copy) {
+                    // the expert uploads are queued on the split backend's stream, behind its earlier work
+                } else if (copy_event != NULL && input_id != split->device_output_input &&
+                           input_backend != split_backend && input_backend->iface.event_wait != NULL &&
+                           !ggml_backend_buffer_is_host(input->buffer)) {
+                    // a peer copy runs on the source stream: order it after the split backend's work on the device
+                    ggml_backend_event_record(copy_event, split_backend);
+                    ggml_backend_event_wait(input_backend, copy_event);
                 } else {
                     sync_split_backend();
                 }
@@ -2336,15 +2429,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     if (copied > 0) continue;
                 }
 
-                // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
-                ggml_tensor * node = split->graph.nodes[0];
-                if (split->graph.n_nodes > 0 &&
-                    ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
-                    ggml_backend_buffer_is_host(input->buffer) && (
-                    (node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID)
-                    //|| (node->src[1] == input_cpy && node->op == GGML_OP_ADD_ID) /* GGML_OP_ADD_ID weights are small and not worth splitting */
-                    )) {
-
+                if (expert_copy) {
                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
 
@@ -2475,25 +2560,41 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ggml_moe_cache.output_bind(sched->moe_cache_session, destination_backend, source,
                             tensor_copy(source, next->backend_id, sched->cur_copy));
                 }
-                if (next->prefetch_input >= 0) {
-                    auto * source = next->inputs[next->prefetch_input];
-                    const uint32_t * ready = nullptr;
-                    auto * current = split->graph.n_nodes ? split->graph.nodes[0] : nullptr;
-                    auto * route = next->graph.nodes[0]->src[2];
-                    // The current matmul consumes these exact IDs, so they are
-                    // already ready before its GPU work starts. Never read a
-                    // router produced by the current split ahead of execution.
-                    if (current && current->op == GGML_OP_MUL_MAT_ID &&
-                            current->src[2] == route && source->ne[2] <= 512 &&
-                            route->type == GGML_TYPE_I32 && route->nb[0] == sizeof(int32_t) &&
-                            route->ne[2] == 1 && route->ne[3] == 1) {
-                        collect_experts(split_backend, route, source->ne[2], next->graph.nodes[0]);
-                        ready = used_ids.data();
+            }
+            int targets[64];
+            const int n_targets =
+                ggml_backend_sched_prefetch_targets(sched, split_id, targets, (int) (sizeof(targets) / sizeof(targets[0])));
+            for (int t = 0; t < n_targets; t++) {
+                const int j = targets[t];
+                auto * next = &splits[j];
+                if (next->prefetch_from != split_id) continue;
+                auto * source = next->inputs[next->prefetch_input];
+                const uint32_t * ready = nullptr;
+                auto * current = split->graph.n_nodes ? split->graph.nodes[0] : nullptr;
+                auto * route = next->graph.nodes[0]->src[2];
+                // The current matmul consumes these exact IDs, so they are
+                // already ready before its GPU work starts. Never read a
+                // router produced by the current split ahead of execution.
+                if (current && current->op == GGML_OP_MUL_MAT_ID &&
+                        current->src[2] == route && source->ne[2] <= 512 &&
+                        route->type == GGML_TYPE_I32 && route->nb[0] == sizeof(int32_t) &&
+                        route->ne[2] == 1 && route->ne[3] == 1) {
+                    // a route copied into this split reads from its source, which the
+                    // other expert-parallel parts share (one download per route)
+                    ggml_backend_t route_backend = split_backend;
+                    for (int i = 0; i < split->n_inputs; i++) {
+                        if (route == tensor_copy(split->inputs[i], split_backend_id, sched->cur_copy)) {
+                            route = split->inputs[i];
+                            route_backend = ggml_backend_sched_get_tensor_backend(sched, route);
+                            break;
+                        }
                     }
-                    prefetch.job = ggml_moe_cache.prefetch_begin(sched->moe_cache_session,
-                            split_backend, source, tensor_copy(source, next->backend_id, sched->cur_copy),
-                            ready, ready ? used_ids.size() : 0);
+                    collect_experts(route_backend, route, source->ne[2], next->graph.nodes[0]);
+                    ready = used_ids.data();
                 }
+                prefetch.job[j] = ggml_moe_cache.prefetch_begin(sched->moe_cache_session,
+                        sched->backends[next->backend_id], source, tensor_copy(source, next->backend_id, sched->cur_copy),
+                        ready, ready ? used_ids.size() : 0);
             }
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -2643,6 +2744,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
             sched->fence_events[b] = ggml_backend_event_new(backends[b]->device);
             // a backend without a synchronize is synchronous and never has work in flight
             sched->can_fence = sched->can_fence && (backends[b]->iface.synchronize == NULL || sched->fence_events[b] != NULL);
+        } else if (backends[b]->iface.event_wait != NULL) {
+            sched->copy_events[b] = ggml_backend_event_new(backends[b]->device);
         }
     }
 
@@ -2726,6 +2829,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
             ggml_backend_event_free(sched->events[b][c]);
         }
         ggml_backend_event_free(sched->fence_events[b]);
+        ggml_backend_event_free(sched->copy_events[b]);
     }
     for (int c = 0; c < GGML_SCHED_MAX_COPIES; c++) {
         ggml_backend_buffer_free(sched->input_stage[c]);
@@ -2780,8 +2884,8 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
     GGML_ASSERT(sizes);
 
-    ggml_backend_sched_reset(sched);
-
+    // like ggml_backend_sched_reserve, no reset here: the caller resets before building the graph,
+    // and resetting now would drop the backends it pinned with ggml_backend_sched_set_tensor_backend
     ggml_backend_sched_synchronize(sched);
 
     ggml_backend_sched_split_graph(sched, measure_graph);

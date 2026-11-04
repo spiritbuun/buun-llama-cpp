@@ -2090,13 +2090,13 @@ static ggml_guid_t ggml_backend_meta_guid() {
 // compute) costs ≈0.6 ms of skew between the first and last device's launch, which every first all-reduce of
 // the step then absorbs; the pool wakes all workers with one notification. Workers sleep between jobs.
 struct ggml_backend_meta_thread_pool {
-    std::vector<std::thread>      threads;
-    std::mutex                    m;
-    std::condition_variable       cv;
-    std::function<void(size_t)>   job;
-    size_t                        generation = 0;
-    size_t                        done       = 0;
-    bool                          stop       = false;
+    std::vector<std::thread>             threads;
+    std::mutex                           m;
+    std::condition_variable              cv;
+    const std::function<void(size_t)> * job = nullptr;
+    std::atomic<size_t>                  generation{0};
+    std::atomic<size_t>                  done{0};
+    std::atomic<bool>                    stop{false};
 
     ~ggml_backend_meta_thread_pool() {
         {
@@ -2116,20 +2116,18 @@ struct ggml_backend_meta_thread_pool {
             threads.emplace_back([this, j]() {
                 size_t seen = 0;
                 for (;;) {
-                    std::function<void(size_t)> my_job;
-                    {
+                    if (!(stop.load() || generation.load(std::memory_order_acquire) != seen)) {
                         std::unique_lock<std::mutex> lock(m);
-                        cv.wait(lock, [&] { return stop || generation != seen; });
-                        if (stop) {
-                            return;
-                        }
-                        seen   = generation;
-                        my_job = job;
+                        cv.wait(lock, [&] { return stop.load() || generation.load() != seen; });
                     }
-                    my_job(j);
+                    if (stop) {
+                        return;
+                    }
+                    seen = generation.load(std::memory_order_acquire);
+                    (*job)(j);
                     {
                         std::lock_guard<std::mutex> lock(m);
-                        done++;
+                        done.fetch_add(1, std::memory_order_release);
                     }
                     cv.notify_all();
                 }
@@ -2137,14 +2135,16 @@ struct ggml_backend_meta_thread_pool {
         }
         {
             std::lock_guard<std::mutex> lock(m);
-            job  = fn;
-            done = 0;
-            generation++;
+            job = &fn;
+            done.store(0);
+            generation.fetch_add(1, std::memory_order_release);
         }
         cv.notify_all();
         fn(0);
-        std::unique_lock<std::mutex> lock(m);
-        cv.wait(lock, [&] { return done == n - 1; });
+        if (done.load(std::memory_order_acquire) != n - 1) {
+            std::unique_lock<std::mutex> lock(m);
+            cv.wait(lock, [&] { return done.load() == n - 1; });
+        }
     }
 };
 
@@ -2211,18 +2211,24 @@ struct ggml_backend_meta_context {
     // sightings per signature over the whole run: a decode-class shape that recurs non-consecutively (the
     // server's 4-token checkpoint tail after every prompt) is recorded on its second sighting
     std::unordered_map<uint64_t, int> step_sightings;
-    uint64_t                 step_sig_uid     = 0;   // graph uid the cached signature belongs to
-    uint64_t                 step_sig_cached  = 0;
+    // signature per graph uid: a graph the caller reuses unchanged keeps its uid, and the per-layer split graphs
+    // alternate, so a single cached entry was rehashed on every call (~70 us per decode split)
+    std::unordered_map<uint64_t, uint64_t> step_sig_by_uid;
     size_t                   cur_min_reduce   = 0;   // smallest all-reduce of the last rebuilt graph (bytes)
     bool                     step_graphs      = false;
 
+    void step_record_free(step_record & rec) {
+        for (size_t j = 0; j < rec.steps.size(); j++) {
+            if (rec.steps[j] != nullptr) {
+                step_free(backend_configs[j].backend, rec.steps[j]);
+                rec.steps[j] = nullptr;
+            }
+        }
+    }
+
     void step_records_free() {
         for (auto & rec : step_records) {
-            for (size_t j = 0; j < rec.steps.size(); j++) {
-                if (rec.steps[j] != nullptr) {
-                    step_free(backend_configs[j].backend, rec.steps[j]);
-                }
-            }
+            step_record_free(rec);
         }
         step_records.clear();
     }
@@ -2249,11 +2255,7 @@ struct ggml_backend_meta_context {
         while (ggml_backend_meta_step_cache_over_budget(step_records.size() + 1, nodes, records_override)) {
             auto oldest = std::min_element(step_records.begin(), step_records.end(),
                     [](const step_record & a, const step_record & b) { return a.last_used < b.last_used; });
-            for (size_t j = 0; j < oldest->steps.size(); j++) {
-                if (oldest->steps[j] != nullptr) {
-                    step_free(backend_configs[j].backend, oldest->steps[j]);
-                }
-            }
+            step_record_free(*oldest);
             nodes -= oldest->nodes;
             step_records.erase(oldest);
         }
@@ -2498,6 +2500,20 @@ static uint64_t ggml_backend_meta_graph_signature(const ggml_cgraph * cgraph) {
     return h == 0 ? 1 : h;
 }
 
+static uint64_t ggml_backend_meta_step_sig(ggml_backend_meta_context * backend_ctx, const ggml_cgraph * cgraph) {
+    auto & cache = backend_ctx->step_sig_by_uid;
+    auto it = cache.find(cgraph->uid);
+    if (it != cache.end()) {
+        return it->second;
+    }
+    if (cache.size() > 4096) {
+        cache.clear(); // uids of graphs that were split again are never seen anymore
+    }
+    const uint64_t sig = ggml_backend_meta_graph_signature(cgraph);
+    cache.emplace(cgraph->uid, sig);
+    return sig;
+}
+
 static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     // A CPU split can leave metadata-only views in this graph, including views
     // of computed embeddings. They have no per-device shards or GPU work.
@@ -2521,7 +2537,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         auto launch_one = [&](size_t j) {
             launched_j[j] = backend_ctx->step_launch(backend_ctx->backend_configs[j].backend, steps[j]);
         };
-        if (n_backends > 2) {
+        // launch on the caller: step replays cost less than waking the pool, most of all on a busy cpu
+        // (GGML_META_SEQ_LAUNCH=0: launch on the pool)
+        static const bool seq_launch = [] { const char * env = getenv("GGML_META_SEQ_LAUNCH"); return !env || atoi(env) != 0; }();
+        if (n_backends > 2 && !seq_launch) {
             backend_ctx->pool.run(n_backends, launch_one);
         } else {
             for (size_t j = 0; j < n_backends; j++) {
@@ -2543,12 +2562,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     const bool step_graphs = backend_ctx->step_graphs && n_backends > 1 && backend_ctx->comm_ctx != nullptr && cgraph->uid != 0;
     uint64_t step_sig = 0;
     if (step_graphs) {
-        // a graph the caller reuses unchanged keeps its uid, so its signature is only computed once
-        if (cgraph->uid != backend_ctx->step_sig_uid) {
-            backend_ctx->step_sig_cached = ggml_backend_meta_graph_signature(cgraph);
-            backend_ctx->step_sig_uid    = cgraph->uid;
-        }
-        step_sig = backend_ctx->step_sig_cached;
+        step_sig = ggml_backend_meta_step_sig(backend_ctx, cgraph);
     }
     if (step_graphs) {
         // replay a recorded step for this shape if its device state has not moved — before any re-split,
@@ -2565,10 +2579,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 stale = backend_ctx->step_epoch(backend_ctx->backend_configs[j].backend) != rec.epochs[j];
             }
             if (stale) {
-                for (size_t j = 0; j < n_backends; j++) {
-                    backend_ctx->step_free(backend_ctx->backend_configs[j].backend, rec.steps[j]);
-                    rec.steps[j] = nullptr;
-                }
+                backend_ctx->step_record_free(rec);
                 rec.sig = 0;
                 break;
             }
@@ -3289,22 +3300,18 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 for (size_t j = 0; j < n_began; j++) {
                     capture_ok = capture_ok && steps[j] != nullptr;
                 }
+                ggml_backend_meta_context::step_record rec;
+                rec.steps = steps;
                 if (status != GGML_STATUS_SUCCESS) {
-                    for (size_t j = 0; j < n_backends; j++) {
-                        if (steps[j] != nullptr) {
-                            backend_ctx->step_free(backend_ctx->backend_configs[j].backend, steps[j]);
-                        }
-                    }
+                    backend_ctx->step_record_free(rec);
                     return status;
                 }
                 if (capture_ok) {
                     // keep the recent shapes (decode at each KV size, prefill chunks, batches with a slot
                     // missing all alternate in a server); evict the least recently used
-                    ggml_backend_meta_context::step_record rec;
                     rec.sig   = step_sig;
                     rec.valid = true;
                     rec.nodes = cgraph->n_nodes;
-                    rec.steps = steps;
                     rec.epochs.resize(n_backends);
                     for (size_t j = 0; j < n_backends; j++) {
                         rec.epochs[j] = backend_ctx->step_epoch(backend_ctx->backend_configs[j].backend);
@@ -3324,11 +3331,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     backend_ctx->step_records.back().sig = 0;
                     // fall through: execute uncaptured
                 } else {
-                    for (size_t j = 0; j < n_backends; j++) {
-                        if (steps[j] != nullptr) {
-                            backend_ctx->step_free(backend_ctx->backend_configs[j].backend, steps[j]);
-                        }
-                    }
+                    backend_ctx->step_record_free(rec);
                     ggml_backend_meta_context::step_record bad;
                     bad.sig   = step_sig;
                     bad.valid = false;
