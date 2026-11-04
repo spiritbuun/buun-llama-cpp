@@ -6078,11 +6078,34 @@ static BATCH_INLINE void mxfp4_batch_impl(int n, float * s, const void * vx, con
     }
 }
 
+// A one-token matvec streams cold weight rows; the hardware prefetcher stops at every 4 KiB page,
+// so pull a row a few rows ahead into cache while the current one is computed.
+// Runtime distance for tuning (GGML_PF_ROWS, 0 = off).
+static int vec_dot_prefetch_rows_get(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char * e = getenv("GGML_PF_ROWS");
+        v = e ? atoi(e) : 2;
+    }
+    return v;
+}
+static inline void vec_dot_prefetch_row(const char * base, int64_t row, size_t size) {
+    const int ahead = vec_dot_prefetch_rows_get();
+    if (ahead == 0) {
+        return;
+    }
+    const char * p = base + (row + ahead) * size;
+    for (size_t off = 0; off < size; off += 64) {
+        _mm_prefetch(p + off, _MM_HINT_T0);
+    }
+}
+
 // Literal row counts let the compiler keep each row's accumulators in registers;
 // a single row goes straight to vec_dot.
 #define VEC_DOT_BATCH_ROWS(NAME, NR) \
     for (int64_t row = 0; row < rows; ++row) { \
         float sums[4]; \
+        vec_dot_prefetch_row((const char *) vx, row, stride); \
         NAME##_batch_impl(n, sums, (const char *) vx + row * stride, vy, NR); \
         for (int r = 0; r < NR; ++r) dst[r][row] = sums[r]; \
     }
@@ -6092,6 +6115,7 @@ static BATCH_INLINE void mxfp4_batch_impl(int n, float * s, const void * vx, con
         switch (nr) { \
             case 1: \
                 for (int64_t row = 0; row < rows; ++row) { \
+                    vec_dot_prefetch_row((const char *) vx, row, stride); \
                     ggml_vec_dot_##NAME##_##VEC_DOT_TYPE(n, dst[0] + row, 0, (const char *) vx + row * stride, 0, vy[0], 0, 1); \
                 } \
                 break; \

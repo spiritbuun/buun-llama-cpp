@@ -1120,7 +1120,7 @@ bool ggml_cpu_iqp_supports_mul_mat_id(const struct ggml_tensor * dst) {
     }
 
     // skip the node entirely (work buffer included) if no expert can reach the per expert threshold
-    if (!ggml_cpu_iqp_mul_mat_id_min_batch(ids->ne[0] * ids->ne[1])) {
+    if (ids->ne[0] * ids->ne[1] < GGML_IQP_MIN_BATCH_ID) {
         return false;
     }
 
@@ -1132,7 +1132,7 @@ void ggml_compute_forward_mul_mat_id_iqp(const struct ggml_compute_params * para
                                          int64_t                            cur_a,
                                          int64_t                            cne1,
                                          const int32_t *                    expert_rows,
-                                         void *                             panels) {
+                                         void *                             panel_scratch) {
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
@@ -1145,7 +1145,7 @@ void ggml_compute_forward_mul_mat_id_iqp(const struct ggml_compute_params * para
 
     const size_t nbw1 = ggml_cpu_iqp_row_size(dst);
 
-    block_iqp_x8 * panel = (block_iqp_x8 *) ((char *) panels + (size_t) ith * ggml_cpu_iqp_scratch_size(dst));
+    block_iqp_x8 * panel = (block_iqp_x8 *) panel_scratch;
 
     const char * src0_cur = (const char *) src0->data + cur_a * nb02;
 
