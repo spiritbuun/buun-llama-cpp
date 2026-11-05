@@ -3031,9 +3031,7 @@ static void * moe_cache_session_create(
         if (lru_fill) {
             session->config.lfu = false;
             session->config.admit_after = 1;
-            session->config.admit_after_explicit = true;
             session->config.readmit_after = 1;
-            session->config.readmit_after_explicit = true;
         }
         if (session->config.expert_parallel > 0) {
             // Expert-parallel verification probes more routed rows per node and
@@ -3043,7 +3041,7 @@ static void * moe_cache_session_create(
             if (!session->config.inserts_per_plan_explicit) {
                 session->config.inserts_per_plan = 16;
             }
-            if (!session->config.readmit_after_explicit) {
+            if (!lru_fill && !session->config.readmit_after_explicit) {
                 session->config.readmit_after = 40;
             }
         }

@@ -568,6 +568,7 @@ struct ggml_threadpool {
     // Thread 0 only: activations saved when down's output aliases them.
     void * moe_acts_copy;
     size_t moe_acts_copy_size;
+    int pin_mode; // ggml_cpu_pin_mode, fixed for the pool
 };
 
 // Per-thread state
@@ -5083,99 +5084,14 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 // (which also drives the GPU backends and spawns helpers) stays unpinned (GGML_CPU_PIN_WORKERS=1),
 // or is kept off the workers' cpus (GGML_CPU_PIN_WORKERS=2), and off their hyperthread siblings too
 // (GGML_CPU_PIN_WORKERS=3). Unset, pool workers get mode 3 when each fits its own physical core
-// (see ggml_cpu_pin_auto_mode).
+// (see ggml_cpu_pin_mode).
 #if defined(__gnu_linux__)
 static int ggml_cpu_pin_workers_policy;
-// unset policy: physical cores per node inside the process affinity, all 0 when auto pinning is off
-static int ggml_cpu_pin_auto_cores[GGML_NUMA_MAX_NODES];
-
-static int ggml_cpu_thread_siblings(int cpu, cpu_set_t * cpus);
-
-// The first hardware thread of each physical core of node that the process may run on.
-static int ggml_cpu_node_cores(int node, int * cores) {
-    const struct ggml_numa_node * nd = &g_state.numa.nodes[node];
-    int n_cores = 0;
-    for (uint32_t i = 0; i < nd->n_cpus; ++i) {
-        const int cpu = (int) nd->cpus[i];
-        if (cpu < CPU_SETSIZE && CPU_ISSET(cpu, &g_state.numa.cpuset) && ggml_cpu_thread_siblings(cpu, NULL) == cpu) {
-            cores[n_cores++] = cpu;
-        }
-    }
-    return n_cores;
-}
-
-// Hybrid parts (P/E cores) leave placement to the scheduler.
-static bool ggml_cpu_cores_uniform(void) {
-    struct stat st;
-    if (stat("/sys/devices/cpu_atom", &st) == 0) {
-        return false;
-    }
-    long first = -1;
-    for (uint32_t cpu = 0; cpu < g_state.numa.total_cpus && cpu < CPU_SETSIZE; ++cpu) {
-        char path[128];
-        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%u/cpu_capacity", cpu);
-        FILE * f = fopen(path, "r");
-        long capacity = -1;
-        if (f) {
-            if (fscanf(f, "%ld", &capacity) != 1) {
-                capacity = -1;
-            }
-            fclose(f);
-        }
-        if (capacity < 0) {
-            continue;
-        }
-        if (first >= 0 && capacity != first) {
-            return false;
-        }
-        first = capacity;
-    }
-    return true;
-}
-#endif
-
-static void ggml_cpu_pin_workers_init(void) {
-#if defined(__gnu_linux__)
-    ggml_critical_section_start();
-    static bool initialized = false;
-    if (!initialized) {
-        const char * env = getenv("GGML_CPU_PIN_WORKERS");
-        ggml_cpu_pin_workers_policy = env ? atoi(env) : -1;
-        if (!env && g_state.numa.n_nodes > 0 && ggml_cpu_cores_uniform()) {
-            int cores[GGML_NUMA_MAX_CPUS];
-            for (uint32_t n = 0; n < g_state.numa.n_nodes; ++n) {
-                ggml_cpu_pin_auto_cores[n] = ggml_cpu_node_cores((int) n, cores);
-            }
-        }
-        initialized = true;
-    }
-    ggml_critical_section_end();
-#endif
-}
-
-#if defined(__gnu_linux__)
-// The pin mode for a pool of n_threads: the explicit policy, or under the unset policy mode 3
-// when no cpu mask was requested, every node gives each of its interleaved workers a core of
-// its own, and a core is left for the main thread; otherwise 0.
-static int ggml_cpu_pin_auto_mode(const struct ggml_threadpool * threadpool, int n_threads) {
-    if (ggml_cpu_pin_workers_policy >= 0) {
-        return ggml_cpu_pin_workers_policy;
-    }
-    if (ggml_thread_cpumask_is_valid(threadpool->workers[0].cpumask)) {
-        return 0;
-    }
-    const int workers = n_threads - 1;
-    const int n_nodes = (int) g_state.numa.n_nodes;
-    int total = 0;
-    for (int n = 0; n < n_nodes; ++n) {
-        const int need = workers / n_nodes + (n < workers % n_nodes);
-        if (need > ggml_cpu_pin_auto_cores[n]) {
-            return 0;
-        }
-        total += ggml_cpu_pin_auto_cores[n];
-    }
-    return n_nodes > 0 && total > workers ? 3 : 0;
-}
+// the first hardware thread of each physical core per node that the process may run on
+static int ggml_cpu_pin_cores[GGML_NUMA_MAX_NODES][GGML_NUMA_MAX_CPUS];
+static int ggml_cpu_pin_n_cores[GGML_NUMA_MAX_NODES];
+// unset policy on a part without hybrid (P/E) cores, which leave placement to the scheduler
+static bool ggml_cpu_pin_auto;
 #endif
 
 // cpu + 1 of each pinned worker, 0 while unpinned
@@ -5208,32 +5124,146 @@ static int ggml_cpu_thread_siblings(int cpu, cpu_set_t * cpus) {
     }
     return first;
 }
+
+static bool ggml_cpu_cores_uniform(void) {
+    struct stat st;
+    if (stat("/sys/devices/cpu_atom", &st) == 0) {
+        return false;
+    }
+    long first = -1;
+    for (uint32_t cpu = 0; cpu < g_state.numa.total_cpus && cpu < CPU_SETSIZE; ++cpu) {
+        char path[128];
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%u/cpu_capacity", cpu);
+        FILE * f = fopen(path, "r");
+        if (!f) {
+            continue;
+        }
+        long capacity = -1;
+        const bool ok = fscanf(f, "%ld", &capacity) == 1 && capacity >= 0;
+        fclose(f);
+        if (!ok) {
+            continue;
+        }
+        if (first >= 0 && capacity != first) {
+            return false;
+        }
+        first = capacity;
+    }
+    return true;
+}
 #endif
 
-static void ggml_cpu_main_avoid_workers(const struct ggml_threadpool * threadpool, int n_threads) {
+static void ggml_cpu_pin_workers_init(void) {
 #if defined(__gnu_linux__)
-    static __thread int applied_n = 0;
-    const int mode = ggml_cpu_pin_auto_mode(threadpool, n_threads);
-    if (mode < 2 || n_threads <= applied_n) {
+    ggml_critical_section_start();
+    static bool initialized = false;
+    static bool topology = false;
+    if (!initialized) {
+        const char * env = getenv("GGML_CPU_PIN_WORKERS");
+        ggml_cpu_pin_workers_policy = env ? atoi(env) : -1;
+        initialized = true;
+    }
+    // a pool created before ggml_numa_init leaves the core table for a later pool to fill
+    if (!topology && g_state.numa.n_nodes > 0) {
+        ggml_cpu_pin_auto = ggml_cpu_pin_workers_policy < 0 && ggml_cpu_cores_uniform();
+        for (uint32_t n = 0; n < g_state.numa.n_nodes; ++n) {
+            const struct ggml_numa_node * nd = &g_state.numa.nodes[n];
+            for (uint32_t i = 0; i < nd->n_cpus; ++i) {
+                const int cpu = (int) nd->cpus[i];
+                if (cpu < CPU_SETSIZE && CPU_ISSET(cpu, &g_state.numa.cpuset) && ggml_cpu_thread_siblings(cpu, NULL) == cpu) {
+                    ggml_cpu_pin_cores[n][ggml_cpu_pin_n_cores[n]++] = cpu;
+                }
+            }
+        }
+        topology = true;
+    }
+    ggml_critical_section_end();
+#endif
+}
+
+// The pin mode for a pool: the explicit policy, or under the unset policy mode 3 when no cpu mask
+// or thread-placing NUMA strategy was requested, every node has a core for each worker
+// interleaved onto it, and a core is left for the main thread; otherwise 0.
+static int ggml_cpu_pin_mode(const struct ggml_threadpool_params * tpp) {
+#if defined(__gnu_linux__)
+    if (ggml_cpu_pin_workers_policy >= 0) {
+        return ggml_cpu_pin_workers_policy;
+    }
+    const int n_nodes = (int) g_state.numa.n_nodes;
+    // a NUMA strategy that places threads per graph (distribute, isolate, numactl) would undo the pins
+    if (!ggml_cpu_pin_auto || n_nodes < 1 || ggml_numa_pins_threads() || ggml_thread_cpumask_is_valid(tpp->cpumask)) {
+        return 0;
+    }
+    int need[GGML_NUMA_MAX_NODES] = { 0 };
+    for (int ith = 1; ith < tpp->n_threads; ++ith) {
+        need[(ith - 1) % n_nodes]++;
+    }
+    int total = 0;
+    for (int n = 0; n < n_nodes; ++n) {
+        if (need[n] > ggml_cpu_pin_n_cores[n]) {
+            return 0;
+        }
+        total += ggml_cpu_pin_n_cores[n];
+    }
+    return total > tpp->n_threads - 1 ? 3 : 0;
+#else
+    GGML_UNUSED(tpp);
+    return 0;
+#endif
+}
+
+#if defined(__gnu_linux__)
+// The (n_threads, mode) the calling thread is kept off the workers for, 0 while unrestricted, and
+// its affinity from before the restriction. Worker cores depend only on ith and the pin mode, so
+// pools that share the key (e.g. a disposable pool per graph) share the restriction.
+static __thread int ggml_cpu_main_key;
+static __thread cpu_set_t ggml_cpu_main_affinity;
+// the affinity installed for the key; a caller that has changed it since keeps its own
+static __thread cpu_set_t ggml_cpu_main_installed;
+
+static void ggml_cpu_main_restore(void) {
+    if (ggml_cpu_main_key != 0) {
+        cpu_set_t cur;
+        if (pthread_getaffinity_np(pthread_self(), sizeof(cur), &cur) == 0 && CPU_EQUAL(&cur, &ggml_cpu_main_installed)) {
+            pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &ggml_cpu_main_affinity);
+        }
+        ggml_cpu_main_key = 0;
+    }
+}
+#endif
+
+static void ggml_cpu_main_avoid_workers(const struct ggml_threadpool * threadpool) {
+#if defined(__gnu_linux__)
+    const int mode = threadpool->pin_mode;
+    const int n_threads = threadpool->n_threads;
+    const int key = mode < 2 ? 0 : n_threads * 4 + mode;
+    if (key == ggml_cpu_main_key) {
         return;
     }
-    cpu_set_t cpus;
-    CPU_ZERO(&cpus);
-    for (int i = 0; i < CPU_SETSIZE && i < (int) g_state.numa.total_cpus; ++i) {
-        CPU_SET(i, &cpus);
+    if (key == 0) {
+        ggml_cpu_main_restore();
+        return;
     }
     for (int ith = 1; ith < n_threads; ++ith) {
-        const int cpu = atomic_load_explicit(&ggml_cpu_worker_cpu[ith], memory_order_relaxed) - 1;
-        if (cpu < 0) {
+        if (atomic_load_explicit(&ggml_cpu_worker_cpu[ith], memory_order_relaxed) == 0) {
             return; // not all workers pinned yet, retry on the next graph
         }
+    }
+    ggml_cpu_main_restore();
+    if (pthread_getaffinity_np(pthread_self(), sizeof(cpu_set_t), &ggml_cpu_main_affinity) != 0) {
+        return;
+    }
+    cpu_set_t cpus = ggml_cpu_main_affinity;
+    for (int ith = 1; ith < n_threads; ++ith) {
+        const int cpu = atomic_load_explicit(&ggml_cpu_worker_cpu[ith], memory_order_relaxed) - 1;
         CPU_CLR(cpu, &cpus);
         if (mode == 3) {
             // also keep off the workers' hyperthread siblings
             ggml_cpu_thread_siblings(cpu, &cpus);
         }
     }
-    applied_n = n_threads;
+    ggml_cpu_main_key = key;
+    ggml_cpu_main_installed = ggml_cpu_main_affinity;
     // GGML_CPU_MAIN_CPUS=a,b,... replaces the computed set (e.g. to keep the moe-cache fill workers off main)
     const char * main_cpus = getenv("GGML_CPU_MAIN_CPUS");
     if (main_cpus && *main_cpus) {
@@ -5254,43 +5284,42 @@ static void ggml_cpu_main_avoid_workers(const struct ggml_threadpool * threadpoo
         const int rv = pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus);
         if (rv) {
             fprintf(stderr, "warning: main thread affinity failed: %s\n", strerror(rv));
+        } else {
+            ggml_cpu_main_installed = cpus;
         }
     }
 #else
     GGML_UNUSED(threadpool);
-    GGML_UNUSED(n_threads);
 #endif
 }
 
-static void ggml_cpu_pin_worker_core(const struct ggml_threadpool * threadpool, int ith, int n_threads) {
+static void ggml_cpu_pin_worker_core(const struct ggml_threadpool * threadpool, int ith) {
 #if defined(__gnu_linux__)
     // OpenMP calls this per graph; pin each team thread only once per ith
     static __thread int pinned_ith = -1;
     const int n_nodes = (int) g_state.numa.n_nodes;
-    if (ith < 1 || n_nodes < 1 || pinned_ith == ith || ggml_cpu_pin_auto_mode(threadpool, n_threads) == 0) {
+    if (ith < 1 || n_nodes < 1 || pinned_ith == ith || threadpool->pin_mode == 0) {
         return;
     }
     pinned_ith = ith;
     const int node = (ith - 1) % n_nodes;
-    const int want = (ith - 1) / n_nodes;
-    int cores[GGML_NUMA_MAX_CPUS];
-    const int n_cores = ggml_cpu_node_cores(node, cores);
+    const int n_cores = ggml_cpu_pin_n_cores[node];
     if (n_cores == 0) {
         return;
     }
+    const int cpu = ggml_cpu_pin_cores[node][((ith - 1) / n_nodes) % n_cores];
     cpu_set_t cpus;
     CPU_ZERO(&cpus);
-    CPU_SET(cores[want % n_cores], &cpus);
+    CPU_SET(cpu, &cpus);
     const int rv = pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus);
     if (rv) {
         fprintf(stderr, "warning: worker %d core pin failed: %s\n", ith, strerror(rv));
     } else if (ith < GGML_MAX_N_THREADS) {
-        atomic_store_explicit(&ggml_cpu_worker_cpu[ith], cores[want % n_cores] + 1, memory_order_relaxed);
+        atomic_store_explicit(&ggml_cpu_worker_cpu[ith], cpu + 1, memory_order_relaxed);
     }
 #else
     GGML_UNUSED(threadpool);
     GGML_UNUSED(ith);
-    GGML_UNUSED(n_threads);
 #endif
 }
 
@@ -5370,7 +5399,7 @@ static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
     if (ggml_thread_cpumask_is_valid(state->cpumask)) {
         ggml_thread_apply_affinity(state->cpumask);
     }
-    ggml_cpu_pin_worker_core(threadpool, state->ith, threadpool->n_threads);
+    ggml_cpu_pin_worker_core(threadpool, state->ith);
 
     while (true) {
         // Check if we need to sleep
@@ -5463,7 +5492,14 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->moe_preplanned   = false;
         threadpool->moe_acts_copy    = NULL;
         threadpool->moe_acts_copy_size = 0;
+        threadpool->pin_mode         = ggml_cpu_pin_mode(tpp);
     }
+#if defined(__gnu_linux__)
+    if (threadpool->pin_mode < 2) {
+        // workers inherit the caller's affinity, not an earlier pool's main-thread restriction
+        ggml_cpu_main_restore();
+    }
+#endif
 
     // Allocate and init workers state
     const size_t workers_size = sizeof(struct ggml_compute_state) * tpp->n_threads;
@@ -5550,7 +5586,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     if (n_threads > 1 && ggml_moe_cache_preplan_graph(threadpool)) {
         n_threads = 1;
     }
-    ggml_cpu_main_avoid_workers(threadpool, threadpool->n_threads);
+    ggml_cpu_main_avoid_workers(threadpool);
 
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
@@ -5570,7 +5606,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
             if (ggml_thread_cpumask_is_valid(threadpool->workers[ith].cpumask)) {
                 ggml_thread_apply_affinity(threadpool->workers[ith].cpumask);
             }
-            ggml_cpu_pin_worker_core(threadpool, ith, n_threads);
+            ggml_cpu_pin_worker_core(threadpool, ith);
             ggml_graph_compute_thread(&threadpool->workers[ith]);
         }
     } else {
