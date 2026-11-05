@@ -7773,7 +7773,7 @@ llama_context_params llama_context_default_params() {
         /*.vbr_growth_headroom_bytes   =*/ 0,
         /*.moe_cache_mode              =*/ LLAMA_MOE_CACHE_MODE_UNSPECIFIED,
         /*.moe_cache_budget_mib        =*/ 0,
-        /*.moe_cache_expert_parallel   =*/ 0,
+        /*.moe_cache_expert_parallel   =*/ -1,
         /*.moe_cache_cpu_overlap       =*/ -2,
         /*.moe_cache_profile_path      =*/ nullptr,
         /*.abort_callback              =*/ nullptr,

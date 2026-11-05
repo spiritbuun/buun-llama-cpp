@@ -271,6 +271,7 @@ struct moe_cache_config {
     // A full pool admits a miss only when its aged frequency beats the LRU
     // victim's; counts halve every lfu_window x slots probes.
     bool lfu = true;
+    bool lfu_explicit = false;
     int lfu_window = 10;
     int lfu_cap = 15;
     // Most slots per pool a drain evicts ahead of demand, so refills need not wait
@@ -1039,6 +1040,7 @@ static moe_cache_config moe_cache_read_config() {
     }
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_LFU", 0, 1, value)) {
         config.lfu = value != 0;
+        config.lfu_explicit = true;
     }
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_LFU_WINDOW", 1, 1000, value)) {
         config.lfu_window = (int)value;
@@ -3014,9 +3016,24 @@ static void * moe_cache_session_create(
             session->config.serial_fill =
                 session->devices.size() < 2 || minimum_capability < moe_cache_cc_ampere;
         }
+        // Expert fanout measured a loss on two and three devices, a gain from four.
         if (session->config.expert_parallel < 0) {
-            session->config.expert_parallel = std::min<int>(
-                    3, session->devices.size());
+            session->config.expert_parallel = session->devices.size() >= 4
+                ? (int)std::min<size_t>(moe_cache_expert_parallel_max, session->devices.size()) : 0;
+        }
+        // Registered fill sources make a fill a direct DMA, cheap enough that LRU with
+        // immediate admission and readmission beats the LFU hot-set policy.
+        bool lru_fill = false;
+#if defined(__linux__) && !defined(GGML_USE_HIP)
+        lru_fill = !session->config.lfu_explicit && !session->config.admit_after_explicit &&
+            !session->config.readmit_after_explicit;
+#endif
+        if (lru_fill) {
+            session->config.lfu = false;
+            session->config.admit_after = 1;
+            session->config.admit_after_explicit = true;
+            session->config.readmit_after = 1;
+            session->config.readmit_after_explicit = true;
         }
         if (session->config.expert_parallel > 0) {
             // Expert-parallel verification probes more routed rows per node and

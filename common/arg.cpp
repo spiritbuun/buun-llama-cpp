@@ -3901,7 +3901,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--moe-cache-expert-parallel"}, "N",
         "split cached MoE expert rows across devices "
-        "(default: 0 = disabled; auto = provider policy; N = device fanout)",
+        "(default: auto = every cache device when there are four or more; 0 = disabled; N = device fanout)",
         [](common_params & params, const std::string & value) {
             if (value == "auto") {
                 params.moe_cache.expert_parallel = -1;
