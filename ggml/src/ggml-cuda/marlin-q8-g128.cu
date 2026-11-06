@@ -174,7 +174,7 @@ void ggml_cuda_marlin_q8_g128_repack_upload(
         reinterpret_cast<nv_bfloat16 *>(static_cast<char *>(storage) + weight_size), n, k);
 
     constexpr auto repack = marlin::gptq_marlin_repack_kernel<marlin::repack_threads, 8, false, false>;
-    CUDA_CHECK(cudaFuncSetAttribute(repack, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared));
+    ggml_cuda_set_max_dynamic_smem(repack, max_shared);
     repack<<<sms, marlin::repack_threads, max_shared, stream>>>(
         static_cast<const uint32_t *>(raw_weight), nullptr,
         static_cast<uint32_t *>(storage), k, n);
@@ -244,7 +244,7 @@ void ggml_cuda_marlin_q8_g128_launch(
         const bool m_block_8 = split <= 8;
         marlin_fn kernel = out_f32 ? select_marlin_kernel<true>(m_blocks, m_block_8) :
                                      select_marlin_kernel<false>(m_blocks, m_block_8);
-        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared));
+        ggml_cuda_set_max_dynamic_smem(kernel, max_shared);
         kernel<<<sms, 256, max_shared, stream>>>(
             reinterpret_cast<const int4 *>(input + offset * k),
             static_cast<const int4 *>(weight),

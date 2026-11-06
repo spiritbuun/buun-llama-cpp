@@ -159,7 +159,7 @@ void launch_fp8_block(
         fp8_block_a, fp8_block_b, fp8_block_c, fp8_block_s,
         layer, fp8_block_compute_config, tuning>;
 
-    CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(storage)));
+    ggml_cuda_set_max_dynamic_smem(kernel, sizeof(storage));
     kernel<<<sms, Threads, sizeof(storage), stream>>>(
         const_cast<nv_bfloat16 *>(input),
         const_cast<void *>(weight),

@@ -214,6 +214,36 @@ cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
     return err;
 }
 
+// Graph buffers and the pool grow after the MoE cache has taken free-minus-reserve, and each growth would eat the
+// free memory that lazily loaded kernel modules need: a load that fails for memory leaves its kernel unlaunchable
+// even after a trim. Surrender cache storage first so growth leaves a floor free.
+static void ggml_cuda_keep_free_floor(int device, size_t size) {
+    constexpr size_t floor_bytes = 4 * ggml_cuda_compute_vmm_chunk;
+    size_t free_bytes = 0, total_bytes = 0;
+    if (ggml_cuda_device_memory_info(device, &free_bytes, &total_bytes) == cudaSuccess && free_bytes < size + floor_bytes) {
+        ggml_moe_cache_trim(device, size + floor_bytes - free_bytes);
+    }
+}
+
+static cudaError_t ggml_cuda_device_malloc_trim(void ** ptr, size_t size, int device) {
+    ggml_cuda_keep_free_floor(device, size);
+    cudaError_t err = ggml_cuda_device_malloc(ptr, size, device);
+    while (err == cudaErrorMemoryAllocation && ggml_moe_cache_trim(device, size) > 0) {
+        (void)cudaGetLastError();
+        err = ggml_cuda_device_malloc(ptr, size, device);
+    }
+    return err;
+}
+
+void ggml_cuda_set_max_dynamic_smem_impl(const void * kernel, int nbytes) {
+    cudaError_t err = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes);
+    while (err == cudaErrorMemoryAllocation && ggml_moe_cache_trim(ggml_cuda_get_device(), ggml_cuda_compute_vmm_chunk) > 0) {
+        (void)cudaGetLastError();
+        err = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes);
+    }
+    CUDA_CHECK(err);
+}
+
 #if defined(GGML_USE_HIP)
 static int ggml_cuda_parse_id(char devName[]) {
     // A list of possible Target IDs can be found under the rocclr/clr repo in device.cpp
@@ -533,7 +563,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         size_t look_ahead_size = (size_t) (1.05 * size);
         look_ahead_size = 256 * ((look_ahead_size + 255)/256);
         ggml_cuda_set_device(device);
-        cudaError_t err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
+        cudaError_t err = ggml_cuda_device_malloc_trim(&ptr, look_ahead_size, device);
         if (err == cudaErrorMemoryAllocation) {
             (void)cudaGetLastError();
             const size_t cached_bytes = pool_size;
@@ -541,12 +571,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
                            device, look_ahead_size/1024.0/1024.0, cached_bytes/1024.0/1024.0);
             CUDA_CHECK(cudaDeviceSynchronize());
             clear_pool();
-            err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
-            // Last resort: surrender cache storage before aborting on allocation failure.
-            while (err == cudaErrorMemoryAllocation && ggml_moe_cache_trim(device, look_ahead_size) > 0) {
-                (void)cudaGetLastError();
-                err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
-            }
+            err = ggml_cuda_device_malloc_trim(&ptr, look_ahead_size, device);
             if (err == cudaSuccess) {
                 GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: retry succeeded\n", device);
             }
@@ -699,6 +724,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 #else
                 CUDA_ERROR_OUT_OF_MEMORY;
 #endif
+            ggml_cuda_keep_free_floor(device, reserve_size);
             auto create_result = cuMemCreate(&handle, reserve_size, &prop, 0);
             if (create_result == out_of_memory) {
                 GGML_LOG_WARN(GGML_CUDA_NAME " pool[%d]: growing %.2f MiB to %.2f MiB failed\n",
@@ -1573,7 +1599,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
 #endif
 
     void * dev_ptr;
-    cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
+    cudaError_t err = ggml_cuda_device_malloc_trim(&dev_ptr, size, buft_ctx->device);
     if (err != cudaSuccess) {
         // clear the error
         (void)cudaGetLastError();

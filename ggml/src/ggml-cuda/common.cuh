@@ -289,7 +289,7 @@ static const char * cu_get_error_str(CUresult err) {
             static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = { false };                         \
             const int   id                                                = ggml_cuda_get_device();            \
             if (!shared_memory_limit_raised[id]) {                                                             \
-                CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes)); \
+                ggml_cuda_set_max_dynamic_smem(kernel, nbytes);                                                \
                 shared_memory_limit_raised[id] = true;                                                         \
             }                                                                                                  \
         } while (0)
@@ -1318,6 +1318,15 @@ const ggml_cuda_device_info & ggml_cuda_info();
 void ggml_cuda_set_device(int device);
 int ggml_cuda_get_device();
 cudaError_t ggml_cuda_device_memory_info(int device, size_t * free, size_t * total);
+
+// cudaFuncSetAttribute(MaxDynamicSharedMemorySize) on the current device. The first call lazily loads
+// the kernel's module, which needs device memory: on OOM, surrender MoE cache storage and retry.
+void ggml_cuda_set_max_dynamic_smem_impl(const void * kernel, int nbytes);
+
+template <typename K>
+static void ggml_cuda_set_max_dynamic_smem(K kernel, int nbytes) {
+    ggml_cuda_set_max_dynamic_smem_impl(reinterpret_cast<const void *>(kernel), nbytes);
+}
 
 struct ggml_cuda_pool_alloc_failure : std::exception {
     const char * what() const noexcept override {

@@ -6971,7 +6971,10 @@ static size_t moe_cache_trim_session(
     size_t freed = 0;
 #if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP)
     if (needed != SIZE_MAX && !selected->dead.load()) {
-        freed = moe_cache_trim_chunks_locked(session, lock, *selected, needed);
+        // Free headroom beyond every request: kernels loaded lazily and per-op scratch allocated after this
+        // point need device memory too, and an exact-fit trim leaves them failing at launch.
+        constexpr size_t trim_headroom = 4 * ggml_cuda_compute_vmm_chunk;
+        freed = moe_cache_trim_chunks_locked(session, lock, *selected, needed + trim_headroom);
         if (freed >= needed) {
             return freed;
         }

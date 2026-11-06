@@ -2857,11 +2857,6 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     constexpr bool sparse_eligible = V_is_K_view && DKQ == 512 && ncols1 == 8 && ncols2 == 8;
     const bool sparse_mask = sparse_eligible && ggml_flash_attn_ext_get_sparse_mask(KQV);
 
-#if defined(GGML_USE_HIP)
-    using fattn_kernel_ptr_t = const void*;
-#else
-    using fattn_kernel_ptr_t = fattn_kernel_t;
-#endif // defined(GGML_USE_HIP)
     fattn_kernel_t fattn_kernel;
     bool use_sparse = false;
     if (logit_softcap == 0.0f) {
@@ -2887,7 +2882,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         const int variant = use_sparse ? 2 : int(sparse_mask);
         static bool shared_memory_limit_raised[3][GGML_CUDA_MAX_DEVICES] = {};
         if (!shared_memory_limit_raised[variant][id]) {
-            CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
+            ggml_cuda_set_max_dynamic_smem(fattn_kernel, nbytes_shared_total);
             shared_memory_limit_raised[variant][id] = true;
         }
 #endif // !defined(GGML_USE_MUSA)
@@ -2904,7 +2899,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 #if !defined(GGML_USE_MUSA)
         static bool shared_memory_limit_raised[2][GGML_CUDA_MAX_DEVICES] = {};
         if (!shared_memory_limit_raised[sparse_mask][id]) {
-            CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
+            ggml_cuda_set_max_dynamic_smem(fattn_kernel, nbytes_shared_total);
             shared_memory_limit_raised[sparse_mask][id] = true;
         }
 #endif // !defined(GGML_USE_MUSA)
@@ -2921,8 +2916,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 #if !defined(GGML_USE_MUSA)
         static bool ordered_shared_raised[GGML_CUDA_MAX_DEVICES] = {};
         if (!ordered_shared_raised[id]) {
-            CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel),
-                cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
+            ggml_cuda_set_max_dynamic_smem(fattn_kernel, nbytes_shared_total);
             ordered_shared_raised[id] = true;
         }
 #endif

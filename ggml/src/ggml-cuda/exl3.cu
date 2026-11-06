@@ -247,14 +247,14 @@ static void exl3_warpk_launch(ggml_backend_cuda_context & ctx, const uint8_t * w
         if (!attributes[ctx.device]) {
             // The K6 consumer also owns a 4.5 KiB static weight stage.
             const int cap = int(ggml_cuda_info().devices[ctx.device].smpbo) - 8192;
-            CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<const void *>(exl3_int8::prepare_warpk<RESID, PAIR, M>), cudaFuncAttributeMaxDynamicSharedMemorySize, cap));
+            ggml_cuda_set_max_dynamic_smem(exl3_int8::prepare_warpk<RESID, PAIR, M>, cap);
             if constexpr (BITS == 4) {
-                CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<const void *>(exl3_int8::gemv_warpk<4, BITS, RESID, PAIR, M>), cudaFuncAttributeMaxDynamicSharedMemorySize, cap));
-                CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<const void *>(exl3_int8::gemv_warpk<5, BITS, RESID, PAIR, M>), cudaFuncAttributeMaxDynamicSharedMemorySize, cap));
-                CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<const void *>(exl3_int8::gemv_warpk<16, BITS, RESID, PAIR, M>), cudaFuncAttributeMaxDynamicSharedMemorySize, cap));
+                ggml_cuda_set_max_dynamic_smem(exl3_int8::gemv_warpk<4, BITS, RESID, PAIR, M>, cap);
+                ggml_cuda_set_max_dynamic_smem(exl3_int8::gemv_warpk<5, BITS, RESID, PAIR, M>, cap);
+                ggml_cuda_set_max_dynamic_smem(exl3_int8::gemv_warpk<16, BITS, RESID, PAIR, M>, cap);
             } else {
-                CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<const void *>(exl3_int8::gemv_warpk<5, BITS, RESID, PAIR, M>), cudaFuncAttributeMaxDynamicSharedMemorySize, cap));
-                CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<const void *>(exl3_int8::gemv_warpk<6, BITS, RESID, PAIR, M>), cudaFuncAttributeMaxDynamicSharedMemorySize, cap));
+                ggml_cuda_set_max_dynamic_smem(exl3_int8::gemv_warpk<5, BITS, RESID, PAIR, M>, cap);
+                ggml_cuda_set_max_dynamic_smem(exl3_int8::gemv_warpk<6, BITS, RESID, PAIR, M>, cap);
             }
             attributes[ctx.device] = true;
         }
@@ -324,8 +324,7 @@ void exl3_gemv_int8_launch(ggml_backend_cuda_context & ctx, const uint8_t * B, c
     // function attributes are per device: opt this instantiation in once on each
     static bool attr_set[GGML_CUDA_MAX_DEVICES] = {};
     if (!attr_set[ctx.device]) {
-        CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<const void *>(kernel),
-                                       cudaFuncAttributeMaxDynamicSharedMemorySize, int(cap)));
+        ggml_cuda_set_max_dynamic_smem(kernel, int(cap));
         attr_set[ctx.device] = true;
     }
     const int colblocks = (n + exl3_int8::COLS - 1) / exl3_int8::COLS;
@@ -359,8 +358,8 @@ void exl3_gemv_int8_launch(ggml_backend_cuda_context & ctx, const uint8_t * B, c
             const auto consume = exl3_int8::gemv_int8_kernel<bits, cb, M, RESID, false, false, exl3_int8::input_mode::consume>;
             static bool prep_attr[GGML_CUDA_MAX_DEVICES] = {};
             if (!prep_attr[ctx.device]) {
-                CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<const void *>(prepare), cudaFuncAttributeMaxDynamicSharedMemorySize, int(cap)));
-                CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<const void *>(consume), cudaFuncAttributeMaxDynamicSharedMemorySize, int(cap)));
+                ggml_cuda_set_max_dynamic_smem(prepare, int(cap));
+                ggml_cuda_set_max_dynamic_smem(consume, int(cap));
                 prep_attr[ctx.device] = true;
             }
             ggml_cuda_pool_alloc<uint8_t> prepared(ctx.pool(), size_t(ksplit) * (2 * nacc * sizeof(uint32_t) + nacc * nrows * 16));
@@ -461,7 +460,7 @@ static bool exl3_int8_bundle_launch(ggml_backend_cuda_context & ctx, ggml_tensor
     }
     static bool attr_set[GGML_CUDA_MAX_DEVICES] = {};
     if (!attr_set[ctx.device]) {
-        CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<const void *>(kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, int(cap)));
+        ggml_cuda_set_max_dynamic_smem(kernel, int(cap));
         attr_set[ctx.device] = true;
     }
     ggml_cuda_pool_alloc<float> partials(ctx.pool(), size_t(M) * (size_t(s0) * n0 + size_t(s1) * n1));

@@ -62,11 +62,6 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
-#if defined(GGML_USE_HIP)
-    using fattn_kernel_ptr_t = const void*;
-#else
-    using fattn_kernel_ptr_t = fattn_kernel_t;
-#endif // defined(GGML_USE_HIP)
     fattn_kernel_t fattn_kernel;
     if (logit_softcap == 0.0f) {
         constexpr bool use_logit_softcap = false;
@@ -80,10 +75,10 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
             // but HIP graph CAPTURE rejects the launch unless the max-dynamic-shared attribute is
             // raised first. The static guard runs this once, on the first (eager, pre-capture)
             // launch. Non-fatal: clear any error if a given ROCm build rejects the attribute.
-            (void) cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total);
+            (void) cudaFuncSetAttribute(reinterpret_cast<const void *>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total);
             (void) cudaGetLastError();
 #else
-            CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
+            ggml_cuda_set_max_dynamic_smem(fattn_kernel, nbytes_shared_total);
 #endif
             shared_memory_limit_raised[id] = true;
         }
@@ -100,10 +95,10 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
             // but HIP graph CAPTURE rejects the launch unless the max-dynamic-shared attribute is
             // raised first. The static guard runs this once, on the first (eager, pre-capture)
             // launch. Non-fatal: clear any error if a given ROCm build rejects the attribute.
-            (void) cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total);
+            (void) cudaFuncSetAttribute(reinterpret_cast<const void *>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total);
             (void) cudaGetLastError();
 #else
-            CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
+            ggml_cuda_set_max_dynamic_smem(fattn_kernel, nbytes_shared_total);
 #endif
             shared_memory_limit_raised[id] = true;
         }
