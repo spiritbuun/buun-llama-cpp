@@ -5,11 +5,15 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -412,5 +416,58 @@ bool ggml_moe_store_find(const void * ptr, size_t size, char * path, size_t path
     GGML_UNUSED(file);
     GGML_UNUSED(offset);
     return false;
+#endif
+}
+
+#if defined(__linux__)
+static size_t moe_store_read_number(const std::string & path, const char * key) {
+    std::ifstream file(path);
+    std::string line;
+    while (std::getline(file, line)) {
+        if (!key) {
+            return line == "max" ? SIZE_MAX : (size_t) strtoull(line.c_str(), nullptr, 10);
+        }
+        if (line.compare(0, strlen(key), key) == 0) {
+            return (size_t) strtoull(line.c_str() + strlen(key), nullptr, 10);
+        }
+    }
+    return SIZE_MAX;
+}
+
+// Headroom under every cgroup v2 limit above this process: its limit less the memory
+// charged to it that cannot be reclaimed without swap: anonymous, shared (pinned host
+// allocations land there) and kernel. Page cache, including the mapped weights, can be.
+static size_t moe_store_cgroup_room() {
+    std::ifstream file("/proc/self/cgroup");
+    std::string line;
+    size_t room = SIZE_MAX;
+    while (std::getline(file, line)) {
+        if (line.compare(0, 3, "0::") != 0) {
+            continue;
+        }
+        std::string dir = "/sys/fs/cgroup" + line.substr(3);
+        while (dir.size() > strlen("/sys/fs/cgroup")) {
+            const size_t limit = moe_store_read_number(dir + "/memory.max", nullptr);
+            if (limit != SIZE_MAX) {
+                size_t used = 0;
+                for (const char * key : {"anon ", "shmem ", "kernel "}) {
+                    const size_t bytes = moe_store_read_number(dir + "/memory.stat", key);
+                    used += bytes == SIZE_MAX ? 0 : bytes;
+                }
+                room = std::min(room, used < limit ? limit - used : 0);
+            }
+            dir.resize(dir.rfind('/'));
+        }
+    }
+    return room;
+}
+#endif
+
+size_t ggml_moe_store_host_room(void) {
+#if defined(__linux__)
+    const size_t available = moe_store_read_number("/proc/meminfo", "MemAvailable:");
+    return std::min(moe_store_cgroup_room(), available == SIZE_MAX ? SIZE_MAX : available << 10);
+#else
+    return SIZE_MAX;
 #endif
 }

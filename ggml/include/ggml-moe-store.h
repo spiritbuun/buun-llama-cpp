@@ -64,6 +64,11 @@ GGML_API void ggml_moe_store_unmap(const void * addr, size_t size);
 GGML_API bool ggml_moe_store_find(const void * ptr, size_t size, char * path, size_t path_size,
         uint64_t * file, uint64_t * offset);
 
+// Host memory this process could still make unreclaimable, which bounds how much of the
+// mapped weights can stay in the page cache: the tightest cgroup v2 limit above it less
+// its anonymous, shared and kernel memory, and at most MemAvailable; SIZE_MAX when unknown.
+GGML_API size_t ggml_moe_store_host_room(void);
+
 #ifdef __cplusplus
 }
 #endif

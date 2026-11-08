@@ -63,7 +63,6 @@ void ggml_moe_tier_prefill(ggml_moe_tier_route *, uint32_t *, bool, char *, cuda
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -601,48 +600,6 @@ bool ggml_moe_tier_enabled() {
     return enabled;
 }
 
-static size_t moe_tier_read_number(const std::string & path, const char * key) {
-    std::ifstream file(path);
-    std::string line;
-    while (std::getline(file, line)) {
-        if (!key) {
-            return line == "max" ? SIZE_MAX : (size_t) strtoull(line.c_str(), nullptr, 10);
-        }
-        if (line.compare(0, strlen(key), key) == 0) {
-            return (size_t) strtoull(line.c_str() + strlen(key), nullptr, 10);
-        }
-    }
-    return SIZE_MAX;
-}
-
-// Headroom under every cgroup v2 limit above this process: its limit less the memory
-// charged to it that cannot be reclaimed without swap: anonymous, shared (pinned host
-// allocations land there) and kernel. Page cache, including the mapped weights, can be.
-static size_t moe_tier_cgroup_room() {
-    std::ifstream file("/proc/self/cgroup");
-    std::string line;
-    size_t room = SIZE_MAX;
-    while (std::getline(file, line)) {
-        if (line.compare(0, 3, "0::") != 0) {
-            continue;
-        }
-        std::string dir = "/sys/fs/cgroup" + line.substr(3);
-        while (dir.size() > strlen("/sys/fs/cgroup")) {
-            const size_t limit = moe_tier_read_number(dir + "/memory.max", nullptr);
-            if (limit != SIZE_MAX) {
-                size_t used = 0;
-                for (const char * key : {"anon ", "shmem ", "kernel "}) {
-                    const size_t bytes = moe_tier_read_number(dir + "/memory.stat", key);
-                    used += bytes == SIZE_MAX ? 0 : bytes;
-                }
-                room = std::min(room, used < limit ? limit - used : 0);
-            }
-            dir.resize(dir.rfind('/'));
-        }
-    }
-    return room;
-}
-
 // auto budgets claimed by live tiers, so tiers do not each spend the same headroom, out of
 // the headroom when the first of them started
 static std::mutex g_moe_tier_claim_mu;
@@ -656,8 +613,7 @@ static size_t moe_tier_headroom() {
         moe_cache_env_i64("GGML_CUDA_MOE_TIER_MARGIN_MB", 0, 1 << 30, margin_mb);
         return (size_t) margin_mb << 20;
     }();
-    const size_t available = moe_tier_read_number("/proc/meminfo", "MemAvailable:");
-    const size_t room = std::min(moe_tier_cgroup_room(), available == SIZE_MAX ? SIZE_MAX : available << 10);
+    const size_t room = ggml_moe_store_host_room();
     return room != SIZE_MAX && room > margin ? room - margin : 0;
 }
 

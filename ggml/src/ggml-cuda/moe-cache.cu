@@ -274,6 +274,9 @@ struct moe_cache_config {
     bool lfu_explicit = false;
     int lfu_window = 10;
     int lfu_cap = 15;
+    // a miss evicts only when its count exceeds lfu_margin x the victim's
+    int lfu_margin = 1;
+    bool lfu_margin_explicit = false;
     // Most slots per pool a drain evicts ahead of demand, so refills need not wait
     // for the evaluation in flight to stop reading the victims.
     int cool = 0;
@@ -449,6 +452,11 @@ struct moe_cache_device {
 
 struct moe_cache_session {
     moe_cache_config config;
+    // LRU fill chosen by default: the experts' fit in host memory is checked once, when
+    // the pools are first built, and LFU with these admission values restored if not
+    bool host_fit_pending = false;
+    int lfu_admit_after = 0;
+    int lfu_readmit_after = 0;
     std::vector<std::unique_ptr<moe_cache_device>> devices;
     std::unordered_map<int, int> layer_devices;
     std::unordered_map<const void *, int> tensor_devices;
@@ -1047,6 +1055,10 @@ static moe_cache_config moe_cache_read_config() {
     }
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_LFU_CAP", 2, 65535, value)) {
         config.lfu_cap = (int)value;
+    }
+    if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_LFU_MARGIN", 1, 64, value)) {
+        config.lfu_margin = (int)value;
+        config.lfu_margin_explicit = true;
     }
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_QUEUE", 1, 65536, value)) {
         config.queue_max = (int)value;
@@ -2620,8 +2632,52 @@ static bool moe_cache_allocate_pool(
     return true;
 }
 
+// True when the bytes are a read-only file mapping (page cache), not pinned host memory.
+static bool moe_cache_source_mapped(const void * data, size_t size) {
+    return ggml_moe_store_find(data, size, nullptr, 0, nullptr, nullptr);
+}
+
+// LRU refills from registered, locked page cache only pay when the mapped experts fit in
+// host memory; otherwise the locked pages crowd out the rest and every miss reads the
+// drive, so the LFU hot set (which registers nothing) is kept instead, with a wider
+// admission margin: every eviction then also costs a drive read to refill. The default
+// margin of 4 was measured with 209 GiB of experts over 166 GiB of room; 8 kept stale
+// experts too long. Only routed experts are counted: host-resident dense weights share
+// the page cache too, so a partial offload errs toward LRU.
+static void moe_cache_check_host_fit_locked(moe_cache_session & session) {
+    if (!session.host_fit_pending) {
+        return;
+    }
+    session.host_fit_pending = false;
+    // expert parallelism censuses each routed tensor on every device
+    std::unordered_set<const void *> counted;
+    size_t mapped = 0;
+    for (const auto & device : session.devices) {
+        for (const auto & tensor : device->seen_tensors) {
+            if (counted.insert(tensor.first).second && moe_cache_source_mapped(tensor.first, tensor.second.bytes)) {
+                mapped += tensor.second.bytes;
+            }
+        }
+    }
+    const size_t room = ggml_moe_store_host_room();
+    if (mapped <= room) {
+        return;
+    }
+    session.config.lfu = true;
+    session.config.admit_after = session.lfu_admit_after;
+    session.config.readmit_after = session.lfu_readmit_after;
+    if (!session.config.lfu_margin_explicit) {
+        session.config.lfu_margin = 4;
+    }
+    GGML_LOG_WARN("[moe-cache] %zu GiB of mapped experts exceed %zu GiB of host memory: "
+            "LFU hot set kept, fill sources unregistered\n", mapped >> 30, room >> 30);
+    // announce the policy now in effect
+    session.config_announced.store(false);
+}
+
 static void moe_cache_build_pending(
         moe_cache_session & session, moe_cache_device & device) {
+    moe_cache_check_host_fit_locked(session);
     if (!moe_cache_prepare_budget(device)) {
         if (!device.budget_ready) {
             return; // capped session still pending, retry on a later build
@@ -2838,7 +2894,8 @@ static void moe_cache_log_configuration(moe_cache_session & session) {
     const std::string overlap_cpu_rows = session.config.overlap_cpu_rows < 0
         ? "auto" : std::to_string(session.config.overlap_cpu_rows);
     const std::string replace = session.config.lfu
-        ? "lfu-x" + std::to_string(session.config.lfu_window)
+        ? "lfu-x" + std::to_string(session.config.lfu_window) +
+            (session.config.lfu_margin > 1 ? "-margin" + std::to_string(session.config.lfu_margin) : "")
         : std::to_string(session.config.readmit_after) + "-replace";
     const std::string admission = session.config.admit_after_explicit
         ? std::to_string(session.config.admit_after) + "-fixed/" + replace
@@ -3028,11 +3085,6 @@ static void * moe_cache_session_create(
         lru_fill = !session->config.lfu_explicit && !session->config.admit_after_explicit &&
             !session->config.readmit_after_explicit;
 #endif
-        if (lru_fill) {
-            session->config.lfu = false;
-            session->config.admit_after = 1;
-            session->config.readmit_after = 1;
-        }
         if (session->config.expert_parallel > 0) {
             // Expert-parallel verification probes more routed rows per node and
             // consumes complete up/gate/down bundles. Admit enough rows to warm a
@@ -3041,9 +3093,17 @@ static void * moe_cache_session_create(
             if (!session->config.inserts_per_plan_explicit) {
                 session->config.inserts_per_plan = 16;
             }
-            if (!lru_fill && !session->config.readmit_after_explicit) {
+            if (!session->config.readmit_after_explicit) {
                 session->config.readmit_after = 40;
             }
+        }
+        if (lru_fill) {
+            session->lfu_admit_after = session->config.admit_after;
+            session->lfu_readmit_after = session->config.readmit_after;
+            session->host_fit_pending = true;
+            session->config.lfu = false;
+            session->config.admit_after = 1;
+            session->config.readmit_after = 1;
         }
         if (!moe_cache_budget_register(*session)) {
             return nullptr;
@@ -4208,7 +4268,7 @@ static int moe_cache_evict_lru_locked(
         return -1;
     }
     const uint16_t victim_freq = pool.slots[candidate].freq;
-    if (contest && victim_freq >= freq) {
+    if (contest && session.config.lfu_margin * victim_freq >= freq) {
         return -2;
     }
     const moe_cache_key victim = pool.slots[candidate].key;
@@ -4779,7 +4839,7 @@ static bool moe_cache_route_source_supported(const ggml_tensor * weights) {
         return true;
     }
     return ggml_moe_tier_enabled() && ggml_backend_buffer_is_host(weights->buffer) &&
-        ggml_moe_store_find(weights->data, ggml_nbytes(weights), nullptr, 0, nullptr, nullptr);
+        moe_cache_source_mapped(weights->data, ggml_nbytes(weights));
 }
 
 // The decision depends only on the op's shape and the session, never on which
