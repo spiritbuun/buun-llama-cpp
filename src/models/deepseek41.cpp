@@ -148,6 +148,21 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
     const int64_t n_idx_embd      = hparams.indexer_head_size;
     const int64_t n_idx_head      = hparams.indexer_n_head;
 
+    // EXL3 svh ("scale", [n]) / suh ("input_scale", [k]) vectors, one per group for the stacked wo_a; the generic
+    // loader covers wq_a, wq_b, the experts and output
+    const auto create_exl3_side = [&](const LLM_TN_IMPL & name, const ggml_tensor * weight, int64_t n) -> ggml_tensor * {
+        if (weight == nullptr || !ggml_type_is_exl3(weight->type)) {
+            return nullptr;
+        }
+        return weight->ne[2] > 1 ? create_tensor(name, { n, weight->ne[2] }, 0) : create_tensor(name, { n }, 0);
+    };
+    const auto create_exl3_sides = [&](llm_tensor tensor, int il, ggml_tensor * weight, ggml_tensor *& scale, ggml_tensor *& in_scale) {
+        if (weight) {
+            scale    = create_exl3_side(tn(tensor, "scale", il),       weight, weight->ne[1]);
+            in_scale = create_exl3_side(tn(tensor, "input_scale", il), weight, weight->ne[0]);
+        }
+    };
+
     tok_embd    = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), {n_embd, n_vocab}, 0);
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
     output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
@@ -185,6 +200,9 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
         layer.attn_kv_norm  = create_tensor(tn(LLM_TENSOR_ATTN_KV_NORM,  "weight", i), {n_embd_head}, 0);
         layer.wo_a          = create_tensor(tn(LLM_TENSOR_ATTN_OUT_A,    "weight", i), {n_head * n_embd_head / o_groups, o_lora_rank, o_groups}, TENSOR_ALLOW_RESHAPE);
         layer.wo_b          = create_tensor(tn(LLM_TENSOR_ATTN_OUT_B,    "weight", i), {o_groups * o_lora_rank, n_embd}, 0);
+        create_exl3_sides(LLM_TENSOR_ATTN_KV,    i, layer.wkv,  layer.wkv_s,  layer.wkv_in_s);
+        create_exl3_sides(LLM_TENSOR_ATTN_OUT_A, i, layer.wo_a, layer.wo_a_s, layer.wo_a_in_s);
+        create_exl3_sides(LLM_TENSOR_ATTN_OUT_B, i, layer.wo_b, layer.wo_b_s, layer.wo_b_in_s);
 
         layer.hc_attn_fn    = create_tensor(tn(LLM_TENSOR_HC_ATTN_FN,    "weight", i), {hc_dim, hc_mix_dim}, 0);
         layer.hc_attn_base  = create_tensor(tn(LLM_TENSOR_HC_ATTN_BASE,  "weight", i), {hc_mix_dim}, 0);
@@ -201,10 +219,15 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
             }
             layer.indexer_attn_k = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_K, "weight", i), {n_embd_head, n_idx_embd}, 0);
             layer.indexer_k_norm = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM, "weight", i), {n_idx_embd}, 0);
+            create_exl3_sides(LLM_TENSOR_ATTN_COMPRESSOR_WKV,   i, layer.attn_comp_wkv,   layer.attn_comp_wkv_s,   layer.attn_comp_wkv_in_s);
+            create_exl3_sides(LLM_TENSOR_ATTN_COMPRESSOR_WGATE, i, layer.attn_comp_wgate, layer.attn_comp_wgate_s, layer.attn_comp_wgate_in_s);
+            create_exl3_sides(LLM_TENSOR_INDEXER_ATTN_K,        i, layer.indexer_attn_k,  layer.indexer_attn_k_s,  layer.indexer_attn_k_in_s);
         }
         if (hparams.dsv41_topk_src[i] == i) {
             layer.indexer_attn_q_b = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_Q_B, "weight", i), {q_lora_rank, n_idx_head * n_idx_embd}, 0);
             layer.indexer_proj     = create_tensor(tn(LLM_TENSOR_INDEXER_PROJ,     "weight", i), {n_embd, n_idx_head}, 0);
+            create_exl3_sides(LLM_TENSOR_INDEXER_ATTN_Q_B, i, layer.indexer_attn_q_b, layer.indexer_attn_q_b_s, layer.indexer_attn_q_b_in_s);
+            create_exl3_sides(LLM_TENSOR_INDEXER_PROJ,     i, layer.indexer_proj,     layer.indexer_proj_s,     layer.indexer_proj_in_s);
         }
 
         if (const int e = engram_index(i); e >= 0) {
@@ -226,6 +249,7 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
             }
             layer.engram_kv  = create_tensor(tn(LLM_TENSOR_ENGRAM_KV,   "weight", i), {(int64_t) hparams.ple_n_heads * hparams.ple_head_dim, n_embd * (hc_mult + 1)}, 0);
             layer.engram_gate = create_tensor(tn(LLM_TENSOR_ENGRAM_GATE, "weight", i), {n_embd, hc_mult}, 0);
+            create_exl3_sides(LLM_TENSOR_ENGRAM_KV, i, layer.engram_kv, layer.engram_kv_s, layer.engram_kv_in_s);
         }
 
         layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,    "weight", i), {n_embd, n_expert}, 0);
@@ -415,7 +439,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_engram(
 
     GGML_ASSERT(rows->ne[0] == (int64_t) (hparams.ple_head_dim*hparams.ple_n_heads) && rows->ne[1] == nt);
 
-    ggml_tensor * kv = build_lora_mm(layer.engram_kv, rows);
+    ggml_tensor * kv = build_lora_mm(layer.engram_kv, rows, layer.engram_kv_s, layer.engram_kv_in_s);
     cb(kv, "engram_kv", il);
 
     ggml_tensor * key   = ggml_cont(ctx0, ggml_view_3d(ctx0, kv, n_embd, hc, nt, ggml_row_size(kv->type, n_embd), kv->nb[1], 0));
@@ -476,14 +500,14 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
         return ggml_rope_set_offset(t, n_nope);
     };
 
-    ggml_tensor * qr = build_norm(build_lora_mm(layer.wq_a, cur), layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
+    ggml_tensor * qr = build_norm(build_lora_mm(layer.wq_a, cur, layer.wq_a_s, layer.wq_a_in_s), layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
     cb(qr, "qr_norm", il);
 
-    ggml_tensor * q = ggml_reshape_3d(ctx0, build_lora_mm(layer.wq_b, qr), n_embd_head, n_head, nt);
+    ggml_tensor * q = ggml_reshape_3d(ctx0, build_lora_mm(layer.wq_b, qr, layer.wq_b_s, layer.wq_b_in_s), n_embd_head, n_head, nt);
     q = rope(q, inp_pos, n_embd_head_nope);
     cb(q, "q", il);
 
-    ggml_tensor * kv = build_norm(build_lora_mm(layer.wkv, cur), layer.attn_kv_norm, nullptr, LLM_NORM_RMS, il);
+    ggml_tensor * kv = build_norm(build_lora_mm(layer.wkv, cur, layer.wkv_s, layer.wkv_in_s), layer.attn_kv_norm, nullptr, LLM_NORM_RMS, il);
     kv = rope(ggml_reshape_3d(ctx0, kv, n_embd_head, 1, nt), inp_pos, n_embd_head_nope);
     cb(kv, "kv", il);
 
@@ -497,8 +521,8 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
         GGML_ASSERT(hparams.dsv41_kv_src[il] >= 0 && (int64_t) comp_state->get_ratio() == ratio);
 
         if (hparams.dsv41_kv_src[il] == il && ci.state_pos) {
-            ggml_tensor * state_kv    = build_lora_mm(layer.attn_comp_wkv, cur);
-            ggml_tensor * state_score = ratio > 1 ? build_lora_mm(layer.attn_comp_wgate, cur) : ggml_fill(ctx0, state_kv, 0.0f);
+            ggml_tensor * state_kv    = build_lora_mm(layer.attn_comp_wkv, cur, layer.attn_comp_wkv_s, layer.attn_comp_wkv_in_s);
+            ggml_tensor * state_score = ratio > 1 ? build_lora_mm(layer.attn_comp_wgate, cur, layer.attn_comp_wgate_s, layer.attn_comp_wgate_in_s) : ggml_fill(ctx0, state_kv, 0.0f);
 
             ggml_tensor * restored_kv    = comp_state->get_kv_all(ctx0, il);
             ggml_tensor * restored_score = comp_state->get_score_all(ctx0, il);
@@ -526,7 +550,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                 cb(comp, "comp_latent", il);
 
                 // index K from the RoPE-free latent; a latent stands for the first token of its group
-                ggml_tensor * ik = build_norm(build_lora_mm(layer.indexer_attn_k, comp), layer.indexer_k_norm, nullptr, LLM_NORM_RMS, il);
+                ggml_tensor * ik = build_norm(build_lora_mm(layer.indexer_attn_k, comp, layer.indexer_attn_k_s, layer.indexer_attn_k_in_s), layer.indexer_k_norm, nullptr, LLM_NORM_RMS, il);
                 ik = rope(ik, ci.state_write_pos, n_idx_embd - n_embd_head_rope);
                 comp = rope(comp, ci.state_write_pos, n_embd_head_nope);
 
@@ -574,11 +598,11 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                 ik = ggml_cont(ctx0, ik);
             }
 
-            ggml_tensor * iq = ggml_reshape_3d(ctx0, build_lora_mm(layer.indexer_attn_q_b, qr), n_idx_embd, n_idx_head, nt);
+            ggml_tensor * iq = ggml_reshape_3d(ctx0, build_lora_mm(layer.indexer_attn_q_b, qr, layer.indexer_attn_q_b_s, layer.indexer_attn_q_b_in_s), n_idx_embd, n_idx_head, nt);
             iq = rope(iq, inp_pos, n_idx_embd - n_embd_head_rope);
             iq = ggml_view_4d(ctx0, iq, iq->ne[0], iq->ne[1], nt/n_stream, n_stream, iq->nb[1], iq->nb[2], iq->nb[2]*(nt/n_stream), 0);
 
-            ggml_tensor * iw = ggml_scale(ctx0, build_lora_mm(layer.indexer_proj, cur), 1.0f/sqrtf(float(n_idx_embd*n_idx_head)));
+            ggml_tensor * iw = ggml_scale(ctx0, build_lora_mm(layer.indexer_proj, cur, layer.indexer_proj_s, layer.indexer_proj_in_s), 1.0f/sqrtf(float(n_idx_embd*n_idx_head)));
             iw = ggml_view_4d(ctx0, iw, iw->ne[0], nt/n_stream, 1, n_stream, iw->nb[1], iw->nb[1]*(nt/n_stream), iw->nb[1]*(nt/n_stream), 0);
 
             // chunk queries so the [n_ih, tokens, n_comp] scores stay near 2^26 elements (at most 64 chunks); the fused indexer runs as one chunk
@@ -789,11 +813,15 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
     cb(out, "attn_derope", il);
 
     out = ggml_permute(ctx0, ggml_reshape_3d(ctx0, out, n_head/n_groups*n_embd_head, n_groups, nt), 0, 2, 1, 3);
-    ggml_tensor * oa = ggml_mul_mat(ctx0, layer.wo_a, out);
+    if (ggml_type_is_exl3(layer.wo_a->type)) {
+        // the EXL3 batched matmul needs contiguous activation planes
+        out = ggml_cont(ctx0, out);
+    }
+    ggml_tensor * oa = build_lora_mm(layer.wo_a, out, layer.wo_a_s, layer.wo_a_in_s);
     cb(oa, "attn_wo_a", il);
     oa = ggml_cont_2d(ctx0, ggml_permute(ctx0, oa, 0, 2, 1, 3), o_lora_rank*n_groups, nt);
 
-    out = build_lora_mm(layer.wo_b, oa);
+    out = build_lora_mm(layer.wo_b, oa, layer.wo_b_s, layer.wo_b_in_s);
     cb(out, "attn_out", il);
 
     return out;
@@ -943,14 +971,17 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
                 LLM_FFN_SILU, hparams.expert_weights_norm && hparams.n_expert_used() > 1,
                 hparams.expert_weights_scale,
                 (llama_expert_gating_func_type) hparams.expert_gating_func,
-                il, logits);
+                il, logits, nullptr,
+                layer.ffn_up_exps_s, layer.ffn_gate_exps_s, layer.ffn_down_exps_s, nullptr,
+                layer.ffn_up_exps_in_s, layer.ffn_gate_exps_in_s, layer.ffn_down_exps_in_s);
         cb(moe_out, "ffn_moe_out", il);
 
         ggml_tensor * ffn_shexp = build_ffn(cur,
-                layer.ffn_up_shexp, nullptr, nullptr,
-                layer.ffn_gate_shexp, nullptr, nullptr,
-                layer.ffn_down_shexp, nullptr, nullptr,
-                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+                layer.ffn_up_shexp, nullptr, layer.ffn_up_shexp_s,
+                layer.ffn_gate_shexp, nullptr, layer.ffn_gate_shexp_s,
+                layer.ffn_down_shexp, nullptr, layer.ffn_down_shexp_s,
+                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il,
+                layer.ffn_up_shexp_in_s, layer.ffn_gate_shexp_in_s, layer.ffn_down_shexp_in_s);
         cb(ffn_shexp, "ffn_shexp", il);
 
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
@@ -973,7 +1004,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = ggml_mul_mat(ctx0, model.output, cur);
+    cur = build_lora_mm(model.output, cur, model.output_s, model.output_in_s);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 

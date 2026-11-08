@@ -198,8 +198,10 @@ target_spec map_target(
         { "ffn_up_shexp.scale",           "ffn.shared_experts.w3",              true  },
         // V4.1
         { "indexer.attn_k.weight",        "attn.indexer.wk",                    true  },
+        { "indexer.attn_k.scale",         "attn.indexer.wk",                    true  },
         { "indexer.k_norm.weight",        "attn.indexer.k_norm.weight",         false },
         { "engram_kv.weight",             "engram.wkv",                         true  },
+        { "engram_kv.scale",              "engram.wkv",                         true  },
         { "exp_probs_b_vl.bias",          "ffn.gate.bias_vl",                   false },
     };
     static const std::string input_suffix = ".input_scale";
