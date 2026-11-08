@@ -30,6 +30,8 @@ ggml_type plain_target_type(const llama_safetensors_tensor & source) {
     switch (source.dtype) {
         case llama_safetensors_dtype::F8_E4M3:
             return GGML_TYPE_F8_E4M3;
+        case llama_safetensors_dtype::F8_E8M0:
+            return GGML_TYPE_E8M0;
         case llama_safetensors_dtype::BF16:
             return source.shape.size() >= 2 ? GGML_TYPE_BF16 : GGML_TYPE_F32;
         case llama_safetensors_dtype::F16:

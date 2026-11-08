@@ -4,6 +4,7 @@
 #include "llama-kv-cache-dsv4.h"
 
 #include <algorithm>
+#include <array>
 #include <cinttypes>
 #include <cmath>
 #include <cstdlib>
@@ -210,6 +211,18 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
             if (split_tables) {
                 layer.engram_embd = create_engram_table(tn(LLM_TENSOR_ENGRAM_EMBD, "weight", i),
                                                         (size_t) e*hparams.ple_n_heads, (size_t) (e + 1)*hparams.ple_n_heads);
+                // the checkpoint keeps its fp8 tables with one power-of-two scale per row block; gathered and applied in-graph
+                const std::string scale_name = tn(LLM_TENSOR_ENGRAM_EMBD, "scale", i).str();
+                ggml_type scale_type = GGML_TYPE_COUNT;
+                std::array<int64_t, GGML_MAX_DIMS> scale_ne{};
+                if (ml.get_tensor_info(scale_name.c_str(), scale_type, scale_ne)) {
+                    if (scale_ne[0] <= 0 || hparams.ple_head_dim % scale_ne[0] != 0) {
+                        throw std::runtime_error(format("%s has %" PRId64 " blocks per row, which does not divide the Engram head dim %u",
+                                                        scale_name.c_str(), scale_ne[0], hparams.ple_head_dim));
+                    }
+                    layer.engram_embd_s = create_tensor(tn(LLM_TENSOR_ENGRAM_EMBD, "scale", i),
+                                                        {scale_ne[0], layer.engram_embd->ne[1]}, TENSOR_READ_LAZY);
+                }
             }
             layer.engram_kv  = create_tensor(tn(LLM_TENSOR_ENGRAM_KV,   "weight", i), {(int64_t) hparams.ple_n_heads * hparams.ple_head_dim, n_embd * (hc_mult + 1)}, 0);
             layer.engram_gate = create_tensor(tn(LLM_TENSOR_ENGRAM_GATE, "weight", i), {n_embd, hc_mult}, 0);
@@ -301,6 +314,7 @@ public:
 
     std::vector<ggml_tensor *> engram_ids;
     std::vector<ggml_tensor *> engram_tables; // the table each engram_ids gathers from
+    std::vector<ggml_tensor *> engram_scales; // its row-block scale table, or null
     ggml_tensor * engram_keep = nullptr;    // 0 for embedding (image) tokens; only in mixed ubatches
     ggml_tensor * cand_pin = nullptr;
     bool cand_csa = false;
@@ -328,8 +342,10 @@ void llm_graph_input_dsv41::set_input(const llama_ubatch * ubatch) {
             if (e + 1 < engram_ids.size() && engram_tables[e + 1] == engram_tables[e]) {
                 continue;
             }
-            if (model.can_prefetch.count(engram_tables[e])) {
-                llama_prefetch_rows(engram_tables[e], all.data(), all.size());
+            for (const ggml_tensor * t : { engram_tables[e], engram_scales[e] }) {
+                if (model.can_prefetch.count(t)) {
+                    llama_prefetch_rows(t, all.data(), all.size());
+                }
             }
             all.clear();
         }
@@ -816,7 +832,15 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
         inp41->engram_ids.push_back(ids);
         inp41->engram_tables.push_back(table);
 
+        inp41->engram_scales.push_back(model.layers[il].engram_embd_s);
+
         ggml_tensor * rows = ggml_get_rows(ctx0, table, ids);
+        if (ggml_tensor * scale = model.layers[il].engram_embd_s) {
+            const int64_t nb = scale->ne[0];
+            ggml_tensor * s = ggml_get_rows(ctx0, scale, ids);
+            rows = ggml_mul(ctx0, ggml_reshape_3d(ctx0, rows, hparams.ple_head_dim/nb, nb, rows->ne[1]),
+                                  ggml_reshape_3d(ctx0, s, 1, nb, s->ne[1]));
+        }
         rows = ggml_reshape_2d(ctx0, rows, hparams.ple_head_dim*hparams.ple_n_heads, n_tokens);
         cb(rows, "engram_rows", il);
         ggml_build_forward_expand(gf, rows);

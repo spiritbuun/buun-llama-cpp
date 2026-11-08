@@ -1772,19 +1772,41 @@ llama_safetensors_registry llama_safetensors_registry::load(
                        __func__, recovered_tensors, first_recovered.c_str());
     }
 
-    result.files_.reserve(result.shards_.size());
-    for (const llama_safetensors_shard & shard : result.shards_) {
-        result.files_.push_back(std::make_unique<llama_file>(
+    result.open_files(io_mode);
+    return result;
+}
+
+llama_safetensors_registry llama_safetensors_registry::load_files(
+        const std::filesystem::path & dir, const std::vector<std::string> & shard_names,
+        llama_safetensors_io_mode io_mode) {
+    llama_safetensors_registry result;
+    for (const std::string & shard_name : shard_names) {
+        parsed_shard parsed = parse_shard(checked_shard_path(dir, shard_name), uint32_t(result.shards_.size()));
+        result.shards_.push_back(std::move(parsed.shard));
+        result.metadata_.insert(parsed.metadata.begin(), parsed.metadata.end());
+        for (auto & tensor : parsed.tensors) {
+            if (!result.tensor_index_.emplace(tensor.name, result.tensors_.size()).second) {
+                throw std::runtime_error("duplicate safetensors tensor '" + tensor.name + "'");
+            }
+            result.tensors_.push_back(std::move(tensor));
+        }
+    }
+    result.open_files(io_mode);
+    return result;
+}
+
+void llama_safetensors_registry::open_files(llama_safetensors_io_mode io_mode) {
+    files_.reserve(shards_.size());
+    for (const llama_safetensors_shard & shard : shards_) {
+        files_.push_back(std::make_unique<llama_file>(
             shard.path.string().c_str(), "rb", io_mode == llama_safetensors_io_mode::DIRECT));
     }
     if (io_mode == llama_safetensors_io_mode::MMAP && llama_mmap::SUPPORTED) {
-        result.mappings_.reserve(result.shards_.size());
-        for (const auto & file : result.files_) {
-            result.mappings_.push_back(std::make_unique<llama_mmap>(file.get(), 0, false));
+        mappings_.reserve(shards_.size());
+        for (const auto & file : files_) {
+            mappings_.push_back(std::make_unique<llama_mmap>(file.get(), 0, false));
         }
     }
-
-    return result;
 }
 
 const llama_safetensors_tensor * llama_safetensors_registry::find(const std::string & name) const {

@@ -15,6 +15,15 @@ file(READ "${CMAKE_CURRENT_SOURCE_DIR}/../models/templates/deepseek-ai-DeepSeek-
           LLAMA_SAFETENSORS_DEEPSEEK4_CHAT_TEMPLATE)
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/../models/templates/deepseek-ai-DeepSeek-V4-Flash-0731.jinja"
           LLAMA_SAFETENSORS_DEEPSEEK4_0731_CHAT_TEMPLATE)
+# V4.1 exceeds MSVC's 16 KiB string-literal limit: split at a line boundary into two
+# adjacent literals (CMake string offsets are bytes, a newline never splits a UTF-8 sequence)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/../models/templates/unsloth-DeepSeek-V4.1-Flash-1017.jinja"
+          LLAMA_DSV41_TEMPLATE)
+string(SUBSTRING "${LLAMA_DSV41_TEMPLATE}" 8192 -1 LLAMA_DSV41_TAIL)
+string(FIND "${LLAMA_DSV41_TAIL}" "\n" LLAMA_DSV41_SPLIT)
+math(EXPR LLAMA_DSV41_SPLIT "8192 + ${LLAMA_DSV41_SPLIT} + 1")
+string(SUBSTRING "${LLAMA_DSV41_TEMPLATE}" 0 ${LLAMA_DSV41_SPLIT} LLAMA_SAFETENSORS_DEEPSEEK41_CHAT_TEMPLATE_0)
+string(SUBSTRING "${LLAMA_DSV41_TEMPLATE}" ${LLAMA_DSV41_SPLIT} -1 LLAMA_SAFETENSORS_DEEPSEEK41_CHAT_TEMPLATE_1)
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/llama-safetensors-templates.h.in"
     "${CMAKE_CURRENT_BINARY_DIR}/llama-safetensors-templates.h"

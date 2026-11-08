@@ -493,7 +493,8 @@ extern "C" {
         GGML_TYPE_EXL3N_7 = 89,
         GGML_TYPE_EXL3N_8 = 90,
         GGML_TYPE_PTQ1_0 = 91, // Prism ternary group-128; GGUF wire id 143
-        GGML_TYPE_COUNT   = 92,
+        GGML_TYPE_E8M0    = 92, // OCP MX E8M0 power-of-two scale (2^(x-127)), one byte per element
+        GGML_TYPE_COUNT   = 93,
     };
 
     // EXL3 helpers: the type encodes the bit width and the codebook.

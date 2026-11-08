@@ -185,6 +185,13 @@ class llama_safetensors_registry {
         const std::filesystem::path & model_dir,
         llama_safetensors_io_mode io_mode = llama_safetensors_io_mode::MMAP);
 
+    // Opens exactly the named shards of `dir`, ignoring any index (a partial download of a
+    // sharded checkpoint, e.g. side tables that live in a few base-model shards).
+    static llama_safetensors_registry load_files(
+        const std::filesystem::path & dir,
+        const std::vector<std::string> & shard_names,
+        llama_safetensors_io_mode io_mode = llama_safetensors_io_mode::MMAP);
+
     const llama_safetensors_tensor * find(const std::string & name) const;
     const uint8_t *                  data(const llama_safetensors_tensor & tensor) const;
     void                             read_into(
@@ -199,6 +206,8 @@ class llama_safetensors_registry {
     const std::string *                            metadata(const std::string & key) const;
 
   private:
+    void open_files(llama_safetensors_io_mode io_mode);
+
     std::vector<llama_safetensors_shard>    shards_;
     std::vector<llama_safetensors_tensor>   tensors_;
     std::unordered_map<std::string, size_t> tensor_index_;

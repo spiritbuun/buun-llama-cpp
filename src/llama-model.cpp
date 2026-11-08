@@ -2583,6 +2583,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     std::vector<ggml_tensor *> lookup_tables = { per_layer_tok_embd };
     for (const auto & layer : layers) {
         lookup_tables.push_back(layer.engram_embd);
+        lookup_tables.push_back(layer.engram_embd_s);
     }
     for (ggml_tensor * t : lookup_tables) {
         if (t && ml.lazy.has(t)) {

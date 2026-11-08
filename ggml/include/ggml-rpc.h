@@ -16,7 +16,7 @@ extern "C" {
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT changed - review fork RPC wire version");
-static_assert(GGML_TYPE_COUNT == 92, "GGML_TYPE_COUNT changed - review fork RPC wire version");
+static_assert(GGML_TYPE_COUNT == 93, "GGML_TYPE_COUNT changed - review fork RPC wire version");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16

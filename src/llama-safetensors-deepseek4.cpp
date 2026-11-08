@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <limits>
@@ -21,6 +22,8 @@
 
 namespace {
 
+#include "llama-safetensors-deepseek41-engram.inc"
+
 enum class target_kind {
     TENSOR,
     EXPERTS,
@@ -28,6 +31,8 @@ enum class target_kind {
     EH_WEIGHT,
     EH_SCALE,
     STACK,
+    ENGRAM_TABLE, // V4.1 Engram lookup table or its block scales, possibly in the base checkpoint's shards
+    ENGRAM_GATE,  // V4.1 q_weight * k_weight, folded to F32 as the GGUF converter does
 };
 
 struct target_spec {
@@ -70,6 +75,8 @@ ggml_type plain_type(const llama_safetensors_tensor & tensor) {
         case llama_safetensors_dtype::F16:  return tensor.shape.size() >= 2 ? GGML_TYPE_F16 : GGML_TYPE_F32;
         case llama_safetensors_dtype::F32:  return GGML_TYPE_F32;
         case llama_safetensors_dtype::I32:  return GGML_TYPE_I32;
+        case llama_safetensors_dtype::F8_E4M3: return GGML_TYPE_F8_E4M3;
+        case llama_safetensors_dtype::F8_E8M0: return GGML_TYPE_E8M0;
         default:
             throw std::runtime_error("unsupported plain DeepSeek-V4 dtype for '" + tensor.name + "'");
     }
@@ -154,6 +161,9 @@ target_spec map_target(
     if (mtp && suffix == "nextn.enorm.weight") return { target_kind::TENSOR, prefix + "enorm.weight" };
     if (mtp && suffix == "nextn.hnorm.weight") return { target_kind::TENSOR, prefix + "hnorm.weight" };
     if (mtp && suffix == "nextn.shared_head_norm.weight") return { target_kind::TENSOR, prefix + "norm.weight" };
+    if (suffix == "engram_embd.weight") return { target_kind::ENGRAM_TABLE, prefix + "engram.embed.weight" };
+    if (suffix == "engram_embd.scale") return { target_kind::ENGRAM_TABLE, prefix + "engram.embed.scale" };
+    if (suffix == "engram_gate.weight") return { target_kind::ENGRAM_GATE, prefix + "engram." };
 
     struct mapping { const char * target; const char * source; bool projected; };
     static constexpr mapping mappings[] = {
@@ -202,6 +212,11 @@ target_spec map_target(
         { "ffn_down_shexp.scale",         "ffn.shared_experts.w2",              true  },
         { "ffn_up_shexp.weight",          "ffn.shared_experts.w3",              true  },
         { "ffn_up_shexp.scale",           "ffn.shared_experts.w3",              true  },
+        // V4.1
+        { "indexer.attn_k.weight",        "attn.indexer.wk",                    true  },
+        { "indexer.k_norm.weight",        "attn.indexer.k_norm.weight",         false },
+        { "engram_kv.weight",             "engram.wkv",                         true  },
+        { "exp_probs_b_vl.bias",          "ffn.gate.bias_vl",                   false },
     };
     static const std::string input_suffix = ".input_scale";
     const bool input = suffix.size() > input_suffix.size() &&
@@ -279,22 +294,83 @@ std::vector<uint8_t> concat_rows(
     return result;
 }
 
+bool is_prime(uint64_t n) {
+    if (n < 2 || n % 2 == 0) return n == 2;
+    for (uint64_t d = 3; d * d <= n; d += 2) {
+        if (n % d == 0) return false;
+    }
+    return true;
+}
+
+// EngramLayout.from_args: per layer, per n-gram order, per head, the next prime above
+// vocab_size - 1 not used before - i.e. consecutive primes from vocab_size on
+std::vector<uint64_t> engram_primes(size_t count, uint64_t vocab_size) {
+    std::vector<uint64_t> result;
+    result.reserve(count);
+    for (uint64_t candidate = vocab_size; result.size() < count; ++candidate) {
+        if (is_prime(candidate)) result.push_back(candidate);
+    }
+    return result;
+}
+
+// EXL3 packs leave out the Engram tables; read them from the base checkpoint's shards,
+// found through $LLAMA_DSV41_ENGRAM_DIR or the config's engram_table_dir
+llama_safetensors_registry load_engram_registry(
+        const llama_safetensors_json & config, const std::vector<uint32_t> & layers) {
+    std::vector<std::filesystem::path> dirs;
+    if (const char * env = std::getenv("LLAMA_DSV41_ENGRAM_DIR")) dirs.emplace_back(env);
+    if (config.contains("engram_table_dir") && config.at("engram_table_dir").is_string()) {
+        dirs.emplace_back(config.at("engram_table_dir").get<std::string>());
+    }
+    for (const auto & dir : dirs) {
+        const auto index_path = dir / "model.safetensors.index.json";
+        if (!std::filesystem::is_regular_file(index_path)) continue;
+        const auto weight_map = llama_safetensors_read_json(index_path).at("weight_map");
+        std::vector<std::string> shards;
+        for (uint32_t layer : layers) {
+            for (const char * part : { "weight", "scale" }) {
+                const std::string name = "layers." + std::to_string(layer) + ".engram.embed." + part;
+                if (!weight_map.contains(name)) {
+                    throw std::runtime_error("'" + index_path.string() + "' does not list '" + name + "'");
+                }
+                const std::string shard = weight_map.at(name).get<std::string>();
+                if (std::find(shards.begin(), shards.end(), shard) == shards.end()) shards.push_back(shard);
+            }
+        }
+        LLAMA_LOG_INFO("%s: DeepSeek-V4.1 Engram tables from %s\n", __func__, dir.string().c_str());
+        return llama_safetensors_registry::load_files(dir, shards);
+    }
+    throw std::runtime_error(
+        "the DeepSeek-V4.1 Engram tables are not in this checkpoint: set LLAMA_DSV41_ENGRAM_DIR to a directory with the "
+        "base model's model.safetensors.index.json and the shards holding layers.N.engram.embed.*");
+}
+
 } // namespace
 
 llama_safetensors_deepseek4_importer::llama_safetensors_deepseek4_importer(
         const std::filesystem::path & model_dir,
         llama_safetensors_json config,
         llama_safetensors_io_mode io_mode) :
-    model_dir_(model_dir), config_(std::move(config)) {
-    if (!probe(config_)) throw std::runtime_error("native DeepSeek-V4 importer received the wrong architecture");
-    n_layer_ = config_.at("num_hidden_layers").get<uint32_t>();
-    n_mtp_ = config_.value("num_nextn_predict_layers", 0U);
-    n_expert_ = config_.at("n_routed_experts").get<uint32_t>();
-    if (n_layer_ != 43 || n_mtp_ > 1 || n_expert_ != 256 ||
+    model_dir_(model_dir), config_(std::move(config)), v41_(probe_v41(config_)) {
+    if (!v41_ && !probe(config_)) throw std::runtime_error("native DeepSeek-V4 importer received the wrong architecture");
+    hparams_ = v41_ ? config_.at("text_config") : config_;
+    n_layer_ = hparams_.at("num_hidden_layers").get<uint32_t>();
+    // the V4.1 mtp.* stages are the DSpark draft, a separate DFLASH model
+    n_mtp_ = v41_ ? 0 : hparams_.value("num_nextn_predict_layers", 0U);
+    n_expert_ = hparams_.at("n_routed_experts").get<uint32_t>();
+    if (v41_) {
+        // the FP8 base checkpoint keeps block scales the V4.1 model does not load; it goes through the GGUF converter
+        const auto & quant = config_.value("quantization_config", llama_safetensors_json::object());
+        if (n_layer_ != 40 || n_expert_ != 384 || quant.value("quant_method", std::string()) != "exl3") {
+            throw std::runtime_error("native DeepSeek-V4.1 importer supports the 40-layer, 384-expert EXL3 checkpoints");
+        }
+    } else if (n_layer_ != 43 || n_mtp_ > 1 || n_expert_ != 256 ||
         config_.at("expert_dtype").get<std::string>() != "fp4") {
         throw std::runtime_error("native DeepSeek-V4 importer does not support this tensor geometry");
     }
-    generation_ = llama_safetensors_read_json(model_dir_ / "generation_config.json");
+    const auto generation_path = model_dir_ / "generation_config.json";
+    generation_ = v41_ && !std::filesystem::is_regular_file(generation_path) ? llama_safetensors_json::object() :
+        llama_safetensors_read_json(generation_path);
     tokenizer_ = llama_safetensors_read_tokenizer_json(model_dir_ / "tokenizer.json");
     const auto tokenizer_config_path = model_dir_ / "tokenizer_config.json";
     if (std::filesystem::is_regular_file(tokenizer_config_path)) {
@@ -306,11 +382,18 @@ llama_safetensors_deepseek4_importer::llama_safetensors_deepseek4_importer(
     if (!chat_template_) chat_template_ = llama_safetensors_read_optional_text(model_dir_ / "chat_template.jinja");
     if (!chat_template_) {
         const std::string model_id_hint = config_.value("_name_or_path", model_dir_.filename().string());
-        const std::string_view fallback = model_id_hint.find("0731") != std::string::npos ?
+        const std::string_view fallback = v41_ ? LLAMA_SAFETENSORS_DEEPSEEK41_CHAT_TEMPLATE :
+            model_id_hint.find("0731") != std::string::npos ?
             LLAMA_SAFETENSORS_DEEPSEEK4_0731_CHAT_TEMPLATE : LLAMA_SAFETENSORS_DEEPSEEK4_CHAT_TEMPLATE;
         chat_template_ = std::string(fallback);
     }
     registry_ = llama_safetensors_registry::load(model_dir_, io_mode);
+    const auto engram_layers = hparams_.value("engram_layer_ids", std::vector<uint32_t>());
+    if (v41_ && !engram_layers.empty() &&
+        registry_.find("layers." + std::to_string(engram_layers.front()) + ".engram.embed.weight") == nullptr) {
+        engram_registry_ = load_engram_registry(config_, engram_layers);
+        engram_external_ = true;
+    }
     quant_ = std::make_unique<llama_safetensors_quant_adapters>(config_, registry_);
     if (n_mtp_ != 0 && registry_.find("mtp.0.attn_norm.weight") == nullptr) n_mtp_ = 0;
     // exllamav3 0731 ships a DSpark block drafter (main_proj over target layers) instead of NextN e/h_proj
@@ -324,9 +407,13 @@ bool llama_safetensors_deepseek4_importer::probe(const llama_safetensors_json & 
     return config.value("model_type", std::string()) == "deepseek_v4";
 }
 
+bool llama_safetensors_deepseek4_importer::probe_v41(const llama_safetensors_json & config) {
+    return config.value("model_type", std::string()) == "deepseek_v41" && config.contains("text_config");
+}
+
 gguf_context * llama_safetensors_deepseek4_importer::build_metadata() const {
     llama_safetensors_metadata_sink sink;
-    const std::string arch = "deepseek4";
+    const std::string arch = v41_ ? "deepseek41" : "deepseek4";
     sink.set_string("general.architecture", arch);
     sink.set_string("general.type", "model");
     sink.set_string("general.name", model_dir_.filename().empty() ? "DeepSeek-V4 Safetensors" : model_dir_.filename().string());
@@ -334,43 +421,45 @@ gguf_context * llama_safetensors_deepseek4_importer::build_metadata() const {
     sink.set_u32("general.quantization_version", 2);
     llama_safetensors_emit_sampling_defaults(sink, generation_);
     sink.set_u32(arch + ".block_count", n_layer_ + n_mtp_);
-    sink.set_u32(arch + ".context_length", config_.at("max_position_embeddings").get<uint32_t>());
-    sink.set_u32(arch + ".embedding_length", config_.at("hidden_size").get<uint32_t>());
-    sink.set_u32(arch + ".embedding_length_out", config_.at("hidden_size").get<uint32_t>() * config_.at("hc_mult").get<uint32_t>());
-    sink.set_u32(arch + ".expert_feed_forward_length", config_.at("moe_intermediate_size").get<uint32_t>());
+    sink.set_u32(arch + ".context_length", hparams_.at("max_position_embeddings").get<uint32_t>());
+    sink.set_u32(arch + ".embedding_length", hparams_.at("hidden_size").get<uint32_t>());
+    sink.set_u32(arch + ".embedding_length_out", hparams_.at("hidden_size").get<uint32_t>() * hparams_.at("hc_mult").get<uint32_t>());
+    sink.set_u32(arch + ".expert_feed_forward_length", hparams_.at("moe_intermediate_size").get<uint32_t>());
     sink.set_u32(arch + ".expert_count", n_expert_);
-    sink.set_u32(arch + ".expert_used_count", config_.at("num_experts_per_tok").get<uint32_t>());
-    sink.set_u32(arch + ".expert_shared_count", config_.at("n_shared_experts").get<uint32_t>());
-    sink.set_f32(arch + ".expert_weights_scale", config_.at("routed_scaling_factor").get<float>());
-    sink.set_bool(arch + ".expert_weights_norm", config_.at("norm_topk_prob").get<bool>());
+    sink.set_u32(arch + ".expert_used_count", hparams_.at("num_experts_per_tok").get<uint32_t>());
+    sink.set_u32(arch + ".expert_shared_count", hparams_.at("n_shared_experts").get<uint32_t>());
+    sink.set_f32(arch + ".expert_weights_scale", hparams_.at("routed_scaling_factor").get<float>());
+    sink.set_bool(arch + ".expert_weights_norm", hparams_.at("norm_topk_prob").get<bool>());
     sink.set_u32(arch + ".expert_gating_func", 4);
-    std::vector<float> clamp(n_layer_ + n_mtp_, config_.at("swiglu_limit").get<float>());
+    std::vector<float> clamp(n_layer_ + n_mtp_, hparams_.at("swiglu_limit").get<float>());
     sink.set_f32_array(arch + ".swiglu_clamp_exp", clamp.data(), clamp.size());
     sink.set_f32_array(arch + ".swiglu_clamp_shexp", clamp.data(), clamp.size());
-    sink.set_u32(arch + ".attention.head_count", config_.at("num_attention_heads").get<uint32_t>());
-    sink.set_u32(arch + ".attention.head_count_kv", config_.at("num_key_value_heads").get<uint32_t>());
-    sink.set_u32(arch + ".attention.key_length", config_.at("head_dim").get<uint32_t>());
-    sink.set_u32(arch + ".attention.value_length", config_.at("head_dim").get<uint32_t>());
-    sink.set_f32(arch + ".attention.layer_norm_rms_epsilon", config_.at("rms_norm_eps").get<float>());
-    sink.set_u32(arch + ".attention.q_lora_rank", config_.at("q_lora_rank").get<uint32_t>());
-    sink.set_u32(arch + ".attention.sliding_window", config_.at("sliding_window").get<uint32_t>());
-    sink.set_u32(arch + ".attention.output_group_count", config_.at("o_groups").get<uint32_t>());
-    sink.set_u32(arch + ".attention.output_lora_rank", config_.at("o_lora_rank").get<uint32_t>());
-    sink.set_u32(arch + ".attention.indexer.head_count", config_.at("index_n_heads").get<uint32_t>());
-    sink.set_u32(arch + ".attention.indexer.key_length", config_.at("index_head_dim").get<uint32_t>());
-    sink.set_u32(arch + ".attention.indexer.top_k", config_.at("index_topk").get<uint32_t>());
-    sink.set_f32(arch + ".attention.compress_rope_freq_base", config_.at("compress_rope_theta").get<float>());
-    auto ratios = config_.at("compress_ratios").get<std::vector<uint32_t>>();
+    sink.set_u32(arch + ".attention.head_count", hparams_.at("num_attention_heads").get<uint32_t>());
+    sink.set_u32(arch + ".attention.head_count_kv", hparams_.at("num_key_value_heads").get<uint32_t>());
+    sink.set_u32(arch + ".attention.key_length", hparams_.at("head_dim").get<uint32_t>());
+    sink.set_u32(arch + ".attention.value_length", hparams_.at("head_dim").get<uint32_t>());
+    sink.set_f32(arch + ".attention.layer_norm_rms_epsilon", hparams_.at("rms_norm_eps").get<float>());
+    sink.set_u32(arch + ".attention.q_lora_rank", hparams_.at("q_lora_rank").get<uint32_t>());
+    sink.set_u32(arch + ".attention.sliding_window", hparams_.at("sliding_window").get<uint32_t>());
+    sink.set_u32(arch + ".attention.output_group_count", hparams_.at("o_groups").get<uint32_t>());
+    sink.set_u32(arch + ".attention.output_lora_rank", hparams_.at("o_lora_rank").get<uint32_t>());
+    sink.set_u32(arch + ".attention.indexer.head_count", hparams_.at("index_n_heads").get<uint32_t>());
+    sink.set_u32(arch + ".attention.indexer.key_length", hparams_.at("index_head_dim").get<uint32_t>());
+    sink.set_u32(arch + ".attention.indexer.top_k", hparams_.at("index_topk").get<uint32_t>());
+    sink.set_f32(arch + ".attention.compress_rope_freq_base", hparams_.at("compress_rope_theta").get<float>());
+    auto ratios = hparams_.at("compress_ratios").get<std::vector<uint32_t>>();
     if (ratios.size() == n_layer_ && n_mtp_ != 0) ratios.push_back(0);
     sink.set_u32_array(arch + ".attention.compress_ratios", ratios.data(), ratios.size());
-    sink.set_u32(arch + ".hyper_connection.count", config_.at("hc_mult").get<uint32_t>());
-    sink.set_u32(arch + ".hyper_connection.sinkhorn_iterations", config_.at("hc_sinkhorn_iters").get<uint32_t>());
-    sink.set_f32(arch + ".hyper_connection.epsilon", config_.at("hc_eps").get<float>());
-    sink.set_u32(arch + ".hash_layer_count", config_.at("num_hash_layers").get<uint32_t>());
-    sink.set_u32(arch + ".rope.dimension_count", config_.at("qk_rope_head_dim").get<uint32_t>());
-    sink.set_f32(arch + ".rope.freq_base", config_.at("rope_theta").get<float>());
-    const auto & rope_scaling = config_.at("rope_scaling");
-    if (!rope_scaling.is_object() || rope_scaling.value("type", std::string()) != "yarn") {
+    sink.set_u32(arch + ".hyper_connection.count", hparams_.at("hc_mult").get<uint32_t>());
+    sink.set_u32(arch + ".hyper_connection.sinkhorn_iterations", hparams_.at("hc_sinkhorn_iters").get<uint32_t>());
+    sink.set_f32(arch + ".hyper_connection.epsilon", hparams_.at("hc_eps").get<float>());
+    sink.set_u32(arch + ".hash_layer_count", hparams_.value("num_hash_layers", 0U)); // none in V4.1
+    sink.set_u32(arch + ".rope.dimension_count", hparams_.at("qk_rope_head_dim").get<uint32_t>());
+    sink.set_f32(arch + ".rope.freq_base", hparams_.at("rope_theta").get<float>());
+    const auto & rope_scaling = hparams_.at("rope_scaling");
+    // V4.1 spells the YaRN type HF-style ("rope_type")
+    if (!rope_scaling.is_object() ||
+        rope_scaling.value("type", rope_scaling.value("rope_type", std::string())) != "yarn") {
         throw std::runtime_error("native DeepSeek-V4 importer requires the published YaRN RoPE scaling contract");
     }
     sink.set_string(arch + ".rope.scaling.type", "yarn");
@@ -381,13 +470,97 @@ gguf_context * llama_safetensors_deepseek4_importer::build_metadata() const {
     sink.set_f32(arch + ".rope.scaling.yarn_beta_fast", rope_scaling.at("beta_fast").get<float>());
     sink.set_f32(arch + ".rope.scaling.yarn_beta_slow", rope_scaling.at("beta_slow").get<float>());
     if (n_mtp_ != 0) sink.set_u32(arch + ".nextn_predict_layers", n_mtp_);
+    if (v41_) emit_v41_metadata(sink, arch);
 
-    const uint32_t bos = llama_safetensors_first_token_id(generation_.at("bos_token_id"), "bos_token_id");
-    const uint32_t eos = llama_safetensors_first_token_id(generation_.at("eos_token_id"), "eos_token_id");
+    // V4.1 EXL3 packs ship no generation_config: the token ids are in config.json
+    const auto & ids = generation_.contains("bos_token_id") ? generation_ : config_;
+    const uint32_t bos = llama_safetensors_first_token_id(ids.at("bos_token_id"), "bos_token_id");
+    const uint32_t eos = llama_safetensors_first_token_id(ids.at("eos_token_id"), "eos_token_id");
     llama_safetensors_emit_bpe_tokenizer(sink, tokenizer_, {
-        "joyai-llm", config_.at("vocab_size").get<uint32_t>(), bos, eos, std::string("<｜▁pad▁｜>"), false,
+        "joyai-llm", hparams_.at("vocab_size").get<uint32_t>(), bos, eos, std::string("<｜▁pad▁｜>"), false,
     }, chat_template_);
-    return sink.release();
+    gguf_context * ctx = sink.release();
+    if (v41_) emit_v41_token_map(ctx);
+    return ctx;
+}
+
+void llama_safetensors_deepseek4_importer::emit_v41_metadata(
+        llama_safetensors_metadata_sink & sink, const std::string & arch) const {
+    const auto kv_src = hparams_.at("kv_source_layer_ids").get<std::vector<uint32_t>>();
+    const auto idx_src = hparams_.at("index_source_layer_ids").get<std::vector<uint32_t>>();
+    sink.set_u32_array(arch + ".attention.kv_source_layers", kv_src.data(), kv_src.size());
+    sink.set_u32_array(arch + ".attention.indexer.source_layers", idx_src.data(), idx_src.size());
+    const int32_t cand_src = hparams_.value("candidate_source_layer_id", -1);
+    if (cand_src >= 0) {
+        sink.set_i32(arch + ".attention.indexer.candidate_source_layer", cand_src);
+        sink.set_u32(arch + ".attention.indexer.candidate_top_k_blocks", hparams_.at("candidate_topk_blocks").get<uint32_t>());
+        sink.set_u32(arch + ".attention.indexer.candidate_block_size", hparams_.at("candidate_block_size").get<uint32_t>());
+    }
+
+    // Engram: one table per layer (local head offsets). The multipliers and the token map come
+    // from numpy's PCG64 and the HF normalizers, so they are baked for the published layout.
+    const auto layers = hparams_.value("engram_layer_ids", std::vector<uint32_t>());
+    if (layers.empty()) return;
+    const uint32_t n_gram = hparams_.at("engram_max_ngram_size").get<uint32_t>();
+    const uint32_t n_head = hparams_.at("engram_n_heads").get<uint32_t>();
+    const auto rows = hparams_.at("engram_num_embeddings").get<std::vector<uint64_t>>();
+    if (!std::equal(layers.begin(), layers.end(), std::begin(DSV41_ENGRAM_LAYERS), std::end(DSV41_ENGRAM_LAYERS)) ||
+        n_gram * std::size(DSV41_ENGRAM_LAYERS) != std::size(DSV41_ENGRAM_MULTIPLIERS) || rows.size() != layers.size() ||
+        hparams_.at("engram_compressed_vocab_size").get<uint32_t>() != DSV41_ENGRAM_COMPRESSED_VOCAB_SIZE ||
+        hparams_.at("vocab_size").get<uint32_t>() != DSV41_ENGRAM_VOCAB_SIZE) {
+        throw std::runtime_error("DeepSeek-V4.1 Engram layout differs from DeepSeek-V4.1-Flash-1017; convert it with convert_hf_to_gguf.py");
+    }
+    const size_t n_cols = size_t(n_gram - 1) * n_head;
+    const auto primes = engram_primes(layers.size() * n_cols, hparams_.at("engram_vocab_size").get<uint64_t>());
+    std::vector<uint64_t> offsets(primes.size());
+    for (size_t e = 0; e < layers.size(); ++e) {
+        uint64_t offset = 0;
+        for (size_t c = e * n_cols; c < (e + 1) * n_cols; ++c) {
+            offsets[c] = offset;
+            offset += primes[c];
+        }
+        if (offset != rows[e]) {
+            throw std::runtime_error("DeepSeek-V4.1 Engram layer " + std::to_string(layers[e]) + ": bucket counts do not sum to engram_num_embeddings");
+        }
+    }
+    sink.set_u32_array(arch + ".engram.layers", layers.data(), layers.size());
+    sink.set_u32(arch + ".engram.max_ngram_size", n_gram);
+    sink.set_u32(arch + ".engram.head_count", n_head);
+    sink.set_u32(arch + ".engram.head_dim", hparams_.at("engram_head_dim").get<uint32_t>());
+    sink.set_u64_array(arch + ".engram.multipliers", DSV41_ENGRAM_MULTIPLIERS, std::size(DSV41_ENGRAM_MULTIPLIERS));
+    sink.set_u64_array(arch + ".engram.offsets", offsets.data(), offsets.size());
+    sink.set_u64_array(arch + ".engram.primes", primes.data(), primes.size());
+    sink.set_u32(arch + ".engram.pad_token_id", hparams_.at("engram_pad_token_id").get<uint32_t>());
+}
+
+// The baked token map is only valid for the vocabulary it was built from: check the emitted tokens
+void llama_safetensors_deepseek4_importer::emit_v41_token_map(gguf_context * ctx) const {
+    if (gguf_find_key(ctx, "deepseek41.engram.layers") < 0) return;
+    const int64_t tokens = gguf_find_key(ctx, "tokenizer.ggml.tokens");
+    const size_t n_vocab = tokens < 0 ? 0 : gguf_get_arr_n(ctx, tokens);
+    uint64_t hash = 0xcbf29ce484222325ull;
+    for (size_t i = 0; i < n_vocab; ++i) {
+        const char * token = gguf_get_arr_str(ctx, tokens, i);
+        for (size_t j = 0, n = std::strlen(token) + 1; j < n; ++j) {
+            hash = (hash ^ uint8_t(token[j])) * 0x100000001b3ull;
+        }
+    }
+    if (n_vocab != DSV41_ENGRAM_VOCAB_SIZE || hash != DSV41_ENGRAM_VOCAB_FNV1A) {
+        gguf_free(ctx);
+        throw std::runtime_error("DeepSeek-V4.1 tokenizer differs from DeepSeek-V4.1-Flash-1017, the baked Engram token map does not apply");
+    }
+    std::vector<uint32_t> token_map(n_vocab);
+    uint32_t next = 0;
+    size_t collision = 0;
+    for (uint32_t token = 0; token < n_vocab; ++token) {
+        if (collision < std::size(DSV41_ENGRAM_TOKEN_COLLISIONS) && DSV41_ENGRAM_TOKEN_COLLISIONS[collision][0] == token) {
+            token_map[token] = DSV41_ENGRAM_TOKEN_COLLISIONS[collision++][1];
+        } else {
+            token_map[token] = next++;
+        }
+    }
+    GGML_ASSERT(next == DSV41_ENGRAM_COMPRESSED_VOCAB_SIZE && collision == std::size(DSV41_ENGRAM_TOKEN_COLLISIONS));
+    gguf_set_arr_data(ctx, "deepseek41.engram.token_map", GGUF_TYPE_UINT32, token_map.data(), token_map.size());
 }
 
 bool llama_safetensors_deepseek4_importer::describe(
@@ -414,6 +587,17 @@ bool llama_safetensors_deepseek4_importer::describe(
         if (source == nullptr) return false;
         type = GGML_TYPE_I32;
         shape = reverse_shape(*source);
+    } else if (spec.kind == target_kind::ENGRAM_TABLE) {
+        const auto * source = engram_registry().find(spec.source);
+        if (source == nullptr) return false;
+        type = plain_type(*source);
+        shape = reverse_shape(*source);
+    } else if (spec.kind == target_kind::ENGRAM_GATE) {
+        const auto * q = registry_.find(spec.source + "q_weight");
+        const auto * k = registry_.find(spec.source + "k_weight");
+        if (q == nullptr || k == nullptr || q->shape != k->shape) return false;
+        type = GGML_TYPE_F32;
+        shape = reverse_shape(*q);
     } else if (spec.kind == target_kind::EH_WEIGHT || spec.kind == target_kind::EH_SCALE) {
         const auto e = quant_->bind(spec.source + "e_proj", spec.kind == target_kind::EH_WEIGHT ?
             llama_safetensors_quant_role::WEIGHT : llama_safetensors_quant_role::WEIGHT_SCALE);
@@ -535,7 +719,18 @@ bool llama_safetensors_deepseek4_importer::load(
     if (spec.kind == target_kind::TENSOR && !spec.source.empty()) {
         return llama_safetensors_load_tensor_direct(registry_, { spec.source, spec.quant }, destination, check_tensor);
     }
+    if (spec.kind == target_kind::ENGRAM_TABLE) {
+        return llama_safetensors_load_tensor_direct(engram_registry(), { spec.source, std::nullopt }, destination, check_tensor);
+    }
     return false;
+}
+
+// The Engram tables are ~100 GB per layer: keep them zero-copy/lazy over the shard mapping
+std::optional<llama_model_tensor_file_region> llama_safetensors_deepseek4_importer::file_region(
+        const ggml_tensor * destination) const {
+    const target_spec spec = map_target(*quant_, registry_, n_layer_, n_mtp_, n_expert_, destination->name);
+    if (spec.kind != target_kind::ENGRAM_TABLE) return std::nullopt;
+    return llama_safetensors_tensor_file_region(engram_registry(), { spec.source, std::nullopt }, destination);
 }
 
 std::vector<uint8_t> llama_safetensors_deepseek4_importer::materialize(
@@ -570,6 +765,25 @@ std::vector<uint8_t> llama_safetensors_deepseek4_importer::materialize(
                 result.reserve(eb.size() + hb.size());
                 result.insert(result.end(), eb.begin(), eb.end());
                 result.insert(result.end(), hb.begin(), hb.end());
+            }
+        } else if (spec.kind == target_kind::ENGRAM_TABLE) {
+            return llama_safetensors_materialize_tensor(engram_registry(), *quant_, { spec.source, std::nullopt }, target_type, target_size);
+        } else if (spec.kind == target_kind::ENGRAM_GATE) {
+            // q * k is folded once: the product of two BF16 values is exact in F32
+            const auto & q = require_tensor(registry_, spec.source + "q_weight");
+            const auto & k = require_tensor(registry_, spec.source + "k_weight");
+            if (q.dtype != llama_safetensors_dtype::BF16 || k.dtype != llama_safetensors_dtype::BF16 || target_type != GGML_TYPE_F32)
+                throw std::runtime_error("invalid DeepSeek-V4.1 Engram gate contract");
+            const auto qf = llama_safetensors_bf16_to_f32(registry_.read(q));
+            const auto kf = llama_safetensors_bf16_to_f32(registry_.read(k));
+            if (qf.size() != kf.size()) throw std::runtime_error("DeepSeek-V4.1 Engram gate q/k size mismatch");
+            result.resize(qf.size());
+            for (size_t i = 0; i < qf.size(); i += sizeof(float)) {
+                float a, b;
+                std::memcpy(&a, qf.data() + i, sizeof(a));
+                std::memcpy(&b, kf.data() + i, sizeof(b));
+                a *= b;
+                std::memcpy(result.data() + i, &a, sizeof(a));
             }
         } else if (spec.kind == target_kind::TENSOR) {
             return llama_safetensors_materialize_tensor(registry_, *quant_, { spec.source, spec.quant }, target_type, target_size);

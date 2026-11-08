@@ -623,6 +623,7 @@ struct llama_layer {
     struct ggml_tensor * engram_kv   = nullptr;
     struct ggml_tensor * engram_gate = nullptr; // q_weight*k_weight folded
     struct ggml_tensor * engram_embd = nullptr; // this layer's n-gram table, when the tables are stored per layer
+    struct ggml_tensor * engram_embd_s = nullptr; // per-row block scales of an fp8 engram_embd (checkpoint layout)
 
     // MSA
     struct ggml_tensor * index_q_proj = nullptr;
