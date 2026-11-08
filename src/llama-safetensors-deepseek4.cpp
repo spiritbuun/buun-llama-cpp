@@ -769,10 +769,18 @@ std::vector<uint8_t> llama_safetensors_deepseek4_importer::materialize(
         } else if (spec.kind == target_kind::ENGRAM_GATE) {
             const auto & q = require_tensor(registry_, spec.source + "q_weight");
             const auto & k = require_tensor(registry_, spec.source + "k_weight");
-            if (q.dtype != llama_safetensors_dtype::BF16 || k.dtype != llama_safetensors_dtype::BF16 || target_type != GGML_TYPE_F32)
-                throw std::runtime_error("invalid DeepSeek-V4.1 Engram gate contract");
-            const auto qf = llama_safetensors_bf16_to_f32(registry_.read(q));
-            const auto kf = llama_safetensors_bf16_to_f32(registry_.read(k));
+            // base checkpoints ship BF16; EXL3 conversions keep them F32
+            const auto read_f32 = [&](const llama_safetensors_tensor & t) {
+                switch (t.dtype) {
+                    case llama_safetensors_dtype::BF16: return llama_safetensors_bf16_to_f32(registry_.read(t));
+                    case llama_safetensors_dtype::F16:  return llama_safetensors_f16_to_f32(registry_.read(t));
+                    case llama_safetensors_dtype::F32:  return registry_.read(t);
+                    default: throw std::runtime_error("invalid DeepSeek-V4.1 Engram gate dtype");
+                }
+            };
+            if (target_type != GGML_TYPE_F32) throw std::runtime_error("invalid DeepSeek-V4.1 Engram gate contract");
+            const auto qf = read_f32(q);
+            const auto kf = read_f32(k);
             if (qf.size() != kf.size()) throw std::runtime_error("DeepSeek-V4.1 Engram gate q/k size mismatch");
             result.resize(qf.size());
             for (size_t i = 0; i < qf.size(); i += sizeof(float)) {
