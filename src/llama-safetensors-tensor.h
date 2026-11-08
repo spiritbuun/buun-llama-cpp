@@ -37,6 +37,10 @@ void llama_safetensors_consume_tensor(const llama_safetensors_quant_adapters & q
 // Device destinations and small copies fall through to a plain ggml_backend_tensor_set.
 void llama_safetensors_tensor_set_parallel(ggml_tensor * destination, const void * data, size_t offset, size_t size);
 
+// Raw dtype of an unquantized tensor; rank-1 half-precision vectors (norms, biases) are promoted to
+// F32 as the GGUF converter does, since the graph adds them to F32 activations.
+ggml_type llama_safetensors_plain_type(const llama_safetensors_tensor & source);
+
 std::vector<uint8_t> llama_safetensors_bf16_to_f32(const std::vector<uint8_t> & source);
 std::vector<uint8_t> llama_safetensors_f16_to_f32(const std::vector<uint8_t> & source);
 

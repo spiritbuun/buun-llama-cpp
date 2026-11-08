@@ -185,12 +185,9 @@ class llama_safetensors_registry {
         const std::filesystem::path & model_dir,
         llama_safetensors_io_mode io_mode = llama_safetensors_io_mode::MMAP);
 
-    // Opens exactly the named shards of `dir`, ignoring any index (a partial download of a
-    // sharded checkpoint, e.g. side tables that live in a few base-model shards).
-    static llama_safetensors_registry load_files(
-        const std::filesystem::path & dir,
-        const std::vector<std::string> & shard_names,
-        llama_safetensors_io_mode io_mode = llama_safetensors_io_mode::MMAP);
+    // Adds the named tensors from another checkpoint directory through its index (a quantized
+    // pack that leaves side tables in its base model). Only their shards need to be present.
+    void add_from(const std::filesystem::path & dir, const std::vector<std::string> & tensor_names);
 
     const llama_safetensors_tensor * find(const std::string & name) const;
     const uint8_t *                  data(const llama_safetensors_tensor & tensor) const;
@@ -214,6 +211,7 @@ class llama_safetensors_registry {
     std::unordered_map<std::string, std::string> metadata_;
     llama_files                             files_;
     llama_mmaps                             mappings_;
+    llama_safetensors_io_mode               io_mode_ = llama_safetensors_io_mode::MMAP;
     // seek+read on shared handles (READ mode); heap-held so the registry stays movable
     std::unique_ptr<std::mutex>             read_mutex_ = std::make_unique<std::mutex>();
 };

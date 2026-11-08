@@ -31,7 +31,6 @@ enum class target_kind {
     EH_WEIGHT,
     EH_SCALE,
     STACK,
-    ENGRAM_TABLE, // V4.1 Engram lookup table or its block scales, possibly in the base checkpoint's shards
     ENGRAM_GATE,  // V4.1 q_weight * k_weight, folded to F32 as the GGUF converter does
 };
 
@@ -65,21 +64,6 @@ std::vector<int64_t> reverse_shape(const llama_safetensors_tensor & tensor) {
         result.push_back(static_cast<int64_t>(*it));
     }
     return result;
-}
-
-// Rank-1 half-precision vectors (norms, the router bias) are promoted to F32 as the GGUF converter
-// does: the graph adds them to F32 activations, which CUDA bin ops and fused top-k only take as F32.
-ggml_type plain_type(const llama_safetensors_tensor & tensor) {
-    switch (tensor.dtype) {
-        case llama_safetensors_dtype::BF16: return tensor.shape.size() >= 2 ? GGML_TYPE_BF16 : GGML_TYPE_F32;
-        case llama_safetensors_dtype::F16:  return tensor.shape.size() >= 2 ? GGML_TYPE_F16 : GGML_TYPE_F32;
-        case llama_safetensors_dtype::F32:  return GGML_TYPE_F32;
-        case llama_safetensors_dtype::I32:  return GGML_TYPE_I32;
-        case llama_safetensors_dtype::F8_E4M3: return GGML_TYPE_F8_E4M3;
-        case llama_safetensors_dtype::F8_E8M0: return GGML_TYPE_E8M0;
-        default:
-            throw std::runtime_error("unsupported plain DeepSeek-V4 dtype for '" + tensor.name + "'");
-    }
 }
 
 std::optional<llama_safetensors_quant_binding> bind_quant(
@@ -161,8 +145,8 @@ target_spec map_target(
     if (mtp && suffix == "nextn.enorm.weight") return { target_kind::TENSOR, prefix + "enorm.weight" };
     if (mtp && suffix == "nextn.hnorm.weight") return { target_kind::TENSOR, prefix + "hnorm.weight" };
     if (mtp && suffix == "nextn.shared_head_norm.weight") return { target_kind::TENSOR, prefix + "norm.weight" };
-    if (suffix == "engram_embd.weight") return { target_kind::ENGRAM_TABLE, prefix + "engram.embed.weight" };
-    if (suffix == "engram_embd.scale") return { target_kind::ENGRAM_TABLE, prefix + "engram.embed.scale" };
+    if (suffix == "engram_embd.weight") return { target_kind::TENSOR, prefix + "engram.embed.weight" };
+    if (suffix == "engram_embd.scale") return { target_kind::TENSOR, prefix + "engram.embed.scale" };
     if (suffix == "engram_gate.weight") return { target_kind::ENGRAM_GATE, prefix + "engram." };
 
     struct mapping { const char * target; const char * source; bool projected; };
@@ -313,35 +297,18 @@ std::vector<uint64_t> engram_primes(size_t count, uint64_t vocab_size) {
     return result;
 }
 
-// EXL3 packs leave out the Engram tables; read them from the base checkpoint's shards,
-// found through $LLAMA_DSV41_ENGRAM_DIR or the config's engram_table_dir
-llama_safetensors_registry load_engram_registry(
-        const llama_safetensors_json & config, const std::vector<uint32_t> & layers) {
+// EXL3 packs leave out the Engram tables: they come from the base checkpoint's shards
+std::filesystem::path engram_base_dir(const llama_safetensors_json & config) {
     std::vector<std::filesystem::path> dirs;
-    if (const char * env = std::getenv("LLAMA_DSV41_ENGRAM_DIR")) dirs.emplace_back(env);
+    if (const char * env = std::getenv("LLAMA_SAFETENSORS_BASE_DIR")) dirs.emplace_back(env);
     if (config.contains("engram_table_dir") && config.at("engram_table_dir").is_string()) {
         dirs.emplace_back(config.at("engram_table_dir").get<std::string>());
     }
     for (const auto & dir : dirs) {
-        const auto index_path = dir / "model.safetensors.index.json";
-        if (!std::filesystem::is_regular_file(index_path)) continue;
-        const auto weight_map = llama_safetensors_read_json(index_path).at("weight_map");
-        std::vector<std::string> shards;
-        for (uint32_t layer : layers) {
-            for (const char * part : { "weight", "scale" }) {
-                const std::string name = "layers." + std::to_string(layer) + ".engram.embed." + part;
-                if (!weight_map.contains(name)) {
-                    throw std::runtime_error("'" + index_path.string() + "' does not list '" + name + "'");
-                }
-                const std::string shard = weight_map.at(name).get<std::string>();
-                if (std::find(shards.begin(), shards.end(), shard) == shards.end()) shards.push_back(shard);
-            }
-        }
-        LLAMA_LOG_INFO("%s: DeepSeek-V4.1 Engram tables from %s\n", __func__, dir.string().c_str());
-        return llama_safetensors_registry::load_files(dir, shards);
+        if (std::filesystem::is_regular_file(dir / "model.safetensors.index.json")) return dir;
     }
     throw std::runtime_error(
-        "the DeepSeek-V4.1 Engram tables are not in this checkpoint: set LLAMA_DSV41_ENGRAM_DIR to a directory with the "
+        "the DeepSeek-V4.1 Engram tables are not in this checkpoint: set LLAMA_SAFETENSORS_BASE_DIR to a directory with the "
         "base model's model.safetensors.index.json and the shards holding layers.N.engram.embed.*");
 }
 
@@ -351,11 +318,10 @@ llama_safetensors_deepseek4_importer::llama_safetensors_deepseek4_importer(
         const std::filesystem::path & model_dir,
         llama_safetensors_json config,
         llama_safetensors_io_mode io_mode) :
-    model_dir_(model_dir), config_(std::move(config)), v41_(probe_v41(config_)) {
-    if (!v41_ && !probe(config_)) throw std::runtime_error("native DeepSeek-V4 importer received the wrong architecture");
-    hparams_ = v41_ ? config_.at("text_config") : config_;
+    model_dir_(model_dir), config_(std::move(config)), v41_(probe_v41(config_)),
+    hparams_(v41_ ? config_.at("text_config") : config_) {
+    if (!probe(config_)) throw std::runtime_error("native DeepSeek-V4 importer received the wrong architecture");
     n_layer_ = hparams_.at("num_hidden_layers").get<uint32_t>();
-    // the V4.1 mtp.* stages are the DSpark draft, a separate DFLASH model
     n_mtp_ = v41_ ? 0 : hparams_.value("num_nextn_predict_layers", 0U);
     n_expert_ = hparams_.at("n_routed_experts").get<uint32_t>();
     if (v41_) {
@@ -369,8 +335,8 @@ llama_safetensors_deepseek4_importer::llama_safetensors_deepseek4_importer(
         throw std::runtime_error("native DeepSeek-V4 importer does not support this tensor geometry");
     }
     const auto generation_path = model_dir_ / "generation_config.json";
-    generation_ = v41_ && !std::filesystem::is_regular_file(generation_path) ? llama_safetensors_json::object() :
-        llama_safetensors_read_json(generation_path);
+    generation_ = std::filesystem::is_regular_file(generation_path) ? llama_safetensors_read_json(generation_path) :
+        llama_safetensors_json::object();
     tokenizer_ = llama_safetensors_read_tokenizer_json(model_dir_ / "tokenizer.json");
     const auto tokenizer_config_path = model_dir_ / "tokenizer_config.json";
     if (std::filesystem::is_regular_file(tokenizer_config_path)) {
@@ -391,8 +357,14 @@ llama_safetensors_deepseek4_importer::llama_safetensors_deepseek4_importer(
     const auto engram_layers = hparams_.value("engram_layer_ids", std::vector<uint32_t>());
     if (v41_ && !engram_layers.empty() &&
         registry_.find("layers." + std::to_string(engram_layers.front()) + ".engram.embed.weight") == nullptr) {
-        engram_registry_ = load_engram_registry(config_, engram_layers);
-        engram_external_ = true;
+        const auto dir = engram_base_dir(config_);
+        std::vector<std::string> tables;
+        for (uint32_t layer : engram_layers) {
+            tables.push_back("layers." + std::to_string(layer) + ".engram.embed.weight");
+            tables.push_back("layers." + std::to_string(layer) + ".engram.embed.scale");
+        }
+        LLAMA_LOG_INFO("%s: DeepSeek-V4.1 Engram tables from %s\n", __func__, dir.string().c_str());
+        registry_.add_from(dir, tables);
     }
     quant_ = std::make_unique<llama_safetensors_quant_adapters>(config_, registry_);
     if (n_mtp_ != 0 && registry_.find("mtp.0.attn_norm.weight") == nullptr) n_mtp_ = 0;
@@ -404,7 +376,7 @@ llama_safetensors_deepseek4_importer::llama_safetensors_deepseek4_importer(
 }
 
 bool llama_safetensors_deepseek4_importer::probe(const llama_safetensors_json & config) {
-    return config.value("model_type", std::string()) == "deepseek_v4";
+    return config.value("model_type", std::string()) == "deepseek_v4" || probe_v41(config);
 }
 
 bool llama_safetensors_deepseek4_importer::probe_v41(const llama_safetensors_json & config) {
@@ -587,11 +559,6 @@ bool llama_safetensors_deepseek4_importer::describe(
         if (source == nullptr) return false;
         type = GGML_TYPE_I32;
         shape = reverse_shape(*source);
-    } else if (spec.kind == target_kind::ENGRAM_TABLE) {
-        const auto * source = engram_registry().find(spec.source);
-        if (source == nullptr) return false;
-        type = plain_type(*source);
-        shape = reverse_shape(*source);
     } else if (spec.kind == target_kind::ENGRAM_GATE) {
         const auto * q = registry_.find(spec.source + "q_weight");
         const auto * k = registry_.find(spec.source + "k_weight");
@@ -611,7 +578,7 @@ bool llama_safetensors_deepseek4_importer::describe(
         if (spec.source.empty()) return false;
         const auto * source = registry_.find(spec.source);
         if (source == nullptr) return false;
-        type = spec.quant ? spec.quant->target_type : plain_type(*source);
+        type = spec.quant ? spec.quant->target_type : llama_safetensors_plain_type(*source);
         shape = spec.quant ? spec.quant->target_shape : reverse_shape(*source);
     }
     if (shape.empty() || shape.size() > GGML_MAX_DIMS) return false;
@@ -719,18 +686,15 @@ bool llama_safetensors_deepseek4_importer::load(
     if (spec.kind == target_kind::TENSOR && !spec.source.empty()) {
         return llama_safetensors_load_tensor_direct(registry_, { spec.source, spec.quant }, destination, check_tensor);
     }
-    if (spec.kind == target_kind::ENGRAM_TABLE) {
-        return llama_safetensors_load_tensor_direct(engram_registry(), { spec.source, std::nullopt }, destination, check_tensor);
-    }
     return false;
 }
 
-// The Engram tables are ~100 GB per layer: keep them zero-copy/lazy over the shard mapping
+// The V4.1 Engram tables (~100 GB per layer) are read lazily, straight from the shards
 std::optional<llama_model_tensor_file_region> llama_safetensors_deepseek4_importer::file_region(
         const ggml_tensor * destination) const {
+    if (std::strstr(destination->name, ".engram_embd.") == nullptr) return std::nullopt;
     const target_spec spec = map_target(*quant_, registry_, n_layer_, n_mtp_, n_expert_, destination->name);
-    if (spec.kind != target_kind::ENGRAM_TABLE) return std::nullopt;
-    return llama_safetensors_tensor_file_region(engram_registry(), { spec.source, std::nullopt }, destination);
+    return llama_safetensors_tensor_file_region(registry_, { spec.source, std::nullopt }, destination);
 }
 
 std::vector<uint8_t> llama_safetensors_deepseek4_importer::materialize(
@@ -766,10 +730,7 @@ std::vector<uint8_t> llama_safetensors_deepseek4_importer::materialize(
                 result.insert(result.end(), eb.begin(), eb.end());
                 result.insert(result.end(), hb.begin(), hb.end());
             }
-        } else if (spec.kind == target_kind::ENGRAM_TABLE) {
-            return llama_safetensors_materialize_tensor(engram_registry(), *quant_, { spec.source, std::nullopt }, target_type, target_size);
         } else if (spec.kind == target_kind::ENGRAM_GATE) {
-            // q * k is folded once: the product of two BF16 values is exact in F32
             const auto & q = require_tensor(registry_, spec.source + "q_weight");
             const auto & k = require_tensor(registry_, spec.source + "k_weight");
             if (q.dtype != llama_safetensors_dtype::BF16 || k.dtype != llama_safetensors_dtype::BF16 || target_type != GGML_TYPE_F32)

@@ -40,21 +40,15 @@ class llama_safetensors_deepseek4_importer final : public llama_safetensors_impo
   private:
     void emit_v41_metadata(llama_safetensors_metadata_sink & sink, const std::string & arch) const;
     void emit_v41_token_map(gguf_context * ctx) const;
-    const llama_safetensors_registry & engram_registry() const {
-        return engram_external_ ? engram_registry_ : registry_;
-    }
 
     std::filesystem::path model_dir_;
     llama_safetensors_json config_;
-    llama_safetensors_json hparams_; // config_, or its text_config for V4.1
     bool v41_ = false;
+    const llama_safetensors_json & hparams_; // config_, or its text_config for V4.1
     llama_safetensors_json generation_;
     llama_safetensors_tokenizer_json tokenizer_;
     std::optional<std::string> chat_template_;
     llama_safetensors_registry registry_;
-    // V4.1 EXL3 packs leave out the Engram tables: they are read from base-checkpoint shards
-    llama_safetensors_registry engram_registry_;
-    bool engram_external_ = false;
     std::unique_ptr<llama_safetensors_quant_adapters> quant_;
     uint32_t n_layer_ = 0;
     uint32_t n_mtp_ = 0;

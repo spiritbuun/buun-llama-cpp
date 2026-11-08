@@ -26,23 +26,6 @@ const llama_safetensors_tensor * find_source(const llama_safetensors_registry & 
     return registry.find(binding.source);
 }
 
-ggml_type plain_target_type(const llama_safetensors_tensor & source) {
-    switch (source.dtype) {
-        case llama_safetensors_dtype::F8_E4M3:
-            return GGML_TYPE_F8_E4M3;
-        case llama_safetensors_dtype::F8_E8M0:
-            return GGML_TYPE_E8M0;
-        case llama_safetensors_dtype::BF16:
-            return source.shape.size() >= 2 ? GGML_TYPE_BF16 : GGML_TYPE_F32;
-        case llama_safetensors_dtype::F16:
-            return source.shape.size() >= 2 ? GGML_TYPE_F16 : GGML_TYPE_F32;
-        case llama_safetensors_dtype::F32:
-            return GGML_TYPE_F32;
-        default:
-            throw std::runtime_error("unsupported plain safetensors dtype for '" + source.name + "'");
-    }
-}
-
 std::vector<int64_t> reverse_shape(const llama_safetensors_tensor & source) {
     std::vector<int64_t> result;
     result.reserve(source.shape.size());
@@ -61,6 +44,25 @@ std::vector<int64_t> reverse_shape(const llama_safetensors_tensor & source) {
 }
 
 }  // namespace
+
+ggml_type llama_safetensors_plain_type(const llama_safetensors_tensor & source) {
+    switch (source.dtype) {
+        case llama_safetensors_dtype::F8_E4M3:
+            return GGML_TYPE_F8_E4M3;
+        case llama_safetensors_dtype::F8_E8M0:
+            return GGML_TYPE_F8_E8M0;
+        case llama_safetensors_dtype::BF16:
+            return source.shape.size() >= 2 ? GGML_TYPE_BF16 : GGML_TYPE_F32;
+        case llama_safetensors_dtype::F16:
+            return source.shape.size() >= 2 ? GGML_TYPE_F16 : GGML_TYPE_F32;
+        case llama_safetensors_dtype::F32:
+            return GGML_TYPE_F32;
+        case llama_safetensors_dtype::I32:
+            return GGML_TYPE_I32;
+        default:
+            throw std::runtime_error("unsupported plain safetensors dtype for '" + source.name + "'");
+    }
+}
 
 std::vector<uint8_t> llama_safetensors_bf16_to_f32(const std::vector<uint8_t> & source) {
     if (source.size() % sizeof(uint16_t) != 0) {
@@ -111,7 +113,7 @@ bool llama_safetensors_describe_tensor(const llama_safetensors_registry &       
     if (source == nullptr) {
         return false;
     }
-    type                             = binding.quant ? binding.quant->target_type : plain_target_type(*source);
+    type                             = binding.quant ? binding.quant->target_type : llama_safetensors_plain_type(*source);
     const std::vector<int64_t> shape = binding.quant ? binding.quant->target_shape : reverse_shape(*source);
     if (shape.size() > GGML_MAX_DIMS) {
         throw std::runtime_error("target tensor rank exceeds GGML_MAX_DIMS for '" + binding.source + "'");
@@ -160,7 +162,7 @@ std::optional<llama_model_tensor_file_region> llama_safetensors_tensor_file_regi
     if (source == nullptr) {
         return std::nullopt;
     }
-    const ggml_type source_type = binding.quant ? binding.quant->target_type : plain_target_type(*source);
+    const ggml_type source_type = binding.quant ? binding.quant->target_type : llama_safetensors_plain_type(*source);
     if (source_type != destination->type || source->size != ggml_nbytes(destination)) {
         return std::nullopt;
     }

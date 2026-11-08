@@ -68,7 +68,7 @@ std::vector<int64_t> reverse_shape(const llama_safetensors_tensor & tensor) {
     return result;
 }
 
-// Mirrors llama_safetensors plain_target_type: rank-1 half-precision vectors (norms, biases) are
+// Mirrors llama_safetensors_plain_type: rank-1 half-precision vectors (norms, biases) are
 // promoted to F32 so the graph reads them directly; rank-2+ stays in its native precision.
 ggml_type plain_type(const llama_safetensors_tensor & tensor, bool force_f32) {
     if (force_f32) {
