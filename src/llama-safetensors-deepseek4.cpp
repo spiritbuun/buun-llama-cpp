@@ -691,6 +691,40 @@ bool llama_safetensors_deepseek4_importer::load(
     return false;
 }
 
+// Streamable expert stacks and projections are prepared into mapped files, so
+// CPU-resident EXL3 experts never need an anonymous copy of the whole stack
+bool llama_safetensors_deepseek4_importer::can_stream(const std::string & target) const {
+    const target_spec spec = map_target(*quant_, registry_, n_layer_, n_mtp_, n_expert_, target);
+    if (spec.kind == target_kind::EXPERTS) {
+        // A dense bank needs every plane in expert 0's type and shape
+        const auto first = quant_->bind(expert_module(spec, 0), llama_safetensors_quant_role::WEIGHT);
+        if (!first) return false;
+        for (uint32_t expert = 0; expert < n_expert_; ++expert) {
+            const auto binding = quant_->bind(expert_module(spec, expert), llama_safetensors_quant_role::WEIGHT);
+            if (!binding || !quant_->can_stream(*binding) || binding->target_type != first->target_type ||
+                binding->target_shape != first->target_shape) return false;
+        }
+        return true;
+    }
+    return spec.kind == target_kind::TENSOR && spec.quant && quant_->can_stream(*spec.quant);
+}
+
+void llama_safetensors_deepseek4_importer::stream(
+        const std::string & target, const std::function<void(const void *, size_t)> & write) const {
+    const target_spec spec = map_target(*quant_, registry_, n_layer_, n_mtp_, n_expert_, target);
+    if (spec.kind == target_kind::EXPERTS) {
+        for (uint32_t expert = 0; expert < n_expert_; ++expert) {
+            const auto binding = quant_->bind(expert_module(spec, expert), llama_safetensors_quant_role::WEIGHT);
+            if (!binding) throw std::runtime_error("missing DeepSeek-V4 expert: " + expert_module(spec, expert));
+            quant_->stream(*binding, write);
+        }
+    } else if (spec.kind == target_kind::TENSOR && spec.quant) {
+        quant_->stream(*spec.quant, write);
+    } else {
+        throw std::runtime_error("unsupported DeepSeek-V4 streaming tensor: " + target);
+    }
+}
+
 // The V4.1 Engram tables (~100 GB per layer) are read lazily, straight from the shards
 std::optional<llama_model_tensor_file_region> llama_safetensors_deepseek4_importer::file_region(
         const ggml_tensor * destination) const {
