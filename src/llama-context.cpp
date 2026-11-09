@@ -1105,6 +1105,12 @@ static int llama_moe_cache_expert_parallel(const llama_model & model, int reques
         for (const auto & pair : {
                 std::make_pair(layer.ffn_up_exps, layer.ffn_gate_exps),
                 std::make_pair(layer.ffn_up_chexps, layer.ffn_gate_chexps)}) {
+            if (host_weight(pair.first) && ggml_type_is_exl3(pair.first->type)) {
+                // The fused bundle path has no EXL3 kernel, and fanout suppresses
+                // the per-node path that does: every expert would stay on the CPU.
+                LLAMA_LOG_WARN("MoE cache: EXL3 experts use ordinary multi-device cache routing; fused expert fanout disabled\n");
+                return 0;
+            }
             if (host_weight(pair.first) && host_weight(pair.second) &&
                     pair.first->type != pair.second->type) {
                 // Expert fanout currently requires a fused up/gate/down bundle
