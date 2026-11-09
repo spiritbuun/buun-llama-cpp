@@ -128,9 +128,75 @@ void dot_tile(const uint8_t * tile, const float * x, const float * lut, float * 
 }
 #endif
 
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__F16C__)
+// All sixteen columns of a tile per row. Tiles of up to 4 bits hold at most
+// 32 words, so two registers and a permute replace the word gathers.
 template<int bits>
+struct window_indices16 {
+    int a[16][16], b[16][16], ar[16][16], al[16][16], br[16][16];
+    constexpr window_indices16() : a{}, b{}, ar{}, al{}, br{} {
+        for (int r = 0; r < 16; ++r) for (int c = 0; c < 16; ++c) {
+            const int element = ((c%8)*4+(r%8)/2)*8 + r%2 + (r/8)*2 + (c/8)*4;
+            const int pos = ((element+1)*bits + 256*bits - 16) % (256*bits);
+            const int offset = pos%32;
+            a[r][c] = pos/32;
+            b[r][c] = (pos/32+1)%(8*bits);
+            ar[r][c] = offset <= 16 ? 16-offset : 32;
+            al[r][c] = offset > 16 ? offset-16 : 32;
+            br[r][c] = offset > 16 ? 48-offset : 32;
+        }
+    }
+};
+
+// Same arithmetic as codebook_value(), sixteen states at a time.
+template<int cb>
+__m512 codebook16(__m512i state, const float * lut) {
+    if constexpr (cb == 2) {
+        return _mm512_i32gather_ps(state, lut, 4);
+    } else {
+        __m512i x = cb == 1 ? _mm512_mullo_epi32(state, _mm512_set1_epi32(int(0xcbac1fedu))) :
+            _mm512_add_epi32(_mm512_mullo_epi32(state, _mm512_set1_epi32(89226354)), _mm512_set1_epi32(64248484));
+        x = _mm512_xor_si512(_mm512_and_si512(x, _mm512_set1_epi32(int(0x8fff8fffu))), _mm512_set1_epi32(0x3b603b60));
+        const __m512 v = _mm512_add_ps(_mm512_cvtph_ps(_mm512_cvtepi32_epi16(x)),
+                                       _mm512_cvtph_ps(_mm512_cvtepi32_epi16(_mm512_srli_epi32(x, 16))));
+        return _mm512_cvtph_ps(_mm512_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+    }
+}
+
+template<int bits, int cb>
+__m512 dot_tile16(const uint8_t * tile, const float * x, const float * lut, __m512 acc) {
+    static constexpr window_indices16<bits> index;
+    constexpr int words = 8*bits;
+    const auto * p = reinterpret_cast<const int *>(tile);
+    const __m512i lo = _mm512_maskz_loadu_epi32(__mmask16(words >= 16 ? 0xffff : (1u << words) - 1), p);
+    const __m512i hi = _mm512_maskz_loadu_epi32(__mmask16(words > 16 ? (1u << (words-16)) - 1 : 0), p + 16);
+    for (int r = 0; r < 16; ++r) {
+        const __m512i a = _mm512_permutex2var_epi32(lo, _mm512_loadu_si512(index.a[r]), hi);
+        const __m512i b = _mm512_permutex2var_epi32(lo, _mm512_loadu_si512(index.b[r]), hi);
+        __m512i state = _mm512_or_si512(_mm512_srlv_epi32(a, _mm512_loadu_si512(index.ar[r])),
+                                        _mm512_sllv_epi32(a, _mm512_loadu_si512(index.al[r])));
+        state = _mm512_or_si512(state, _mm512_srlv_epi32(b, _mm512_loadu_si512(index.br[r])));
+        state = _mm512_and_si512(state, _mm512_set1_epi32(65535));
+        acc = _mm512_fmadd_ps(codebook16<cb>(state, lut), _mm512_set1_ps(x[r]), acc);
+    }
+    return acc;
+}
+#endif
+
+template<int bits, int cb>
 void dot128(const uint8_t * weights, const float * x, const float * lut,
             int64_t k, int64_t col0, float * sum) {
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__F16C__)
+    if constexpr (bits <= 4) {
+        for (int col = 0; col < had_size; col += 16) {
+            __m512 acc = _mm512_loadu_ps(sum+col);
+            for (int64_t kt = 0; kt < k/16; ++kt)
+                acc = dot_tile16<bits, cb>(weights + (((col0+col)/16)*(k/16)+kt)*32*bits, x+kt*16, lut, acc);
+            _mm512_storeu_ps(sum+col, acc);
+        }
+        return;
+    }
+#endif
     for (int col = 0; col < had_size; col += 16) {
         for (int64_t kt = 0; kt < k/16; ++kt) {
             const uint8_t * tile = weights + (((col0+col)/16)*(k/16)+kt)*32*bits;
@@ -150,11 +216,13 @@ void dot128(const uint8_t * weights, const float * x, const float * lut,
     }
 }
 
-// Resolve bit width once per operation so circular-window extraction does
-// not perform integer division for every decoded weight.
+// Resolve bit width and codebook once per operation so circular-window
+// extraction does not perform integer division for every decoded weight.
 using dot_fn = void (*)(const uint8_t *, const float *, const float *, int64_t, int64_t, float *);
-constexpr dot_fn dot_kernels[] = {dot128<1>, dot128<2>, dot128<3>, dot128<4>,
-                                 dot128<5>, dot128<6>, dot128<7>, dot128<8>};
+template<int cb>
+constexpr dot_fn dot_row[] = {dot128<1, cb>, dot128<2, cb>, dot128<3, cb>, dot128<4, cb>,
+                              dot128<5, cb>, dot128<6, cb>, dot128<7, cb>, dot128<8, cb>};
+constexpr const dot_fn * dot_kernels[] = {dot_row<0>, dot_row<1>, dot_row<2>};
 
 bool auxiliary_shape(const ggml_tensor * tensor, int64_t width, int64_t experts) {
     return tensor && tensor->type == GGML_TYPE_F16 && tensor->ne[0] == width &&
@@ -213,8 +281,9 @@ void ggml_cpu_exl3_compute(const ggml_compute_params * params, ggml_tensor * dst
     const int64_t topk = grouped ? ids->ne[0] : 1;
     const int64_t tokens = grouped ? ids->ne[1] : x->ne[1]*x->ne[2];
     const int bits = ggml_exl3_bits(w->type);
-    const auto dot = dot_kernels[bits-1];
-    const float * lut = codebook(ggml_exl3_codebook(w->type));
+    const int cb = ggml_exl3_codebook(w->type);
+    const auto dot = dot_kernels[cb][bits-1];
+    const float * lut = codebook(cb);
     const int64_t shared = shared_rows(dst);
     float * transformed = static_cast<float *>(params->wdata);
     float * xh = shared ? nullptr : transformed + params->ith*k;
