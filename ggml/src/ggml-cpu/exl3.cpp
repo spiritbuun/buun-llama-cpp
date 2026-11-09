@@ -163,62 +163,76 @@ __m512 codebook16(__m512i state, const float * lut) {
     }
 }
 
-template<int bits, int cb>
-__m512 dot_tile16(const uint8_t * tile, const float * x, const float * lut, __m512 acc) {
+// Each decoded tile row feeds nx activation rows routed to the same expert.
+template<int bits, int cb, int nx>
+void dot_tiles16(const uint8_t * weights, const float * const * x, const float * lut,
+                 int64_t k, int64_t col0, float * sum) {
     static constexpr window_indices16<bits> index;
     constexpr int words = 8*bits;
-    const auto * p = reinterpret_cast<const int *>(tile);
-    const __m512i lo = _mm512_maskz_loadu_epi32(__mmask16(words >= 16 ? 0xffff : (1u << words) - 1), p);
-    const __m512i hi = _mm512_maskz_loadu_epi32(__mmask16(words > 16 ? (1u << (words-16)) - 1 : 0), p + 16);
-    for (int r = 0; r < 16; ++r) {
-        const __m512i a = _mm512_permutex2var_epi32(lo, _mm512_loadu_si512(index.a[r]), hi);
-        const __m512i b = _mm512_permutex2var_epi32(lo, _mm512_loadu_si512(index.b[r]), hi);
-        __m512i state = _mm512_or_si512(_mm512_srlv_epi32(a, _mm512_loadu_si512(index.ar[r])),
-                                        _mm512_sllv_epi32(a, _mm512_loadu_si512(index.al[r])));
-        state = _mm512_or_si512(state, _mm512_srlv_epi32(b, _mm512_loadu_si512(index.br[r])));
-        state = _mm512_and_si512(state, _mm512_set1_epi32(65535));
-        acc = _mm512_fmadd_ps(codebook16<cb>(state, lut), _mm512_set1_ps(x[r]), acc);
+    for (int col = 0; col < had_size; col += 16) {
+        __m512 acc[nx];
+        for (int j = 0; j < nx; ++j) acc[j] = _mm512_loadu_ps(sum + j*had_size + col);
+        for (int64_t kt = 0; kt < k/16; ++kt) {
+            const auto * p = reinterpret_cast<const int *>(weights + (((col0+col)/16)*(k/16)+kt)*32*bits);
+            const __m512i lo = _mm512_maskz_loadu_epi32(__mmask16(words >= 16 ? 0xffff : (1u << words) - 1), p);
+            const __m512i hi = _mm512_maskz_loadu_epi32(__mmask16(words > 16 ? (1u << (words-16)) - 1 : 0), p + 16);
+            for (int r = 0; r < 16; ++r) {
+                const __m512i a = _mm512_permutex2var_epi32(lo, _mm512_loadu_si512(index.a[r]), hi);
+                const __m512i b = _mm512_permutex2var_epi32(lo, _mm512_loadu_si512(index.b[r]), hi);
+                __m512i state = _mm512_or_si512(_mm512_srlv_epi32(a, _mm512_loadu_si512(index.ar[r])),
+                                                _mm512_sllv_epi32(a, _mm512_loadu_si512(index.al[r])));
+                state = _mm512_or_si512(state, _mm512_srlv_epi32(b, _mm512_loadu_si512(index.br[r])));
+                const __m512 value = codebook16<cb>(_mm512_and_si512(state, _mm512_set1_epi32(65535)), lut);
+                for (int j = 0; j < nx; ++j) acc[j] = _mm512_fmadd_ps(value, _mm512_set1_ps(x[j][kt*16+r]), acc[j]);
+            }
+        }
+        for (int j = 0; j < nx; ++j) _mm512_storeu_ps(sum + j*had_size + col, acc[j]);
     }
-    return acc;
 }
 #endif
 
+// x holds nx activation rows for one expert; sum holds nx*had_size outputs.
 template<int bits, int cb>
-void dot128(const uint8_t * weights, const float * x, const float * lut,
+void dot128(const uint8_t * weights, const float * const * x, int nx, const float * lut,
             int64_t k, int64_t col0, float * sum) {
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__F16C__)
     if constexpr (bits <= 4) {
-        for (int col = 0; col < had_size; col += 16) {
-            __m512 acc = _mm512_loadu_ps(sum+col);
-            for (int64_t kt = 0; kt < k/16; ++kt)
-                acc = dot_tile16<bits, cb>(weights + (((col0+col)/16)*(k/16)+kt)*32*bits, x+kt*16, lut, acc);
-            _mm512_storeu_ps(sum+col, acc);
+        for (int j = 0; j < nx; j += 4) {
+            switch (nx - j) {
+                case 1:  dot_tiles16<bits, cb, 1>(weights, x+j, lut, k, col0, sum + j*had_size); break;
+                case 2:  dot_tiles16<bits, cb, 2>(weights, x+j, lut, k, col0, sum + j*had_size); break;
+                case 3:  dot_tiles16<bits, cb, 3>(weights, x+j, lut, k, col0, sum + j*had_size); break;
+                default: dot_tiles16<bits, cb, 4>(weights, x+j, lut, k, col0, sum + j*had_size); break;
+            }
         }
         return;
     }
 #endif
-    for (int col = 0; col < had_size; col += 16) {
-        for (int64_t kt = 0; kt < k/16; ++kt) {
-            const uint8_t * tile = weights + (((col0+col)/16)*(k/16)+kt)*32*bits;
+    for (int j = 0; j < nx; ++j) {
+        float * out = sum + j*had_size;
+        for (int col = 0; col < had_size; col += 16) {
+            for (int64_t kt = 0; kt < k/16; ++kt) {
+                const uint8_t * tile = weights + (((col0+col)/16)*(k/16)+kt)*32*bits;
 #if defined(__AVX2__) && defined(__FMA__)
-            dot_tile<bits>(tile, x+kt*16, lut, sum+col);
+                dot_tile<bits>(tile, x[j]+kt*16, lut, out+col);
 #else
-            for (int c = 0; c < 16; ++c) {
-                float part = sum[col+c];
-                for (int r = 0; r < 16; ++r) {
-                    const int element = ((c%8)*4+(r%8)/2)*8 + r%2 + (r/8)*2 + (c/8)*4;
-                    part = std::fma(lut[window<bits>(tile, element)], x[kt*16+r], part);
+                for (int c = 0; c < 16; ++c) {
+                    float part = out[col+c];
+                    for (int r = 0; r < 16; ++r) {
+                        const int element = ((c%8)*4+(r%8)/2)*8 + r%2 + (r/8)*2 + (c/8)*4;
+                        part = std::fma(lut[window<bits>(tile, element)], x[j][kt*16+r], part);
+                    }
+                    out[col+c] = part;
                 }
-                sum[col+c] = part;
-            }
 #endif
+            }
         }
     }
 }
 
 // Resolve bit width and codebook once per operation so circular-window
 // extraction does not perform integer division for every decoded weight.
-using dot_fn = void (*)(const uint8_t *, const float *, const float *, int64_t, int64_t, float *);
+using dot_fn = void (*)(const uint8_t *, const float * const *, int, const float *, int64_t, int64_t, float *);
 template<int cb>
 constexpr dot_fn dot_row[] = {dot128<1, cb>, dot128<2, cb>, dot128<3, cb>, dot128<4, cb>,
                               dot128<5, cb>, dot128<6, cb>, dot128<7, cb>, dot128<8, cb>};
@@ -366,6 +380,44 @@ void ggml_cpu_exl3_compute(const ggml_compute_params * params, ggml_tensor * dst
     // A whole Hadamard output block belongs to one worker, so neither a
     // reduction barrier nor thread-count-dependent summation is required.
     auto compute = [&](bool retry) {
+        if (shared) {
+            // Rows routed to one expert share each decoded weight tile. Every
+            // worker derives the same groups; each row keeps its own sum order.
+            int32_t group_expert[cache_max_rows], group_of[cache_max_rows];
+            int n_groups = 0;
+            for (int64_t row = 0; row < shared; ++row) {
+                group_of[row] = -1;
+                const bool hit = cache && (cache->hit_mask & (uint64_t(1) << row));
+                if (hit != retry) continue;
+                const int32_t expert = expert_at(row);
+                int g = 0;
+                while (g < n_groups && group_expert[g] != expert) ++g;
+                if (g == n_groups) group_expert[n_groups++] = expert;
+                group_of[row] = g;
+            }
+            for (int64_t task = params->ith; task < n_groups*(n/had_size); task += params->nth) {
+                const int g = int(task / (n/had_size));
+                const int64_t col0 = (task % (n/had_size))*had_size;
+                int64_t rows[cache_max_rows];
+                const float * acts[cache_max_rows];
+                int nx = 0;
+                for (int64_t row = 0; row < shared; ++row) {
+                    if (group_of[row] != g) continue;
+                    rows[nx] = row;
+                    acts[nx++] = transformed + row*k;
+                }
+                if (group_expert[g] < 0) {
+                    for (int j = 0; j < nx; ++j)
+                        std::memset(static_cast<float *>(dst->data) + rows[j]*n + col0, 0, had_size*sizeof(float));
+                    continue;
+                }
+                float sums[cache_max_rows*had_size];
+                std::memset(sums, 0, nx*had_size*sizeof(float));
+                dot(static_cast<const uint8_t *>(w->data) + group_expert[g]*w->nb[2], acts, nx, lut, k, col0, sums);
+                for (int j = 0; j < nx; ++j) finish(rows[j], col0, sums + j*had_size);
+            }
+            return;
+        }
         int64_t prepared_row = -1;
         for (int64_t task = params->ith; task < tokens*topk*(n/had_size); task += params->nth) {
             const int64_t col0 = (task % (n/had_size))*had_size;
@@ -377,14 +429,14 @@ void ggml_cpu_exl3_compute(const ggml_compute_params * params, ggml_tensor * dst
                 std::memset(static_cast<float *>(dst->data) + row*n + col0, 0, had_size*sizeof(float));
                 continue;
             }
-            if (!shared && row != prepared_row) {
+            if (row != prepared_row) {
                 prepare(row, xh);
                 prepared_row = row;
             }
 
             float sum[had_size] = {};
-            const auto * weights = static_cast<const uint8_t *>(w->data) + expert*w->nb[2];
-            dot(weights, shared ? transformed+row*k : xh, lut, k, col0, sum);
+            const float * act = xh;
+            dot(static_cast<const uint8_t *>(w->data) + expert*w->nb[2], &act, 1, lut, k, col0, sum);
             finish(row, col0, sum);
         }
     };
