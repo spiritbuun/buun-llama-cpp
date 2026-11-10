@@ -1086,6 +1086,25 @@ static bool llama_model_has_cacheable_moe_weights(
     return false;
 }
 
+static bool llama_host_weight(const ggml_tensor * tensor) {
+    if (!tensor) return false;
+    const ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    return buffer && ggml_backend_buffer_is_host(buffer);
+}
+
+static bool llama_model_has_host_exl3_experts(const llama_model & model) {
+    for (const auto & layer : model.layers) {
+        for (const ggml_tensor * tensor : {
+                layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps, layer.ffn_gate_up_exps,
+                layer.ffn_up_chexps, layer.ffn_gate_chexps, layer.ffn_down_chexps}) {
+            if (llama_host_weight(tensor) && ggml_type_is_exl3(tensor->type)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static int llama_moe_cache_expert_parallel(const llama_model & model, int requested) {
     if (requested == 0) {
         return 0;
@@ -1096,26 +1115,17 @@ static int llama_moe_cache_expert_parallel(const llama_model & model, int reques
         LLAMA_LOG_WARN("MoE cache: mixed-precision expert banks use ordinary multi-device cache routing; fused expert fanout disabled\n");
         return 0;
     }
-    const auto host_weight = [](const ggml_tensor * tensor) {
-        if (!tensor) return false;
-        const ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
-        return buffer && ggml_backend_buffer_is_host(buffer);
-    };
+    if (llama_model_has_host_exl3_experts(model)) {
+        // The fused bundle path has no EXL3 kernel, and fanout suppresses
+        // the per-node path that does: every expert would stay on the CPU.
+        LLAMA_LOG_WARN("MoE cache: EXL3 experts use ordinary multi-device cache routing; fused expert fanout disabled\n");
+        return 0;
+    }
     for (const auto & layer : model.layers) {
-        for (const ggml_tensor * tensor : {
-                layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps, layer.ffn_gate_up_exps,
-                layer.ffn_up_chexps, layer.ffn_gate_chexps, layer.ffn_down_chexps}) {
-            if (host_weight(tensor) && ggml_type_is_exl3(tensor->type)) {
-                // The fused bundle path has no EXL3 kernel, and fanout suppresses
-                // the per-node path that does: every expert would stay on the CPU.
-                LLAMA_LOG_WARN("MoE cache: EXL3 experts use ordinary multi-device cache routing; fused expert fanout disabled\n");
-                return 0;
-            }
-        }
         for (const auto & pair : {
                 std::make_pair(layer.ffn_up_exps, layer.ffn_gate_exps),
                 std::make_pair(layer.ffn_up_chexps, layer.ffn_gate_chexps)}) {
-            if (host_weight(pair.first) && host_weight(pair.second) &&
+            if (llama_host_weight(pair.first) && llama_host_weight(pair.second) &&
                     pair.first->type != pair.second->type) {
                 // Expert fanout currently requires a fused up/gate/down bundle
                 // and suppresses ordinary cache admission. Mixed up/gate quants
@@ -1218,6 +1228,25 @@ void llama_context::sched_reserve() {
         ? (ggml_moe_cache_mode)cparams.moe_cache_mode : GGML_MOE_CACHE_MODE_OFF;
     const int moe_cache_expert_parallel = moe_cache_eligible
         ? llama_moe_cache_expert_parallel(model, cparams.moe_cache_expert_parallel) : 0;
+    moe_cache_prompt_ubatch = 0;
+    if (moe_cache_eligible && llama_model_has_host_exl3_experts(model)) {
+        ggml_moe_cache_config config = {};
+        const int automatic = cparams.moe_cache_mode == LLAMA_MOE_CACHE_MODE_UNSPECIFIED
+            ? -1 : cparams.moe_cache_mode == LLAMA_MOE_CACHE_MODE_AUTO;
+        if (ggml_moe_cache.query_config(automatic, cparams.moe_cache_budget_mib, &config) && config.max_batch > 0) {
+            // The split pays while cache hits outweigh the extra passes, and the
+            // hit rate follows the VRAM available for experts: measured break-even
+            // is about 40 / 110 / 340 prompt tokens on 1 / 2 / 4 24 GB devices.
+            constexpr uint32_t prompt_tokens_per_device = 48;
+            uint32_t n_gpu = 0;
+            for (ggml_backend_t backend : backend_ptrs) {
+                const auto type = ggml_backend_dev_type(ggml_backend_get_device(backend));
+                n_gpu += type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU;
+            }
+            moe_cache_prompt_ubatch = config.max_batch;
+            moe_cache_prompt_tokens = prompt_tokens_per_device * n_gpu;
+        }
+    }
     const char * moe_cache_requested = "provider";
     switch (cparams.moe_cache_mode) {
         case LLAMA_MOE_CACHE_MODE_OFF:  moe_cache_requested = "off";  break;
@@ -5007,8 +5036,17 @@ int llama_context::decode(const llama_batch & batch_inp, const llama_batch_ext *
 
     llama_memory_context_ptr mctx;
 
+    // Host EXL3 experts reach the expert cache only in cache-sized ubatches. Below
+    // this prompt length that beats copying each ubatch's selected experts to the GPU.
+    // Pooled embeddings need the whole sequence in one ubatch, and recurrent rollback
+    // keeps the trailing 1 + n_rs_seq tokens of a sequence together.
+    const bool pooled = cparams.embeddings && cparams.pooling_type != LLAMA_POOLING_TYPE_NONE;
+    const uint32_t n_ubatch = moe_cache_prompt_ubatch > cparams.n_rs_seq + 1 && cparams.causal_attn &&
+            !pooled && n_tokens_all <= moe_cache_prompt_tokens
+        ? std::min(cparams.n_ubatch, moe_cache_prompt_ubatch) : cparams.n_ubatch;
+
     while (true) {
-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
+        mctx = memory->init_batch(*balloc, n_ubatch, output_all);
         if (!mctx) {
             return -2;
         }
