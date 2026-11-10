@@ -461,6 +461,11 @@ int main(int argc, char ** argv) {
     ok &= run(backend, 2, 2, true, 21, 1);
     ok &= run(backend, 2, 2, true, 22, 3);
     ok &= run(backend, 2, 2, true, 22, 3, true);
+    // Large batches group rows by expert; cover full and ragged row chunks
+    // for every in-register codebook and vectorized bit width.
+    for (int cb = 0; cb < 2; ++cb) for (int bits = 1; bits <= 4; ++bits) {
+        ok &= run(backend, bits, cb, true, 27, 3, bits == 3);
+    }
     ok &= run(backend, 2, 2, true, 2, 1, false, 2560, 640);
     ok &= run(backend, 2, 2, true, 2, 3, false, 640, 2560);
     if (cache_gpu) {

@@ -2,6 +2,7 @@
 #include "ggml-cpu-impl.h"
 #include "../ggml-backend-moe-cache.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <new>
@@ -270,8 +271,11 @@ size_t ggml_cpu_exl3_work_size(const ggml_tensor * dst, int threads) {
     // keep one per worker; packed weights stay packed in both cases.
     const auto * w = dst->src[0];
     const size_t rows = cache_rows(dst);
-    const size_t transforms = shared_rows(dst) ? shared_rows(dst) : threads;
+    const auto * x = dst->src[1];
+    const size_t all_rows = dst->op == GGML_OP_MUL_MAT_ID ? ggml_nelements(dst->src[2]) : x->ne[1]*x->ne[2];
+    const size_t transforms = shared_rows(dst) ? shared_rows(dst) : size_t(threads)*tile_rows;
     return transforms * size_t(w->ne[0]) * sizeof(float) +
+        (shared_rows(dst) ? 0 : 2*(all_rows+1)*sizeof(int64_t)) +
         (rows ? GGML_PAD(sizeof(cache_state), 64) + rows*w->ne[1]*sizeof(float) : 0);
 }
 
@@ -294,7 +298,9 @@ void ggml_cpu_exl3_compute(const ggml_compute_params * params, ggml_tensor * dst
     const float * lut = codebook(cb);
     const int64_t shared = shared_rows(dst);
     float * transformed = static_cast<float *>(params->wdata);
-    float * xh = shared ? nullptr : transformed + params->ith*k;
+    const int64_t n_rows = tokens*topk;
+    float * xh = shared ? nullptr : transformed + params->ith*tile_rows*k;
+    int64_t * order = shared ? nullptr : reinterpret_cast<int64_t *>(transformed + params->nth*tile_rows*k);
 
     // a batched MUL_MAT (weight planes matched to src1 planes) runs plane-major like an expert bank
     auto expert_at = [&](int64_t row) {
@@ -371,6 +377,28 @@ void ggml_cpu_exl3_compute(const ggml_compute_params * params, ggml_tensor * dst
         if (!cache->node) cache = nullptr;
     }
 
+    // Large batches sort rows by expert once and cut each expert's rows into
+    // chunks of tile_rows: order[n_rows] holds the chunk count, then the
+    // n_chunks+1 chunk bounds follow.
+    if (!shared) {
+        if (params->ith == 0) {
+            for (int64_t row = 0; row < n_rows; ++row) order[row] = row;
+            std::sort(order, order + n_rows, [&](int64_t a, int64_t b) {
+                const int32_t ea = expert_at(a), eb = expert_at(b);
+                return ea != eb ? ea < eb : a < b;
+            });
+            int64_t * bounds = order + n_rows + 1;
+            int64_t n_chunks = 0;
+            for (int64_t i = 0; i < n_rows; ++i) {
+                if (!i || i - bounds[n_chunks-1] == tile_rows || expert_at(order[i]) != expert_at(order[i-1])) bounds[n_chunks++] = i;
+            }
+            bounds[n_chunks] = n_rows;
+            order[n_rows] = n_chunks;
+            ggml_threadpool_chunk_set(params->threadpool, 0);
+        }
+        ggml_barrier(params->threadpool);
+    }
+
     // A whole Hadamard output block belongs to one worker, so neither a
     // reduction barrier nor thread-count-dependent summation is required.
     auto compute = [&](bool retry) {
@@ -423,26 +451,28 @@ void ggml_cpu_exl3_compute(const ggml_compute_params * params, ggml_tensor * dst
             }
             return;
         }
-        int64_t prepared_row = -1;
-        for (int64_t task = params->ith; task < tokens*topk*(n/had_size); task += params->nth) {
-            const int64_t col0 = (task % (n/had_size))*had_size;
-            const int64_t row = task / (n/had_size);
-            const bool hit = cache && (cache->hit_mask & (uint64_t(1) << row));
-            if (hit != retry) continue;
-            const int expert = expert_at(row);
+        // Large batches: a worker claims a whole chunk, so each activation is
+        // transformed once and every tile is decoded once per chunk.
+        const int64_t * bounds = order + n_rows + 1;
+        for (int64_t chunk; (chunk = ggml_threadpool_chunk_add(params->threadpool, 1)) < order[n_rows];) {
+            const int64_t * rows = order + bounds[chunk];
+            const int nx = int(bounds[chunk+1] - bounds[chunk]);
+            const int32_t expert = expert_at(rows[0]);
             if (expert < 0) {
-                std::memset(static_cast<float *>(dst->data) + row*n + col0, 0, had_size*sizeof(float));
+                for (int j = 0; j < nx; ++j)
+                    std::memset(static_cast<float *>(dst->data) + rows[j]*n, 0, n*sizeof(float));
                 continue;
             }
-            if (row != prepared_row) {
-                prepare(row, xh);
-                prepared_row = row;
+            const float * acts[tile_rows];
+            for (int j = 0; j < nx; ++j) {
+                prepare(rows[j], xh + j*k);
+                acts[j] = xh + j*k;
             }
-
-            float sum[had_size] = {};
-            const float * act = xh;
-            dot(static_cast<const uint8_t *>(w->data) + expert*w->nb[2], &act, 1, lut, k, col0, sum);
-            finish(row, col0, sum);
+            for (int64_t col0 = 0; col0 < n; col0 += had_size) {
+                float sums[tile_rows*had_size] = {};
+                dot(static_cast<const uint8_t *>(w->data) + expert*w->nb[2], acts, nx, lut, k, col0, sums);
+                for (int j = 0; j < nx; ++j) finish(rows[j], col0, sums + j*had_size);
+            }
         }
     };
     compute(false);
