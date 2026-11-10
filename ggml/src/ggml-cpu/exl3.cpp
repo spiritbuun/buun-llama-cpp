@@ -98,7 +98,9 @@ constexpr int tile_element(int r, int c) {
 template<int bits>
 struct window_indices {
     int a[16][16], b[16][16], ar[16][16], al[16][16], br[16][16];
-    constexpr window_indices() : a{}, b{}, ar{}, al{}, br{} {
+    // Double-shift form: state = low 16 bits of (word a : word low) >> shift.
+    int low[16][16], shift[16][16];
+    constexpr window_indices() : a{}, b{}, ar{}, al{}, br{}, low{}, shift{} {
         for (int r = 0; r < 16; ++r) for (int c = 0; c < 16; ++c) {
             const int pos = ((tile_element(r, c)+1)*bits + 256*bits - 16) % (256*bits);
             const int offset = pos%32;
@@ -107,6 +109,8 @@ struct window_indices {
             ar[r][c] = offset <= 16 ? 16-offset : 32;
             al[r][c] = offset > 16 ? offset-16 : 32;
             br[r][c] = offset > 16 ? 48-offset : 32;
+            low[r][c] = offset > 16 ? b[r][c] : a[r][c];
+            shift[r][c] = offset > 16 ? 48-offset : 16-offset;
         }
     }
 };
@@ -177,10 +181,15 @@ void dot_tiles16(const uint8_t * weights, const float * const * x, const float *
             const __m512i hi = _mm512_maskz_loadu_epi32(__mmask16(words > 16 ? (1u << (words-16)) - 1 : 0), p + 16);
             for (int r = 0; r < 16; ++r) {
                 const __m512i a = _mm512_permutex2var_epi32(lo, _mm512_loadu_si512(index.a[r]), hi);
+#if defined(__AVX512VBMI2__)
+                const __m512i low = _mm512_permutex2var_epi32(lo, _mm512_loadu_si512(index.low[r]), hi);
+                const __m512i state = _mm512_shrdv_epi32(low, a, _mm512_loadu_si512(index.shift[r]));
+#else
                 const __m512i b = _mm512_permutex2var_epi32(lo, _mm512_loadu_si512(index.b[r]), hi);
                 __m512i state = _mm512_or_si512(_mm512_srlv_epi32(a, _mm512_loadu_si512(index.ar[r])),
                                                 _mm512_sllv_epi32(a, _mm512_loadu_si512(index.al[r])));
                 state = _mm512_or_si512(state, _mm512_srlv_epi32(b, _mm512_loadu_si512(index.br[r])));
+#endif
                 const __m512 value = codebook16<cb>(_mm512_and_si512(state, _mm512_set1_epi32(65535)), lut);
                 for (int j = 0; j < nx; ++j) acc[j] = _mm512_fmadd_ps(value, _mm512_set1_ps(x[j][kt*16+r]), acc[j]);
             }
