@@ -550,7 +550,9 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                 cb(comp, "comp_latent", il);
 
                 // index K from the RoPE-free latent; a latent stands for the first token of its group
-                ggml_tensor * ik = build_norm(build_lora_mm(layer.indexer_attn_k, comp, layer.indexer_attn_k_s, layer.indexer_attn_k_in_s), layer.indexer_k_norm, nullptr, LLM_NORM_RMS, il);
+                // EXL3 projections take one input plane, so project the [n_embd_head, 1, n_blocks] latents as a matrix
+                ggml_tensor * ik = build_lora_mm(layer.indexer_attn_k, ggml_reshape_2d(ctx0, comp, n_embd_head, n_blocks), layer.indexer_attn_k_s, layer.indexer_attn_k_in_s);
+                ik = build_norm(ggml_reshape_3d(ctx0, ik, n_idx_embd, 1, n_blocks), layer.indexer_k_norm, nullptr, LLM_NORM_RMS, il);
                 ik = rope(ik, ci.state_write_pos, n_idx_embd - n_embd_head_rope);
                 comp = rope(comp, ci.state_write_pos, n_embd_head_nope);
 
