@@ -8,9 +8,16 @@
 #include <sstream>
 #include <string>
 #include <cctype>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <map>
 #include <vector>
 #include <optional>
+#include <set>
+#include <string_view>
 #include <algorithm>
+#include <unordered_set>
 
 #define FILENAME "jinja-value"
 
@@ -160,6 +167,554 @@ template<value_compare_op op>
 static value test_compare_fn(const func_args & args) {
     args.ensure_count(2, 2);
     return mk_val<value_bool>(value_compare(args.get_pos(0), args.get_pos(1), op));
+}
+
+std::string float_to_string(double v) {
+    if (std::isnan(v)) {
+        return "nan";
+    }
+    if (std::isinf(v)) {
+        return v < 0 ? "-inf" : "inf";
+    }
+    // shortest scientific form that parses back to the same double
+    char buf[40];
+    for (int prec = 0; prec < 17; ++prec) {
+        snprintf(buf, sizeof(buf), "%.*e", prec, v);
+        if (std::strtod(buf, nullptr) == v) {
+            break;
+        }
+    }
+    const std::string sci(buf);
+    const size_t epos = sci.find('e');
+    const int exp10 = std::atoi(sci.c_str() + epos + 1);
+    std::string digits;
+    for (size_t i = 0; i < epos; ++i) {
+        if (std::isdigit(static_cast<unsigned char>(sci[i]))) {
+            digits += sci[i];
+        }
+    }
+    std::string out = std::signbit(v) ? "-" : "";
+    if (exp10 >= -4 && exp10 < 16) {
+        const size_t n_int = static_cast<size_t>(exp10 < 0 ? 0 : exp10 + 1);
+        if (exp10 < 0) {
+            out += "0." + std::string(static_cast<size_t>(-exp10 - 1), '0') + digits;
+        } else if (digits.size() <= n_int) {
+            out += digits + std::string(n_int - digits.size(), '0') + ".0";
+        } else {
+            out += digits.substr(0, n_int) + "." + digits.substr(n_int);
+        }
+    } else {
+        out += digits.substr(0, 1);
+        if (digits.size() > 1) {
+            out += "." + digits.substr(1);
+        }
+        const int abs_exp = exp10 < 0 ? -exp10 : exp10;
+        out += exp10 < 0 ? "e-" : "e+";
+        out += (abs_exp < 10 ? "0" : "") + std::to_string(abs_exp);
+    }
+    return out;
+}
+
+// dec = dec * mul + add, on a decimal digit string
+static void decimal_mul_add(std::string & dec, int mul, int add) {
+    int carry = add;
+    for (size_t i = dec.size(); i-- > 0;) {
+        const int v = (dec[i] - '0') * mul + carry;
+        dec[i] = static_cast<char>('0' + v % 10);
+        carry = v / 10;
+    }
+    for (; carry > 0; carry /= 10) {
+        dec.insert(dec.begin(), static_cast<char>('0' + carry % 10));
+    }
+}
+
+// Python int(text, base); null when the text is not an integer literal
+static value parse_int_text(const std::string & text, int64_t base) {
+    if (base != 0 && (base < 2 || base > 36)) {
+        return nullptr;
+    }
+    const std::string s = jinja::string(text).strip(true, true).str();
+    size_t i = 0;
+    bool negative = false;
+    if (i < s.size() && (s[i] == '+' || s[i] == '-')) {
+        negative = s[i] == '-';
+        ++i;
+    }
+    bool prefixed = false;
+    if (i + 1 < s.size() && s[i] == '0') {
+        const char p = static_cast<char>(std::tolower(static_cast<unsigned char>(s[i + 1])));
+        const int prefix_base = p == 'x' ? 16 : p == 'o' ? 8 : p == 'b' ? 2 : 0;
+        if (prefix_base != 0 && (base == 0 || base == prefix_base)) {
+            base = prefix_base;
+            prefixed = true;
+            i += 2;
+        }
+    }
+    const bool no_leading_zero = base == 0;
+    if (base == 0) {
+        base = 10;
+    }
+    // digits, with single underscores allowed between them (and right after a prefix)
+    std::vector<int> digits;
+    bool underscore_ok = prefixed;
+    bool after_underscore = false;
+    for (; i < s.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c == '_') {
+            if (!underscore_ok) {
+                return nullptr;
+            }
+            underscore_ok = false;
+            after_underscore = true;
+            continue;
+        }
+        const int d = std::isdigit(c) ? c - '0' : std::isalpha(c) ? std::tolower(c) - 'a' + 10 : 99;
+        if (d >= base) {
+            return nullptr;
+        }
+        digits.push_back(d);
+        underscore_ok = true;
+        after_underscore = false;
+    }
+    if (digits.empty() || after_underscore) {
+        return nullptr;
+    }
+    const bool is_zero = std::all_of(digits.begin(), digits.end(), [](int d) { return d == 0; });
+    if (no_leading_zero && digits.size() > 1 && digits[0] == 0 && !is_zero) {
+        return nullptr;
+    }
+    if (base == 10 && digits.size() > 4300) {
+        return nullptr; // Python's limit on int <-> str conversions
+    }
+    uint64_t acc = 0;
+    bool overflow = false;
+    for (const int d : digits) {
+        if (acc > (UINT64_MAX - static_cast<uint64_t>(d)) / static_cast<uint64_t>(base)) {
+            overflow = true;
+            break;
+        }
+        acc = acc * static_cast<uint64_t>(base) + static_cast<uint64_t>(d);
+    }
+    const uint64_t limit = static_cast<uint64_t>(INT64_MAX) + (negative ? 1 : 0);
+    if (!overflow && acc <= limit) {
+        if (negative) {
+            return mk_val<value_int>(acc == limit ? INT64_MIN : -static_cast<int64_t>(acc));
+        }
+        return mk_val<value_int>(static_cast<int64_t>(acc));
+    }
+    std::string dec = "0";
+    for (const int d : digits) {
+        decimal_mul_add(dec, static_cast<int>(base), d);
+    }
+    if (negative) {
+        dec.insert(dec.begin(), '-');
+    }
+    return mk_val<value_bigint>(dec, std::strtod(dec.c_str(), nullptr));
+}
+
+// Python float(text)
+static bool parse_float_text(const std::string & text, double & out) {
+    const std::string s = jinja::string(text).strip(true, true).str();
+    size_t i = 0;
+    bool negative = false;
+    if (i < s.size() && (s[i] == '+' || s[i] == '-')) {
+        negative = s[i] == '-';
+        ++i;
+    }
+    std::string body = s.substr(i);
+    std::transform(body.begin(), body.end(), body.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (body == "inf" || body == "infinity") {
+        out = negative ? -INFINITY : INFINITY;
+        return true;
+    }
+    if (body == "nan") {
+        out = NAN;
+        return true;
+    }
+    // digits [. digits] [e [sign] digits], underscores only between digits
+    std::string clean;
+    size_t pos = 0;
+    auto read_digits = [&]() -> size_t {
+        size_t n = 0;
+        for (; pos < body.size(); ++pos) {
+            const unsigned char c = static_cast<unsigned char>(body[pos]);
+            if (std::isdigit(c)) {
+                clean += body[pos];
+                ++n;
+            } else if (!(c == '_' && n > 0 && pos + 1 < body.size() && std::isdigit(static_cast<unsigned char>(body[pos + 1])))) {
+                break;
+            }
+        }
+        return n;
+    };
+    size_t n_mantissa = read_digits();
+    if (pos < body.size() && body[pos] == '.') {
+        clean += '.';
+        ++pos;
+        n_mantissa += read_digits();
+    }
+    if (n_mantissa == 0) {
+        return false;
+    }
+    if (pos < body.size() && body[pos] == 'e') {
+        clean += 'e';
+        ++pos;
+        if (pos < body.size() && (body[pos] == '+' || body[pos] == '-')) {
+            clean += body[pos++];
+        }
+        if (read_digits() == 0) {
+            return false;
+        }
+    }
+    if (pos != body.size()) {
+        return false;
+    }
+    out = std::strtod(clean.c_str(), nullptr);
+    if (negative) {
+        out = -out;
+    }
+    return true;
+}
+
+static std::pair<bool, std::string> decimal_parts(const std::string & text) {
+    const size_t first = text.find_first_not_of("+-0");
+    const std::string magnitude = first == std::string::npos ? "" : text.substr(first);
+    return {!magnitude.empty() && text[0] == '-', magnitude};
+}
+
+std::pair<bool, std::string> value_int_decimal(const value_t & val) {
+    const auto * big = dynamic_cast<const value_bigint_t *>(&val);
+    return decimal_parts(big ? big->digits : std::to_string(val.val_int));
+}
+
+static int decimal_compare(const std::pair<bool, std::string> & a, const std::pair<bool, std::string> & b) {
+    if (a.first != b.first) {
+        return a.first ? -1 : 1;
+    }
+    int cmp = a.second.size() != b.second.size() ? (a.second.size() < b.second.size() ? -1 : 1) : a.second.compare(b.second);
+    cmp = (cmp > 0) - (cmp < 0);
+    return a.first ? -cmp : cmp;
+}
+
+int value_number_compare(const value_t & a, const value_t & b) {
+    const bool a_int = dynamic_cast<const value_int_t *>(&a) != nullptr;
+    const bool b_int = dynamic_cast<const value_int_t *>(&b) != nullptr;
+    const bool a_flt = dynamic_cast<const value_float_t *>(&a) != nullptr;
+    const bool b_flt = dynamic_cast<const value_float_t *>(&b) != nullptr;
+    if ((!a_int && !a_flt) || (!b_int && !b_flt)) {
+        return VALUE_NOT_NUMBERS;
+    }
+    if (a_flt && b_flt) {
+        const double x = a.val_flt;
+        const double y = b.val_flt;
+        return std::isnan(x) || std::isnan(y) ? VALUE_UNORDERED : (x > y) - (x < y);
+    }
+    if (a_int && b_int) {
+        return decimal_compare(value_int_decimal(a), value_int_decimal(b));
+    }
+    // integer against float: compare with the float's integral part, then its fraction
+    const double f = a_flt ? a.val_flt : b.val_flt;
+    int cmp;
+    if (std::isnan(f)) {
+        return VALUE_UNORDERED;
+    } else if (std::isinf(f)) {
+        cmp = f > 0 ? -1 : 1;
+    } else {
+        const double whole = std::trunc(f);
+        std::vector<char> buf(400);
+        snprintf(buf.data(), buf.size(), "%.0f", whole);
+        cmp = decimal_compare(value_int_decimal(a_flt ? b : a), decimal_parts(buf.data()));
+        if (cmp == 0) {
+            cmp = (f < whole) - (f > whole);
+        }
+    }
+    return a_flt ? -cmp : cmp;
+}
+
+// Python int(float): truncates; null for nan and infinities
+
+value value_int_negate(const value & val) {
+    if (is_int64(val) && val->as_int() != INT64_MIN) {
+        return mk_val<value_int>(-val->as_int());
+    }
+    const auto dec = value_int_decimal(*val);
+    if (!dec.first && dec.second == "9223372036854775808") {
+        return mk_val<value_int>(INT64_MIN);
+    }
+    return mk_val<value_bigint>((dec.first ? "" : "-") + dec.second, -val->as_float());
+}
+
+static value float_to_int_value(double f) {
+    if (!std::isfinite(f)) {
+        return nullptr;
+    }
+    f = std::trunc(f);
+    if (f >= -9223372036854775808.0 && f < 9223372036854775808.0) {
+        return mk_val<value_int>(static_cast<int64_t>(f));
+    }
+    std::vector<char> buf(400);
+    snprintf(buf.data(), buf.size(), "%.0f", f);
+    return mk_val<value_bigint>(std::string(buf.data()), f);
+}
+
+// int filter: int(value, base), then int(float(value)), then the default
+static value filter_int(const func_args & args) {
+    args.ensure_count(1, 3);
+    value input       = args.get_pos(0);
+    value val_default = args.get_kwarg_or_pos("default", 1);
+    value val_base    = args.get_kwarg_or_pos("base",    2);
+    value res;
+    if (is_val<value_string>(input)) {
+        const std::string str = input->as_string().str();
+        res = parse_int_text(str, val_base->is_undefined() ? 10 : val_base->as_int());
+        double f = 0.0;
+        if (!res && parse_float_text(str, f)) {
+            res = float_to_int_value(f);
+        }
+    } else if (is_val<value_bool>(input)) {
+        res = mk_val<value_int>(input->as_int());
+    } else if (is_val<value_int>(input)) {
+        res = input;
+    } else if (is_val<value_float>(input)) {
+        res = float_to_int_value(input->as_float());
+    }
+    if (res) {
+        return res;
+    }
+    return val_default->is_undefined() ? mk_val<value_int>(0) : val_default;
+}
+
+// float filter: float(value), then the default
+static value filter_float(const func_args & args) {
+    args.ensure_count(1, 2);
+    value input       = args.get_pos(0);
+    value val_default = args.get_kwarg_or_pos("default", 1);
+    double f = 0.0;
+    if (is_val<value_string>(input)) {
+        if (parse_float_text(input->as_string().str(), f)) {
+            return mk_val<value_float>(f);
+        }
+    } else if (is_val<value_float>(input)) {
+        return input;
+    } else if (is_val<value_int>(input)) {
+        return mk_val<value_float>(input->as_float());
+    } else if (is_val<value_bool>(input)) {
+        return mk_val<value_float>(input->as_bool() ? 1.0 : 0.0);
+    }
+    return val_default->is_undefined() ? mk_val<value_float>(0.0) : val_default;
+}
+
+string percent_format(const string & fmt, const value & values) {
+    const bool fmt_is_input = fmt.all_parts_are_input();
+    const std::string f = fmt.str();
+    const bool is_mapping = is_val<value_object>(values);
+    std::vector<value> positional;
+    if (is_val<value_tuple>(values)) {
+        positional = values->as_array();
+    } else {
+        positional.push_back(values);
+    }
+    size_t next_arg = 0;
+    auto take_arg = [&]() -> value {
+        if (next_arg >= positional.size()) {
+            throw raised_exception("not enough arguments for format string");
+        }
+        return positional[next_arg++];
+    };
+
+    string result;
+    std::string literal;
+    auto flush_literal = [&]() {
+        if (!literal.empty()) {
+            result.parts.push_back({fmt_is_input, literal});
+            literal.clear();
+        }
+    };
+    auto at_end = [&](size_t i) {
+        if (i >= f.size()) {
+            throw raised_exception("incomplete format");
+        }
+    };
+
+    for (size_t i = 0; i < f.size(); ++i) {
+        if (f[i] != '%') {
+            literal += f[i];
+            continue;
+        }
+        at_end(++i);
+        value keyed;
+        if (f[i] == '(') {
+            const size_t close = f.find(')', i);
+            if (close == std::string::npos) {
+                throw raised_exception("incomplete format key");
+            }
+            if (!is_mapping) {
+                throw raised_exception("format requires a mapping");
+            }
+            keyed = values->at(f.substr(i + 1, close - i - 1));
+            i = close + 1;
+        }
+        bool left = false, plus = false, space = false, alt = false, zero = false;
+        for (; i < f.size(); ++i) {
+            if (f[i] == '-') left = true;
+            else if (f[i] == '+') plus = true;
+            else if (f[i] == ' ') space = true;
+            else if (f[i] == '#') alt = true;
+            else if (f[i] == '0') zero = true;
+            else break;
+        }
+        auto read_number = [&]() -> int64_t {
+            at_end(i);
+            if (f[i] == '*') {
+                ++i;
+                return std::max<int64_t>(-1000000, std::min<int64_t>(take_arg()->as_int(), 1000000));
+            }
+            int64_t n = 0;
+            for (; i < f.size() && std::isdigit(static_cast<unsigned char>(f[i])); ++i) {
+                n = std::min<int64_t>(n * 10 + (f[i] - '0'), 1000000);
+            }
+            return n;
+        };
+        int64_t width = read_number();
+        if (width < 0) {
+            left = true;
+            width = -width;
+        }
+        int64_t precision = -1;
+        if (i < f.size() && f[i] == '.') {
+            ++i;
+            precision = std::max<int64_t>(read_number(), 0);
+        }
+        while (i < f.size() && (f[i] == 'h' || f[i] == 'l' || f[i] == 'L')) {
+            ++i;
+        }
+        at_end(i);
+        const char conv = f[i];
+        if (conv == '%') {
+            literal += '%';
+            continue;
+        }
+        value arg = keyed ? keyed : take_arg();
+        const bool arg_is_input = is_val<value_string>(arg) && arg->val_str.all_parts_are_input();
+
+        std::string body;
+        std::string sign_prefix; // sign and 0x/0o prefix: zero padding goes after it
+        bool numeric = false;
+        if (conv == 's' || conv == 'r' || conv == 'a') {
+            if (conv == 's') {
+                if (is_val<value_string>(arg) && width == 0 && precision < 0) {
+                    flush_literal();
+                    result.parts.insert(result.parts.end(), arg->val_str.parts.begin(), arg->val_str.parts.end());
+                    continue;
+                }
+                body = arg->is_undefined() ? "" : arg->as_string().str();
+            } else {
+                body = value_to_string_repr(arg);
+            }
+            if (precision >= 0) {
+                body.erase(utf8_offset(body, static_cast<size_t>(precision)));
+            }
+        } else if (conv == 'c') {
+            if (is_val<value_string>(arg)) {
+                body = arg->as_string().str();
+                if (utf8_length(body) != 1) {
+                    throw raised_exception("%c requires an int or a unicode character, not a string of length " + std::to_string(utf8_length(body)));
+                }
+            } else if (is_val<value_int>(arg) || is_val<value_bool>(arg)) {
+                const int64_t cp = arg->as_int();
+                if (cp < 0 || cp > 0x10FFFF) {
+                    throw raised_exception("%c arg not in range(0x110000)");
+                }
+                body = common_unicode_cpt_to_utf8(static_cast<uint32_t>(cp));
+            } else {
+                throw raised_exception("%c requires an int or a unicode character");
+            }
+        } else if (conv == 'd' || conv == 'i' || conv == 'u' || conv == 'x' || conv == 'X' || conv == 'o') {
+            const bool decimal = conv == 'd' || conv == 'i' || conv == 'u';
+            value num = arg;
+            if (decimal && is_val<value_float>(arg)) {
+                num = float_to_int_value(arg->as_float());
+                if (!num) {
+                    throw raised_exception("cannot convert float NaN or infinity to integer");
+                }
+            } else if (!is_val<value_int>(arg) && !is_val<value_bool>(arg)) {
+                throw raised_exception(std::string("%") + conv + " format: an integer is required, not " + arg->type());
+            }
+            numeric = true;
+            bool negative = false;
+            if (is_val<value_bigint>(num)) {
+                if (!decimal) {
+                    throw not_implemented_exception(std::string("%") + conv + " format of an integer beyond 64 bits");
+                }
+                body = num->as_string().str();
+                negative = body[0] == '-';
+                if (negative) {
+                    body.erase(0, 1);
+                }
+            } else {
+                const int64_t n = num->as_int();
+                negative = n < 0;
+                const uint64_t mag = negative ? 0 - static_cast<uint64_t>(n) : static_cast<uint64_t>(n);
+                char buf[32];
+                snprintf(buf, sizeof(buf), decimal ? "%llu" : conv == 'o' ? "%llo" : conv == 'x' ? "%llx" : "%llX", static_cast<unsigned long long>(mag));
+                body = buf;
+            }
+            if (precision > static_cast<int64_t>(body.size())) {
+                body.insert(0, static_cast<size_t>(precision) - body.size(), '0');
+            }
+            sign_prefix = negative ? "-" : plus ? "+" : space ? " " : "";
+            if (alt && !decimal) {
+                sign_prefix += conv == 'o' ? "0o" : conv == 'x' ? "0x" : "0X";
+            }
+        } else if (conv == 'e' || conv == 'E' || conv == 'f' || conv == 'F' || conv == 'g' || conv == 'G') {
+            if (!is_val<value_int>(arg) && !is_val<value_float>(arg) && !is_val<value_bool>(arg)) {
+                throw raised_exception("must be real number, not " + arg->type());
+            }
+            const double v = is_val<value_bool>(arg) ? static_cast<double>(arg->as_int()) : arg->as_float();
+            numeric = true;
+            std::string spec = alt ? "%#.*" : "%.*";
+            spec += conv;
+            const int prec = static_cast<int>(precision < 0 ? 6 : precision);
+            const int n = snprintf(nullptr, 0, spec.c_str(), prec, std::fabs(v));
+            if (n < 0) {
+                throw raised_exception("float formatting failed");
+            }
+            std::vector<char> buf(static_cast<size_t>(n) + 1);
+            snprintf(buf.data(), buf.size(), spec.c_str(), prec, std::fabs(v));
+            body = buf.data();
+            sign_prefix = std::signbit(v) ? "-" : plus ? "+" : space ? " " : "";
+            if (!std::isfinite(v)) {
+                zero = false;
+            }
+        } else {
+            throw raised_exception(std::string("unsupported format character '") + conv + "'");
+        }
+
+        const size_t len = utf8_length(body) + sign_prefix.size();
+        const size_t pad = static_cast<size_t>(width) > len ? static_cast<size_t>(width) - len : 0;
+        std::string piece;
+        if (left) {
+            piece = sign_prefix + body + std::string(pad, ' ');
+        } else if (zero && numeric) {
+            piece = sign_prefix + std::string(pad, '0') + body;
+        } else {
+            piece = std::string(pad, ' ') + sign_prefix + body;
+        }
+        if (arg_is_input == fmt_is_input) {
+            literal += piece;
+        } else {
+            flush_literal();
+            result.parts.push_back({arg_is_input, piece});
+        }
+    }
+    flush_literal();
+    if (!is_mapping && next_arg < positional.size()) {
+        throw raised_exception("not all arguments converted during string formatting");
+    }
+    if (result.parts.empty()) {
+        result.parts.push_back({fmt_is_input, ""});
+    }
+    return result;
 }
 
 static void append_codepoint_as_ascii_json_escape(std::string & out, uint32_t codepoint) {
@@ -410,6 +965,67 @@ static value toobject(const func_args & args) {
     return out;
 }
 
+static const std::string & filter_alias(const std::string & name) {
+    static const std::map<std::string, std::string> aliases = {
+        {"count", "length"},
+        {"d", "default"},
+        {"e", "escape"},
+        {"trim", "strip"},
+    };
+    auto it = aliases.find(name);
+    return it == aliases.end() ? name : it->second;
+}
+
+// the format filter is printf-style: value % (kwargs or args)
+static value filter_format(const func_args & args) {
+    const value val_input = args.get_pos(0);
+    std::vector<value> positional;
+    auto kwargs = mk_val<value_object>();
+    for (size_t i = 1; i < args.count(); ++i) {
+        const value & arg = args.get_args()[i];
+        if (is_val<value_kwarg>(arg)) {
+            auto * kwarg = cast_val<value_kwarg>(arg);
+            kwargs->insert(kwarg->key, kwarg->val);
+        } else {
+            positional.push_back(arg);
+        }
+    }
+    if (!positional.empty() && kwargs->as_bool()) {
+        throw raised_exception("can't handle positional and keyword arguments at the same time");
+    }
+    if (kwargs->as_bool()) {
+        return mk_val<value_string>(percent_format(val_input->val_str, kwargs));
+    }
+    return mk_val<value_string>(percent_format(val_input->val_str, mk_val<value_tuple>(std::move(positional))));
+}
+
+// name is already alias-resolved
+static value apply_resolved_filter(context & ctx, const std::string & name, value input, const func_args & args) {
+    JJ_DEBUG("Applying filter '%s' to %s", name.c_str(), input->type().c_str());
+    // TODO: Refactor filters so this coercion can be done automatically
+    if (!input->is_undefined() && !is_val<value_string>(input) && (
+        name == "capitalize" ||
+        name == "lower" ||
+        name == "replace" ||
+        name == "strip" ||
+        name == "title" ||
+        name == "upper" ||
+        name == "wordcount"
+    )) {
+        JJ_DEBUG("Coercing %s to String for '%s' filter", input->type().c_str(), name.c_str());
+        input = mk_val<value_string>(input->as_string());
+    }
+    // string filters whose name is something else as a method
+    static const func_builtins string_filters = {
+        {"format", filter_format},
+    };
+    return try_builtin_func(ctx, name, input, false, is_val<value_string>(input) ? &string_filters : nullptr)->invoke(args);
+}
+
+value apply_filter_by_name(context & ctx, const std::string & name, value input, const func_args & args) {
+    return apply_resolved_filter(ctx, filter_alias(name), std::move(input), args);
+}
+
 const func_builtins & global_builtins() {
     static const func_builtins builtins = {
         {"raise_exception", [](const func_args & args) -> value {
@@ -595,8 +1211,34 @@ const func_builtins & global_builtins() {
             throw not_implemented_exception("escaped test not implemented");
         }},
         {"test_is_filter", [](const func_args & args) -> value {
-            (void)args;
-            throw not_implemented_exception("filter test not implemented");
+            // a Jinja2 built-in filter that at least one value type implements
+            static const std::set<std::string> jinja2_filters = {
+                "abs", "attr", "batch", "capitalize", "center", "count", "d", "default", "dictsort", "e", "escape",
+                "filesizeformat", "first", "float", "forceescape", "format", "groupby", "indent", "int", "items",
+                "join", "last", "length", "list", "lower", "map", "max", "min", "pprint", "random", "reject",
+                "rejectattr", "replace", "reverse", "round", "safe", "select", "selectattr", "slice", "sort",
+                "string", "striptags", "sum", "title", "tojson", "trim", "truncate", "unique", "upper", "urlencode",
+                "urlize", "wordcount", "wordwrap", "xmlattr",
+            };
+            static const std::set<std::string> implemented = []() {
+                std::set<std::string> names;
+                const std::vector<value> samples = {
+                    mk_val<value_int>(0), mk_val<value_float>(0.0), mk_val<value_string>(), mk_val<value_bool>(false),
+                    mk_val<value_array>(), mk_val<value_object>(), mk_val<value_none>(),
+                };
+                for (const auto & sample : samples) {
+                    for (const auto & builtin : sample->get_builtins()) {
+                        names.insert(builtin.first);
+                    }
+                }
+                return names;
+            }();
+            args.ensure_count(1);
+            if (!is_val<value_string>(args.get_pos(0))) {
+                return mk_val<value_bool>(false);
+            }
+            const std::string name = args.get_pos(0)->as_string().str();
+            return mk_val<value_bool>(jinja2_filters.count(name) > 0 && implemented.count(filter_alias(name)) > 0);
         }},
     };
     return builtins;
@@ -611,15 +1253,8 @@ const func_builtins & value_int_t::get_builtins() const {
             int64_t val = args.get_pos(0)->as_int();
             return mk_val<value_int>(val < 0 ? -val : val);
         }},
-        {"int", [](const func_args & args) -> value {
-            args.ensure_vals<value_int>();
-            return mk_val<value_int>(args.get_pos(0)->as_int());
-        }},
-        {"float", [](const func_args & args) -> value {
-            args.ensure_vals<value_int>();
-            double val = static_cast<double>(args.get_pos(0)->as_int());
-            return mk_val<value_float>(val);
-        }},
+        {"int", filter_int},
+        {"float", filter_float},
         {"safe", tojson},
         {"string", tojson},
         {"tojson", tojson},
@@ -636,15 +1271,8 @@ const func_builtins & value_float_t::get_builtins() const {
             double val = args.get_pos(0)->as_float();
             return mk_val<value_float>(val < 0.0 ? -val : val);
         }},
-        {"int", [](const func_args & args) -> value {
-            args.ensure_vals<value_float>();
-            int64_t val = static_cast<int64_t>(args.get_pos(0)->as_float());
-            return mk_val<value_int>(val);
-        }},
-        {"float", [](const func_args & args) -> value {
-            args.ensure_vals<value_float>();
-            return mk_val<value_float>(args.get_pos(0)->as_float());
-        }},
+        {"int", filter_int},
+        {"float", filter_float},
         {"safe", tojson},
         {"string", tojson},
         {"tojson", tojson},
@@ -721,8 +1349,78 @@ const func_builtins & value_string_t::get_builtins() const {
         }},
         {"length", [](const func_args & args) -> value {
             args.ensure_vals<value_string>();
-            jinja::string str = args.get_pos(0)->as_string();
-            return mk_val<value_int>(str.length());
+            return mk_val<value_int>(static_cast<int64_t>(utf8_length(args.get_pos(0)->val_str.str())));
+        }},
+        {"count", [](const func_args & args) -> value {
+            args.ensure_count(2, 4);
+            args.ensure_vals<value_string, value_string>();
+            const std::string str = args.get_pos(0)->val_str.str();
+            const std::string sub = args.get_pos(1)->val_str.str();
+            const value val_start = args.get_pos(2, mk_val<value_undefined>());
+            const value val_end   = args.get_pos(3, mk_val<value_undefined>());
+            auto is_unset = [](const value & v) { return v->is_undefined() || v->is_none(); };
+            // byte range to search: the whole string unless bounds (in characters) are given
+            size_t from = 0;
+            size_t to   = str.size();
+            if (sub.empty() || !is_unset(val_start) || !is_unset(val_end)) {
+                const int64_t len = static_cast<int64_t>(utf8_length(str));
+                auto clamp = [&](const value & v, int64_t fallback) {
+                    int64_t n = is_unset(v) ? fallback : v->as_int();
+                    if (n < 0) {
+                        n += len;
+                    }
+                    return static_cast<size_t>(std::max<int64_t>(0, std::min(n, len)));
+                };
+                const size_t start = clamp(val_start, 0);
+                const size_t end   = clamp(val_end, len);
+                if (sub.empty()) {
+                    const bool past_end = !is_unset(val_start) && val_start->as_int() > len;
+                    return mk_val<value_int>(start <= end && !past_end ? static_cast<int64_t>(end - start + 1) : 0);
+                }
+                from = utf8_offset(str, start);
+                to   = start < end ? utf8_offset(str, end - start, from) : from;
+            }
+            const std::string_view range = std::string_view(str).substr(from, to - from);
+            int64_t count = 0;
+            for (size_t pos = 0; (pos = range.find(sub, pos)) != std::string_view::npos; pos += sub.size()) {
+                ++count;
+            }
+            return mk_val<value_int>(count);
+        }},
+        {"truncate", [](const func_args & args) -> value {
+            args.ensure_count(1, 5);
+            args.ensure_val<value_string>(args.get_pos(0));
+            value val_length = args.get_kwarg_or_pos("length",    1);
+            value val_kill   = args.get_kwarg_or_pos("killwords", 2);
+            value val_end    = args.get_kwarg_or_pos("end",       3);
+            value val_leeway = args.get_kwarg_or_pos("leeway",    4);
+            const int64_t length = val_length->is_undefined() ? 255 : val_length->as_int();
+            const int64_t leeway = val_leeway->is_undefined() || val_leeway->is_none() ? 5 : val_leeway->as_int();
+            const std::string end = val_end->is_undefined() ? "..." : val_end->as_string().str();
+            const int64_t end_len = static_cast<int64_t>(utf8_length(end));
+            if (length < end_len) {
+                throw raised_exception("expected length >= " + std::to_string(end_len) + ", got " + std::to_string(length));
+            }
+            if (leeway < 0) {
+                throw raised_exception("expected leeway >= 0, got " + std::to_string(leeway));
+            }
+            value input = args.get_pos(0);
+            // within the limit when walking length + leeway characters reaches the end
+            const std::string str = input->val_str.str();
+            const size_t limit = static_cast<size_t>(length) + static_cast<size_t>(leeway);
+            if (str.size() <= limit || utf8_offset(str, limit) == str.size()) {
+                return input;
+            }
+            std::string cut = str.substr(0, utf8_offset(str, static_cast<size_t>(length - end_len)));
+            if (!val_kill->as_bool()) { // undefined == false
+                const size_t space = cut.rfind(' ');
+                if (space != std::string::npos) {
+                    cut.erase(space);
+                }
+            }
+            auto res = mk_val<value_string>(cut + end);
+            res->val_str.mark_input_based_on(input->val_str);
+            return res;
         }},
         {"startswith", [](const func_args & args) -> value {
             args.ensure_vals<value_string, value_string>();
@@ -829,7 +1527,6 @@ const func_builtins & value_string_t::get_builtins() const {
             }
             const jinja::string & fmt = val_input->as_string();
             const bool fmt_is_input = fmt.all_parts_are_input();
-
             const std::string str = fmt.str();
             jinja::string result;
             std::string literal;
@@ -857,35 +1554,8 @@ const func_builtins & value_string_t::get_builtins() const {
             flush_literal();
             return mk_val<value_string>(result);
         }},
-        {"int", [](const func_args & args) -> value {
-            value val_input   = args.get_pos(0);
-            value val_default = args.get_kwarg_or_pos("default", 1);
-            value val_base    = args.get_kwarg_or_pos("base",    2);
-            const int base = val_base->is_undefined() ? 10 : val_base->as_int();
-            if (base != 0 && (base < 2 || base > 36)) {
-                // an out-of-range base makes std::stoi fail fast on the MSVC CRT instead of throwing
-                throw raised_exception("int() base must be 0 or between 2 and 36");
-            }
-            if (is_val<value_string>(val_input) == false) {
-                throw raised_exception("int() first argument must be a string");
-            }
-            std::string str = val_input->as_string().str();
-            try {
-                return mk_val<value_int>(std::stoi(str, nullptr, base));
-            } catch (...) {
-                return mk_val<value_int>(val_default->is_undefined() ? 0 : val_default->as_int());
-            }
-        }},
-        {"float", [](const func_args & args) -> value {
-            args.ensure_vals<value_string>();
-            value val_default = args.get_kwarg_or_pos("default", 1);
-            std::string str = args.get_pos(0)->as_string().str();
-            try {
-                return mk_val<value_float>(std::stod(str));
-            } catch (...) {
-                return mk_val<value_float>(val_default->is_undefined() ? 0.0 : val_default->as_float());
-            }
-        }},
+        {"int", filter_int},
+        {"float", filter_float},
         {"string", [](const func_args & args) -> value {
             // no-op
             args.ensure_vals<value_string>();
@@ -933,7 +1603,23 @@ const func_builtins & value_string_t::get_builtins() const {
                 throw raised_exception("slice step cannot be zero");
             }
             auto input = args.get_pos(0);
-            auto sliced = slice(input->as_string().str(), start, stop, step);
+            const std::string str = input->val_str.str();
+            std::string sliced;
+            if (utf8_is_ascii(str)) {
+                sliced = slice(str, start, stop, step);
+            } else if (step == 1) {
+                // bounds clamp as in slice(), then one byte range
+                const int64_t len = start < 0 || stop < 0 ? static_cast<int64_t>(utf8_length(str)) : 0;
+                const size_t from = utf8_offset(str, static_cast<size_t>(start < 0 ? std::max<int64_t>(len + start, 0) : start));
+                const size_t to   = utf8_offset(str, static_cast<size_t>(stop  < 0 ? std::max<int64_t>(len + stop,  0) : stop));
+                if (from < to) {
+                    sliced = str.substr(from, to - from);
+                }
+            } else {
+                for (const auto & ch : slice(utf8_chars(str), start, stop, step)) {
+                    sliced += ch;
+                }
+            }
             auto res = mk_val<value_string>(sliced);
             res->val_str.mark_input_based_on(input->as_string());
             return res;
@@ -999,16 +1685,8 @@ const func_builtins & value_bool_t::get_builtins() const {
     };
     static const func_builtins builtins = {
         {"default", default_value},
-        {"int", [](const func_args & args) -> value {
-            args.ensure_vals<value_bool>();
-            bool val = args.get_pos(0)->as_bool();
-            return mk_val<value_int>(val ? 1 : 0);
-        }},
-        {"float", [](const func_args & args) -> value {
-            args.ensure_vals<value_bool>();
-            bool val = args.get_pos(0)->as_bool();
-            return mk_val<value_float>(val ? 1.0 : 0.0);
-        }},
+        {"int", filter_int},
+        {"float", filter_float},
         {"safe", tostring},
         {"string", tostring},
         {"tojson", tojson},
@@ -1016,8 +1694,27 @@ const func_builtins & value_bool_t::get_builtins() const {
     return builtins;
 }
 
-[[noreturn]] static value array_unique_not_implemented(const func_args &) {
-    throw not_implemented_exception("Array unique builtin not implemented");
+static value array_unique(const func_args & args) {
+    args.ensure_count(1, 3);
+    args.ensure_val<value_array>(args.get_pos(0));
+    const bool case_sensitive = args.get_kwarg_or_pos("case_sensitive", 1)->as_bool(); // undefined == false
+    value attribute = args.get_kwarg_or_pos("attribute", 2);
+    value undef = mk_val<value_undefined>();
+    std::unordered_set<value, value_hasher, value_equivalence> seen;
+    auto out = mk_val<value_array>();
+    for (const auto & item : args.get_pos(0)->as_array()) {
+        value key = attribute->is_undefined() ? item : get_attribute(item, attribute, undef);
+        if (!case_sensitive && is_val<value_string>(key)) {
+            key = mk_val<value_string>(key->as_string().lowercase());
+        }
+        if (!key->is_hashable()) {
+            throw raised_exception("unique: unhashable type " + key->type());
+        }
+        if (seen.insert(key).second) {
+            out->push_back(item);
+        }
+    }
+    return out;
 }
 
 const func_builtins & value_array_t::get_builtins() const {
@@ -1127,10 +1824,23 @@ const func_builtins & value_array_t::get_builtins() const {
             if (!is_val<value_array>(args.get_pos(0))) {
                 throw raised_exception("map: first argument must be an array");
             }
-            if (!is_val<value_kwarg>(args.get_args().at(1))) {
-                throw not_implemented_exception("map: filter-mapping not implemented");
-            }
             value val       = args.get_pos(0);
+            if (!is_val<value_kwarg>(args.get_args().at(1))) {
+                // example: array | map("int", 0, 16) applies a filter to each item
+                if (!is_val<value_string>(args.get_pos(1))) {
+                    throw raised_exception("map: filter name must be a string");
+                }
+                const std::string filter_name = filter_alias(args.get_pos(1)->as_string().str());
+                func_args filter_args(args.ctx);
+                for (size_t i = 2; i < args.count(); ++i) {
+                    filter_args.push_back(args.get_args()[i]);
+                }
+                auto mapped = mk_val<value_array>();
+                for (const auto & item : val->as_array()) {
+                    mapped->push_back(apply_resolved_filter(args.ctx, filter_name, item, filter_args));
+                }
+                return mapped;
+            }
             value attribute = args.get_kwarg_or_pos("attribute", 1);
             value default_val = args.get_kwarg("default", mk_val<value_undefined>());
             auto out = mk_val<value_array>();
@@ -1175,7 +1885,7 @@ const func_builtins & value_array_t::get_builtins() const {
             const bool reverse = val_reverse->as_bool(); // undefined == false
             value undef = mk_val<value_undefined>();
             std::vector<value> arr = val->as_array(); // copy
-            std::sort(arr.begin(), arr.end(),[&](const value & a, const value & b) {
+            std::stable_sort(arr.begin(), arr.end(),[&](const value & a, const value & b) {
                 value val_a = a;
                 value val_b = b;
                 if (!attribute->is_undefined()) {
@@ -1245,7 +1955,39 @@ const func_builtins & value_array_t::get_builtins() const {
             }
             return result;
         }},
-        {"unique", array_unique_not_implemented},
+        {"unique", array_unique},
+        {"sum", [](const func_args & args) -> value {
+            args.ensure_count(1, 3);
+            args.ensure_val<value_array>(args.get_pos(0));
+            value attribute = args.get_kwarg_or_pos("attribute", 1);
+            value start     = args.get_kwarg_or_pos("start",     2);
+            value undef = mk_val<value_undefined>();
+            // integer sums stay exact until a float, a bigint or an int64 overflow promotes them
+            bool is_float = is_val<value_float>(start) || is_val<value_bigint>(start);
+            int64_t total_int = is_float || start->is_undefined() ? 0 : start->as_int();
+            double total_flt  = is_float ? start->as_float() : 0.0;
+            for (const auto & item : args.get_pos(0)->as_array()) {
+                value num = attribute->is_undefined() ? item : get_attribute(item, attribute, undef);
+                if (!is_val<value_int>(num) && !is_val<value_float>(num) && !is_val<value_bool>(num)) {
+                    throw raised_exception("sum: unsupported operand type " + num->type());
+                }
+                const bool inexact = is_val<value_float>(num) || is_val<value_bigint>(num);
+                const int64_t n = inexact ? 0 : num->as_int();
+                if (!is_float && !inexact && (n >= 0 ? total_int <= INT64_MAX - n : total_int >= INT64_MIN - n)) {
+                    total_int += n;
+                    continue;
+                }
+                if (!is_float) {
+                    is_float = true;
+                    total_flt = static_cast<double>(total_int);
+                }
+                total_flt += inexact ? num->as_float() : static_cast<double>(n);
+            }
+            if (is_float) {
+                return mk_val<value_float>(total_flt);
+            }
+            return mk_val<value_int>(total_int);
+        }},
     };
     return builtins;
 }
@@ -1277,6 +2019,10 @@ const func_builtins & value_object_t::get_builtins() const {
             const value obj = args.get_pos(0);
             const value key = args.get_pos(1);
             return obj->at(key, default_val);
+        }},
+        {"copy", [](const func_args & args) -> value {
+            args.ensure_vals<value_object>();
+            return mk_val<value_object>(args.get_pos(0)->as_ordered_object());
         }},
         {"keys", [](const func_args & args) -> value {
             args.ensure_vals<value_object>();
@@ -1336,7 +2082,7 @@ const func_builtins & value_object_t::get_builtins() const {
             const bool reverse = val_reverse->as_bool(); // undefined == false
             const bool by_value = is_val<value_string>(val_by) && val_by->as_string().str() == "value" ? true : false;
             auto result = mk_val<value_object>(val_input); // copy
-            std::sort(result->val_obj.begin(), result->val_obj.end(), [&](const auto & a, const auto & b) {
+            std::stable_sort(result->val_obj.begin(), result->val_obj.end(), [&](const auto & a, const auto & b) {
                 if (by_value) {
                     return value_compare(a.second, b.second, reverse ? value_compare_op::gt : value_compare_op::lt);
                 } else {
@@ -1415,7 +2161,15 @@ static value from_json(const common_json & j, bool mark_input) {
     } else if (j.is_boolean()) {
         return mk_val<value_bool>(j.get<bool>());
     } else if (j.is_number_integer()) {
-        return mk_val<value_int>(j.get<int64_t>());
+        const int64_t n = j.get<int64_t>();
+        if (n < 0) {
+            // an unsigned value beyond INT64_MAX wraps negative: keep its text
+            const std::string text = j.dump();
+            if (!text.empty() && text[0] != '-') {
+                return mk_val<value_bigint>(text, std::strtod(text.c_str(), nullptr));
+            }
+        }
+        return mk_val<value_int>(n);
     } else if (j.is_number_float()) {
         return mk_val<value_float>(j.get<double>());
     } else if (j.is_string()) {
@@ -1441,48 +2195,33 @@ static value from_json(const common_json & j, bool mark_input) {
     }
 }
 
+template<typename T>
+static bool compare_with_op(const T & x, const T & y, value_compare_op op) {
+    switch (op) {
+        case value_compare_op::eq: return x == y;
+        case value_compare_op::ge: return x >= y;
+        case value_compare_op::gt: return x > y;
+        case value_compare_op::lt: return x < y;
+        case value_compare_op::ne: return x != y;
+    }
+    return false;
+}
+
 // compare operator for value_t
 bool value_compare(const value & a, const value & b, value_compare_op op) {
     auto cmp = [&]() {
         // compare numeric types
         if ((is_val<value_int>(a) || is_val<value_float>(a)) &&
             (is_val<value_int>(b) || is_val<value_float>(b))){
-            try {
-                if (op == value_compare_op::eq) {
-                    return a->as_float() == b->as_float();
-                } else if (op == value_compare_op::ge) {
-                    return a->as_float() >= b->as_float();
-                } else if (op == value_compare_op::gt) {
-                    return a->as_float() > b->as_float();
-                } else if (op == value_compare_op::lt) {
-                    return a->as_float() < b->as_float();
-                } else if (op == value_compare_op::ne) {
-                    return a->as_float() != b->as_float();
-                } else {
-                    throw std::runtime_error("Unsupported comparison operator for numeric types");
-                }
-            } catch (...) {}
+            const int order = value_number_compare(*a, *b);
+            return order == VALUE_UNORDERED ? op == value_compare_op::ne : compare_with_op(order, 0, op);
         }
         // compare string and number
         // TODO: not sure if this is the right behavior
         if ((is_val<value_string>(b) && (is_val<value_int>(a) || is_val<value_float>(a))) ||
             (is_val<value_string>(a) && (is_val<value_int>(b) || is_val<value_float>(b))) ||
             (is_val<value_string>(a) && is_val<value_string>(b))) {
-            try {
-                if (op == value_compare_op::eq) {
-                    return a->as_string().str() == b->as_string().str();
-                } else if (op == value_compare_op::ge) {
-                    return a->as_string().str() >= b->as_string().str();
-                } else if (op == value_compare_op::gt) {
-                    return a->as_string().str() > b->as_string().str();
-                } else if (op == value_compare_op::lt) {
-                    return a->as_string().str() < b->as_string().str();
-                } else if (op == value_compare_op::ne) {
-                    return a->as_string().str() != b->as_string().str();
-                } else {
-                    throw std::runtime_error("Unsupported comparison operator for string/number types");
-                }
-            } catch (...) {}
+            return compare_with_op(a->as_string().str(), b->as_string().str(), op);
         }
         // compare boolean simple
         if (is_val<value_bool>(a) && is_val<value_bool>(b)) {
@@ -1532,9 +2271,11 @@ static void value_to_json_internal(std::ostringstream & oss, const value & val, 
     } else if (is_val<value_bool>(val)) {
         oss << (val->as_bool() ? "true" : "false");
     } else if (is_val<value_int>(val)) {
-        oss << val->as_int();
+        oss << (is_val<value_bigint>(val) ? val->as_string().str() : std::to_string(val->as_int()));
     } else if (is_val<value_float>(val)) {
-        oss << val->as_float();
+        // as Python's json.dumps: repr() of the float, non-finite values spelled the JavaScript way
+        const double f = val->as_float();
+        oss << (std::isnan(f) ? "NaN" : std::isinf(f) ? (f < 0 ? "-Infinity" : "Infinity") : float_to_string(f));
     } else if (is_val<value_string>(val)) {
         oss << "\"";
         for (char c : val->as_string().str()) {

@@ -109,6 +109,46 @@ value object_literal::execute_impl(context & ctx) const {
     return obj;
 }
 
+// expands *expr and **expr arguments in place
+static void gather_args(context & ctx, const statements & arg_stmts, func_args & args) {
+    for (const auto & arg_stmt : arg_stmts) {
+        if (is_stmt<spread_expression>(arg_stmt)) {
+            auto * spread = cast_stmt<spread_expression>(arg_stmt);
+            value spread_val = spread->argument->execute(ctx);
+            if (spread->mapping) {
+                if (!is_val<value_object>(spread_val)) {
+                    throw std::runtime_error("Argument after ** must be a mapping: got " + spread_val->type());
+                }
+                for (const auto & pair : spread_val->as_ordered_object()) {
+                    args.push_back(mk_val<value_kwarg>(pair.first->as_string().str(), pair.second));
+                }
+            } else {
+                if (!is_val<value_array>(spread_val)) {
+                    throw std::runtime_error("Argument after * must be an array: got " + spread_val->type());
+                }
+                for (const auto & item : spread_val->as_array()) {
+                    args.push_back(item);
+                }
+            }
+            continue;
+        }
+        auto arg_val = arg_stmt->execute(ctx);
+        JJ_DEBUG("  Argument type: %s", arg_val->type().c_str());
+        args.push_back(arg_val);
+    }
+}
+
+static value eval_binary(context & ctx, const token & op, value left_val, value right_val);
+
+static bool is_ordering_op(const std::string & op) {
+    return op == "<" || op == ">" || op == "<=" || op == ">=";
+}
+
+// outcome of an ordering operator for a three-way comparison result
+static bool ordering_result(const std::string & op, int cmp) {
+    return op == "<" ? cmp < 0 : op == ">" ? cmp > 0 : op == "<=" ? cmp <= 0 : cmp >= 0;
+}
+
 value binary_expression::execute_impl(context & ctx) const {
     value left_val = left->execute(ctx);
 
@@ -121,13 +161,35 @@ value binary_expression::execute_impl(context & ctx) const {
         return left_val->as_bool() ? std::move(left_val) : right->execute(ctx);
     }
 
-    // Equality operators
-    value right_val = right->execute(ctx);
+    return eval_binary(ctx, op, std::move(left_val), right->execute(ctx));
+}
+
+value comparison_chain_expression::execute_impl(context & ctx) const {
+    // a < b < c is (a < b) and (b < c), each operand evaluated once
+    value left_val = operands[0]->execute(ctx);
+    value res;
+    for (size_t i = 0; i < ops.size(); ++i) {
+        value right_val = operands[i + 1]->execute(ctx);
+        res = eval_binary(ctx, ops[i], left_val, right_val);
+        if (!res->as_bool()) {
+            break;
+        }
+        left_val = std::move(right_val);
+    }
+    return res;
+}
+
+static value eval_binary(context & ctx, const token & op, value left_val, value right_val) {
     JJ_DEBUG("Executing binary expression %s '%s' %s", left_val->type().c_str(), op.value.c_str(), right_val->type().c_str());
     if (op.value == "==") {
         return mk_val<value_bool>(*left_val == *right_val);
     } else if (op.value == "!=") {
         return mk_val<value_bool>(!(*left_val == *right_val));
+    }
+
+    // printf-style formatting: "%s-%d" % (a, b)
+    if (op.value == "%" && is_val<value_string>(left_val)) {
+        return mk_val<value_string>(percent_format(left_val->as_string(), right_val));
     }
 
     auto workaround_concat_null_with_str = [&](value & res) -> bool {
@@ -187,39 +249,100 @@ value binary_expression::execute_impl(context & ctx) const {
         (is_val<value_int>(right_val) || is_val<value_float>(right_val))) {
         double a = left_val->as_float();
         double b = right_val->as_float();
-        if (op.value == "+" || op.value == "-" || op.value == "*") {
-            double res = (op.value == "+") ? a + b : (op.value == "-") ? a - b : a * b;
-            JJ_DEBUG("Arithmetic operation: %f %s %f = %f", a, op.value.c_str(), b, res);
-            bool is_float = is_val<value_float>(left_val) || is_val<value_float>(right_val);
-            if (is_float) {
-                return mk_val<value_float>(res);
-            } else {
-                return mk_val<value_int>(static_cast<int64_t>(res));
+        // plain 64-bit integers on both sides: no detour through doubles
+        auto both_int64 = [&]() { return is_int64(left_val) && is_int64(right_val); };
+        if (is_ordering_op(op.value)) {
+            if (both_int64()) {
+                const int64_t ia = left_val->as_int();
+                const int64_t ib = right_val->as_int();
+                return mk_val<value_bool>(ordering_result(op.value, (ia > ib) - (ia < ib)));
             }
+            const int order = value_number_compare(*left_val, *right_val);
+            return mk_val<value_bool>(order != VALUE_UNORDERED && ordering_result(op.value, order));
+        }
+        if (op.value == "+" || op.value == "-" || op.value == "*") {
+            const double res = (op.value == "+") ? a + b : (op.value == "-") ? a - b : a * b;
+            JJ_DEBUG("Arithmetic operation: %f %s %f = %f", a, op.value.c_str(), b, res);
+            if (!both_int64()) {
+                return mk_val<value_float>(res);
+            }
+            // exact while the result fits: doubles lose integer precision beyond 2^53
+            const int64_t ia = left_val->as_int();
+            const int64_t ib = right_val->as_int();
+            const uint64_t ua = static_cast<uint64_t>(ia);
+            const uint64_t ub = static_cast<uint64_t>(ib);
+            const double fa = static_cast<double>(ia);
+            const double fb = static_cast<double>(ib);
+            bool overflow;
+            uint64_t wrapped;
+            double approx;
+            if (op.value == "+") {
+                overflow = ib > 0 ? ia > INT64_MAX - ib : ia < INT64_MIN - ib;
+                wrapped = ua + ub;
+                approx = fa + fb;
+            } else if (op.value == "-") {
+                overflow = ib < 0 ? ia > INT64_MAX + ib : ia < INT64_MIN + ib;
+                wrapped = ua - ub;
+                approx = fa - fb;
+            } else {
+                const uint64_t ma = ia < 0 ? 0 - ua : ua;
+                const uint64_t mb = ib < 0 ? 0 - ub : ub;
+                const uint64_t limit = static_cast<uint64_t>(INT64_MAX) + ((ia < 0) != (ib < 0) ? 1 : 0);
+                overflow = mb != 0 && ma > limit / mb;
+                wrapped = ua * ub;
+                approx = fa * fb;
+            }
+            if (overflow) {
+                return mk_val<value_float>(approx);
+            }
+            return mk_val<value_int>(static_cast<int64_t>(wrapped));
         } else if (op.value == "/") {
             JJ_DEBUG("Division operation: %f / %f", a, b);
             return mk_val<value_float>(a / b);
         } else if (op.value == "%") {
-            double rem = std::fmod(a, b);
-            JJ_DEBUG("Modulo operation: %f %% %f = %f", a, b, rem);
+            // the result takes the sign of the divisor
             bool is_float = is_val<value_float>(left_val) || is_val<value_float>(right_val);
+            if (b == 0.0) {
+                throw std::runtime_error("modulo by zero");
+            }
+            if (!is_float && !is_int64(right_val)) {
+                throw std::runtime_error("modulo by an integer outside the 64-bit range is not supported");
+            }
+            if (!is_float && !is_int64(left_val)) {
+                // decimal long division, the remainder takes the sign of the divisor
+                const int64_t ib = right_val->as_int();
+                const uint64_t m = ib < 0 ? 0 - static_cast<uint64_t>(ib) : static_cast<uint64_t>(ib);
+                const auto dec = value_int_decimal(*left_val);
+                uint64_t rem = 0;
+                for (const char c : dec.second) {
+                    uint64_t next = static_cast<uint64_t>(c - '0') % m;
+                    for (int k = 0; k < 10; ++k) {
+                        next = next >= m - rem ? next - (m - rem) : next + rem;
+                    }
+                    rem = next;
+                }
+                if (rem != 0 && dec.first != (ib < 0)) {
+                    rem = m - rem;
+                }
+                return mk_val<value_int>(ib < 0 ? -static_cast<int64_t>(rem) : static_cast<int64_t>(rem));
+            }
             if (is_float) {
-                return mk_val<value_float>(rem);
-            } else {
+                double rem = std::fmod(a, b);
+                if (rem != 0.0 && (rem < 0.0) != (b < 0.0)) {
+                    rem += b;
+                }
+                JJ_DEBUG("Modulo operation: %f %% %f = %f", a, b, rem);
+                if (is_float) {
+                    return mk_val<value_float>(rem);
+                }
                 return mk_val<value_int>(static_cast<int64_t>(rem));
             }
-        } else if (op.value == "<") {
-            JJ_DEBUG("Comparison operation: %f < %f is %d", a, b, a < b);
-            return mk_val<value_bool>(a < b);
-        } else if (op.value == ">") {
-            JJ_DEBUG("Comparison operation: %f > %f is %d", a, b, a > b);
-            return mk_val<value_bool>(a > b);
-        } else if (op.value == ">=") {
-            JJ_DEBUG("Comparison operation: %f >= %f is %d", a, b, a >= b);
-            return mk_val<value_bool>(a >= b);
-        } else if (op.value == "<=") {
-            JJ_DEBUG("Comparison operation: %f <= %f is %d", a, b, a <= b);
-            return mk_val<value_bool>(a <= b);
+            const int64_t ib = right_val->as_int();
+            int64_t rem = ib == -1 ? 0 : left_val->as_int() % ib;
+            if (rem != 0 && (rem < 0) != (ib < 0)) {
+                rem += ib;
+            }
+            return mk_val<value_int>(rem);
         }
     }
 
@@ -274,6 +397,12 @@ value binary_expression::execute_impl(context & ctx) const {
         return res;
     }
 
+    // String ordering (UTF-8 byte order is code point order)
+    if (is_val<value_string>(left_val) && is_val<value_string>(right_val) && is_ordering_op(op.value)) {
+        const int cmp = left_val->as_string().str().compare(right_val->as_string().str());
+        return mk_val<value_bool>(ordering_result(op.value, cmp));
+    }
+
     // String membership
     if (is_val<value_string>(left_val) && is_val<value_string>(right_val)) {
         // case: "a" in "abc"
@@ -299,13 +428,19 @@ value binary_expression::execute_impl(context & ctx) const {
     throw std::runtime_error("Unknown operator \"" + op.value + "\" between " + left_val->type() + " and " + right_val->type());
 }
 
-static value try_builtin_func(context & ctx, const std::string & name, value & input, bool undef_on_missing = false) {
+value try_builtin_func(context & ctx, const std::string & name, value & input, bool undef_on_missing, const func_builtins * filters) {
     JJ_DEBUG("Trying built-in function '%s' for type %s", name.c_str(), input->type().c_str());
     if (ctx.is_get_stats) {
         value_t::stats_t::mark_used(input);
         input->stats.ops.insert(name);
     }
-    auto builtins = input->get_builtins();
+    if (filters) {
+        auto it = filters->find(name);
+        if (it != filters->end()) {
+            return mk_val<value_func>(name, it->second, input);
+        }
+    }
+    const auto & builtins = input->get_builtins();
     auto it = builtins.find(name);
     if (it != builtins.end()) {
         JJ_DEBUG("Binding built-in '%s'", name.c_str());
@@ -320,53 +455,17 @@ static value try_builtin_func(context & ctx, const std::string & name, value & i
 static value apply_filter(context & ctx, const statement_ptr & filter, value input) {
     JJ_DEBUG("Applying filter to %s", input->type().c_str());
 
-    auto set_filter_alias = [](auto & filter_id) {
-        if (filter_id == "count") {
-            filter_id = "length";
-        } else if (filter_id == "d") {
-            filter_id = "default";
-        } else if (filter_id == "e") {
-            filter_id = "escape";
-        } else if (filter_id == "trim") {
-            filter_id = "strip";
-        }
-    };
-
+    func_args args(ctx);
     if (is_stmt<identifier>(filter)) {
-        auto filter_id = cast_stmt<identifier>(filter)->val;
-
-        set_filter_alias(filter_id);
-        JJ_DEBUG("Applying filter '%s' to %s", filter_id.c_str(), input->type().c_str());
-        // TODO: Refactor filters so this coercion can be done automatically
-        if (!input->is_undefined() && !is_val<value_string>(input) && (
-            filter_id == "capitalize" ||
-            filter_id == "lower" ||
-            filter_id == "replace" ||
-            filter_id == "strip" ||
-            filter_id == "title" ||
-            filter_id == "upper" ||
-            filter_id == "wordcount"
-        )) {
-            JJ_DEBUG("Coercing %s to String for '%s' filter", input->type().c_str(), filter_id.c_str());
-            input = mk_val<value_string>(input->as_string());
-        }
-        return try_builtin_func(ctx, filter_id, input)->invoke(func_args(ctx));
+        return apply_filter_by_name(ctx, cast_stmt<identifier>(filter)->val, std::move(input), args);
 
     } else if (is_stmt<call_expression>(filter)) {
         auto call = cast_stmt<call_expression>(filter);
         if (!is_stmt<identifier>(call->callee)) {
             throw std::runtime_error("Filter callee must be an identifier");
         }
-        auto filter_id = cast_stmt<identifier>(call->callee)->val;
-
-        set_filter_alias(filter_id);
-        JJ_DEBUG("Applying filter '%s' with arguments to %s", filter_id.c_str(), input->type().c_str());
-        func_args args(ctx);
-        for (const auto & arg_expr : call->args) {
-            args.push_back(arg_expr->execute(ctx));
-        }
-
-        return try_builtin_func(ctx, filter_id, input)->invoke(args);
+        gather_args(ctx, call->args, args);
+        return apply_filter_by_name(ctx, cast_stmt<identifier>(call->callee)->val, std::move(input), args);
 
     } else {
         throw std::runtime_error("Invalid filter expression");
@@ -407,9 +506,7 @@ value test_expression::execute_impl(context & ctx) const {
         test_id = cast_stmt<identifier>(call->callee)->val;
 
         JJ_DEBUG("Applying test '%s' with arguments to %s", test_id.c_str(), input->type().c_str());
-        for (const auto & arg_expr : call->args) {
-            args.push_back(arg_expr->execute(ctx));
-        }
+        gather_args(ctx, call->args, args);
 
     } else {
         throw std::runtime_error("Invalid test expression");
@@ -444,7 +541,7 @@ value unary_expression::execute_impl(context & ctx) const {
         return mk_val<value_bool>(!operand_val->as_bool());
     } else if (op.value == "-") {
         if (is_val<value_int>(operand_val)) {
-            return mk_val<value_int>(-operand_val->as_int());
+            return value_int_negate(operand_val);
         } else if (is_val<value_float>(operand_val)) {
             return mk_val<value_float>(-operand_val->as_float());
         } else {
@@ -503,6 +600,19 @@ value for_statement::execute_impl(context & ctx) const {
     if (iterable_val->is_undefined()) {
         JJ_DEBUG("%s", "For loop iterable is undefined, skipping loop");
         iterable_val = mk_val<value_array>();
+    }
+
+    if (is_val<value_string>(iterable_val)) {
+        // a string iterates over its characters
+        auto chars = mk_val<value_array>();
+        const std::string str = iterable_val->val_str.str();
+        const bool is_input = iterable_val->val_str.all_parts_are_input();
+        for (size_t pos = 0; pos < str.size();) {
+            const size_t next = utf8_offset(str, 1, pos);
+            chars->push_back(mk_val<value_string>(string(str.substr(pos, next - pos), is_input)));
+            pos = next;
+        }
+        iterable_val = std::move(chars);
     }
 
     if (!is_val<value_array>(iterable_val) && !is_val<value_object>(iterable_val)) {
@@ -791,12 +901,7 @@ value call_statement::execute_impl(context & ctx) const {
     call_ctx.set_val("caller", mk_val<value_func>("caller", func));
 
     func_args args(call_ctx);
-
-    for (const auto & arg_expr : call_expr->args) {
-        auto arg_val = arg_expr->execute(ctx);
-        JJ_DEBUG("  Argument type: %s", arg_val->type().c_str());
-        args.push_back(arg_val);
-    }
+    gather_args(ctx, call_expr->args, args);
 
     JJ_DEBUG("Calling macro '%s' with %zu arguments", callee_func->name.c_str(), args.count());
     return callee_func->invoke(args);
@@ -810,15 +915,16 @@ value member_expression::execute_impl(context & ctx) const {
         // syntax: obj[expr]
         JJ_DEBUG("Member expression, computing property type %s", this->property->type().c_str());
 
-        int64_t arr_size = 0;
-        if (is_val<value_array>(object)) {
-            arr_size = object->as_array().size();
-        } else if (is_val<value_string>(object)) {
-            arr_size = object->as_string().length();
-        }
-
         if (is_stmt<slice_expression>(this->property)) {
             auto s = cast_stmt<slice_expression>(this->property);
+            // only an omitted bound needs the size
+            const bool need_size = !s->start_expr || !s->stop_expr;
+            int64_t arr_size = 0;
+            if (need_size && is_val<value_array>(object)) {
+                arr_size = object->as_array().size();
+            } else if (need_size && is_val<value_string>(object)) {
+                arr_size = static_cast<int64_t>(utf8_length(object->val_str.str()));
+            }
             value step_val  = s->step_expr  ? s->step_expr->execute(ctx)  : mk_val<value_int>(1);
             value start_val = s->start_expr ? s->start_expr->execute(ctx) : (step_val->as_int() < 0 ? mk_val<value_int>(arr_size - 1) : mk_val<value_int>(0));
             value stop_val  = s->stop_expr  ? s->stop_expr->execute(ctx)  : (step_val->as_int() < 0 ? mk_val<value_int>(-1) : mk_val<value_int>(arr_size));
@@ -899,9 +1005,20 @@ value member_expression::execute_impl(context & ctx) const {
                     val = arr[index];
                 }
             } else { // value_string
-                auto str = object->as_string().str();
-                if (index >= 0 && index < static_cast<int64_t>(str.size())) {
-                    val = mk_val<value_string>(std::string(1, str[index]));
+                const std::string str = object->val_str.str();
+                const bool ascii = utf8_is_ascii(str);
+                if (index < 0) {
+                    index += static_cast<int64_t>(ascii ? str.size() : utf8_length(str));
+                }
+                if (index >= 0) {
+                    const size_t idx = static_cast<size_t>(index);
+                    const size_t pos = ascii ? idx : utf8_offset(str, idx);
+                    if (pos < str.size()) {
+                        const size_t len = ascii ? 1 : utf8_offset(str, 1, pos) - pos;
+                        auto ch = mk_val<value_string>(str.substr(pos, len));
+                        ch->val_str.mark_input_based_on(object->val_str);
+                        val = std::move(ch);
+                    }
                 }
             }
 
@@ -936,11 +1053,7 @@ value member_expression::execute_impl(context & ctx) const {
 value call_expression::execute_impl(context & ctx) const {
     // gather arguments
     func_args args(ctx);
-    for (auto & arg_stmt : this->args) {
-        auto arg_val = arg_stmt->execute(ctx);
-        JJ_DEBUG("  Argument type: %s", arg_val->type().c_str());
-        args.push_back(arg_val);
-    }
+    gather_args(ctx, this->args, args);
     // execute callee
     value callee_val = callee->execute(ctx);
     if (!is_val<value_func>(callee_val)) {

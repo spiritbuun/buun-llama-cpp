@@ -1,5 +1,6 @@
 #include "jinja/string.h"
 #include "jinja/value.h"
+#include "unicode.h"
 
 #include <algorithm>
 #include <functional>
@@ -9,6 +10,44 @@
 #include <vector>
 
 namespace jinja {
+
+static size_t utf8_char_len(const std::string & s, size_t pos) {
+    if (static_cast<unsigned char>(s[pos]) < 0x80) {
+        return 1;
+    }
+    const auto r = common_parse_utf8_codepoint(s, pos);
+    return r.status == utf8_parse_result::SUCCESS ? r.bytes_consumed : 1;
+}
+
+bool utf8_is_ascii(const std::string & s) {
+    return std::all_of(s.begin(), s.end(), [](unsigned char c) { return c < 0x80; });
+}
+
+size_t utf8_length(const std::string & s) {
+    size_t n = 0;
+    for (size_t pos = 0; pos < s.size(); pos += utf8_char_len(s, pos)) {
+        ++n;
+    }
+    return n;
+}
+
+size_t utf8_offset(const std::string & s, size_t n_chars, size_t pos) {
+    for (; n_chars > 0 && pos < s.size(); --n_chars) {
+        pos += utf8_char_len(s, pos);
+    }
+    return pos;
+}
+
+std::vector<std::string> utf8_chars(const std::string & s) {
+    std::vector<std::string> chars;
+    chars.reserve(s.size());
+    for (size_t pos = 0; pos < s.size();) {
+        const size_t len = utf8_char_len(s, pos);
+        chars.push_back(s.substr(pos, len));
+        pos += len;
+    }
+    return chars;
+}
 
 //
 // string_part

@@ -1,5 +1,6 @@
 #include "lexer.h"
 #include "runtime.h"
+#include "unicode.h"
 
 #include <cctype>
 #include <functional>
@@ -75,6 +76,20 @@ lexer_result lexer::tokenize(const std::string & source) {
                 }
                 // add escaped char
                 char escaped_char = src[pos++];
+                // Python-style \xHH and \uHHHH name a code point
+                if (escaped_char == 'x' || escaped_char == 'u') {
+                    const size_t n_hex = escaped_char == 'x' ? 2 : 4;
+                    uint32_t cp = 0;
+                    for (size_t i = 0; i < n_hex; ++i, ++pos) {
+                        if (pos >= src.size() || !std::isxdigit(static_cast<unsigned char>(src[pos]))) {
+                            throw lexer_exception(std::string("invalid \\") + escaped_char + " escape", source, pos);
+                        }
+                        const char c = src[pos];
+                        cp = cp * 16 + (c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10);
+                    }
+                    str += common_unicode_cpt_to_utf8(cp);
+                    continue;
+                }
                 if (escape_chars.find(escaped_char) == escape_chars.end()) {
                     throw lexer_exception(std::string("unknown escape character \\") + escaped_char, source, pos);
                 }

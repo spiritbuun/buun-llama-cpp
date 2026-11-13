@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -182,6 +183,9 @@ std::string value_to_json(const value & val, int indent = -1, const std::string_
 // Note: only used for debugging purposes
 std::string value_to_string_repr(const value & val);
 
+// Python repr() of a float: shortest text that round-trips
+std::string float_to_string(double v);
+
 struct not_implemented_exception : public std::runtime_error {
     not_implemented_exception(const std::string & msg) : std::runtime_error("NotImplemented: " + msg) {}
 };
@@ -207,6 +211,10 @@ struct value_equality {
     }
 };
 
+// exact three-way comparison of two integer or float values, without rounding integers to doubles
+enum { VALUE_UNORDERED = 2, VALUE_NOT_NUMBERS = 3 };
+int value_number_compare(const value_t & a, const value_t & b);
+
 //
 // primitive value types
 //
@@ -215,7 +223,7 @@ struct value_int_t : public value_t {
     value_int_t(int64_t v) {
         val_int = v;
         val_flt = static_cast<double>(v);
-        if (static_cast<int64_t>(val_flt) != v) {
+        if (val_flt >= 9223372036854775808.0 || static_cast<int64_t>(val_flt) != v) {
             val_flt = v < 0 ? -INFINITY : INFINITY;
         }
     }
@@ -236,6 +244,10 @@ struct value_int_t : public value_t {
     }
 protected:
     virtual bool equivalent(const value_t & other) const override {
+        const int cmp = value_number_compare(*this, other);
+        if (cmp != VALUE_NOT_NUMBERS) {
+            return cmp == 0;
+        }
         return other.is_numeric() && val_int == other.val_int && val_flt == other.val_flt;
     }
     virtual bool nonequal(const value_t & other) const override {
@@ -244,23 +256,53 @@ protected:
 };
 using value_int = std::shared_ptr<value_int_t>;
 
+// integer outside the int64 range (always: in-range values are plain ints): keeps its decimal text, val_int saturates
+struct value_bigint_t : public value_int_t {
+    std::string digits;
+    value_bigint_t(const std::string & digits, double flt) : value_int_t(flt < 0 ? INT64_MIN : INT64_MAX), digits(digits) {
+        val_flt = flt;
+    }
+    virtual string as_string() const override { return digits; }
+    // shared with integral floats beyond the int64 range, which compare equal
+    static hasher digits_hash(const std::string & digits) {
+        return hasher(typeid(value_bigint_t)).update(digits.data(), digits.size());
+    }
+    virtual hasher unique_hash() const noexcept override { return digits_hash(digits); }
+protected:
+    virtual bool equivalent(const value_t & other) const override {
+        const int cmp = value_number_compare(*this, other);
+        return cmp != VALUE_NOT_NUMBERS ? cmp == 0 : (other.is_numeric() && val_flt == other.val_flt);
+    }
+    virtual bool nonequal(const value_t & other) const override {
+        auto * big = dynamic_cast<const value_bigint_t *>(&other);
+        return !(big && digits == big->digits);
+    }
+};
+using value_bigint = std::shared_ptr<value_bigint_t>;
+
+// an integer that as_int() represents exactly
+inline bool is_int64(const value & val) {
+    return is_val<value_int>(val) && !is_val<value_bigint>(val);
+}
+
+// sign and magnitude digits (no leading zeros) of an integer value
+std::pair<bool, std::string> value_int_decimal(const value_t & val);
+// exact negation of an integer value
+value value_int_negate(const value & val);
+
 
 struct value_float_t : public value_t {
     value val;
     value_float_t(double v) {
         val_flt = v;
-        val_int = std::isfinite(v) ? static_cast<int64_t>(v) : 0;
+        // 2^63 and beyond does not fit: saturate instead of an undefined cast
+        val_int = !std::isfinite(v) ? 0 : v >= 9223372036854775808.0 ? INT64_MAX : v <= -9223372036854775808.0 ? INT64_MIN : static_cast<int64_t>(v);
         val = mk_val<value_int>(val_int);
     }
     virtual std::string type() const override { return "Float"; }
     virtual double as_float() const override { return val_flt; }
     virtual int64_t as_int() const override { return val_int; }
-    virtual string as_string() const override {
-        std::string out = std::to_string(val_flt);
-        out.erase(out.find_last_not_of('0') + 1, std::string::npos); // remove trailing zeros
-        if (out.back() == '.') out.push_back('0'); // leave one zero if no decimals
-        return out;
-    }
+    virtual string as_string() const override { return float_to_string(val_flt); }
     virtual bool as_bool() const override {
         return val_flt != 0.0;
     }
@@ -268,6 +310,11 @@ struct value_float_t : public value_t {
     virtual bool is_numeric() const override { return true; }
     virtual bool is_hashable() const override { return true; }
     virtual hasher unique_hash() const noexcept override {
+        if (std::isfinite(val_flt) && (val_flt >= 9223372036854775808.0 || val_flt < -9223372036854775808.0)) {
+            char buf[400];
+            snprintf(buf, sizeof(buf), "%.0f", val_flt);
+            return value_bigint_t::digits_hash(buf);
+        }
         if (static_cast<double>(val_int) == val_flt) {
             return val->unique_hash();
         } else {
@@ -278,6 +325,10 @@ struct value_float_t : public value_t {
     }
 protected:
     virtual bool equivalent(const value_t & other) const override {
+        const int cmp = value_number_compare(*this, other);
+        if (cmp != VALUE_NOT_NUMBERS) {
+            return cmp == 0;
+        }
         return other.is_numeric() && val_int == other.val_int && val_flt == other.val_flt;
     }
     virtual bool nonequal(const value_t & other) const override {
@@ -760,6 +811,15 @@ protected:
     }
 };
 using value_kwarg = std::shared_ptr<value_kwarg_t>;
+
+// applies the filter `name` to input, as `input | name(args...)` does
+value apply_filter_by_name(context & ctx, const std::string & name, value input, const func_args & args);
+
+// binds the built-in `name` of input; filters, when given, take precedence over the type's own table
+value try_builtin_func(context & ctx, const std::string & name, value & input, bool undef_on_missing = false, const func_builtins * filters = nullptr);
+
+// Python `fmt % values`
+string percent_format(const string & fmt, const value & values);
 
 
 } // namespace jinja

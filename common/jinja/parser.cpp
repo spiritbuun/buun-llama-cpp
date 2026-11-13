@@ -381,9 +381,12 @@ private:
     }
 
     statement_ptr parse_comparison_expression() {
-        // NOTE: membership has same precedence as comparison
-        // e.g., ('a' in 'apple' == 'b' in 'banana') evaluates as ('a' in ('apple' == ('b' in 'banana')))
-        auto left = parse_additive_expression();
+        // NOTE: membership has same precedence as comparison, and comparisons chain:
+        // e.g., ('a' in 'apple' == 'b') evaluates as ('a' in 'apple') and ('apple' == 'b')
+        std::vector<token> ops;
+        statements operands;
+        size_t first_pos = current;
+        operands.push_back(parse_additive_expression());
         while (true) {
             token op;
             size_t start_pos = current;
@@ -396,9 +399,19 @@ private:
             } else if (is(token::comparison_binary_operator)) {
                 op = next();
             } else break;
-            left = mk_stmt<binary_expression>(start_pos, op, std::move(left), parse_additive_expression());
+            if (ops.empty()) {
+                first_pos = start_pos;
+            }
+            ops.push_back(std::move(op));
+            operands.push_back(parse_additive_expression());
         }
-        return left;
+        if (ops.empty()) {
+            return std::move(operands[0]);
+        }
+        if (ops.size() == 1) {
+            return mk_stmt<binary_expression>(first_pos, ops[0], std::move(operands[0]), std::move(operands[1]));
+        }
+        return mk_stmt<comparison_chain_expression>(first_pos, std::move(ops), std::move(operands));
     }
 
     statement_ptr parse_additive_expression() {
@@ -491,11 +504,15 @@ private:
         statements args;
         while (!is(token::close_paren)) {
             statement_ptr arg;
-            // unpacking: *expr
+            // unpacking: *expr or **expr
             if (peek().t == token::multiplicative_binary_operator && peek().value == "*") {
                 size_t start_pos = current;
                 ++current; // consume *
-                arg = mk_stmt<spread_expression>(start_pos, parse_expression());
+                const bool mapping = peek().t == token::multiplicative_binary_operator && peek().value == "*";
+                if (mapping) {
+                    ++current;
+                }
+                arg = mk_stmt<spread_expression>(start_pos, parse_expression(), mapping);
             } else {
                 arg = parse_expression();
                 if (is(token::equals)) {

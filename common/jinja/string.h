@@ -58,4 +58,11 @@ struct string {
     string strip(bool left, bool right, std::optional<const std::string_view> chars = std::nullopt);
 };
 
+// UTF-8 helpers: strings are indexed by code point, a malformed byte counts as one character
+bool utf8_is_ascii(const std::string & s);
+size_t utf8_length(const std::string & s);
+// byte offset reached after walking n_chars characters from byte pos (stops at the end)
+size_t utf8_offset(const std::string & s, size_t n_chars, size_t pos = 0);
+std::vector<std::string> utf8_chars(const std::string & s);
+
 } // namespace jinja

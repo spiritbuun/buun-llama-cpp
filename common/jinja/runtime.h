@@ -448,6 +448,26 @@ struct object_literal : public expression {
 // Complex Expressions
 
 /**
+ * Two or more chained comparisons, e.g. a < b <= c.
+ */
+struct comparison_chain_expression : public expression {
+    std::vector<token> ops;
+    statements operands; // one more than ops
+
+    comparison_chain_expression(std::vector<token> && ops, statements && operands)
+        : ops(std::move(ops)), operands(std::move(operands)) {
+        for (const auto & operand : this->operands) chk_type<expression>(operand);
+    }
+    std::string type() const override { return "ComparisonChainExpression"; }
+    value execute_impl(context & ctx) const override;
+    void visit(context & ctx) const override {
+        ctx.visitor(false, this, {
+            {"operands", stmts_to_ptr(operands)}
+        });
+    }
+};
+
+/**
  * An operation with two sides, separated by an operator.
  * Note: Either side can be a Complex Expression, with order
  * of operations being determined by the operator.
@@ -634,7 +654,8 @@ struct keyword_argument_expression : public expression {
 
 struct spread_expression : public expression {
     statement_ptr argument;
-    explicit spread_expression(statement_ptr && argument) : argument(std::move(argument)) {
+    bool mapping; // **expr: entries become keyword arguments
+    explicit spread_expression(statement_ptr && argument, bool mapping = false) : argument(std::move(argument)), mapping(mapping) {
         chk_type<expression>(this->argument);
     }
     std::string type() const override { return "SpreadExpression"; }

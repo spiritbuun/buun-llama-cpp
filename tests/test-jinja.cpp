@@ -32,6 +32,7 @@ static void test_tests(testing & t);
 static void test_string_methods(testing & t);
 static void test_array_methods(testing & t);
 static void test_object_methods(testing & t);
+static void test_jinja2_parity(testing & t);
 static void test_hasher(testing & t);
 static void test_stats(testing & t);
 static void test_caps(testing & t);
@@ -72,6 +73,7 @@ int main(int argc, char *argv[]) {
     t.test("string methods", test_string_methods);
     t.test("array methods", test_array_methods);
     t.test("object methods", test_object_methods);
+    t.test("jinja2 parity", test_jinja2_parity);
     if (!g_python_mode) {
         t.test("hasher", test_hasher);
         t.test("stats", test_stats);
@@ -1414,6 +1416,57 @@ static void test_tests(testing & t) {
 }
 
 static void test_string_methods(testing & t) {
+    test_template(t, "argument unpacking",
+        "{{ dict({'a': 1}, **{'b': 2}) | tojson }}{{ '%s-%s' | format(*['x', 'y']) }}",
+        json::object(),
+        "{\"a\": 1, \"b\": 2}x-y"
+    );
+
+    test_template(t, "hex and unicode escapes",
+        "{{ '\\x41\\u00e9' }}{{ '\\x00\\x1f' | length }}{{ 'a\\x01b'.split('\\x01') | join('-') }}",
+        json::object(),
+        "A\xc3\xa9" "2a-b"
+    );
+
+    test_template(t, "integer and width limits",
+        "{{ [9007199254740993] | sum }}|{{ [9223372036854775807, 1] | sum }}|{{ 'abc'.count('', 4) }}{{ 'abc'.count('', 3) }}|"
+        "{{ 'abc' | truncate(4611686018427387904, leeway=4611686018427387904) }}|{{ '9223372036854775808' | int }}|"
+        "{{ ('%*s' % (1000000000, 'x')) | length }}|{{ ('%*s|' % (('-9223372036854775808' | int), 'x')) | length }}",
+        json::object(),
+        "9007199254740993|9.223372036854776e+18|01|abc|9223372036854775808|1000000|1000001"
+    );
+
+    test_template(t, "bigint modulo, ordering and mixed sums",
+        "{{ (('9' * 400) | int) % 2 }}|{{ (('9' * 20) | int) % 7 }}|{{ (('-' ~ '9' * 20) | int) % 7 }}|{{ (('9' * 20) | int) % -7 }}|"
+        "{{ ('9223372036854775808' | int) < ('9223372036854775809' | int) }}|{{ ('-9223372036854775809' | int) < 0 }}|{{ 5 > ('9223372036854775808' | int) }}|"
+        "{{ [9007199254740993, -9007199254740992, 0.0] | sum }}|{{ [1, 2.5, true] | sum }}",
+        json::object(),
+        "1|1|6|-6|True|True|False|1.0|4.5"
+    );
+
+    test_template(t, "bigint negation, equality and sorting",
+        "{{ -('-9223372036854775809' | int) }}|{{ -('9223372036854775808' | int) }}|{{ -('-9223372036854775808' | int) }}|"
+        "{% set a = '-9223372036854775809' | int %}{% set b = '-9223372036854775808' | int %}{{ a == b }} {{ b == a }} {{ a < b }} {{ a == a }}|"
+        "{{ ['9223372036854775809', '9223372036854775808', '5'] | map('int') | sort | join(',') }}|{{ 9300000000000000000.0 | int }}|{{ 9210000000000000000.0 | int == 9210000000000000000 }}",
+        json::object(),
+        "9223372036854775809|-9223372036854775808|9223372036854775808|False False True True|5,9223372036854775808,9223372036854775809|9300000000000000000|True"
+    );
+
+    test_template(t, "integer against float comparisons",
+        "{{ ('9223372036854775809' | int) == 9223372036854775808.0 }} {{ ('9223372036854775809' | int) > 9223372036854775808.0 }}|"
+        "{% set n = ('9' * 400) | int %}{{ n == ('inf' | float) }} {{ n < ('inf' | float) }} {{ n > ('-inf' | float) }}|"
+        "{{ 9007199254740993 == 9007199254740992.0 }} {{ 9007199254740993 > 9007199254740992.0 }} {{ 3 == 3.0 }} {{ 3 < 3.5 }} {{ -3 > -3.5 }} {{ 2.5 < 3 }}|"
+        "{{ 1 < ('nan' | float) }} {{ ('nan' | float) == ('nan' | float) }} {{ [3, 2.5, 1] | sort | join(',') }}",
+        json::object(),
+        "False True|False True True|False True True True True True|False False 1,2.5,3"
+    );
+
+    test_template(t, "unique across equal integers and floats",
+        "{{ [('9223372036854775808' | int), 9223372036854775808.0, ('-9223372036854775809' | int), 3, 3.0] | unique | list | length }}",
+        json::object(),
+        "3"
+    );
+
     test_template(t, "string.upper()",
         "{{ s.upper() }}",
         {{"s", "hello"}},
@@ -2057,6 +2110,177 @@ static void test_object_methods(testing & t) {
         "{% set o = dict((obj | items | list), c=2) %}{{ o|tojson }}",
         {{"obj", {{"a", 3}, {"b", 1}}}},
         "{\"a\": 3, \"b\": 1, \"c\": 2}"
+    );
+}
+
+static void test_jinja2_parity(testing & t) {
+    // expected values come from Python Jinja2 3.1.6
+    test_template(t, "chained comparisons",
+        "{{ 1 < 2 < 3 }} {{ 3 > 2 > 2 }} {{ 1 in [1] == true }} {{ \"a\" in \"abc\" != \"x\" }} {{ 1 <= 5 <= 100 }}",
+        json::object(),
+        "True False False True True"
+    );
+
+    test_template(t, "chained comparison evaluates operands once",
+        "{% set ns = namespace(n=0) %}{% macro bump() %}{% set ns.n = ns.n + 1 %}5{% endmacro %}{{ 1 < bump() | int < 9 }} {{ ns.n }}",
+        json::object(),
+        "True 1"
+    );
+
+    test_template(t, "string comparison",
+        "{{ \"a\" < \"b\" }} {{ \"abc\" >= \"abd\" }} {{ \"\303\251\" > \"z\" }}",
+        json::object(),
+        "True False True"
+    );
+
+    test_template(t, "integer arithmetic is exact",
+        "{{ 9007199254740993 + 2 }} {{ 3037000499 * 3037000499 }} {{ -7 % 3 }} {{ 7 % -3 }} {{ 9007199254740993 < 9007199254740994 }} {{ 9223372036854775807 - 1 }}",
+        json::object(),
+        "9007199254740995 9223372030926249001 2 -2 True 9223372036854775806"
+    );
+
+    test_template(t, "float to string",
+        "{{ 1.0 }} {{ 10000000000000000.0 }} {{ 0.1 + 0.2 }} {{ 0.00001 }} {{ 123456789.125 }} {{ 7 / 2 }} {{ 1000000000000000.0 }} {{ [1.5, 10000000000000000000000.0, 100.0 * 3] | tojson }}",
+        json::object(),
+        "1.0 1e+16 0.30000000000000004 1e-05 123456789.125 3.5 1000000000000000.0 [1.5, 1e+22, 300.0]"
+    );
+
+    test_template(t, "big integers",
+        "{{ \"123456789012345678901234567890\" | int }} {{ [\"18446744073709551616\", \"-9223372036854775809\"] | map(\"int\") | list | tojson }}",
+        json::object(),
+        "123456789012345678901234567890 [18446744073709551616, -9223372036854775809]"
+    );
+
+    test_template(t, "tojson non-finite floats",
+        "{% set big = \"1e400\" %}{% set n = \"nan\" %}{% set z = \"-0.0\" %}{{ [big | float, (\"-\" ~ big) | float, n | float, z | float] | tojson }} {{ big | float }} {{ n | float }}",
+        json::object(),
+        "[Infinity, -Infinity, NaN, -0.0] inf nan"
+    );
+
+    test_template(t, "int filter",
+        "{{ [\"12\", \" 7 \", \"0x1f\", \"1_0\", \"abc\", \"3.9\", \"-0\", \"1e3\", \"\", \"1__0\", \"+5\"] | map(\"int\") | list | tojson }}",
+        json::object(),
+        "[12, 7, 0, 10, 0, 3, 0, 1000, 0, 0, 5]"
+    );
+
+    test_template(t, "int filter with default and base",
+        "{{ [\"ff\", \"0xff\", \"z\", \"1_f\", \"-7f\"] | map(\"int\", 5, 16) | list | tojson }} {{ \"x\" | int(-1) }} {{ \"0b101\" | int(0, 2) }} {{ \"0o17\" | int(base=8) }} {{ 3.99 | int }} {{ true | int }}",
+        json::object(),
+        "[255, 255, 5, 31, -127] -1 5 15 3 1"
+    );
+
+    test_template(t, "float filter",
+        "{{ [\"1.5\", \"1e400\", \"-0.0\", \"nan\", \"x\", \"Infinity\", \"1e-7\", \"1e16\", \"123456789.123\", \"0x10\", \" 2 \", \"1_0.5\", \".5\", \"5.\", \"1e\"] | map(\"float\") | list | tojson }} {{ \"x\" | float(2.5) }} {{ 3 | float }}",
+        json::object(),
+        "[1.5, Infinity, -0.0, NaN, 0.0, Infinity, 1e-07, 1e+16, 123456789.123, 0.0, 2.0, 10.5, 0.5, 5.0, 0.0] 2.5 3.0"
+    );
+
+    test_template(t, "format filter is printf-style",
+        "{{ \"%c%5.2f|%-4d|%s|%r|%x|%%|%05d|%+d|%e|%g\" | format(233, 3.14159, 7, [1, \"a\"], \"q\", 255, 42, 5, 1234.5, 0.00001234) }}",
+        json::object(),
+        "\303\251 3.14|7   |[1, 'a']|'q'|ff|%|00042|+5|1.234500e+03|1.234e-05"
+    );
+
+    test_template(t, "format filter with keyword arguments",
+        "{{ \"%(a)s-%(b)03d\" | format(a=\"x\", b=7) }}",
+        json::object(),
+        "x-007"
+    );
+
+    test_template(t, "string modulo operator",
+        "{{ \"%s and %s\" % (\"a\", 2) }} {{ \"%d%%\" % 5 }} {{ \"%(k)s\" % {\"k\": \"v\"} }} {{ \"%.3s|%5s|%-5s|\" % (\"abcdef\", \"\303\251\", \"\303\251\") }}",
+        json::object(),
+        "a and 2 5% v abc|    \303\251|\303\251    |"
+    );
+
+    test_template(t, "format %c builds code points",
+        "{{ [\"%c\"] | map(\"format\", 233) | first }}{{ \"%c%c\" | format(20013, 127881) }}{{ \"%c\" | format(\"x\") }}",
+        json::object(),
+        "\303\251\344\270\255\360\237\216\211x"
+    );
+
+    test_template(t, "map with filter name and arguments",
+        "{{ [3, 1, 2] | map(\"string\") | join(\",\") }} {{ [\"a\", \"b\"] | map(\"upper\") | join }} {{ [\"ff\"] | map(\"int\", 0, 16) | first }} {{ [\"abcdef\", \"xy\"] | map(\"truncate\", 4, true, \"\", 0) | join(\",\") }} {{ [none, 2] | map(\"default\", 5, true) | list | tojson }}",
+        json::object(),
+        "3,1,2 AB 255 abcd,xy [5, 2]"
+    );
+
+    test_template(t, "unique",
+        "{{ [\"a\", \"A\", \"b\", \"a\"] | unique | join }} {{ [\"a\", \"A\", \"b\", \"a\"] | unique(true) | join }} {{ [1, \"1\", 1.0, true, 2] | unique | list | tojson }} {{ [{\"k\": 1}, {\"k\": 1}, {\"k\": 2}] | unique(attribute=\"k\") | list | length }}",
+        json::object(),
+        "ab aAb [1, \"1\", 2] 2"
+    );
+
+    test_template(t, "truncate",
+        "{{ \"abcdef\" | truncate(4, true, \"\", 0) }}|{{ \"hello world foo bar\" | truncate(9) }}|{{ \"hello world foo bar\" | truncate(9, true) }}|{{ \"hello world\" | truncate(9) }}|{{ \"h\303\251llo w\303\266rld\" | truncate(4, true, \"\", 0) }}",
+        json::object(),
+        "abcd|hello...|hello ...|hello world|h\303\251ll"
+    );
+
+    test_template(t, "string.count()",
+        "{{ \"aXbXc\".count(\"X\") }} {{ \"aaaa\".count(\"aa\") }} {{ \"h\303\251\303\251\".count(\"\303\251\") }} {{ \"abc\".count(\"\") }} {{ \"abcabc\".count(\"b\", 2) }}",
+        json::object(),
+        "2 2 2 4 1"
+    );
+
+    test_template(t, "strings are indexed by code point",
+        "{{ \"h\303\251llo\" | length }} {{ \"h\303\251llo\"[1:3] }} {{ \"h\303\251llo\"[1] }} {{ \"h\303\251llo\"[-1] }} {{ \"\344\270\255\346\226\207\360\237\216\211\"[::-1] }} {{ \"\303\251\" in \"h\303\251llo\" }}",
+        json::object(),
+        "5 \303\251l \303\251 o \360\237\216\211\346\226\207\344\270\255 True"
+    );
+
+    test_template(t, "for loop over a string",
+        "{% for c in \"h\303\251\360\237\216\211\" %}[{{ c }}]{% endfor %}{% for c in \"abcd\" if c in \"bd\" %}{{ loop.index }}{{ c }}{% endfor %}",
+        json::object(),
+        "[h][\303\251][\360\237\216\211]1b2d"
+    );
+
+    test_template(t, "is filter",
+        "{{ \"upper\" is filter }} {{ \"fromjson\" is filter }} {{ \"tojson\" is filter }} {{ \"nope\" is filter }} {{ \"int\" is filter }}",
+        json::object(),
+        "True False True False True"
+    );
+
+    test_template(t, "dict.copy()",
+        "{% set d = {\"a\": 1} %}{% set c = d.copy() %}{{ c is sameas d }} {{ c == d }} {{ c | tojson }}",
+        json::object(),
+        "False True {\"a\": 1}"
+    );
+
+    test_template(t, "dict() with unpacked keyword arguments",
+        "{% set k = \"x y\" %}{{ dict({\"a\": 1}, **{k: 2}) | tojson }} {{ dict(a=1, **{\"b\": 2}) | tojson }}",
+        json::object(),
+        "{\"a\": 1, \"x y\": 2} {\"a\": 1, \"b\": 2}"
+    );
+
+    test_template(t, "argument unpacking in filters and tests",
+        "{{ \"a-b\" | replace(*[\"-\", \"+\"]) }} {{ 6 is divisibleby(*[3]) }} {{ [1, 2, 3] | join(**{\"d\": \"/\"}) }}",
+        json::object(),
+        "a+b True 1/2/3"
+    );
+
+    test_template(t, "sort is stable",
+        "{{ [{\"k\": 1, \"v\": \"a\"}, {\"k\": 0, \"v\": \"b\"}, {\"k\": 1, \"v\": \"c\"}, {\"k\": 0, \"v\": \"d\"}] | sort(attribute=\"k\") | map(attribute=\"v\") | join }}",
+        json::object(),
+        "bdac"
+    );
+
+    test_template(t, "sum",
+        "{{ [1, 2, 3] | sum }} {{ [1.5, 2] | sum }} {{ [{\"a\": 2}, {\"a\": 3}] | sum(attribute=\"a\") }} {{ [1] | sum(start=10) }} {{ [] | sum }}",
+        json::object(),
+        "6 3.5 5 11 0"
+    );
+
+    test_template(t, "control characters in string literals",
+        "{{ \"a\\x00b\\x1f\\x7f\" | length }} {{ \"\\x01\" in \"a\\x01b\" }} {{ \"a\\x02b\".replace(\"\\x02\", \"-\") }} {{ \"\303\251\\x41\" }}",
+        json::object(),
+        "5 True a-b \303\251A"
+    );
+
+    test_template(t, "loop.nextitem",
+        "{% for x in [1, 2, 3] %}{{ x }}>{{ loop.nextitem if loop.nextitem is defined else \"end\" }} {% endfor %}",
+        json::object(),
+        "1>2 2>3 3>end "
     );
 }
 
